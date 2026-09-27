@@ -431,6 +431,16 @@ pub fn ability(def: &GodDef, slot: usize) -> Vec<f32> {
             let low = tones(0.7, &[b * 0.75, b * 0.8], 0.15, 0.4, 0.05, 0.3);
             mix_at(&mut x, &low, 0.0, 0.5);
         }
+        Archetype::Lantern { .. } => {
+            // the lamp going up: a brass chime (a bell's out-of-tune
+            // partials), a flare of flame rising, and a warm chord under it
+            let chime = tones(1.1, &[b * 8.0, b * 8.0 * 2.76, b * 8.0 * 5.40], 0.002, 0.5, 0.0, 0.0);
+            mix_at(&mut x, &chime, 0.0, 0.55);
+            let flare = whoosh(0.6, 500.0, 5200.0, 1.3, &mut n);
+            mix_at(&mut x, &flare, 0.02, 0.7);
+            let warm = tones(1.2, &[b * 2.0, b * 2.5, b * 3.0], 0.12, 0.7, 0.1, 0.2);
+            mix_at(&mut x, &warm, 0.1, 0.6);
+        }
         Archetype::Echoes { .. } => {
             // a low cluster a semitone apart, trembling, and heavy steps
             // coming from everywhere at once

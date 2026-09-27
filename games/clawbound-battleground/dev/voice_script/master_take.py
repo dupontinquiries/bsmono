@@ -172,6 +172,12 @@ CHAINS = {
                "equalizer=f=140:t=q:w=1:g=3,equalizer=f=3000:t=q:w=1.4:g=-2,lowpass=f=7000,"
                "acompressor=threshold=-28dB:ratio=3:attack=10:release=180:makeup=3,"
                "aecho=0.8:0.35:14|27:0.10|0.05",
+ # the lamp-keeper of the salt roads: a big warm voice out in the open
+ # desert night -- warmth low down, a little presence, a long slap back
+ # off the dunes; no pitch shift (the voice is already the size it is)
+ 'brasshowl':  "equalizer=f=180:t=q:w=1:g=2,equalizer=f=2600:t=q:w=1.2:g=1.5,"
+               "acompressor=threshold=-22dB:ratio=3:attack=8:release=160:makeup=2,"
+               "aecho=0.8:0.5:130|260:0.16|0.08",
  # a young daredevil: bright and quick, a short slap
  'cometail':   "rubberband=pitch=1.04:tempo=1.03:formant=preserved:pitchq=quality,"
                "highpass=f=120,treble=g=4:f=6000,"

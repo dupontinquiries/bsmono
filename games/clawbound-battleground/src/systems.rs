@@ -61,6 +61,7 @@ impl Game {
         self.zones_tick(dt);
         self.kit_tick(dt);
         self.stalker_tick(dt);
+        self.lantern_tick(dt);
 
         // 6b. sky + map events (weather.rs / map_events.rs)
         self.atmosphere_tick(dt);
@@ -392,6 +393,8 @@ impl Game {
             let speed = self.move_speed(i) * self.gods[i].casting.map_or(1.0, |c| c.move_mul);
             self.gods[i].face_hold = (self.gods[i].face_hold - dt).max(0.0);
             let dir = crate::kit::confused(self.gods[i].move_dir, self.gods[i].giggle_t, self.t, i);
+            // fleeing the lamp (`lantern`): straight away, at a run
+            let dir = self.flee_dir(i, dir);
             let yaw_cur = self.gods[i].yaw;
             let g = &mut self.gods[i];
             g.leap_cd = (g.leap_cd - dt).max(0.0);

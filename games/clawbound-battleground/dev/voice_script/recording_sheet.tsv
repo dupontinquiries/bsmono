@@ -143,6 +143,15 @@ voice/hollowstep/kill.1.opus	hollowstep	Found you.	soft, almost tender	2	takes d
 voice/hollowstep/kill.2.opus	hollowstep	You ran. They always run.	weary	2	takes down an enemy ancestor
 voice/hollowstep/death.1.opus	hollowstep	I'll... be... waiting...	fading, not beaten	1	falls
 voice/hollowstep/death.2.opus	hollowstep	Check... the shadows...	a last whisper, a threat	1	falls
+voice/brasshowl/select.opus	brasshowl	Keep to the light!	calling back down the road	4	locked in on the select screen
+voice/brasshowl/cast1.opus	brasshowl	Catch!	a throw, cheerful	3	winds up Lamp Oil
+voice/brasshowl/cast2.opus	brasshowl	BACK!	one bark, sharp	4	winds up Bark
+voice/brasshowl/cast3.opus	brasshowl	Sit by the fire.	warm, looking after someone	2	winds up Watchfire
+voice/brasshowl/cast4.opus	brasshowl	SHADOWS!	the biggest bellow you have	5	winds up SHADOWS!
+voice/brasshowl/kill.1.opus	brasshowl	Out you go.	brisk	3	takes down an enemy ancestor
+voice/brasshowl/kill.2.opus	brasshowl	The road is clear.	satisfied, to the caravan	3	takes down an enemy ancestor
+voice/brasshowl/death.1.opus	brasshowl	The lamp... is out...	surprised, quiet	2	falls
+voice/brasshowl/death.2.opus	brasshowl	Keep... it... lit...	a last instruction	1	falls
 narrator/prologue1.opus	narrator	Before any word was written, the world belonged to the clans.	hushed, as if starting an old story	2	the prologue opens, line 1 of 8 (first match of a session)
 narrator/prologue2.opus	narrator	No hand raised a wall. No fire burned but the lightning's.	slow, each sentence its own image	2	the prologue, line 2 of 8
 narrator/prologue3.opus	narrator	From the frozen long-ago to the endless dunes, the great cats kept it.	growing, sweeping	3	the prologue, line 3 of 8

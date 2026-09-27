@@ -580,6 +580,7 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             // off is still worth sending it toward
             Archetype::Send { .. } => f32::INFINITY,
             Archetype::Echoes { .. } => 12.0,
+            Archetype::Lantern { radius, .. } => radius * 0.8,
         };
         let pri = match ab.arch {
             Archetype::Nova { .. } => {
@@ -633,6 +634,12 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             }
             Archetype::Echoes { .. } => {
                 if engage && is_god_target && dist < range { 0.93 } else { 0.0 }
+            }
+            // the lamp on a cat in its light, or on a shadow of
+            // Hollowstep's standing in it
+            Archetype::Lantern { radius, .. } => {
+                let shadow = game.others.iter().any(|o| o.team != g.team && o.pos.distance(g.pos) < radius * 0.8);
+                if (is_god_target && dist < range) || shadow { 0.95 } else { 0.0 }
             }
             Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } => {
                 let hurt = g.hp / g.max_hp;

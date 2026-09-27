@@ -285,6 +285,21 @@ pub const PARTS: &[Part] = &[
         ],
     },
     Part {
+        who: "brasshowl",
+        voice: "A small cat with an enormous voice: warm, loud, a caravan hand calling down the line at night. Big and round even when he is being kind. The ultimate is the biggest bellow you have.",
+        lines: &[
+            l("select", "Keep to the light!", "calling back down the road", 4, SELECT),
+            l("cast1", "Catch!", "a throw, cheerful", 3, "winds up Lamp Oil"),
+            l("cast2", "BACK!", "one bark, sharp", 4, "winds up Bark"),
+            l("cast3", "Sit by the fire.", "warm, looking after someone", 2, "winds up Watchfire"),
+            l("cast4", "SHADOWS!", "the biggest bellow you have", 5, "winds up SHADOWS!"),
+            l("kill.1", "Out you go.", "brisk", 3, KILL),
+            l("kill.2", "The road is clear.", "satisfied, to the caravan", 3, KILL),
+            l("death.1", "The lamp... is out...", "surprised, quiet", 2, DEATH),
+            l("death.2", "Keep... it... lit...", "a last instruction", 1, DEATH),
+        ],
+    },
+    Part {
         who: "narrator",
         voice: "The storyteller of the clans, over the first match's prologue: unhurried, weighty, a little in awe. Let each line breathe; the music leaves room between them. Record each as its own file.",
         lines: &[

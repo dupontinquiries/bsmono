@@ -95,7 +95,7 @@ fn trophies_grow_the_stat_they_name_up_to_their_most() {
 
 #[test]
 fn roster_is_14_ancestors_with_4_abilities_each() {
-    assert_eq!(ROSTER.len(), 16);
+    assert_eq!(ROSTER.len(), 17);
     let roles: std::collections::HashSet<_> = ROSTER.iter().map(|g| g.role).collect();
     assert!(roles.len() >= 4, "roster should span multiple roles");
     for g in &ROSTER {
@@ -858,7 +858,7 @@ fn firing_range_every_ability_goes_where_it_is_aimed_and_turns_the_cat() {
             }
             // the step goes to wherever his other is, and the echoes rise
             // round him: neither goes along the aim
-            let directional = !matches!(ab.arch, Archetype::Nova { .. } | Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } | Archetype::Giggle { .. } | Archetype::Swap { .. } | Archetype::Echoes { .. });
+            let directional = !matches!(ab.arch, Archetype::Nova { .. } | Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } | Archetype::Giggle { .. } | Archetype::Swap { .. } | Archetype::Echoes { .. } | Archetype::Lantern { .. });
             if directional {
                 assert!(!dirs.is_empty(), "{} slot {slot} ({:?}): no directional effect found", def.name, ab.arch);
                 for d in &dirs {
@@ -2966,5 +2966,151 @@ mod hollowstep {
             }
         }
         assert!(used.iter().all(|&n| n > 0), "the step, the sending, the reach and every shadow in four minutes: {used:?}");
+    }
+}
+
+/// Brasshowl (`lantern`): the lamp raised -- the struck flee, cannot act,
+/// are shown up and cannot stalk; Hollowstep's shadows cannot stand in it.
+mod brasshowl {
+    use clawbound::gods::{Archetype, ROSTER};
+    use clawbound::sim::{Event, Game};
+    use glam::Vec3;
+
+    fn quiet(g: &mut Game) {
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+            c.move_dir = Vec3::ZERO;
+            c.attack_held = false;
+        }
+        g.minions.clear();
+        g.next_wave_t = 1e9;
+    }
+    fn run(g: &mut Game, secs: f32) {
+        for _ in 0..(secs * 60.0) as usize {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+        }
+    }
+    fn id(name: &str) -> u32 {
+        ROSTER.iter().position(|d| d.name == name).unwrap() as u32
+    }
+    fn lamp() -> (u32, f32, f32, f32) {
+        let d = &ROSTER[id("Brasshowl") as usize];
+        let s = (0..4).find(|&s| matches!(d.abilities[s].arch, Archetype::Lantern { .. })).unwrap();
+        let Archetype::Lantern { radius, flee, reveal, .. } = d.abilities[s].arch else { unreachable!() };
+        (s as u32, radius, flee, reveal)
+    }
+    fn game(red: &[u32]) -> Game {
+        let mut g = Game::new_teams(&[id("Brasshowl")], red);
+        quiet(&mut g);
+        g.set_level(0, 5);
+        g.gods[0].pos = Vec3::new(-38.0, 0.0, -8.0);
+        g.gods[0].mana = 9999.0;
+        for i in 1..g.gods.len() {
+            g.gods[i].pos = Vec3::new(-120.0 + i as f32 * 3.0, 0.0, -20.0);
+        }
+        g
+    }
+
+    /// SHADOWS!: a cat in the light is struck, runs straight away from him
+    /// (whatever it is steered to do), cannot attack or cast while it runs,
+    /// and is shown up -- it cannot stalk -- for longer than it runs. One
+    /// out of the light is untouched.
+    #[test]
+    fn the_lamp_sends_them_running_and_shows_them_up() {
+        let (slot, radius, flee, reveal) = lamp();
+        let mut g = game(&[0, 1]);
+        let me = g.gods[0].pos;
+        g.gods[1].pos = me + Vec3::new(4.0, 0.0, 0.0);
+        g.gods[2].pos = me + Vec3::new(0.0, 0.0, radius + 6.0);
+        g.gods[1].sneak = true;
+        g.gods[2].sneak = true;
+        run(&mut g, 2.0);
+        assert!(g.stalking(1), "stalking before the lamp");
+        let h = g.gods[1].hp;
+        // it tries to come at him
+        g.gods[1].move_dir = Vec3::new(-1.0, 0.0, 0.0);
+        g.cast_queue.push((0, slot, me));
+        let mut lit = false;
+        // the ultimate's wind-up is 0.6 s
+        for _ in 0..50 {
+            g.tick(1.0 / 60.0);
+            lit |= g.events.iter().any(|e| matches!(e, Event::LanternFx { .. }));
+            g.events.clear();
+        }
+        assert!(lit, "the lamp went up");
+        assert!(g.gods[1].hp < h - 60.0, "struck: {h} -> {}", g.gods[1].hp);
+        assert!(g.gods[1].flee_t > 0.0 && g.gods[1].revealed_t > flee, "running, and shown up for longer");
+        assert!(!g.kit_free(1), "a fleeing cat cannot act");
+        let x0 = g.gods[1].pos.x;
+        run(&mut g, 0.8);
+        assert!(g.gods[1].pos.x > x0 + 3.0, "it ran away from him though it was steered at him: {x0:.1} -> {:.1}", g.gods[1].pos.x);
+        assert!(!g.stalking(1), "shown up: no stalking");
+        assert!(g.stalking(2), "out of the light: still stalking");
+        assert_eq!(g.gods[2].flee_t, 0.0);
+        run(&mut g, flee);
+        assert!(g.kit_free(1), "the running wears off");
+        // past the break a hit puts on stalking, and still shown up: it is
+        // the light that stops the stalk, not the blow
+        assert!(0.8 + flee > clawbound::consts::STALK_BREAK_SECS + 0.3, "the blow's own break on stalking is over by now");
+        assert!(g.gods[1].revealed_t > 0.0, "still shown up");
+        assert!(!g.stalking(1), "shown up, long after the blow: still no stalking");
+        run(&mut g, reveal);
+        assert!(g.stalking(1), "and so does the showing up");
+    }
+
+    /// No shadow stands in the light: Hollowstep's echoes in it are gone,
+    /// and his other is driven to the far side of the map from him.
+    #[test]
+    fn no_shadow_stands_in_the_light() {
+        let (slot, radius, ..) = lamp();
+        let mut g = game(&[id("Hollowstep")]);
+        run(&mut g, 0.1);
+        let me = g.gods[0].pos;
+        // Hollowstep beside the lamp, his other and his echoes too
+        g.gods[1].pos = me + Vec3::new(-(radius + 30.0), 0.0, 0.0);
+        let k = g.main_other(1).expect("his other");
+        g.others[k].pos = me + Vec3::new(3.0, 0.0, 0.0);
+        g.gods[1].cds = [0.0; 4];
+        g.gods[1].mana = 9999.0;
+        g.set_level(1, 5);
+        g.every_shadow(1, 2, 8.0, 10.0);
+        assert!(g.others.iter().filter(|o| o.echo).count() >= 2);
+        let echoes_near = g.others.iter().filter(|o| o.echo && o.pos.distance(me) < radius).count();
+        assert!(echoes_near >= 2, "echoes stand in the light: {echoes_near}");
+        g.cast_queue.push((0, slot, me));
+        let mut driven = 0;
+        for _ in 0..50 {
+            g.tick(1.0 / 60.0);
+            driven += g.events.iter().filter(|e| matches!(e, Event::ShadowDriven { .. })).count();
+            g.events.clear();
+        }
+        assert!(driven >= 3, "his other and its echoes torn out of the light: {driven}");
+        assert!(g.others.iter().all(|o| o.pos.distance(me) > radius), "nothing of his in the light");
+        let back = g.main_other(1).map(|k| g.others[k].pos).expect("his other rises again, elsewhere");
+        let him = g.gods[1].pos;
+        assert!(back.distance(him) > 30.0, "far from him: {:.1}", back.distance(him));
+    }
+
+    /// A bot Brasshowl uses his kit, the lamp included.
+    #[test]
+    fn a_bot_brasshowl_raises_the_lamp() {
+        let mut g = Game::new_teams(&[0, id("Brasshowl")], &[1, 2]);
+        for c in g.gods.iter_mut() {
+            c.ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+        }
+        for i in 0..g.gods.len() {
+            g.set_level(i, 5);
+        }
+        let mut used = [0u32; 4];
+        for _ in 0..(240 * 30) {
+            g.tick(1.0 / 30.0);
+            for e in g.events.drain(..) {
+                if let Event::Cast { god: 1, slot, .. } = e {
+                    used[slot as usize] += 1;
+                }
+            }
+        }
+        assert!(used[0] > 0 && used[1] > 0 && used[3] > 0, "oil, bark and the lamp in four minutes: {used:?}");
     }
 }

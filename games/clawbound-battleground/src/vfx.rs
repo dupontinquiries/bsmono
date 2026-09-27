@@ -352,6 +352,8 @@ impl Vfx {
                 Event::StarfallFx { at, radius } => add(*at + Vec3::Y * 3.0, [0.88, 0.94, 1.0], radius * 4.0, 0.6, 18.0),
                 Event::HealFx { pos, radius } => add(*pos + Vec3::Y, [0.45, 1.0, 0.55], radius * 1.5, 0.6, 2.0),
                 Event::GiggleFx { pos, radius } => add(*pos + Vec3::Y, [1.0, 0.55, 0.8], radius * 1.5, 0.5, 3.0),
+                // the lamp raised: warm light out to its reach, held a moment
+                Event::LanternFx { pos, radius } => add(*pos + Vec3::Y * 2.0, [1.0, 0.72, 0.35], radius * 1.3, 1.2, 5.0),
                 Event::ShieldFx { pos, dur, color } => add(*pos + Vec3::Y, *color, 4.0, dur.min(1.5), 1.5),
                 Event::BeamFx { from, dir, length, color, dur, .. } => add(*from + *dir * (length * 0.5) + Vec3::Y, *color, length * 0.6 + 2.0, dur.min(2.0), 3.0),
                 _ => {}
@@ -1276,6 +1278,22 @@ impl Vfx {
                             let (p, v) = if inward { (at + d * r + Vec3::Y * 0.4, -d * 2.4) } else { (at + d * 0.4 + Vec3::Y * 0.5, d * 3.2 + Vec3::Y * 0.3) };
                             self.particles.push(Particle { pos: p, vel: v, life: 1.3, max_life: 1.3, size: 0.42, color: [0.30, 0.31, 0.36], alpha: 0.5, gravity: 0.0, drag: 1.2 });
                         }
+                    }
+                }
+                Event::LanternFx { pos, radius } => {
+                    // the lamp goes up: a ring of warm light thrown out to
+                    // its reach, and sparks from the wick
+                    self.rings.push(Ring { pos: *pos + Vec3::Y * 0.05, r0: 0.5, r1: *radius, until: 0.5, dur: 0.5, color: [1.4, 1.0, 0.45], thick: 0.3 });
+                    for k in 0..40 {
+                        let a = k as f32 * 2.399;
+                        self.particles.push(Particle { pos: *pos + Vec3::new(a.cos() * 0.3, 1.6, a.sin() * 0.3), vel: Vec3::new(a.cos() * 1.2, 2.5 + (k % 5) as f32 * 0.5, a.sin() * 1.2), life: 1.4, max_life: 1.4, size: 0.09, color: [1.6, 1.1, 0.4], alpha: 1.0, gravity: -0.5, drag: 0.6 });
+                    }
+                }
+                Event::ShadowDriven { pos } => {
+                    // a shadow torn to rags in the light
+                    for k in 0..24 {
+                        let a = k as f32 * 2.399;
+                        self.particles.push(Particle { pos: *pos + Vec3::Y * (0.4 + (k % 4) as f32 * 0.35), vel: Vec3::new(a.cos() * 4.0, 1.0, a.sin() * 4.0), life: 0.7, max_life: 0.7, size: 0.3, color: [0.12, 0.12, 0.15], alpha: 0.7, gravity: 0.0, drag: 2.0 });
                     }
                 }
                 Event::EchoRise { pos, .. } => {

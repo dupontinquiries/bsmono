@@ -112,6 +112,8 @@ pub fn cues_for(ev: &Event, game: &Game) -> Vec<Cue> {
         // he is (heard near the cat: loud to whoever IS that cat)
         Event::HeavyStep { pos } => vec![Cue { keys: vec!["sfx/stalker/step".into()], bus: Bus::Sfx, gain: 0.95, pos: Some(*pos), speaker: None, priority: 3 }],
         Event::SwapFx { from, .. } => vec![Cue { keys: vec!["sfx/stalker/swap".into()], bus: Bus::Sfx, gain: 0.9, pos: Some(*from), speaker: None, priority: 4 }],
+        // a shadow torn out of Brasshowl's light: the air closing on it
+        Event::ShadowDriven { pos } => vec![Cue { keys: vec!["sfx/stalker/swap".into()], bus: Bus::Sfx, gain: 0.8, pos: Some(*pos), speaker: None, priority: 3 }],
         Event::Heartbeat { god, fear } => vec![Cue { keys: vec!["sfx/stalker/heart".into()], bus: Bus::Sfx, gain: 0.45 + 0.55 * fear, pos: god_pos(*god), speaker: None, priority: 4 }],
         _ => Vec::new(),
     }

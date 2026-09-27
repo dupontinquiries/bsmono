@@ -41,6 +41,8 @@ pub fn cast_timing(ab: &crate::gods::AbilityDef) -> (f32, f32) {
         Archetype::Swap { .. } => (0.12, 0.0),
         Archetype::Send { .. } => (0.1, 0.8),
         Archetype::Echoes { .. } => (0.35, 0.0),
+        // the lamp goes up with the breath for the bellow
+        Archetype::Lantern { .. } => (0.4, 0.0),
     };
     if ab.ult && w > 0.0 {
         ((w * 1.5).max(0.45), 0.0)
@@ -360,6 +362,10 @@ impl Game {
             Archetype::Echoes { each, life, dmg } => {
                 let d = dmg_scale(dmg, ab.power_scale);
                 self.every_shadow(gi, each, life, d);
+            }
+            Archetype::Lantern { radius, dmg, flee, reveal } => {
+                let d = dmg_scale(dmg, ab.power_scale);
+                self.raise_the_lamp(gi, radius, d, flee, reveal);
             }
             Archetype::Blink { dist: dd, dmg } => {
                 let d = if dmg > 0.0 { dmg_scale(dmg, ab.power_scale) } else { 0.0 };

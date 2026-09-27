@@ -75,7 +75,8 @@ impl Game {
     /// Can cat `i` act (attack, cast) -- not giggling, not dancing?
     pub fn kit_free(&self, i: usize) -> bool {
         let g = &self.gods[i];
-        g.giggle_t <= 0.0 && g.dance_t <= 0.0
+        // (and not fleeing Brasshowl's lamp, `lantern`)
+        g.giggle_t <= 0.0 && g.dance_t <= 0.0 && self.lamp_free(i)
     }
 
     /// The litter bursts out of `gi` toward `dir`.

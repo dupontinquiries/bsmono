@@ -50,7 +50,7 @@ pub struct Ancestor {
     pub instruments: &'static str,
 }
 
-pub const ANCESTORS: [Ancestor; 16] = [
+pub const ANCESTORS: [Ancestor; 17] = [
     Ancestor {
         name: "Goldenmane",
         species: "lion",
@@ -194,6 +194,15 @@ pub const ANCESTORS: [Ancestor; 16] = [
         gender: Gender::Male,
         story: "Nobody on the moors ever saw Hollowstep arrive. His tread was heard on one side of the heath and he was found on the other, and the clans learned to count their own shadows before they slept. He never ran after anything in his life; he never had to. They say another of him is still out on the moor tonight, walking, and that you will hear it long before you see it.",
         instruments: "bowed saw, low cello drones, a slow bass drum like a heartbeat, held breath; wind over heather, a curlew far off",
+    },
+    Ancestor {
+        name: "Brasshowl",
+        species: "sand cat",
+        age: "the caravan years",
+        land: "the salt roads",
+        gender: Gender::Male,
+        story: "The smallest of the ancestors, with the biggest voice. He walked ahead of the caravans on the salt roads at night with a brass lantern, and when something moved at the edge of its light he raised the lamp and bellowed, and whatever it was did not come in. It is said that Hollowstep has never once stood in Brasshowl's light, and that the two of them know exactly why.",
+        instruments: "frame drum, oud, a brass bell, clapping hands, a caravan's camel bells; desert wind, a crackling lamp",
     },
 ];
 

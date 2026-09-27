@@ -57,6 +57,9 @@ CAST = {
     # master_take (sproutkit's chain) until it is small
     'sproutkit': ('am_liam', 1.1),
     # (Hollowstep is recorded: Nelson's session, nelson_take001.json)
+    # the lamp-keeper: a big warm voice (a stand-in for all but his
+    # bellow, which Nelson recorded: nelson_bellow001.json)
+    'brasshowl': ('am_michael', 1.0),
 }
 
 

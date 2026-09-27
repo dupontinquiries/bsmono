@@ -1024,6 +1024,15 @@ impl Scene {
             r.queue_draw(mesh, base, [1.0; 4], 0.0, 0.09, false);
         }
 
+        // shown up by Brasshowl's lamp (`lantern`): a small flame over the
+        // cat, bobbing, for everyone to see
+        for g in &game.gods {
+            if g.revealed_t > 0.0 && g.respawn_t <= 0.0 {
+                let p = g.pos + Vec3::Y * (2.6 + (vfx.time * 3.0).sin() * 0.08);
+                let a = g.revealed_t.min(1.0);
+                r.queue_draw(self.orb, Mat4::from_translation(p) * Mat4::from_scale(Vec3::splat(1.6)), [1.0, 0.72, 0.30, a], 2.5, 0.05, false);
+            }
+        }
         // Hollowstep's others (`stalker`): his standing other is him, a
         // shade darker, gliding rather than walking (it does not move its
         // legs -- the tell, for whoever looks long enough); his echoes are

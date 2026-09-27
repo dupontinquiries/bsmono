@@ -71,12 +71,15 @@ pub enum Motif {
     /// Hollowstep -- moor fog: a flat, cold bank creeping out along the
     /// ground, knee-high and slow, taking a long time to go.
     Fog,
+    /// Brasshowl -- lamplight: a ring of warm light thrown out flat and
+    /// fast, and sparks from the wick climbing slowly out of it.
+    Lamplight,
 }
 
-pub const MOTIFS: [Motif; 16] = [
+pub const MOTIFS: [Motif; 17] = [
     Motif::Sunroar, Motif::Rake, Motif::Rainfall, Motif::Umbra, Motif::Gyre, Motif::Yowl, Motif::Rime,
     Motif::Fangs, Motif::Halo, Motif::Hush, Motif::Lash, Motif::Thunderhead, Motif::Scree, Motif::Starfall,
-    Motif::Bloom, Motif::Fog,
+    Motif::Bloom, Motif::Fog, Motif::Lamplight,
 ];
 
 impl Motif {
@@ -104,6 +107,7 @@ impl Motif {
             Motif::Starfall => [[1.0, 1.0, 0.95], [1.0, 0.86, 0.45], [0.45, 0.55, 1.0]],
             Motif::Bloom => [[1.0, 0.70, 0.85], [0.55, 0.92, 0.45], [1.0, 0.92, 0.55]],
             Motif::Fog => [[0.46, 0.48, 0.53], [0.30, 0.32, 0.36], [0.15, 0.16, 0.19]],
+            Motif::Lamplight => [[1.0, 0.92, 0.65], [1.0, 0.65, 0.22], [0.75, 0.30, 0.08]],
         }
     }
 }
@@ -125,7 +129,7 @@ impl Gesture {
     pub fn of(arch: &Archetype) -> Gesture {
         use Archetype as A;
         match arch {
-            A::Nova { .. } | A::Storm { .. } | A::Pull { .. } | A::Giggle { .. } | A::Echoes { .. } => Gesture::Burst,
+            A::Nova { .. } | A::Storm { .. } | A::Pull { .. } | A::Giggle { .. } | A::Echoes { .. } | A::Lantern { .. } => Gesture::Burst,
             A::Bolt { .. } | A::Volley { .. } | A::Beam { .. } | A::Dash { .. } | A::Litter { .. } | A::Send { .. } => Gesture::Line,
             A::Lob { .. } | A::Ring { .. } | A::Blink { .. } | A::Meteor { .. } | A::DanceParty { .. } | A::Swap { .. } => Gesture::Mark,
             A::Shield { .. } | A::Buff { .. } | A::Heal { .. } => Gesture::Mantle,
@@ -291,6 +295,18 @@ pub fn emit(motif: Motif, gesture: Gesture, origin: Vec3, aim: Vec3, ult: bool, 
                     push(high, fall * (17.0 + 5.0 * rng.f()), 0.35, 0.15, (i % 2) as usize + (i % 7 == 0) as usize, 1.0, 0.0, 0.0);
                 }
             }
+            Motif::Lamplight => {
+                // Two in three thrown out flat and fast as a ring of light
+                // at waist height; one in three a spark from the wick,
+                // climbing slowly and swaying.
+                if i % 3 == 2 {
+                    push(centre + Vec3::new(rng.s() * 0.3, 1.0 + 0.3 * rng.f(), rng.s() * 0.3), Vec3::new(rng.s() * 0.6, 2.2 + 1.2 * rng.f(), rng.s() * 0.6), 1.4, 0.09, 1 + (i % 2), 1.0, -1.0, 0.4);
+                } else {
+                    let out = if gesture == Gesture::Line { (dir + side * rng.s() * 0.25).normalize() } else { ring };
+                    let base = if gesture == Gesture::Line { origin } else { centre };
+                    push(base + Vec3::Y * 0.9 + out * 0.4, out * (10.0 + 4.0 * rng.f()), 0.4, 0.16, 0, 0.9, 0.0, 3.5);
+                }
+            }
             Motif::Fog => {
                 // Low and flat, creeping OUT slowly along the ground, and
                 // slow to go: height is what it does not have.
@@ -385,7 +401,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(pairs, 2 * 16 * 15 / 2);
+        assert_eq!(pairs, 2 * 17 * 16 / 2);
         eprintln!("closest pair: {closest:?}");
     }
 
@@ -424,7 +440,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(total, 16 * 4 * 2);
+        assert_eq!(total, 17 * 4 * 2);
         // Aim on top of the caster, and garbage: no panic, no NaN.
         assert!(emit(Motif::Yowl, Gesture::Line, o, o, false, &mut Rng(1)).iter().all(|p| p.pos.is_finite()));
         assert!(emit(Motif::Rake, Gesture::Line, Vec3::splat(f32::NAN), o, false, &mut Rng(1)).is_empty());

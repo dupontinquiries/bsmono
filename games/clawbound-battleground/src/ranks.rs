@@ -91,6 +91,7 @@ pub fn mastery_text(arch: &Archetype) -> &'static str {
         Archetype::Swap { .. } => "Mastery: arriving staggers a 35% wider ring",
         Archetype::Send { .. } => "Mastery: the other goes 40% farther, and faster",
         Archetype::Echoes { .. } => "Mastery: the echoes linger 30% longer",
+        Archetype::Lantern { .. } => "Mastery: the light reaches 25% further",
     }
 }
 
@@ -118,6 +119,7 @@ pub fn mastery(arch: Archetype) -> Archetype {
         Swap { radius, dmg, slow, secs } => Swap { radius: radius * 1.35, dmg, slow, secs },
         Send { range, speed } => Send { range: range * 1.4, speed: speed * 1.25 },
         Echoes { each, life, dmg } => Echoes { each, life: life * 1.3, dmg },
+        Lantern { radius, dmg, flee, reveal } => Lantern { radius: radius * 1.25, dmg, flee, reveal },
     }
 }
 
@@ -148,6 +150,7 @@ fn scale_amounts(arch: Archetype, m: f32) -> Archetype {
         // a sending has no amount: the other glides a little faster instead
         Send { range, speed } => Send { range, speed: speed * (1.0 + (m - 1.0) * 0.5) },
         Echoes { each, life, dmg } => Echoes { each, life, dmg: dmg * m },
+        Lantern { radius, dmg, flee, reveal } => Lantern { radius, dmg: dmg * m, flee, reveal },
     }
 }
 

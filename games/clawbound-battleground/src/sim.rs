@@ -93,6 +93,10 @@ pub enum Event {
     SwapFx { from: Vec3, to: Vec3 },
     /// An echo of him rose (Every Shadow).
     EchoRise { pos: Vec3, dmg: f32 },
+    /// Brasshowl raised the lamp (`lantern`).
+    LanternFx { pos: Vec3, radius: f32 },
+    /// A shadow of Hollowstep's was driven out of the light.
+    ShadowDriven { pos: Vec3 },
 }
 
 #[derive(Clone, Debug)]
@@ -258,6 +262,11 @@ pub struct GodUnit {
     pub beat_t: f32,
     /// Units walked since the last heavy footfall (a stalker's tread).
     pub stride: f32,
+    /// Fleeing Brasshowl's lamp (`lantern`): seconds left, and from where.
+    pub flee_t: f32,
+    pub flee_from: Vec3,
+    /// Shown up by the lamp: seconds left (seen through cloud, no stalking).
+    pub revealed_t: f32,
     /// A cast winding up or channelling: fires when `t` reaches `dur`.
     pub casting: Option<Casting>,
     /// Seconds during which movement does not turn the cat: after a cast
@@ -587,6 +596,9 @@ impl Game {
                 fear: 0.0,
                 beat_t: 0.0,
                 stride: 0.0,
+                flee_t: 0.0,
+                flee_from: Vec3::ZERO,
+                revealed_t: 0.0,
                 last_act_t: -99.0,
                 ai: if is_player { None } else { Some(AiBrain::new(lane, 0.45 + rng.f32() * 0.5)) },
                 prot,
@@ -823,7 +835,8 @@ impl Game {
     pub fn stalking(&self, i: usize) -> bool {
         let g = &self.gods[i];
         let b = crate::consts::STALK_BREAK_SECS;
-        g.sneak && self.t - g.last_dmg_t > b && self.t - g.last_act_t > b
+        // shown up by Brasshowl's lamp (`lantern`): nothing to hide in
+        g.sneak && g.revealed_t <= 0.0 && self.t - g.last_dmg_t > b && self.t - g.last_act_t > b
     }
 
     /// How quietly this cat carries itself, `0..=1`, from every source.
@@ -835,6 +848,10 @@ impl Game {
     /// Can `team` see cat `j`? Always, off the sky map, for its own cats,
     /// and before the first cloud refresh (`vision_tick`).
     pub fn sees(&self, team: Team, j: usize) -> bool {
+        // shown up by Brasshowl's lamp (`lantern`): seen by everyone
+        if self.gods.get(j).is_some_and(|g| g.revealed_t > 0.0) {
+            return true;
+        }
         self.vision.seen[team as usize].get(j).copied().unwrap_or(true)
     }
 

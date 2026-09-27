@@ -220,6 +220,8 @@ fn god_grid(def: &GodDef, team: Team) -> Grid {
         PeltKind::BigEars => (7, 2, false),
         // long, lean ears (one notched, below)
         PeltKind::Hollow => (5, 1, false),
+        // a sand cat's ears: broad and low, set wide
+        PeltKind::Lamp => (3, 2, false),
         _ => (3, 1, false),
     };
     for sx in [-1i32, 1] {
@@ -299,6 +301,18 @@ fn god_grid(def: &GodDef, team: Team) -> Grid {
                 let r = 1.4 * (1.0 - t * 0.6);
                 g.ellipsoid(x, y, z, r, r, r * 1.3, solid(mix(accent, second, t)));
             }
+        }
+        PeltKind::Lamp => {
+            // a brass lantern hung at the breast from the collar: a small
+            // frame of brass round a bright flame, a ring on top; faint
+            // bars on the legs (a sand cat's)
+            let brass = solid([0.72, 0.52, 0.20]);
+            let lz = czf as i32 + 19;
+            g.filled_box(cx - 1, 20, lz, cx + 1, 23, lz + 2, brass);
+            g.filled_box(cx, 21, lz + 1, cx, 22, lz + 2, solid([1.0, 0.92, 0.55]));
+            g.set(cx, 24, lz + 1, brass);
+            g.set(cx, 25, lz + 1, brass);
+            paint_shell(&mut g, |_x, y, _z| (6..=12).contains(&y) && y % 3 == 0, solid(mix(pelt, dark, 0.35)));
         }
         PeltKind::Hollow => {
             // a hood of dark fur over the brow and the eyes, falling back
@@ -405,7 +419,7 @@ mod rig_tests {
     /// a hole that only shows in one pose.
     #[test]
     fn every_ancestor_cuts_into_ten_nonempty_parts_and_loses_nothing() {
-        assert_eq!(ROSTER.len(), 16);
+        assert_eq!(ROSTER.len(), 17);
         for def in ROSTER.iter() {
             let grid = god_grid(def, Team::Blue);
             let plan = feline_cut_plan(role_bulk(def.role), matches!(def.pelt, PeltKind::Antlers));

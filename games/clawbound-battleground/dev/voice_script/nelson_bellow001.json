@@ -1,0 +1,15 @@
+{
+ "session": "nelson-bellow.opus",
+ "clean": true,
+ "rnnoise": "sh.rnnn",
+ "source": "nelson-bellow",
+ "takes": [
+  [
+   "brasshowl",
+   "cast4",
+   5.25,
+   8.0
+  ]
+ ],
+ "note": "Nelson's bellow of 'SHADOWS!', the line Brasshowl was designed round (his ultimate, cast4). Neither file is in the repo: put the session and the RNNoise model (GregorR/rnnoise-models somnolent-hogwash sh.rnnn) beside this manifest. Window from silero VAD + Parakeet. Brasshowl's other eight lines are stand-ins (synth_session.py) until they are recorded."
+}

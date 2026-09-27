@@ -65,7 +65,7 @@ what else is known-but-unresolved.
   it keeps falling, the wind drifts it from the blown stretches into the lee,
   cats bound through drifts ploughing a trench and leave separate prints on
   powder, and blasts throw craters, fire melts it, frost lays more.
-- **16 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
+- **17 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
   Windclaw, Faryowl, Oldroar, Twofang, Suneye, Snowhush, Riptail, Stillsmoke,
   Stonewhisper, Cometail (the star-fallen caracal: Starshot, Meteor Pounce,
   Flare, and the Falling Star ultimate), Sproutkit (the ever-young kitten,
@@ -82,10 +82,16 @@ what else is known-but-unresolved.
   Between** trades places with his other, **Send the Other** glides it where he
   points, **The Long Reach** is a cleave, and the **Every Shadow** ultimate
   raises two hunting echoes beside him and two beside his other, any of which
-  he can step into; `src/stalker.rs`) — across 5 roles (Warrior / Guardian / Mage / Hunter / Assassin).
+  he can step into; `src/stalker.rs`) and Brasshowl (the lamp-keeper of the
+  salt roads, a sand cat with an enormous voice, and Hollowstep's answer:
+  **Lamp Oil**, a **Bark** and a **Watchfire** shield, and the **SHADOWS!**
+  ultimate -- he raises the lamp and bellows, and every enemy in its light is
+  struck, runs from him unable to act, and is shown up (seen through cloud,
+  no stalking) for 6 s, while no shadow of Hollowstep's can stand in it;
+  `src/lantern.rs`) — across 5 roles (Warrior / Guardian / Mage / Hunter / Assassin).
   Each is a quadruped feline voxel body with a pelt signature (mane, stripes,
   rosettes, saber fangs, antlers, sun disc, ear tufts…) and its crest colour,
-  plus **4 mechanical abilities** (64 total) built from 20 archetype systems.
+  plus **4 mechanical abilities** (68 total) built from 21 archetype systems.
   Clawbound kits are a passive + two techniques + an ultimate; here the passive
   is reforged as a third short-cooldown technique (see `src/gods.rs`).
 - **Dynamic weather** (`src/weather.rs`) — Clear / Overcast / Rain / Storm /
@@ -373,6 +379,7 @@ src/
 ├── lift.rs        Starwell's updrafts: pads, rides up to the Aerie and down
 ├── kit.rs         Sproutkit's litter (kitten doubles), giggles and dance party
 ├── stalker.rs     Hollowstep's other, the terror radius, the step and every shadow
+├── lantern.rs     Brasshowl's lamp: the flight from it, the shown-up, no shadows in it
 ├── bosses.rs      the Elder Boar + Storm Drake: pits, AI, rewards, TargetRef::Boss
 ├── disasters.rs   wildfire / tempest / earthquake / flood / tornado + map scars
 ├── audio.rs       acoustics_at(pos) → howl/reverb voicing; WindSynth DSP; cpal shell

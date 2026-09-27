@@ -124,6 +124,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("hollow") {
         return run_hollow_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("brass") {
+        return run_brass_shots();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("hud") {
         return run_hud_shots();
     }
@@ -2449,5 +2452,69 @@ pub fn run_hollow_shots() -> Result<(), String> {
     game.gods[0].beat_t = crate::stalker::beat_every(game.gods[0].fear);
     let p = game.gods[0].pos;
     shoot(&mut renderer, &game, &mut vfx, "hollow_afraid_hud.png", Camera { eye: p + Vec3::new(0.0, 5.0, 9.0), target: p + Vec3::new(0.0, 1.0, -4.0), fov_y: 0.95 }, true)?;
+    Ok(())
+}
+
+/// Brasshowl (`lantern`): close up, and the lamp raised on the lane --
+/// Hollowstep and a friend of his running from it, shown up with a flame
+/// over them, Hollowstep's other torn out of the light.
+/// `CLAWBOUND_SHOTS=brass`.
+pub fn run_brass_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("brass"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let id = |n: &str| crate::gods::ROSTER.iter().position(|d| d.name == n).unwrap() as u32;
+    let mut game = Game::new_teams(&[id("Brasshowl")], &[id("Hollowstep"), 1]);
+    game.blockers = scene.blockers.clone();
+    game.next_wave_t = 1e9;
+    for i in 0..game.gods.len() {
+        game.set_level(i, 5);
+        game.gods[i].ai = None;
+        game.gods[i].mana = 9999.0;
+    }
+    let at = Vec3::new(0.0, 0.0, -24.0);
+    game.gods[0].pos = at;
+    game.gods[0].yaw = std::f32::consts::FRAC_PI_2;
+    game.gods[1].pos = at + Vec3::new(-2.0, 0.0, 6.0);
+    game.gods[2].pos = at + Vec3::new(3.0, 0.0, 7.0);
+    let mut vfx = Vfx::default();
+    let step = |game: &mut Game, vfx: &mut Vfx, secs: f32| {
+        for _ in 0..(secs * 60.0) as usize {
+            game.tick(1.0 / 60.0);
+            let ev = std::mem::take(&mut game.events);
+            vfx.update(1.0 / 60.0, &ev, game);
+        }
+    };
+    let mut shoot = |renderer: &mut Renderer, game: &Game, vfx: &mut Vfx, name: &str, cam: Camera| -> Result<(), String> {
+        renderer.clear_queues();
+        scene.draw(renderer, game, vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+        Ok(())
+    };
+    step(&mut game, &mut vfx, 0.3);
+    shoot(&mut renderer, &game, &mut vfx, "brass_close.png", Camera { eye: at + Vec3::new(2.0, 1.3, 2.6), target: at + Vec3::Y * 0.9, fov_y: 0.8 })?;
+    // Hollowstep's other beside him too
+    if let Some(k) = game.main_other(1) {
+        game.others[k].pos = at + Vec3::new(4.0, 0.0, 3.0);
+    }
+    game.cast_queue.push((0, 3, at + Vec3::Z));
+    step(&mut game, &mut vfx, 0.75);
+    shoot(&mut renderer, &game, &mut vfx, "brass_lamp.png", Camera { eye: at + Vec3::new(-8.0, 6.0, -8.0), target: at + Vec3::new(0.0, 1.0, 4.0), fov_y: 1.0 })?;
+    step(&mut game, &mut vfx, 0.9);
+    shoot(&mut renderer, &game, &mut vfx, "brass_fleeing.png", Camera { eye: at + Vec3::new(-10.0, 8.0, -6.0), target: at + Vec3::new(0.0, 1.0, 8.0), fov_y: 1.0 })?;
     Ok(())
 }
