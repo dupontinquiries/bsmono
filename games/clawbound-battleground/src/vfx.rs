@@ -104,6 +104,10 @@ pub struct Vfx {
     pub beams: Vec<Beam>,
     pub rings: Vec<Ring>,
     pub time: f32,
+    /// How far the Thornmaze's machinery has turned (radians of a unit
+    /// wheel): its drive (`machine::drive`) integrated, so the gears spin
+    /// up and settle rather than jump.
+    pub machine_turn: f32,
     /// ambient jungle life (seeded lazily on first update)
     fireflies: Vec<(Vec3, f32)>,
     leaves: Vec<Particle>,
@@ -992,6 +996,9 @@ impl Vfx {
             }
         }
         self.time += dt;
+        if crate::map::active() == crate::map::MapId::Maze {
+            self.machine_turn += dt * 1.6 * crate::machine::drive(game.wake.seed, game.t);
+        }
         let atm = game.weather.atmosphere();
         self.ground.tick(dt, atm.rain, atm.wetness);
         if !self.seeded {
@@ -1313,6 +1320,14 @@ impl Vfx {
                             Material::Magma => (*pos + d * 1.0 + Vec3::Y * h, d * 1.8 + Vec3::Y * 3.0, 0.12, [2.0, 0.8, 0.25], 2.0),
                         };
                         self.particles.push(Particle { pos: p, vel: v, life: 1.0, max_life: 1.0, size, color: col, alpha: 1.0, gravity: grav, drag: 1.0 });
+                    }
+                }
+                Event::BoulderHit { pos } => {
+                    // a cat thrown aside: stone grit and dust off the ball
+                    for k in 0..28 {
+                        let a = k as f32 * 2.399;
+                        let d = Vec3::new(a.cos(), 0.0, a.sin());
+                        self.dust.push(Particle { pos: *pos + d * 0.8 + Vec3::Y * (0.3 + (k % 4) as f32 * 0.3), vel: d * (2.5 + (k % 3) as f32) + Vec3::Y * 2.0, life: 0.9, max_life: 0.9, size: 0.22, color: [0.50, 0.46, 0.40], alpha: 0.8, gravity: 5.0, drag: 1.6 });
                     }
                 }
                 Event::ThornBite { pos, alone } => {

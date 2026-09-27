@@ -65,6 +65,7 @@ impl Game {
         self.sentinel_tick(dt);
         // after sentinel_tick: that resets `ward`, this multiplies into it
         self.maze_tick(dt);
+        self.machine_tick(dt);
 
         // 6b. sky + map events (weather.rs / map_events.rs)
         self.atmosphere_tick(dt);

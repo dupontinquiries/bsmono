@@ -21,7 +21,7 @@
 use glam::Vec3;
 
 use crate::blockers::{Blocker, Blockers, Cover, Shape};
-use crate::consts::{Lane, Team};
+use crate::consts::Lane;
 use crate::maze::{self as mz, Room, PASSAGE_R, WALL_H};
 use crate::scene::{Piece, V_MED};
 use crate::voxel::{Grid, VoxelMesh};
@@ -34,11 +34,14 @@ pub enum Item {
     Pillar { at: Vec3, variant: i32 },
     /// A broken stretch of wall from `a` to `b`: cover.
     Stub { a: Vec3, b: Vec3 },
+    /// An Archimedes screw at the head of a boulder track (`machine`): it
+    /// winds the ball up out of the floor. Drawn turning by `scene`.
+    Screw { at: Vec3 },
 }
 
 pub fn item_at(it: &Item) -> Vec3 {
     match *it {
-        Item::Statue { at, .. } | Item::Brazier { at } | Item::Pillar { at, .. } => at,
+        Item::Statue { at, .. } | Item::Brazier { at } | Item::Pillar { at, .. } | Item::Screw { at } => at,
         Item::Stub { a, b } => (a + b) * 0.5,
     }
 }
@@ -50,6 +53,7 @@ fn flip(it: Item) -> Item {
         Item::Brazier { at } => Item::Brazier { at: f(at) },
         Item::Pillar { at, variant } => Item::Pillar { at: f(at), variant },
         Item::Stub { a, b } => Item::Stub { a: f(a), b: f(b) },
+        Item::Screw { at } => Item::Screw { at: f(at) },
     }
 }
 
@@ -104,9 +108,27 @@ fn placements_here() -> Vec<Item> {
             let h = if along_x { Vec3::new(4.0, 0.0, 0.0) } else { Vec3::new(0.0, 0.0, 4.0) };
             let (a, b) = (c - h, c + h);
             let spring_d = |p: Vec3| mz::heal_tree_positions().iter().map(|s| s.distance(p)).fold(f32::MAX, f32::min);
-            if [a, b, c].iter().all(|&p| lane_d(p) > 5.0 && mouth_d(p) > 6.0 && spring_d(p) > 6.0) {
+            // (and off the boulders' tracks: a stub beside one pinned a bot
+            // against its end, alone in the thorns, for 24 s -- seed 5)
+            let track_d = |p: Vec3| crate::machine::pairs().iter().flatten().map(|t| t.dist(p, 0.0)).fold(f32::MAX, f32::min);
+            if [a, b, c].iter().all(|&p| lane_d(p) > 5.0 && mouth_d(p) > 6.0 && spring_d(p) > 6.0 && track_d(p) > crate::machine::BOULDER_R + 5.0) {
                 both(&mut out, Item::Stub { a, b });
             }
+        }
+    }
+    // a screw at the head of every boulder track (both of each pair: the
+    // tracks are already mirrored), beside where the ball comes up, on
+    // whichever side has floor for it
+    let f = mz::floor();
+    // (chosen on each pair's blue track and mirrored, so the two halves
+    // agree even where both sides have floor)
+    for pair in crate::machine::pairs() {
+        let tr = &pair[0];
+        let (s, d) = (tr.pts[0], (tr.pts[1] - tr.pts[0]).normalize_or_zero());
+        let side = Vec3::new(-d.z, 0.0, d.x);
+        let spot = [1.0f32, -1.0].into_iter().map(|k| s + side * k * (crate::machine::BOULDER_R + 2.4)).find(|p| f.fits(p.x, p.z, 2.0));
+        if let Some(at) = spot {
+            both(&mut out, Item::Screw { at });
         }
     }
     // braziers round the pit (blue; mirrored), on its diagonals
@@ -125,7 +147,11 @@ fn placements_here() -> Vec<Item> {
             let (u, v) = ((a - c).normalize_or_zero(), (e - c).normalize_or_zero());
             if u.dot(v) > -0.9 {
                 let out_corner = -(u + v).normalize_or_zero();
-                both(&mut out, Item::Brazier { at: c + out_corner * 9.0 });
+                let at = c + out_corner * 9.0;
+                // (not where a boulder comes down its track)
+                if crate::machine::pairs().iter().flatten().all(|t| t.dist(at, 0.0) > crate::machine::BOULDER_R + 2.0) {
+                    both(&mut out, Item::Brazier { at });
+                }
             }
         }
     }
@@ -191,6 +217,193 @@ pub fn thorn_mesh(variant: i32) -> VoxelMesh {
     g.mesh(0.12, true)
 }
 
+/// A gear wheel lying flat on a wall top: its centre (at the wall's top),
+/// radius, and which way it turns (+1 / -1: neighbours turn opposite, so a
+/// train reads as meshed).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Gear {
+    pub at: Vec3,
+    pub r: f32,
+    pub turn: f32,
+}
+
+/// How far a wheel's teeth stand out past its rim (u). Two wheels whose
+/// centres are `r1 + r2 + TOOTH` apart mesh: each one's teeth reach into the
+/// other's.
+pub const TOOTH: f32 = 1.0;
+
+/// The gear trains: wheels meshed tooth to tooth across the wall tops. A
+/// train starts on the deepest free block of wall and grows wheel by wheel
+/// (each placed so its teeth reach into its parent's, turning the other
+/// way) while the wall holds them; none overlaps any but its own
+/// neighbours. Found on the blue half and mirrored, turns reversed.
+/// Visible from the play camera, which looks down over the walls.
+pub fn gears() -> Vec<Gear> {
+    crate::map::with(crate::map::MapId::Maze, || {
+        let f = mz::floor();
+        // a wheel of radius r fits at p: its teeth over wall, off the far
+        // side, and clear of its own mirror
+        let fits = |p: Vec3, r: f32| {
+            f.sdf(p.x, p.z) >= r + TOOTH + 0.8 && !mz::beyond(p.x, p.z) && p.z <= 0.01 && (p.z.abs() < 0.5 || p.z.abs() * 2.0 > r * 2.0 + TOOTH + 1.5)
+        };
+        let clear = |out: &[Gear], p: Vec3, r: f32, parent: Option<usize>| {
+            out.iter().enumerate().all(|(i, g)| {
+                let q = Vec3::new(g.at.x, 0.0, g.at.z);
+                let m = Vec3::new(q.x, 0.0, -q.z);
+                let need = if Some(i) == parent { g.r + r + TOOTH - 0.01 } else { g.r + r + TOOTH * 2.0 + 4.0 };
+                q.distance(p) >= need && m.distance(p) > g.r + r + TOOTH * 2.0 + 1.0
+            })
+        };
+        let (hx, hz) = (mz::COLS[2] + mz::ROOM_HX + 8.0, mz::ROWS as f32 * mz::ROW_Z + mz::ROOM_HZ + 8.0);
+        let mut cand = Vec::new();
+        let mut z = -hz;
+        while z <= 0.01 {
+            let mut x = -hx;
+            while x <= hx {
+                let d = f.sdf(x, z);
+                if d > 6.0 {
+                    cand.push((d, Vec3::new(x, 0.0, z)));
+                }
+                x += 2.0;
+            }
+            z += 2.0;
+        }
+        cand.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.x.total_cmp(&b.1.x)).then(a.1.z.total_cmp(&b.1.z)));
+        let mut out: Vec<Gear> = Vec::new();
+        let mut trains = 0;
+        for (d, p) in cand {
+            let r = (d - TOOTH - 0.8).min(6.0);
+            if r < 4.5 || !fits(p, r) || !clear(&out, p, r, None) {
+                continue;
+            }
+            let turn = if trains % 2 == 0 { 1.0 } else { -1.0 };
+            trains += 1;
+            let start = out.len();
+            out.push(Gear { at: Vec3::new(p.x, WALL_H + 0.9, p.z), r, turn });
+            // grow the train: from each wheel in it, the first spot round
+            // it (from its parent's far side) where a wheel fits
+            let mut k = start;
+            while k < out.len() && out.len() - start < 4 {
+                let g = out[k];
+                'grow: for step in 0..16 {
+                    let a = step as f32 / 16.0 * std::f32::consts::TAU;
+                    for r2 in [5.0f32, 4.0, 3.0] {
+                        let dir = Vec3::new(a.cos(), 0.0, a.sin());
+                        let c = Vec3::new(g.at.x, 0.0, g.at.z) + dir * (g.r + r2 + TOOTH);
+                        if fits(c, r2) && clear(&out, c, r2, Some(k)) {
+                            out.push(Gear { at: Vec3::new(c.x, WALL_H + 0.9, c.z), r: r2, turn: -g.turn });
+                            break 'grow;
+                        }
+                    }
+                }
+                k += 1;
+            }
+        }
+        let mirrored: Vec<Gear> = out.iter().filter(|g| g.at.z.abs() > 0.5).map(|g| Gear { at: Vec3::new(g.at.x, g.at.y, -g.at.z), r: g.r, turn: -g.turn }).collect();
+        out.extend(mirrored);
+        out
+    })
+}
+
+/// A gear wheel, lying flat, radius `r` to its rim: a thick wooden rim,
+/// six spokes and a bronze hub, and square cogs standing TOOTH out all
+/// round, one every ~1.4 u of rim (so two wheels that mesh interleave).
+/// Centred on its axle, y from 0 (so it sits on the wall top).
+pub fn gear_mesh(r: f32) -> VoxelMesh {
+    const V: f32 = 0.25;
+    use std::f32::consts::{PI, TAU};
+    let n = ((r + TOOTH) / V).ceil() as i32 + 1;
+    let mut g = Grid::new((n * 2 + 1) as usize, 6, (n * 2 + 1) as usize);
+    let wood = [0.46, 0.30, 0.15, 1.0];
+    let dark = [0.30, 0.19, 0.10, 1.0];
+    let bronze = [0.70, 0.49, 0.21, 1.0];
+    let (rv, tv) = (r / V, TOOTH / V);
+    let teeth = ((TAU * r / 1.4) as i32).max(10);
+    for x in -n..=n {
+        for z in -n..=n {
+            let d = ((x * x + z * z) as f32).sqrt();
+            let a = (z as f32).atan2(x as f32);
+            let (cx, cz) = (x + n, z + n);
+            if d <= rv && d >= rv - 3.5 {
+                g.filled_box(cx, 0, cz, cx, 2, cz, if d >= rv - 0.8 { dark } else { wood });
+            } else if d < rv - 3.5 {
+                let spoke = (0..6).any(|k| {
+                    let s = k as f32 / 6.0 * TAU;
+                    ((a - s + PI).rem_euclid(TAU) - PI).abs() * d < 1.4
+                });
+                if d < 3.0 {
+                    g.filled_box(cx, 0, cz, cx, 4, cz, bronze);
+                } else if spoke {
+                    g.filled_box(cx, 0, cz, cx, 1, cz, wood);
+                }
+            } else if d <= rv + tv {
+                let k = ((a + PI) / TAU * teeth as f32).fract();
+                if k < 0.45 {
+                    g.filled_box(cx, 0, cz, cx, 2, cz, wood);
+                }
+            }
+        }
+    }
+    g.mesh(V, true)
+}
+
+/// An Archimedes screw, standing: a wooden core, a helical blade round it
+/// climbing three turns, bronze bands top and bottom. ~7 u tall; its axis
+/// through the grid's middle, feet at y = 0.
+pub fn screw_mesh() -> VoxelMesh {
+    const V: f32 = 0.2;
+    let (r_core, r_blade) = (0.45 / V, 1.5 / V);
+    let n = (r_blade.ceil() as i32) + 1;
+    let h = (7.0 / V) as i32;
+    let mut g = Grid::new((n * 2 + 1) as usize, (h + 2) as usize, (n * 2 + 1) as usize);
+    let wood = [0.45, 0.30, 0.16, 1.0];
+    let blade = [0.55, 0.38, 0.20, 1.0];
+    let bronze = [0.68, 0.48, 0.22, 1.0];
+    for y in 0..h {
+        let turn = y as f32 / h as f32 * 3.0 * std::f32::consts::TAU;
+        for x in -n..=n {
+            for z in -n..=n {
+                let d = ((x * x + z * z) as f32).sqrt();
+                let a = (z as f32).atan2(x as f32);
+                let (cx, cz) = (x + n, z + n);
+                if d <= r_core {
+                    g.set(cx, y, cz, if y < 3 || y > h - 4 { bronze } else { wood });
+                } else if d <= r_blade {
+                    let off = ((a - turn).rem_euclid(std::f32::consts::TAU)) / std::f32::consts::TAU;
+                    if off < 0.08 {
+                        g.set(cx, y, cz, blade);
+                    }
+                }
+            }
+        }
+    }
+    g.mesh(V, true)
+}
+
+/// The boulder: a stone ball with two bronze bands round it at right
+/// angles, so its roll reads. Centred on its middle.
+pub fn boulder_mesh() -> VoxelMesh {
+    const V: f32 = 0.25;
+    let r = crate::machine::BOULDER_R / V;
+    let n = r.ceil() as i32 + 1;
+    let mut g = Grid::new((n * 2 + 1) as usize, (n * 2 + 1) as usize, (n * 2 + 1) as usize);
+    let bronze = [0.66, 0.46, 0.20, 1.0];
+    for x in -n..=n {
+        for y in -n..=n {
+            for z in -n..=n {
+                let d = ((x * x + y * y + z * z) as f32).sqrt();
+                if d <= r {
+                    let k = ((x * 7 + y * 13 + z * 5) as u32).wrapping_mul(2654435761) >> 28;
+                    let stone = [0.44 + k as f32 * 0.008, 0.42 + k as f32 * 0.007, 0.38 + k as f32 * 0.006, 1.0];
+                    let band = d > r - 1.5 && (x.abs() <= 0 || y.abs() <= 0);
+                    g.set(x + n, y + n, z + n, if band { bronze } else { stone });
+                }
+            }
+        }
+    }
+    g.mesh(V, false)
+}
+
 /// Where thorns rise when a section wakes: along the foot of every room's
 /// walls (and its passages'), every few units, by the section's class.
 /// `(class, position, yaw)`.
@@ -248,6 +461,10 @@ pub fn build() -> (Vec<Piece>, Blockers) {
                 blockers.push(Blocker { shape: Shape::Circle { x: at.x, z: at.z, r: 1.3 }, top: 6.0, cover: Cover::NONE });
                 pieces.push(Piece { mesh: pillars[variant as usize % 4].clone(), pos: at, quarter: (variant % 4) as u8, vsize: V_MED, sway: 0.0 });
             }
+            Item::Screw { at } => {
+                // drawn by the scene, turning; here only its collision
+                blockers.push(Blocker { shape: Shape::Circle { x: at.x, z: at.z, r: 1.6 }, top: 7.0, cover: Cover::NONE });
+            }
             Item::Stub { a, b } => {
                 blockers.push(Blocker { shape: Shape::Segment { x0: a.x, z0: a.z, x1: b.x, z1: b.z, r: 0.8 }, top: 3.2, cover: Cover::NONE });
                 pieces.push(Piece { mesh: stub_mesh(a, b), pos: (a + b) * 0.5, quarter: 0, vsize: 0.4, sway: 0.0 });
@@ -292,6 +509,7 @@ mod tests {
         let pillars = count(&|i| matches!(i, Item::Pillar { .. }));
         assert!((16..=32).contains(&pillars), "{pillars} pillars: two colonnades a side, less what the lanes cross");
         assert!(count(&|i| matches!(i, Item::Stub { .. })) >= 8);
+        assert_eq!(count(&|i| matches!(i, Item::Screw { .. })), 6, "one at every track's head");
         let braziers = count(&|i| matches!(i, Item::Brazier { .. }));
         assert!((8 + 4..=8 + 16).contains(&braziers), "braziers {braziers}");
         for it in &items {
@@ -312,7 +530,7 @@ mod tests {
                     for lane in [Lane::Top, Lane::Bot] {
                         let d = lane.polyline().windows(2).map(|w| crate::abilities::point_segment_dist(p, w[0], w[1])).fold(f32::MAX, f32::min);
                         assert!(d > 3.0, "{it:?} stands in the {lane:?} lane ({d})");
-                        for team in [Team::Blue, Team::Red] {
+                        for team in [crate::consts::Team::Blue, crate::consts::Team::Red] {
                             for inner in [false, true] {
                                 assert!(p.distance(crate::consts::tower_pos(lane, team, inner)) > 5.0, "{it:?} crowds a tower");
                             }
@@ -321,6 +539,15 @@ mod tests {
                     for s in mz::heal_tree_positions() {
                         assert!(p.distance(s) > 4.0, "{it:?} is on a spring");
                     }
+                    // the boulders' way is clear (a screw stands at a
+                    // track's head, beside it, by design)
+                    // and a stub stands well off one: the bots' dodge room
+                    // (one 5 u off pinned a bot against its end: seed 5)
+                    if !matches!(it, Item::Screw { .. }) {
+                        let d = crate::machine::pairs().iter().flatten().map(|t| t.dist(p, 0.0)).fold(f32::MAX, f32::min);
+                        let need = if matches!(it, Item::Stub { .. }) { crate::machine::BOULDER_R + 5.0 } else { crate::machine::BOULDER_R + 1.5 };
+                        assert!(d > need, "{it:?} stands on a boulder track ({d})");
+                    }
                     for g in mz::passages() {
                         for end in [g.p0, g.p1] {
                             assert!(p.distance(end) > 4.0 || matches!(it, Item::Statue { .. }), "{it:?} at a passage's mouth {end}");
@@ -328,6 +555,41 @@ mod tests {
                     }
                 }
             }
+        });
+    }
+
+    /// The gear trains: on the walls (never over the floor, never past the
+    /// outer wall), meshed in trains, mirrored with the turn reversed, and
+    /// enough of them to read as machinery from anywhere.
+    #[test]
+    fn gears_crown_the_walls() {
+        let gs = gears();
+        // (122 at writing, trains of up to four; each is one culled draw of
+        // MAX_DRAWS 4096, so the ceiling is about clutter, not cost)
+        assert!((40..=140).contains(&gs.len()), "{} gears", gs.len());
+        crate::map::with(crate::map::MapId::Maze, || {
+            for g in &gs {
+                let d = mz::floor().sdf(g.at.x, g.at.z);
+                assert!(d >= g.r + 1.0, "a gear of {} over the floor's edge at {} (wall depth {d})", g.r, g.at);
+                assert!(!mz::beyond(g.at.x, g.at.z));
+                assert!(gs.iter().any(|m| (m.at - Vec3::new(g.at.x, g.at.y, -g.at.z)).length() < 1e-3 && (m.turn == -g.turn || g.at.z.abs() < 0.5)), "{g:?} has no mirror");
+            }
+            // any two wheels either mesh (teeth into teeth, turning opposite
+            // ways) or stand clear of each other's teeth
+            let mut meshed = 0;
+            for (i, a) in gs.iter().enumerate() {
+                for b in gs.iter().skip(i + 1) {
+                    let d = a.at.distance(b.at);
+                    if d < a.r + b.r + TOOTH + 0.05 {
+                        assert!(d > a.r + b.r + TOOTH - 0.05, "gears overlap at {} and {}", a.at, b.at);
+                        assert_eq!(a.turn, -b.turn, "meshed wheels at {} and {} turn the same way", a.at, b.at);
+                        meshed += 1;
+                    } else {
+                        assert!(d > a.r + b.r + TOOTH * 2.0, "wheels at {} and {} foul each other's teeth", a.at, b.at);
+                    }
+                }
+            }
+            assert!(meshed * 3 >= gs.len(), "{meshed} meshings among {} wheels: not trains", gs.len());
         });
     }
 

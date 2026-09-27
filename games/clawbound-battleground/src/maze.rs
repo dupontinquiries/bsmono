@@ -584,6 +584,11 @@ impl Wake {
                 shut[m] = true;
             }
         }
+        // the machine's tracks for this turn run through open gates
+        // (`machine::held_open`)
+        for g in crate::machine::held_open(self.seed, k) {
+            shut[g] = false;
+        }
         let all = rooms().count();
         let mut g = 0;
         while reachable(&|i| !shut[i]).len() < all && g < ps.len() {
@@ -779,10 +784,14 @@ pub fn bot_goal(game: &Game, gi: usize) -> Option<Vec3> {
         return None;
     }
     let me = &game.gods[gi];
+    let t = game.t;
+    // a boulder coming first: step off its track, pack or no pack
+    if let Some(p) = crate::machine::dodge(game, gi) {
+        return Some(p);
+    }
     if game.pack(gi) >= 2 {
         return None;
     }
-    let t = game.t;
     let waking = |p: Vec3| !matches!(game.wake.mood_at(p.x, p.z, t), Mood::Calm);
     if !waking(me.pos) {
         let brain = me.ai.as_ref()?;

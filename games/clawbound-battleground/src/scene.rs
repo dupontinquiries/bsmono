@@ -99,6 +99,13 @@ pub struct Scene {
     pub thorn_spots: Vec<(u8, Vec3, f32)>,
     /// The Thornmaze's gate slab (one mesh, turned across each passage).
     pub maze_gate: u64,
+    /// The Thornmaze's machine (`machine`): the gear trains on the walls
+    /// (each with its wheel's mesh, shared by radius), the screws at the
+    /// tracks' heads, and the boulder; empty on other maps.
+    pub gears: Vec<(crate::mazeworld::Gear, u64)>,
+    pub screws: Vec<Vec3>,
+    pub screw_mesh: u64,
+    pub maze_ball: u64,
     pub disco: u64,
     /// The sky map's drifting stone and cloud (`skydrift`), and their meshes
     /// by kind (anchor, fragment, puff) and variant.
@@ -393,6 +400,24 @@ impl Scene {
         let thorns = [0, 1, 2].map(|v| r.upload_mesh(&crate::mazeworld::thorn_mesh(v)));
         let thorn_spots = if crate::map::active() == crate::map::MapId::Maze { crate::mazeworld::thorn_spots() } else { Vec::new() };
         let maze_gate = r.upload_mesh(&crate::mazeworld::gate_mesh());
+        let (gears, screws) = if crate::map::active() == crate::map::MapId::Maze {
+            // one mesh per wheel size, to the half unit
+            let mut by_r: std::collections::HashMap<i32, u64> = std::collections::HashMap::new();
+            let gears = crate::mazeworld::gears()
+                .into_iter()
+                .map(|g| {
+                    let key = (g.r * 2.0).round() as i32;
+                    let id = *by_r.entry(key).or_insert_with(|| r.upload_mesh(&crate::mazeworld::gear_mesh(key as f32 * 0.5)));
+                    (g, id)
+                })
+                .collect();
+            let screws = crate::mazeworld::placements().into_iter().filter_map(|i| if let crate::mazeworld::Item::Screw { at } = i { Some(at) } else { None }).collect();
+            (gears, screws)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let screw_mesh = r.upload_mesh(&crate::mazeworld::screw_mesh());
+        let maze_ball = r.upload_mesh(&crate::mazeworld::boulder_mesh());
         let sky = crate::map::active() == crate::map::MapId::Sky;
         let drift = if sky { crate::skydrift::placements() } else { Vec::new() };
         let mut drift_mesh = [[0u64; DRIFT_VARIANTS]; 3];
@@ -451,6 +476,10 @@ impl Scene {
             thorns,
             thorn_spots,
             maze_gate,
+            gears,
+            screws,
+            screw_mesh,
+            maze_ball,
             disco,
             drift,
             drift_mesh,
@@ -1100,6 +1129,43 @@ impl Scene {
                 let m = Mat4::from_translation(mid - Vec3::Y * sink.min(crate::maze::WALL_H - 0.6)) * Mat4::from_axis_angle(Vec3::Y, yaw);
                 let (tint, glow) = if warn { ([1.3 + 0.5 * pulse, 0.55, 0.45, 1.0], 0.3 * pulse) } else { ([1.0; 4], 0.0) };
                 r.queue_draw(self.maze_gate, m, tint, glow, 0.5, false);
+            }
+        }
+        // The Thornmaze's machine (`machine`): the gear trains turning on
+        // the walls (a wheel turns at the train's pace over its own radius,
+        // so neighbours read as meshed), the screws winding (fastest while a
+        // ball comes up), and the boulders winding up out of the floor,
+        // rolling their tracks and sinking away at the end
+        if crate::map::active() == crate::map::MapId::Maze {
+            let turn = vfx.machine_turn;
+            for (g, mesh) in &self.gears {
+                if !sphere_in_frustum(&vp, g.at, g.r + 1.0) {
+                    continue;
+                }
+                let m = Mat4::from_translation(g.at) * Mat4::from_axis_angle(Vec3::Y, g.turn * turn * 4.0 / g.r);
+                r.queue_draw(*mesh, m, [1.0; 4], 0.0, 0.25, false);
+            }
+            let balls = crate::machine::boulders_at(game.wake.seed, game.t);
+            let winding = balls.iter().any(|b| !b.rolling && b.s <= 0.0);
+            for (k, at) in self.screws.iter().enumerate() {
+                if !sphere_in_frustum(&vp, *at + Vec3::Y * 3.5, 4.5) {
+                    continue;
+                }
+                let spin = turn * if k % 2 == 0 { 2.5 } else { -2.5 } + if winding { vfx.time * 6.0 } else { 0.0 };
+                let m = Mat4::from_translation(*at) * Mat4::from_axis_angle(Vec3::Y, spin);
+                r.queue_draw(self.screw_mesh, m, [1.0; 4], 0.0, 0.2, false);
+            }
+            let pulse = 0.5 + 0.5 * (vfx.time * 8.0).sin();
+            for b in &balls {
+                if !sphere_in_frustum(&vp, b.pos, crate::machine::BOULDER_R + 1.0) {
+                    continue;
+                }
+                // it rolls: about the axis across its way, by s / R
+                let axis = Vec3::Y.cross(b.dir).normalize_or_zero();
+                let spin = if axis.length_squared() > 0.5 { Mat4::from_axis_angle(axis, b.s / crate::machine::BOULDER_R) } else { Mat4::IDENTITY };
+                // red-hot bands while it is winding up: the warning
+                let (tint, glow) = if b.rolling || b.s > 0.0 { ([1.0; 4], 0.0) } else { ([1.05 + 0.25 * pulse, 0.85, 0.75, 1.0], 0.18 * pulse * b.up) };
+                r.queue_draw(self.maze_ball, Mat4::from_translation(b.pos) * spin, tint, glow, 0.25, false);
             }
         }
         // The Thornmaze (`maze`): thorns rise along the walls of a waking

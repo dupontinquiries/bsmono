@@ -37,7 +37,16 @@ what else is known-but-unresolved.
   friend close a fiftieth, with two or more nothing. Anywhere on the map, a
   cat with two friends within 10 u takes 10% less from every blow. Bots
   route round shut gates, walk out of waking rooms they are alone in, and
-  hold at the edge rather than walk into one alone.
+  hold at the edge rather than walk into one alone. The labyrinth is a
+  MACHINE, built by the Geartooth clan of engineer-cats (`src/machine.rs`):
+  wooden gear trains turn on every wall top, spinning up as the gates move;
+  and from each turn but the first, Archimedes screws at one pair of track
+  heads wind a stone boulder up out of the floor (it glows while it winds,
+  for 4 s) and let it roll the track at 15 u/s -- a cat in its way takes
+  18% of its health, is thrown aside and slowed, once a run. The track's
+  gates are held open for that turn. Bots step off a track when a ball is
+  due within 1.5 s. The machine knows its own: a Sentinel is hurt but not
+  thrown.
 - **The Drowned Halls** (3v3, `--map atlantis`): one colonnaded hall and a
   domed library on the sea floor.
 - **The first three maps** — the jungle valley (5v5, three lanes), Twinfang Pass (15v15
@@ -104,8 +113,9 @@ what else is known-but-unresolved.
   ultimate -- he raises the lamp and bellows, and every enemy in its light is
   struck, runs from him unable to act, and is shown up (seen through cloud,
   no stalking) for 6 s, while no shadow of Hollowstep's can stand in it;
-  `src/lantern.rs`) and Oremantle (Stonewhisper's grandmother, the first
-  **Sentinel**: drawn and struck 1.4x the size of any other cat, the slowest
+  `src/lantern.rs`) and Oremantle (the first **Sentinel** -- the Sentinels
+  are the Geartooth engineers' work, great cats of stone and ore, and she was
+  built in the likeness of Stonewhisper's grandmother: drawn and struck 1.4x the size of any other cat, the slowest
   on the field, and she casts nothing -- each key shifts what her coat is made
   of, and that material's field is always on around her: **Granite** spares
   friends in it a share of every blow, **Rime** slows enemies, **Lodestone**
@@ -406,7 +416,8 @@ src/
 ├── lantern.rs     Brasshowl's lamp: the flight from it, the shown-up, no shadows in it
 ├── sentinel.rs    the Sentinel role: coats instead of casts, the four fields, the bot's choice
 ├── maze.rs        the Thornmaze: rooms and gates, the labyrinth turning, the waking, the thorns, the pack
-├── mazeworld.rs   the Thornmaze's dressing, gate slabs (collision + mesh), thorn spots
+├── mazeworld.rs   the Thornmaze's dressing, gate slabs (collision + mesh), thorn spots, gear trains, screws, boulder
+├── machine.rs     the Thornmaze's machine: boulder tracks, which pair runs each turn, the roll, the hit, the bots' dodge
 ├── bosses.rs      the Elder Boar + Storm Drake: pits, AI, rewards, TargetRef::Boss
 ├── disasters.rs   wildfire / tempest / earthquake / flood / tornado + map scars
 ├── audio.rs       acoustics_at(pos) → howl/reverb voicing; WindSynth DSP; cpal shell
