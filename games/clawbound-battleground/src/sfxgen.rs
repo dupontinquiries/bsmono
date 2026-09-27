@@ -527,7 +527,7 @@ pub fn ability(def: &GodDef, slot: usize) -> Vec<f32> {
 }
 
 /// The shared sounds, by bank key.
-pub const GENERIC: [&str; 12] = [
+pub const GENERIC: [&str; 13] = [
     "sfx/hit", "sfx/hit_big", "sfx/whiff", "sfx/levelup", "sfx/tower_down", "sfx/cast",
     // Hollowstep's world (`stalker`): a pounding heart, his heavy tread,
     // and the air closing where he left
@@ -538,6 +538,8 @@ pub const GENERIC: [&str; 12] = [
     "sfx/maze/thorns",
     // the labyrinth turning: stone grinding on stone, far off
     "sfx/maze/turn",
+    // a boulder let go down its track: the screws' ratchet, then the roll
+    "sfx/maze/boulder",
 ];
 
 pub fn generic(key: &str) -> Vec<f32> {
@@ -633,6 +635,32 @@ pub fn generic(key: &str) -> Vec<f32> {
             }
             let knock = thud(0.35, 55.0, 30.0, 0.6, &mut n);
             mix_at(&mut x, &knock, len - 0.45, 0.9);
+            x
+        }
+        "sfx/maze/boulder" => {
+            // the last clicks of the screws' ratchet, then stone rolling on
+            // stone: a heavy low rumble with a bump each turn of the ball,
+            // passing (swell, then fade)
+            let len = 1.6;
+            let mut x = vec![0.0; secs(len)];
+            let mut lp = Svf::default();
+            for (i, o) in x.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let u = t / len;
+                let (l, _, _) = lp.run(n.next(), 55.0 + 25.0 * (t * 6.5).sin().abs(), 0.8);
+                let swell = ((t - 0.15) / 0.25).clamp(0.0, 1.0) * (1.0 - u).powf(1.3);
+                *o = drive(l * 3.5, 0.8) * swell;
+            }
+            for k in 0..4 {
+                let click = thud(0.05, 900.0, 600.0, 0.4, &mut n);
+                mix_at(&mut x, &click, k as f32 * 0.06, 0.35);
+            }
+            let mut b = 0.3;
+            while b < len - 0.3 {
+                let bump = thud(0.18, 48.0, 30.0, 0.5, &mut n);
+                mix_at(&mut x, &bump, b, 0.5 * (1.0 - b / len));
+                b += 0.36;
+            }
             x
         }
         "sfx/maze/thorns" => {

@@ -3253,7 +3253,7 @@ mod thornmaze {
     /// Eight minutes of bots on the Thornmaze, one seed: nobody in a wall,
     /// every cat out of its base, the thorns biting, and no cat left alone
     /// in biting ground for long (the bots walk out of it: `maze::bot_goal`).
-    pub fn play(seed: u64, secs: f32) -> (f32, usize, [usize; 2], u32, f32, u32) {
+    pub fn play(seed: u64, secs: f32) -> (f32, usize, [usize; 2], u32, f32, u32, usize) {
         map::with(MapId::Maze, || {
             let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
             let (b, r) = map::team_picks(4, &mut clawbound::sim::Rng::new(seed));
@@ -3265,6 +3265,7 @@ mod thornmaze {
             let mut left_base = vec![false; game.gods.len()];
             let mut alone_for = vec![0.0f32; game.gods.len()];
             let (mut worst, mut bites, mut alone_total) = (0.0f32, 0usize, 0.0f32);
+            let mut boulder_hits = 0usize;
             // stuck: wanting to move (a move direction), alive, not
             // fighting, yet not 1.5 u from where it was 5 s ago
             let mut anchor: Vec<(glam::Vec3, f32)> = game.gods.iter().map(|g| (g.pos, 0.0)).collect();
@@ -3273,6 +3274,7 @@ mod thornmaze {
             for _ in 0..(secs / dt) as usize {
                 game.tick(dt);
                 bites += game.events.iter().filter(|e| matches!(e, Event::ThornBite { .. })).count();
+                boulder_hits += game.events.iter().filter(|e| matches!(e, Event::BoulderHit { .. })).count();
                 game.events.clear();
                 for i in 0..game.gods.len() {
                     let g = &game.gods[i];
@@ -3309,7 +3311,7 @@ mod thornmaze {
                 }
             }
             assert!(left_base.iter().all(|x| *x), "seed {seed}: every cat leaves its base: {left_base:?}");
-            (worst, bites, game.tower_alive, game.gods.iter().map(|g| g.kills).sum(), alone_total, stuck)
+            (worst, bites, game.tower_alive, game.gods.iter().map(|g| g.kills).sum(), alone_total, stuck, boulder_hits)
         })
     }
 
@@ -3317,8 +3319,8 @@ mod thornmaze {
     fn eight_minutes_in_the_thornmaze() {
         let t0 = std::time::Instant::now();
         for seed in [5u64, 9] {
-            let (worst, bites, towers, kills, alone, stuck) = play(seed, 8.0 * 60.0);
-            eprintln!("thornmaze seed {seed}: worst alone-in-thorns {worst:.1}s, total {alone:.1}s, {bites} bites, towers {towers:?}, {kills} kills, {stuck} stuck, in {:.1}s", t0.elapsed().as_secs_f32());
+            let (worst, bites, towers, kills, alone, stuck, hits) = play(seed, 8.0 * 60.0);
+            eprintln!("thornmaze seed {seed}: worst alone-in-thorns {worst:.1}s, total {alone:.1}s, {bites} bites, towers {towers:?}, {kills} kills, {stuck} stuck, {hits} boulder hits, in {:.1}s", t0.elapsed().as_secs_f32());
             assert!(bites > 0, "seed {seed}: the thorns never bit");
             assert_eq!(stuck, 0, "seed {seed}: a bot stood stuck (against a shut gate?)");
             // measured with the bots' rule: 9.1 s worst (seed 5); without

@@ -360,10 +360,23 @@ pub fn think(game: &mut Game, gi: usize) {
     // The Thornmaze: alone (or one of two) in ground that is waking, get
     // out of it -- to a friend close enough to reach, else to calm ground
     // (`maze::bot_goal`). Not mid-fight: the stance decides that.
+    let mut escaping = false;
     if state == AiState::Push && goal.is_none() {
         if let Some(p) = crate::maze::bot_goal(game, gi) {
+            escaping = true;
             let me = &game.gods[gi];
             move_dir = Vec3::new(p.x - me.pos.x, 0.0, p.z - me.pos.z).normalize_or_zero();
+            goal = Some(p);
+        }
+    }
+
+    // A boulder coming (the Thornmaze's machine): step off its track, in
+    // any state -- a duel is not worth being rolled over (`machine::dodge`)
+    if let Some(p) = crate::machine::dodge(game, gi) {
+        escaping = true;
+        let me = &game.gods[gi];
+        move_dir = Vec3::new(p.x - me.pos.x, 0.0, p.z - me.pos.z).normalize_or_zero();
+        if state == AiState::Push {
             goal = Some(p);
         }
     }
@@ -371,7 +384,9 @@ pub fn think(game: &mut Game, gi: usize) {
     // the hunt: hurt, with no enemy ancestor in sight and prey close by,
     // an ancestor breaks off to chase it (a mouthful of health + gold). If a
     // dash is off cooldown and the animal is in range, pounce with it.
-    if hp_frac < 0.6 && state != AiState::Fight {
+    // (not while getting out of the thorns or off a track: a hurt bot
+    // chasing prey round a biting room stayed in it 24 s -- seed 5)
+    if hp_frac < 0.6 && state != AiState::Fight && !escaping {
         let enemy_near = (0..game.gods.len()).any(|j| game.gods[j].team != team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(g.pos) < 16.0);
         if !enemy_near {
             let mut best: Option<(f32, Vec3)> = None;

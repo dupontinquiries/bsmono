@@ -56,6 +56,14 @@ bring down; stones to break first.
   the elder dawn. Fifteen a side: for matters that concern every clan at
   once. The high path climbs a shelf around the western fang; the caves along
   the side paths are the dens of the vole-beasts that keep the camps.
+- **The Thornmaze**: the works of the **Geartooth clan**, the engineer-cats
+  of the old hills, who learned to cut wood and stone with their teeth and
+  set the rivers to turn it. They built the labyrinth as a machine for
+  moving the mountain: gear trains across the wall tops, stone gates that
+  rise and sink in their slots, Archimedes screws that lift quarried stone
+  up from the cisterns, and tracks the stones roll down through the rooms.
+  The Geartooth are long gone; the machine is not. The thorns grew over it
+  after them, and wake where it is working. Five a side.
 
 ## The ancestors
 
@@ -84,7 +92,7 @@ voice note contradicts its ancestor. Seven are female, six male.
 | Sproutkit | a kitten, of every clan | every spring | wherever something is being born | he |
 | Hollowstep | wildcat | the long nights | the fog moors | he |
 | Brasshowl | sand cat | the caravan years | the salt roads | he |
-| Oremantle | snow leopard, the old kind | the first winters | the roots of the high crags | she |
+| Oremantle | a Sentinel: a snow leopard of stone and ore, built by the Geartooth clan | the first winters | the roots of the high crags | she |
 
 **Goldenmane.** First of the lion-clan to lead a pride that was not his by
 birth. He taught that a cat alone is a whisker and a pride is a storm, and
@@ -166,13 +174,17 @@ lamp and bellowed, and whatever it was did not come in. It is said that
 Hollowstep has never once stood in Brasshowl's light, and that the two of
 them know exactly why.
 
-**Oremantle.** Stonewhisper's grandmother, of the old snow leopards that were
-half as big again as any cat since. She lay so long on the roots of the crags
-that the mountain forgot she was not part of it, and when she rose, its stuff
-came with her: granite in the thaw, rime in the long dark, lodestone where the
-iron veins run, and once, when the clans needed it, the molten heart itself.
-She never went to a fight in her life. She became what the fight was standing
-on.
+**Oremantle.** The first of the **Sentinels**, the great cats the Geartooth
+engineers built of stone and ore to keep their works when they were gone.
+They built her in the likeness of Stonewhisper's grandmother, of the old
+snow leopards that were half as big again as any cat since, who lay so long
+on the roots of the crags that the engineers could quarry her shape from the
+mountain itself; and they gave her the grandmother's voice. Her coat is
+plates on the machine's axles, and turned, it shows what the mountain is
+made of: granite in the thaw, rime in the long dark, lodestone where the
+iron veins run, and once, when the clans needed it, the molten heart
+itself. She never went to a fight in her life. She became what the fight
+was standing on. The Geartooth machines know her as their own.
 
 ## The music of the clans
 

@@ -124,6 +124,10 @@ pub fn cues_for(ev: &Event, game: &Game) -> Vec<Cue> {
         // a Sentinel (`sentinel`): the ground taking her weight
         // the Thornmaze's thorns: louder when it is the heavy bite (alone)
         Event::ThornBite { pos, alone } => vec![Cue { keys: vec!["sfx/maze/thorns".into()], bus: Bus::Sfx, gain: if *alone { 0.85 } else { 0.55 }, pos: Some(*pos), speaker: None, priority: 3 }],
+        // the Thornmaze's machine (`machine`): a boulder let go, and a cat
+        // it runs down
+        Event::BoulderRoll { pos } => vec![Cue { keys: vec!["sfx/maze/boulder".into()], bus: Bus::Sfx, gain: 0.95, pos: Some(*pos), speaker: None, priority: 4 }],
+        Event::BoulderHit { pos } => vec![Cue { keys: vec!["sfx/hit_big".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 5 }],
         // the labyrinth turning: heard everywhere
         Event::LabyrinthTurns => vec![Cue { keys: vec!["sfx/maze/turn".into()], bus: Bus::Sfx, gain: 0.8, pos: None, speaker: None, priority: 5 }],
         Event::Tread { pos } => vec![Cue { keys: vec!["sfx/sentinel/tread".into()], bus: Bus::Sfx, gain: 0.85, pos: Some(*pos), speaker: None, priority: 2 }],

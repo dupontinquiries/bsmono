@@ -206,11 +206,11 @@ pub const ANCESTORS: [Ancestor; 18] = [
     },
     Ancestor {
         name: "Oremantle",
-        species: "snow leopard -- the old kind, half as big again as any cat living",
+        species: "a Sentinel -- a snow leopard of stone and ore, half as big again as any cat living, built by the Geartooth clan",
         age: "the first winters",
         land: "the roots of the high crags",
         gender: Gender::Female,
-        story: "Stonewhisper's grandmother, of the old snow leopards that were half as big again as any cat since. She lay so long on the roots of the crags that the mountain forgot she was not part of it, and when she rose, its stuff came with her: granite in the thaw, rime in the long dark, lodestone where the iron veins run, and once, when the clans needed it, the molten heart itself. She never went to a fight in her life. She became what the fight was standing on.",
+        story: "The first of the Sentinels, the great cats the Geartooth engineers built of stone and ore to keep their works when they were gone. They made her in the likeness of Stonewhisper's grandmother, who lay so long on the roots of the crags that they could quarry her shape from the mountain, and they gave her the grandmother's voice. Her coat turns on the machine's axles to show what the mountain is made of: granite in the thaw, rime in the long dark, lodestone where the iron veins run, and once, when the clans needed it, the molten heart itself. She never went to a fight in her life. She became what the fight was standing on.",
         instruments: "the deepest mountain horns, stone chimes, a slow frame drum like footfalls, overtone throat-singing; wind in a cave mouth, rock settling",
     },
 ];

@@ -106,6 +106,9 @@ pub enum Event {
     ThornBite { pos: Vec3, alone: bool },
     /// The Thornmaze's labyrinth turned: gates rise and sink (`maze`).
     LabyrinthTurns,
+    /// A boulder was let go (`machine`), and one rolled over a cat.
+    BoulderRoll { pos: Vec3 },
+    BoulderHit { pos: Vec3 },
 }
 
 #[derive(Clone, Debug)]
@@ -289,6 +292,8 @@ pub struct GodUnit {
     pub ward: f32,
     /// Seconds toward the next thorn bite (`maze`).
     pub thorn_t: f32,
+    /// The last boulder run that hit this cat (`machine`: once a run).
+    pub boulder_run: u32,
     /// A cast winding up or channelling: fires when `t` reaches `dur`.
     pub casting: Option<Casting>,
     /// Seconds during which movement does not turn the cat: after a cast
@@ -629,6 +634,7 @@ impl Game {
                 burn_t: 0.0,
                 ward: 1.0,
                 thorn_t: 0.0,
+                boulder_run: 0,
                 last_act_t: -99.0,
                 ai: if is_player { None } else { Some(AiBrain::new(lane, 0.45 + rng.f32() * 0.5)) },
                 prot,

@@ -7,7 +7,9 @@
 //! for as long as she wears it ([`Game::sentinel_tick`]). She always wears
 //! one: the first coat she has, from the moment she first stands up.
 //!
-//! Oremantle, the first of them, is Stonewhisper's grandmother:
+//! The Sentinels are the Geartooth engineers' work (the clan that built the
+//! Thornmaze's machine, which knows them: `machine`). Oremantle, the first
+//! of them, was built in the likeness of Stonewhisper's grandmother:
 //!
 //! * **Granite** -- every friend in the field, and she, takes a share less
 //!   from every blow (`GodUnit::ward`, read by `Game::deal_damage`).

@@ -615,8 +615,9 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
         ],
     },
     // ── OREMANTLE — the mountain's grandmother, the first Sentinel ──
-    // Stonewhisper's grandmother, of the old kind of snow leopard, half as
-    // big again as any cat living. She casts nothing: each key shifts what
+    // The Geartooth engineers' first Sentinel: a snow leopard of stone and
+    // ore, built in the likeness of Stonewhisper's grandmother, half as big
+    // again as any cat living. She casts nothing: each key shifts what
     // her coat is made of, and what it is made of is a field that is
     // always on around her (`sentinel`).
     GodDef {
