@@ -134,6 +134,12 @@ struct SettingsSheet {
 
 #[derive(Default)]
 pub struct ShellView {
+    /// When anyone last interacted (ms on the frame clock): a touch, the
+    /// cover appearing, a wake. The breathing settles after a while without
+    /// one (season::breath_envelope), so an untouched screen stops repainting.
+    last_activity_ms: u64,
+    /// Inside sleeping hours (copied from the shell each frame): dim and still.
+    night: bool,
     pub show_trace: bool,
     /// Whether the mouse may drive the trackpad pad. Off by default: when the
     /// pad's output is the real pointer (EI), a mouse on the pad moves the
@@ -521,6 +527,12 @@ impl ShellView {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, shell: &mut Shell, pal: &PaletteColors, info: &FrameInfo) -> Vec<Action> {
+        // Anything moving on its own counts as someone being around: a wake
+        // fade, the cover being dragged, a drawer settling.
+        self.night = shell.night_window;
+        if shell.sleep.black > 0.0 || !shell.lock.reveal.is_settled() || shell.drawer.is_animating() {
+            self.last_activity_ms = (info.t_secs * 1000.0) as u64;
+        }
         let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
         let dt_ms = self.last_frame_ms.map(|t| now_ms.saturating_sub(t) as f32).unwrap_or(16.0).min(100.0);
         self.last_frame_ms = Some(now_ms);
@@ -623,7 +635,7 @@ impl ShellView {
         }
         // Home indicator: the affordance for every bottom-edge gesture. It
         // breathes: a slow widening and brightening at the mood's pace.
-        let br = tideshell_core::season::breath(&mood, info.t_secs);
+        let br = tideshell_core::season::breath(&mood, info.t_secs) * self.breath_envelope(info);
         let hw = 110.0 + shell.swipe_up * 40.0 + br * 22.0;
         let hy = size.y - 9.0 - shell.swipe_up * 30.0;
         p.rect_filled(Rect::from_center_size(to(size.x / 2.0 + shell.peek_dx * 0.3, hy), Vec2::new(hw, 5.0)), cr(3), with_alpha(pal.text, 0.6 + br * 0.35));
@@ -634,6 +646,21 @@ impl ShellView {
         // Screen fade to black (sleep), above everything.
         if shell.sleep.black > 0.0 {
             p.rect_filled(Rect::from_min_size(origin, size), cr(0), Color32::from_black_alpha((shell.sleep.black * 255.0) as u8));
+        }
+        // Bedside pulse: a dim, warm clock on black (OLED: black pixels are
+        // off), moved every minute so no digit edge sits on the same pixels.
+        if shell.night.is_pulsing() {
+            let lt = info.time;
+            let m = lt.hour as u16 * 60 + lt.minute as u16;
+            let (dx, dy) = tideshell_core::nightclock::shift(m);
+            let a = (tideshell_core::nightclock::NIGHT_ALPHA * 255.0) as u8;
+            p.text(
+                origin + Vec2::new(size.x / 2.0 + dx, size.y * 0.42 + dy),
+                Align2::CENTER_CENTER,
+                format!("{:02}:{:02}", lt.hour, lt.minute),
+                FontId::proportional(64.0),
+                Color32::from_rgba_unmultiplied(255, 176, 120, a),
+            );
         }
         if let Some(prefs) = self.settings_sheet(ui.ctx(), shell) {
             out.extend(shell.set_prefs(prefs));
@@ -711,6 +738,9 @@ impl ShellView {
     /// Call once per frame with that frame's events: the simulator from
     /// eframe's `raw_input_hook`, the layer runtime before `run_ui`.
     pub fn route_raw(&mut self, shell: &mut Shell, events: &mut Vec<egui::Event>, origin: Pos2, now: u64) -> Vec<Action> {
+        if !events.is_empty() {
+            self.last_activity_ms = now;
+        }
         if shell.is_covered() {
             // Pocket / face: nothing reaches anything (the sleep model still
             // sees touches, so the wake gate is its decision).
@@ -879,6 +909,18 @@ impl ShellView {
             // Grain, to break the banding a gradient this smooth shows on a
             // dim screen. One tiled texture, drawn at low alpha.
             p.rect_filled(r, cr(0), Color32::from_black_alpha((alpha * 90.0) as u8));
+            // Depth orbs: the tracked corners, sized and lit by parallax depth
+            // (orbs.rs). Soft discs, never a picture; three rings each for blur.
+            let short = r.width().min(r.height());
+            for o in &shell.orbs.orbs {
+                let c = Pos2::new(r.left() + o.x * r.width(), r.top() + o.y * r.height());
+                let rad = o.radius(short);
+                let lift = |v: u8| (v as f32 * 0.5 + 127.0) as u8; // toward white: glows, not holes
+                let col = |a: f32| Color32::from_rgba_unmultiplied(lift(o.color[0]), lift(o.color[1]), lift(o.color[2]), (a * o.alpha * alpha * 255.0).clamp(0.0, 255.0) as u8);
+                p.circle_filled(c, rad * 1.8, col(0.10));
+                p.circle_filled(c, rad * 1.25, col(0.18));
+                p.circle_filled(c, rad, col(0.32 + 0.3 * o.depth));
+            }
         } else if let Some((tex, fw, fh)) = &self.camera_tex {
             let r = Rect::from_min_size(top, size);
             // Not `p.image` with a full 0..1 uv: that stretches the frame to
@@ -921,7 +963,7 @@ impl ShellView {
             p.text(top + Vec2::new(size.x - 34.0, 22.0), Align2::RIGHT_CENTER, format!("{:.0}°", shell.world.yaw_deg()), FontId::proportional(12.0), Color32::from_white_alpha((alpha * 200.0) as u8));
         }
         let bands = if self.camera_tex.is_some() { 0 } else { 32 };
-        let br = tideshell_core::season::breath(&shell.mood(), info.t_secs);
+        let br = tideshell_core::season::breath(&shell.mood(), info.t_secs) * self.breath_envelope(info);
         let acc = shell.accent();
         for i in 0..bands {
             let t = i as f32 / (bands - 1) as f32;
@@ -948,11 +990,58 @@ impl ShellView {
     /// The cover clock at `c`: digital (exact digits, or words when fuzzy) or
     /// analog (hands snapped to the precision; weekday mode shows the day
     /// inside the face; words underneath when fuzzy).
+    fn breath_envelope(&self, info: &FrameInfo) -> f32 {
+        if self.night {
+            return 0.0; // sleeping hours: nothing moves on its own
+        }
+        let idle_s = ((info.t_secs * 1000.0) as u64).saturating_sub(self.last_activity_ms) as f32 / 1000.0;
+        tideshell_core::season::breath_envelope(idle_s)
+    }
+
+    /// The cover clock drawn anamorphically for a phone lying flat
+    /// (clock3d.rs): polygons from the core, painted as one mesh.
+    fn clock_3d(&self, p: &egui::Painter, shell: &Shell, info: &FrameInfo, c: Pos2, alpha: f32) {
+        use tideshell_core::clock3d::{build, Eye, Scene};
+        let screen = p.clip_rect().size();
+        // A seated viewer about three phone-heights away, 40° above the table.
+        let eye = Eye::seated((screen.x, screen.y), 40.0, screen.y * 3.0);
+        let scene = Scene {
+            style: shell.prefs.clock_3d_style,
+            amount: shell.clock_3d_amount(),
+            t: info.t_secs,
+            screen: (screen.x, screen.y),
+            anchor: (c.x, c.y + 40.0),
+            height: 84.0,
+        };
+        let text = format!("{:02}:{:02}", info.time.hour, info.time.minute);
+        let mut mesh = egui::Mesh::default();
+        for q in build(&text, &scene, &eye) {
+            let a = (q.alpha * alpha * 255.0).clamp(0.0, 255.0) as u8;
+            let color = if q.shadow {
+                Color32::from_black_alpha(a)
+            } else {
+                let v = (q.shade * 255.0) as u8;
+                Color32::from_rgba_unmultiplied(v, v, v, a)
+            };
+            let base = mesh.vertices.len() as u32;
+            for (x, y) in q.pts {
+                mesh.vertices.push(egui::epaint::Vertex { pos: Pos2::new(x, y), uv: egui::epaint::WHITE_UV, color });
+            }
+            mesh.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        p.add(egui::Shape::mesh(mesh));
+    }
+
     fn clock_face(&self, p: &egui::Painter, shell: &Shell, info: &FrameInfo, c: Pos2, alpha: f32) {
         use tideshell_core::clock::{hands, weekday_name, words, ClockStyle, Fuzzy};
+        // Dim inside sleeping hours (bsettings), for the eyes and the OLED.
+        let alpha = alpha * tideshell_core::nightclock::night_alpha(shell.night_window);
         let white = |a: f32| Color32::from_white_alpha((a * alpha * 255.0) as u8);
         let f = shell.prefs.clock_fuzzy;
         match shell.prefs.clock_style {
+            ClockStyle::Digital if f == Fuzzy::Exact && shell.clock_3d_amount() > 0.001 => {
+                self.clock_3d(p, shell, info, c, alpha);
+            }
             ClockStyle::Digital => {
                 let (txt, font) = if f == Fuzzy::Exact { (format!("{:02}:{:02}", info.time.hour, info.time.minute), 72.0) } else { (words(info.time, f), 34.0) };
                 p.text(c, Align2::CENTER_CENTER, txt, FontId::proportional(font), white(1.0));
@@ -1463,6 +1552,26 @@ impl ShellView {
                 ui.horizontal_wrapped(|ui| {
                     for f in tideshell_core::clock::Fuzzy::ALL {
                         ui.radio_value(&mut draft.clock_fuzzy, f, f.label());
+                    }
+                });
+                ui.label("3D clock (digital, exact time)");
+                ui.horizontal_wrapped(|ui| {
+                    for t in tideshell_core::clock3d::Trigger::ALL {
+                        ui.radio_value(&mut draft.clock_3d, t, t.label());
+                    }
+                });
+                ui.add_enabled_ui(draft.clock_3d != tideshell_core::clock3d::Trigger::Off, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for st in tideshell_core::clock3d::Style::ALL {
+                            ui.radio_value(&mut draft.clock_3d_style, st, st.label());
+                        }
+                    });
+                });
+                ui.separator();
+                ui.label("Screen sleep when idle (triple tap or power key wakes)");
+                ui.horizontal_wrapped(|ui| {
+                    for (secs, label) in [(0, "Never"), (30, "30 s"), (60, "1 min"), (120, "2 min"), (300, "5 min")] {
+                        ui.radio_value(&mut draft.sleep_idle_s, secs, label);
                     }
                 });
                 ui.separator();

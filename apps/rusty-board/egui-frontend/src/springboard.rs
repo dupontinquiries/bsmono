@@ -327,8 +327,6 @@ pub struct Zone {
     pub live_while_swiping: bool,
 }
 
-/// `~36px tall` (§4).
-pub const BOTTOM_H: f32 = 36.0;
 /// `~24px wide` (§4).
 pub const SIDE_W: f32 = 24.0;
 /// The thinnest bottom zone worth offering.
@@ -350,18 +348,11 @@ pub const MIN_ZONE_H: f32 = 12.0;
 /// under the palm is not a space zone.
 pub fn zones(board: Rect, letters: Rect, half: crate::halfboard::Side) -> Vec<Zone> {
     let mut out = Vec::new();
-    // BELOW THE KEYS, and only where there is room. `letters` must be the rect the keys
-    // occupy: the demo once passed "the board minus one key height", which put this zone
-    // on top of the bottom row, so ⌫ / ⏎ / space typed their key and a space. A zone
-    // thinner than MIN_ZONE_H is not offered -- a sliver along the screen edge is a
-    // mis-tap waiting to happen, not a spacebar.
-    let bottom = Rect::from_min_max(
-        Pos2::new(board.left(), letters.bottom()),
-        Pos2::new(board.right(), (letters.bottom() + BOTTOM_H).min(board.bottom())),
-    );
-    if bottom.height() >= MIN_ZONE_H {
-        out.push(Zone { rect: bottom, edge: Edge::Bottom, live_while_swiping: true });
-    }
+    // NO BOTTOM ZONE. There was a 36pt "␣" strip under the keys wherever the
+    // surface had room; on the phone it sat over the buttons below the board
+    // (it was never a real key, and the bottom row already has a spacebar).
+    // Swiping out past the bottom edge still ends a word: that is `SwipeState`'s
+    // exit test, not this strip. Only the one-handed side strip remains.
     if let Some(free) = half.free_zone(board) {
         let (rect, edge) = match half {
             // Anchored left: the strip is on the right.
@@ -406,20 +397,13 @@ mod zone_tests {
         Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 200.0))
     }
 
-    /// Full width: one zone, along the bottom, and it survives an active swipe so a word can
-    /// be ended mid-gesture.
+    /// Full width: no zone at all. The bottom strip overlapped the buttons
+    /// under the board on the phone and was removed.
     #[test]
-    fn a_full_width_board_has_one_space_zone() {
+    fn a_full_width_board_has_no_space_zone() {
         let z = zones(board(), letters(), Side::Off);
-        assert_eq!(z.len(), 1);
-        assert_eq!(z[0].edge, Edge::Bottom);
-        assert!(z[0].live_while_swiping);
-        assert!((z[0].rect.height() - BOTTOM_H).abs() < 0.01);
-        assert_eq!(z[0].rect.width(), board().width());
-
-        assert!(zone_at(&z, Pos2::new(250.0, 215.0), false).is_some());
-        assert!(zone_at(&z, Pos2::new(250.0, 215.0), true).is_some(), "the bottom stays live");
-        assert!(zone_at(&z, Pos2::new(250.0, 100.0), false).is_none(), "that is a letter");
+        assert!(z.is_empty(), "{z:?}");
+        assert!(zone_at(&z, Pos2::new(250.0, 215.0), false).is_none(), "under the keys taps nothing");
     }
 
     /// THE STRIP HAS TO BE OUTSIDE THE LETTERS, or a swipe through it delimits nothing.
@@ -500,8 +484,8 @@ mod zone_tests {
                 Pos2::new(keys.right(), l.bottom()),
             );
             let z = zones(b, letters_here, side);
-            assert_eq!(z.len(), 2, "{side:?}: {z:?}");
-            let strip = z[1];
+            assert_eq!(z.len(), 1, "{side:?}: {z:?}");
+            let strip = z[0];
             assert_eq!(strip.edge, want_edge);
             assert!((strip.rect.width() - SIDE_W).abs() < 0.01);
             assert!(
@@ -519,17 +503,16 @@ mod zone_tests {
     }
 
     /// A side zone is suppressed during a swipe, so a word's own path cannot tap one on its
-    /// way past. The bottom is not, because ending a word there is deliberate.
+    /// way past.
     #[test]
     fn the_side_zone_goes_quiet_while_swiping() {
         let (b, l) = (board(), letters());
         let keys = Side::Left.board_rect(b);
         let letters_here = Rect::from_min_max(Pos2::new(keys.left(), l.top()), Pos2::new(keys.right(), l.bottom()));
         let z = zones(b, letters_here, Side::Left);
-        let side_point = z[1].rect.center();
+        let side_point = z[0].rect.center();
         assert!(zone_at(&z, side_point, false).is_some(), "tappable at rest");
         assert!(zone_at(&z, side_point, true).is_none(), "a swipe past it tapped it");
-        assert!(zone_at(&z, z[0].rect.center(), true).is_some(), "the bottom stayed live");
     }
 }
 
@@ -662,11 +645,8 @@ mod feedback_tests {
         let board = Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 260.0));
         let letters = Rect::from_min_size(Pos2::ZERO, egui::vec2(390.0, 200.0));
         let z = zones(board, letters, crate::halfboard::Side::Left);
-        assert_eq!(z.len(), 2);
-        // A touch low and central is nearest the bottom bar; one out to the right is
-        // nearest the freed strip.
-        assert_eq!(nearest_zone(&z, Pos2::new(200.0, 215.0)), Some(0));
-        assert_eq!(nearest_zone(&z, Pos2::new(430.0, 100.0)), Some(1));
+        assert_eq!(z.len(), 1);
+        assert_eq!(nearest_zone(&z, Pos2::new(430.0, 100.0)), Some(0));
         assert_eq!(nearest_zone(&[], Pos2::ZERO), None);
     }
 }

@@ -186,7 +186,21 @@ pub struct DutyCycle {
     got_frame: bool,
     /// Consecutive windows whose scene looked the same as the last.
     quiet_windows: u32,
+    /// A live window: stream (not one frame) until this time. Opened when the
+    /// cover appears on a lit screen, so the depth orbs have motion to track
+    /// while someone is actually looking; closed on its own after `LIVE_MS`.
+    live_until: Option<u64>,
+    /// `go_live` interrupted a sample window: the next tick restarts at once.
+    restart_live: bool,
 }
+
+/// How long the camera streams after the cover appears (see `go_live`).
+pub const LIVE_MS: u64 = 8_000;
+/// Frame rate while live. Enough for block matching to follow a hand's
+/// motion on a 240x320 frame; the software debayer is paid per frame.
+pub const LIVE_FPS: u32 = 8;
+/// Frame rate for the one-frame tint samples.
+pub const SAMPLE_FPS: u32 = 2;
 
 impl DutyCycle {
     pub fn new(duty: Duty) -> DutyCycle {
@@ -217,6 +231,22 @@ impl DutyCycle {
         self.quiet_windows = 0;
     }
 
+    /// Stream for `ms` from `now` (the cover just appeared). A running
+    /// one-frame window is extended rather than restarted.
+    pub fn go_live(&mut self, now_ms: u64, ms: u64) {
+        self.quiet_windows = 0;
+        self.live_until = Some(now_ms + ms);
+        // A sample window started at the old rate: restart it at the live rate.
+        if self.running_since.is_some() {
+            self.running_since = None;
+            self.restart_live = true;
+        }
+    }
+
+    pub fn is_live(&self, now_ms: u64) -> bool {
+        self.live_until.is_some_and(|t| now_ms < t)
+    }
+
     /// The gap in force right now: doubling from `period_ms` toward
     /// `idle_period_ms` once the scene has been still for a few windows.
     pub fn current_period_ms(&self) -> u64 {
@@ -230,6 +260,8 @@ impl DutyCycle {
     /// camera stops at once rather than finishing its window.
     pub fn tick(&mut self, wanted: bool, now_ms: u64) -> DutyAction {
         if !wanted {
+            self.live_until = None;
+            self.restart_live = false;
             if self.running_since.take().is_some() {
                 self.last_stop = Some(now_ms);
                 self.got_frame = false;
@@ -237,7 +269,24 @@ impl DutyCycle {
             }
             return DutyAction::Wait;
         }
+        if std::mem::take(&mut self.restart_live) {
+            // The caller still holds the old source; Stop it, then Start next tick.
+            self.last_stop = None;
+            self.got_frame = false;
+            return DutyAction::Stop;
+        }
+        let live = self.is_live(now_ms);
+        if !live && self.live_until.is_some() {
+            // The live window just ended: stop streaming, back to samples.
+            self.live_until = None;
+            if self.running_since.take().is_some() {
+                self.last_stop = Some(now_ms);
+                self.got_frame = false;
+                return DutyAction::Stop;
+            }
+        }
         match self.running_since {
+            Some(_) if live => DutyAction::Wait,
             Some(started) => {
                 if self.got_frame || now_ms.saturating_sub(started) >= self.duty.warmup_ms {
                     self.running_since = None;
@@ -249,7 +298,7 @@ impl DutyCycle {
                 }
             }
             None => match self.last_stop {
-                Some(t) if now_ms.saturating_sub(t) < self.current_period_ms() => DutyAction::Wait,
+                Some(t) if !live && now_ms.saturating_sub(t) < self.current_period_ms() => DutyAction::Wait,
                 _ => {
                     self.running_since = Some(now_ms);
                     self.got_frame = false;
@@ -330,6 +379,46 @@ pub fn gst_command(choice: &CameraChoice, w: usize, h: usize) -> Vec<String> {
         v.push(a.into());
     }
     v
+}
+
+/// The capture size to ask the sensor for, with a fallback. The default
+/// stream on this phone is the sensor's full mode (4096x3072 rear), which the
+/// `simple` pipeline debayers IN SOFTWARE before it is scaled to 240x320: most
+/// of the camera's cost for pixels that are thrown away. So ask for a small
+/// mode first; if the camera will not produce it (the pipeline ends with no
+/// frame), stop asking and use the default from then on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureProbe {
+    pub small: (usize, usize),
+    /// None = untried, Some(true) = works, Some(false) = refused.
+    pub small_ok: Option<bool>,
+}
+
+impl Default for CaptureProbe {
+    fn default() -> Self {
+        CaptureProbe { small: (640, 480), small_ok: None }
+    }
+}
+
+impl CaptureProbe {
+    /// The size to request (None = the camera's default).
+    pub fn request(&self) -> Option<(usize, usize)> {
+        (self.small_ok != Some(false)).then_some(self.small)
+    }
+    /// A source using `request()` ended; `frames` is how many it produced.
+    /// Returns a note when the probe learned something.
+    pub fn observe(&mut self, frames: u64) -> Option<String> {
+        if self.small_ok.is_some() {
+            return None;
+        }
+        if frames > 0 {
+            self.small_ok = Some(true);
+            Some(format!("camera: small capture {}x{} works", self.small.0, self.small.1))
+        } else {
+            self.small_ok = Some(false);
+            Some(format!("camera: {}x{} refused; using the camera's default mode (costlier)", self.small.0, self.small.1))
+        }
+    }
 }
 
 pub struct ChildSource {
@@ -688,5 +777,48 @@ mod exposure_tests {
         assert!(scene_ev(255.0, &e).is_finite());
         assert!(scene_ev(1e9, &e).is_finite());
         assert!(scene_ev(100.0, &Exposure { time_us: 0, gain: 0.0 }).is_finite(), "nonsense settings must not poison the number");
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    fn the_live_window_streams_then_falls_back_to_samples() {
+        let mut d = DutyCycle::new(Duty::default());
+        d.go_live(0, LIVE_MS);
+        assert_eq!(d.tick(true, 0), DutyAction::Start);
+        d.frame(true);
+        assert_eq!(d.tick(true, 100), DutyAction::Wait, "live: a frame does NOT end the window");
+        d.frame(true);
+        assert_eq!(d.tick(true, 5_000), DutyAction::Wait);
+        assert!(d.is_live(5_000));
+        assert_eq!(d.tick(true, LIVE_MS), DutyAction::Stop, "window over");
+        assert!(!d.is_live(LIVE_MS));
+        assert_eq!(d.tick(true, LIVE_MS + 100), DutyAction::Wait, "then the normal period applies");
+    }
+
+    #[test]
+    fn going_live_mid_sample_restarts_at_the_live_rate_and_hiding_ends_it() {
+        let mut d = DutyCycle::new(Duty::default());
+        assert_eq!(d.tick(true, 0), DutyAction::Start);
+        d.go_live(100, LIVE_MS);
+        assert_eq!(d.tick(true, 100), DutyAction::Stop, "drop the 2 fps source");
+        assert_eq!(d.tick(true, 101), DutyAction::Start, "and start the live one at once");
+        assert_eq!(d.tick(false, 200), DutyAction::Stop, "cover gone: stop now");
+        assert!(!d.is_live(300), "and the live window is forgotten");
+    }
+
+    #[test]
+    fn the_capture_probe_asks_small_once_then_remembers() {
+        let mut p = CaptureProbe::default();
+        assert_eq!(p.request(), Some((640, 480)));
+        assert!(p.observe(0).unwrap().contains("refused"));
+        assert_eq!(p.request(), None, "fall back to the default mode");
+        assert!(p.observe(5).is_none(), "decided: no more notes");
+        let mut p = CaptureProbe::default();
+        assert!(p.observe(3).unwrap().contains("works"));
+        assert_eq!(p.request(), Some((640, 480)));
     }
 }

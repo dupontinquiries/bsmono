@@ -44,6 +44,13 @@ pub trait VirtualKeyboard {
     fn pump(&self) -> Result<usize> {
         Ok(0)
     }
+
+    /// A file descriptor that becomes readable when `pump` has work, for
+    /// hosts that sleep in `poll()`. `None` (the default) means there is
+    /// nothing to wait on and the host must fall back to a timer.
+    fn poll_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
 }
 
 /// Which backend strategy is in use. Picked at startup.
@@ -149,6 +156,10 @@ impl VirtualKeyboard for WaylandVirtualKeyboard {
             Some(b) => b.pump(),
             None => Ok(0),
         }
+    }
+
+    fn poll_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.backend.as_ref().map(|b| b.poll_fd())
     }
 
     fn commit_text(&self, text: &str) -> Result<()> {

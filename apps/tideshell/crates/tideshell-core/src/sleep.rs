@@ -12,6 +12,18 @@
 //! it lasts, plus POCKET_HOLD_MS after it clears so the sensor's own lag
 //! cannot let a pocket tap through.
 //!
+//! Two other paths lead to the same Off, so there is ONE screen-off and one
+//! way back:
+//! * **Idle** (`idle`): the shell asks the compositor for an idle notification
+//!   (ext-idle-notify, which honours inhibitors like a playing video) and
+//!   sleeps exactly as the power key does.
+//! * **The compositor blanking on its own** (`display_reported(false)`, e.g.
+//!   cosmic-idle's screen-off timer): adopted as Off, so touches are captured
+//!   and the triple tap is what wakes it. And the panel coming back on while
+//!   Off WITHOUT a triple tap or the power key — cosmic-idle turns outputs on
+//!   at the first input after it blanked them, i.e. a single pocket touch —
+//!   is refused: the answer is `DisplayPower(false)` again.
+//!
 //! The triple-tap detector is strict because a pocket produces touches: a tap
 //! is short (TAP_MAX_MS) and still (TAP_SLOP); three must land within
 //! TRIPLE_WINDOW_MS of the first touch and within CLUSTER px of the first
@@ -57,11 +69,18 @@ pub struct Sleep {
     /// Proximity "near" (covered) and when it last cleared.
     near: bool,
     near_cleared_at: Option<Millis>,
+    /// Times the compositor blanked the panel on its own (adopted as Off).
+    pub external_blanks: u32,
+    /// Times the panel was lit while Off without a triple tap (turned off again).
+    pub refused_wakes: u32,
+    /// The bedside clock is lighting the panel on purpose (nightclock.rs):
+    /// a lit report now is ours, not an intruder's.
+    pub glance: bool,
 }
 
 impl Default for Sleep {
     fn default() -> Self {
-        Sleep { phase: Phase::Awake, black: 0.0, lock_on_sleep: true, taps: Vec::new(), down: None, near: false, near_cleared_at: None }
+        Sleep { phase: Phase::Awake, black: 0.0, lock_on_sleep: true, taps: Vec::new(), down: None, near: false, near_cleared_at: None, external_blanks: 0, refused_wakes: 0, glance: false }
     }
 }
 
@@ -89,6 +108,40 @@ impl Sleep {
 
     pub fn is_animating(&self) -> bool {
         matches!(self.phase, Phase::FadingOut | Phase::FadingIn)
+    }
+
+    /// The user has been idle for the configured time: the same as the power
+    /// key from Awake, and nothing otherwise (idle while asleep means nothing).
+    pub fn idle(&mut self) -> Vec<SleepAction> {
+        match self.phase {
+            Phase::Awake => self.power_key(),
+            _ => vec![],
+        }
+    }
+
+    /// The compositor's report of the panel, whoever changed it. See the module
+    /// doc: blanking we did not ask for is adopted as Off; the panel lit while
+    /// we are Off (not via `wake`, which moves to FadingIn first) is turned off
+    /// again.
+    pub fn display_reported(&mut self, on: bool) -> Vec<SleepAction> {
+        match (on, self.phase) {
+            (false, Phase::Awake | Phase::FadingIn) => {
+                self.phase = Phase::Off;
+                self.black = 1.0;
+                self.reset_taps();
+                self.external_blanks += 1;
+                if self.lock_on_sleep {
+                    vec![SleepAction::Lock]
+                } else {
+                    vec![]
+                }
+            }
+            (true, Phase::Off) if !self.glance => {
+                self.refused_wakes += 1;
+                vec![SleepAction::DisplayPower(false)]
+            }
+            _ => vec![],
+        }
     }
 
     pub fn power_key(&mut self) -> Vec<SleepAction> {
@@ -319,6 +372,47 @@ mod tests {
         s.tick(100.0); // part-way through the fade
         assert!(s.power_key().is_empty(), "panel never went off: nothing to turn on");
         assert_eq!(s.phase, Phase::FadingIn);
+    }
+
+    #[test]
+    fn idle_sleeps_like_the_power_key_and_only_from_awake() {
+        let mut s = Sleep::default();
+        assert_eq!(s.idle(), vec![SleepAction::Lock]);
+        assert_eq!(s.phase, Phase::FadingOut);
+        let mut s = asleep();
+        assert!(s.idle().is_empty(), "idle while asleep: nothing");
+        assert_eq!(s.phase, Phase::Off);
+    }
+
+    #[test]
+    fn compositor_blanking_is_adopted_and_still_needs_a_triple_tap() {
+        let mut s = Sleep::default();
+        assert_eq!(s.display_reported(false), vec![SleepAction::Lock], "cosmic-idle blanked us: lock, like a sleep");
+        assert_eq!((s.phase, s.black), (Phase::Off, 1.0));
+        assert!(s.captures_input(), "touches go to the wake detector, not the apps under a dark panel");
+        assert!(tap(&mut s, 200.0, 500.0, 0, 80).is_empty());
+        assert_eq!(s.phase, Phase::Off, "one tap does not wake");
+        tap(&mut s, 200.0, 500.0, 150, 80);
+        assert_eq!(tap(&mut s, 200.0, 500.0, 300, 80), vec![SleepAction::DisplayPower(true)]);
+        assert_eq!(s.external_blanks, 1);
+    }
+
+    #[test]
+    fn a_panel_lit_behind_our_back_while_off_is_turned_off_again() {
+        let mut s = asleep();
+        assert_eq!(s.display_reported(true), vec![SleepAction::DisplayPower(false)], "a single touch woke it via cosmic-idle");
+        assert_eq!(s.phase, Phase::Off);
+        assert_eq!(s.refused_wakes, 1);
+        // Our own wake is not refused: it leaves Off before the panel reports on.
+        tap(&mut s, 200.0, 500.0, 0, 80);
+        tap(&mut s, 200.0, 500.0, 150, 80);
+        assert_eq!(tap(&mut s, 200.0, 500.0, 300, 80), vec![SleepAction::DisplayPower(true)]);
+        assert!(s.display_reported(true).is_empty());
+        // Reports that agree with us are no-ops.
+        let mut s = asleep();
+        assert!(s.display_reported(false).is_empty());
+        let mut s = Sleep::default();
+        assert!(s.display_reported(true).is_empty());
     }
 
     #[test]

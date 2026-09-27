@@ -105,9 +105,14 @@ pub fn surface_height(content: f32) -> u32 {
     content.ceil().clamp(120.0, 1600.0) as u32
 }
 
-/// Poll timeout while nothing is animating. Bounds the Activate→shown latency when idle; the
-/// GTK backend's SLOW_MS is in the same range.
+/// Poll timeout while nothing is animating AND the sink has no descriptor to wait on. Bounds
+/// the Activate→shown latency in that case; the GTK backend's SLOW_MS is in the same range.
 const IDLE_POLL: Duration = Duration::from_millis(50);
+
+/// Poll timeout when the sink's socket is polled too: nothing needs a timer to be noticed, so
+/// this is only a safety net. 20 wakes a second used to be the idle floor, which on a phone is
+/// a radio-and-CPU tax paid all day by a keyboard nobody is touching.
+const IDLE_POLL_WITH_FD: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum LayerError {
@@ -165,6 +170,8 @@ struct State {
     frame_pending: bool,
     /// When that callback was requested, to notice one that never lands.
     frame_sent: Option<Instant>,
+    /// The input-method socket hung up; stop polling it (see `wait_for_socket`).
+    sink_fd_dead: bool,
     /// The compositor closed the layer surface (output gone, shell shutting down).
     closed: bool,
     /// egui input for the next frame.
@@ -239,6 +246,7 @@ pub fn run(title: &str) -> Result<(), LayerError> {
         configured: false,
         frame_pending: false,
         frame_sent: None,
+        sink_fd_dead: false,
         closed: false,
         events: Vec::new(),
         primary_touch: None,
@@ -270,7 +278,13 @@ pub fn run(title: &str) -> Result<(), LayerError> {
     tracing::info!("layer-shell shell up: {}x{} @{}x, layer {:?}", state.logical_size().0, state.logical_size().1, state.scale, layer_from_env());
 
     let mut callback_lost_noted = false;
+    // RUSTY_BOARD_LOOP_STATS=1: every 5 s, one stderr line saying how many frames ran and WHY
+    // (input, a configure, the sink's show/hide wish, or egui asking), how many were painted and
+    // how often the loop woke. Printed on the first wake after each 5 s, so a truly idle keyboard
+    // prints nothing at all (it does not wake); a busy one names its cause.
+    let mut stats = LoopStats::from_env();
     while !state.closed {
+        stats.report_if_due();
         // ---- 0. the sink first: Activate/Deactivate are seen on every wake, and a change of
         //         wish is itself a reason to run a frame (which is what emits `Visible`).
         let wanted = feel.pump_sink();
@@ -295,9 +309,14 @@ pub fn run(title: &str) -> Result<(), LayerError> {
             || (state.needs_paint && can_paint)
             || wanted != mapped
             || Instant::now() >= repaint_at;
+        stats.wakes += 1;
+        if due {
+            stats.count(!state.events.is_empty(), state.needs_paint && can_paint, wanted != mapped, Instant::now() >= repaint_at);
+        }
         if !due {
-            let timeout = deadline_timeout(repaint_at, &state);
-            wait_for_socket(&conn, &mut queue, &mut state, timeout)?;
+            let sink_fd = feel.sink_wake_fd().filter(|_| !state.sink_fd_dead);
+            let timeout = deadline_timeout(repaint_at, &state, sink_fd.is_some());
+            wait_for_socket(&conn, &mut queue, &mut state, timeout, sink_fd)?;
             continue;
         }
 
@@ -320,7 +339,9 @@ pub fn run(title: &str) -> Result<(), LayerError> {
         let mut repaint_delay = Duration::from_secs(3600);
         if let Some(vp) = out.viewport_output.get(&egui::ViewportId::ROOT) {
             repaint_delay = vp.repaint_delay;
-            repaint_at = Instant::now() + repaint_delay;
+            // egui says "never" as Duration::MAX; `Instant + MAX` panics (overflow). The old
+            // unconditional 320 ms repaint request hid this: no frame ever said "never".
+            repaint_at = repaint_deadline(Instant::now(), repaint_delay);
             for cmd in &vp.commands {
                 if let egui::ViewportCommand::Visible(v) = cmd {
                     want_visible = Some(*v);
@@ -406,17 +427,65 @@ pub fn run(title: &str) -> Result<(), LayerError> {
             callback_lost_noted = false;
             gl.swap().map_err(LayerError::Runtime)?;
             state.needs_paint = false;
+            stats.paints += 1;
         }
 
         // ---- 4. sleep until the socket is readable or egui's next deadline.
-        let timeout = deadline_timeout(repaint_at, &state);
-        wait_for_socket(&conn, &mut queue, &mut state, timeout)?;
+        let sink_fd = feel.sink_wake_fd().filter(|_| !state.sink_fd_dead);
+        let timeout = deadline_timeout(repaint_at, &state, sink_fd.is_some());
+        wait_for_socket(&conn, &mut queue, &mut state, timeout, sink_fd)?;
         let _ = repaint_delay;
     }
 
     gl.destroy();
     tracing::info!("layer-shell shell: surface closed by the compositor, exiting");
     Ok(())
+}
+
+/// When egui next wants a frame: `now + delay`, where a delay too large to represent (egui
+/// uses `Duration::MAX` for "no repaint wanted") becomes a day away — the idle cap bounds the
+/// actual sleep anyway.
+pub fn repaint_deadline(now: Instant, delay: Duration) -> Instant {
+    now.checked_add(delay).unwrap_or_else(|| now + Duration::from_secs(86_400))
+}
+
+/// Opt-in loop accounting (`RUSTY_BOARD_LOOP_STATS=1`). Costs a branch per wake when off.
+#[derive(Default)]
+struct LoopStats {
+    on: bool,
+    since: Option<Instant>,
+    wakes: u32,
+    paints: u32,
+    input: u32,
+    configure: u32,
+    wish: u32,
+    egui: u32,
+}
+
+impl LoopStats {
+    fn from_env() -> Self {
+        let on = matches!(std::env::var("RUSTY_BOARD_LOOP_STATS").ok().as_deref(), Some("1") | Some("true"));
+        LoopStats { on, since: Some(Instant::now()), ..Default::default() }
+    }
+    /// One frame ran; attribute it to every reason that made it due.
+    fn count(&mut self, input: bool, configure: bool, wish: bool, egui: bool) {
+        self.input += input as u32;
+        self.configure += configure as u32;
+        self.wish += wish as u32;
+        self.egui += egui as u32;
+    }
+    fn report_if_due(&mut self) {
+        if !self.on || self.since.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
+            return;
+        }
+        let frames = self.input.max(self.configure).max(self.wish).max(self.egui);
+        eprintln!(
+            "[rusty-board] loop/5s: wakes {} paints {} | frames due to: input {} configure {} show/hide {} egui-repaint {}{}",
+            self.wakes, self.paints, self.input, self.configure, self.wish, self.egui,
+            if frames == 0 { " (idle)" } else { "" },
+        );
+        *self = LoopStats { on: true, since: Some(Instant::now()), ..Default::default() };
+    }
 }
 
 /// How long a frame callback may take before it is treated as lost.
@@ -450,14 +519,31 @@ pub fn merge_textures(pending: &mut egui::TexturesDelta, newer: egui::TexturesDe
     }
 }
 
-/// How long the loop may sleep: until egui's deadline, capped at IDLE_POLL so the sink is
-/// pumped often enough — and never a zero-timeout spin while a frame callback is outstanding
-/// (the callback arrives on the socket; poll wakes us for it).
-fn deadline_timeout(repaint_at: Instant, state: &State) -> Duration {
-    if state.frame_pending {
-        IDLE_POLL
+/// How long the loop may sleep: until egui's deadline, capped so the sink is pumped often
+/// enough (IDLE_POLL when its socket cannot be polled, a long safety net when it can) — and
+/// never a zero-timeout spin while a frame callback is outstanding (the callback arrives on the
+/// socket; poll wakes us for it; the cap is the lost-callback grace so that check still runs).
+fn deadline_timeout(repaint_at: Instant, state: &State, sink_polled: bool) -> Duration {
+    idle_cap_timeout(repaint_at, Instant::now(), state.frame_pending, state.frame_sent, sink_polled)
+}
+
+/// Pure half of [`deadline_timeout`], testable without a compositor.
+pub fn idle_cap_timeout(
+    repaint_at: Instant,
+    now: Instant,
+    frame_pending: bool,
+    frame_sent: Option<Instant>,
+    sink_polled: bool,
+) -> Duration {
+    let cap = if sink_polled { IDLE_POLL_WITH_FD } else { IDLE_POLL };
+    if frame_pending {
+        let grace_left = frame_sent
+            .map(|t| (t + FRAME_CALLBACK_GRACE).saturating_duration_since(now))
+            .unwrap_or(FRAME_CALLBACK_GRACE);
+        // A little past the grace so the check at the top of the loop sees it expired.
+        (grace_left + Duration::from_millis(5)).min(cap)
     } else {
-        repaint_at.saturating_duration_since(Instant::now()).min(IDLE_POLL)
+        repaint_at.saturating_duration_since(now).min(cap)
     }
 }
 
@@ -469,6 +555,7 @@ fn wait_for_socket(
     queue: &mut wayland_client::EventQueue<State>,
     state: &mut State,
     timeout: Duration,
+    sink_fd: Option<i32>,
 ) -> Result<(), LayerError> {
     conn.flush().map_err(|e| LayerError::Runtime(anyhow::anyhow!("flush: {e}")))?;
     // Anything already buffered is dispatched before sleeping, so an event that arrived
@@ -476,11 +563,28 @@ fn wait_for_socket(
     queue.dispatch_pending(state).map_err(|e| LayerError::Runtime(anyhow::anyhow!("dispatch: {e}")))?;
     if let Some(guard) = conn.prepare_read() {
         let fd = guard.connection_fd();
-        let mut pfd = libc::pollfd { fd: fd.as_fd().as_raw_fd_compat(), events: libc::POLLIN, revents: 0 };
+        // Our socket, plus the input-method connection's when the sink has one: an
+        // Activate/Deactivate on that connection wakes us directly. The sink's socket is
+        // only WATCHED here; `Feel::pump_sink` at the top of the loop reads it.
+        let mut pfds = [
+            libc::pollfd { fd: fd.as_fd().as_raw_fd_compat(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: sink_fd.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
+        ];
+        let n = if sink_fd.is_some() { 2 } else { 1 };
         let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-        // SAFETY: pfd is a valid, initialised pollfd for the duration of the call.
-        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
-        if ready > 0 {
+        // SAFETY: pfds is a valid, initialised array of `n` pollfds for the duration of the call.
+        let _ = unsafe { libc::poll(pfds.as_mut_ptr(), n as libc::nfds_t, ms) };
+        // A hung-up input-method socket stays "ready" forever; stop watching it (the
+        // sink's own pump logs the dead connection) rather than spin on it.
+        if n == 2 && pfds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            if !state.sink_fd_dead {
+                tracing::warn!("layer: input-method socket hung up; falling back to timed polling");
+            }
+            state.sink_fd_dead = true;
+        }
+        // POLLHUP/POLLERR on OUR socket: read anyway, so the error surfaces as a Runtime
+        // error instead of a zero-timeout loop around a dead connection.
+        if pfds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
             match guard.read() {
                 Ok(_) => {}
                 Err(wayland_client::backend::WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -909,5 +1013,39 @@ mod height_tests {
         assert_eq!(surface_height(40.0), 120);
         assert_eq!(surface_height(9000.0), 1600);
         assert_eq!(surface_height(f32::NAN), HEIGHT);
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+
+    #[test]
+    fn an_idle_keyboard_with_a_polled_sink_sleeps_long_not_twenty_times_a_second() {
+        let now = Instant::now();
+        let far = now + Duration::from_secs(3600);
+        assert_eq!(idle_cap_timeout(far, now, false, None, true), IDLE_POLL_WITH_FD);
+        assert_eq!(idle_cap_timeout(far, now, false, None, false), IDLE_POLL, "no fd: the old timer stays");
+    }
+
+    #[test]
+    fn egui_never_wanting_a_frame_is_not_an_overflow_panic() {
+        let now = Instant::now();
+        let at = repaint_deadline(now, Duration::MAX);
+        assert!(at > now + Duration::from_secs(3600));
+        assert_eq!(idle_cap_timeout(at, now, false, None, true), IDLE_POLL_WITH_FD);
+        assert_eq!(repaint_deadline(now, Duration::from_millis(7)), now + Duration::from_millis(7));
+    }
+
+    #[test]
+    fn deadlines_and_frame_callbacks_still_bound_the_sleep() {
+        let now = Instant::now();
+        let soon = now + Duration::from_millis(120);
+        assert_eq!(idle_cap_timeout(soon, now, false, None, true), Duration::from_millis(120));
+        // Callback outstanding: wake just after the grace so a lost callback is noticed.
+        let t = idle_cap_timeout(now, now, true, Some(now), true);
+        assert!(t > FRAME_CALLBACK_GRACE && t < FRAME_CALLBACK_GRACE + Duration::from_millis(50), "{t:?}");
+        // ...but never longer than the no-fd cap when the sink cannot be polled.
+        assert_eq!(idle_cap_timeout(now, now, true, Some(now), false), IDLE_POLL);
     }
 }

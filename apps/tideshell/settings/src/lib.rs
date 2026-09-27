@@ -310,3 +310,11 @@ mod screen_tests {
         assert_eq!(a.speaker.values.iter().find(|(_, c, _)| *c == "amt").unwrap().2, 0.6);
     }
 }
+
+/// Tests that change process-wide environment variables (XDG_*) hold this,
+/// so parallel tests do not read each other's directories.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}

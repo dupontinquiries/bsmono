@@ -676,6 +676,41 @@ pub fn rotate_output(deg: u32) -> Outcome {
 /// `$XDG_CONFIG_HOME/tideshell/prefs`, flat `key = value` lines — the same
 /// pairs `ShellPrefs::to_kv` hands settingsd, so moving to settingsd later is
 /// a transport swap, not a format change.
+/// The fleet settings file settingsd persists (bsettings writes through it):
+/// `$XDG_CONFIG_HOME/gitmind/settings.conf`, `k = v` lines.
+pub fn fleet_settings_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("gitmind").join("settings.conf"))
+}
+
+/// Sleeping hours from the fleet settings text (defaults: off).
+pub fn parse_fleet_sleep(text: &str) -> settings_kit::SleepPrefs {
+    let kv: Vec<(String, String)> = text
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            if l.starts_with('#') {
+                return None;
+            }
+            let (k, v) = l.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect();
+    settings_kit::Prefs::from_kv(&kv).sleep
+}
+
+/// Re-read the fleet sleeping hours if the file changed since `seen`
+/// (its mtime). Returns the new value and mtime when it did.
+pub fn reload_fleet_sleep(seen: Option<std::time::SystemTime>) -> Option<(settings_kit::SleepPrefs, Option<std::time::SystemTime>)> {
+    let p = fleet_settings_path()?;
+    let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+    if mtime.is_some() && mtime == seen {
+        return None;
+    }
+    let text = std::fs::read_to_string(&p).unwrap_or_default();
+    Some((parse_fleet_sleep(&text), mtime))
+}
+
 pub fn prefs_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -740,6 +775,18 @@ pub fn hatch_tiles(l: &hatch_core::Launcher, max: usize) -> Vec<AppTile> {
     }
     out.truncate(max);
     out
+}
+
+#[cfg(test)]
+mod fleet_sleep_tests {
+    use super::*;
+
+    #[test]
+    fn sleeping_hours_are_read_from_settingsd_text() {
+        let s = parse_fleet_sleep("# settingsd\ntheme.palette = Dark\nsleep.hours = 22:45-06:30\nsleep.pulse = true\n");
+        assert!(s.enabled && s.pulse && s.start_min == 22 * 60 + 45 && s.end_min == 6 * 60 + 30);
+        assert!(!parse_fleet_sleep("").enabled, "no file, no window");
+    }
 }
 
 #[cfg(test)]

@@ -523,6 +523,15 @@ impl WaylandBackend {
         dispatch_once(&self.conn, &self.inner)
     }
 
+    /// The connection's socket, for a host loop to `poll()` alongside its
+    /// own: readable means `pump()` has something to do. With it a host can
+    /// sleep until the compositor speaks instead of waking on a timer just
+    /// to ask. Valid for as long as this backend lives.
+    pub fn poll_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.conn.backend().poll_fd().as_raw_fd()
+    }
+
     /// Whether this backend uses the modern input-method-v2 path
     /// (Phosh/wlroots) versus the legacy v1 path (Plasma Mobile).
     /// Useful for deciding whether to trust Activate events for

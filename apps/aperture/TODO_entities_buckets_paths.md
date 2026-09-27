@@ -294,7 +294,22 @@ with the retry-on-empty the F12 test already needed. Then a fifth
 `lsp_worker.rs` outcome channel (own generation counter — the reason the
 fourth one has its own is written in root `TODO.md`).
 
-### E. `NavPath` + jump-back — core DONE, shell unstarted
+### E. `NavPath` + jump-back — core DONE, flat-editor shell DONE, viewer unstarted
+
+Shell half landed (2026-09-27): steps are pushed by F12
+(`jump_to_lsp_definition`, relation References) and every palette accept
+(`AppState::palette_jump`: picker = `Opened`, project search = `TextMatch`,
+symbols/route = `References`). Alt+Left / Alt+Right, placed above every
+other Left/Right arm with a test that fails if reordered, plus ‹ › chips
+and a breadcrumb in the status bar (no Alt key on a phone). Core grew
+`NavStep::landing` (forward needs a position, `to` is only an entity) and
+a narrower self-loop rule (same entity AND same line), because file-level
+entities made every same-file F12 a dropped self-loop. Sites carry the
+absolute path: `workspace_root()` is per-file outside a repo. Found on the
+way: `open_file` silently discarded unsaved edits on every file switch
+(F12, picker, search hits); it now refuses once and discards on the same
+request repeated. Still to do: `aperture-view`'s `jump_to_graph_node` and
+station clicks.
 
 Core is in the same patch as B. `NavStep{from, rel, to, site}`, `NavPath`
 with a cursor (back returns the STEP, so the callsite comes with it),

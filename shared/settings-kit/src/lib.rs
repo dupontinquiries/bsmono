@@ -382,6 +382,70 @@ impl Default for DisplayPrefs {
     }
 }
 
+/// Sleeping hours: when the phone is on the nightstand. Shells use them to
+/// protect an OLED and the sleeper's eyes (tideshell: the screen stays off
+/// and a dim clock pulses once a minute, pixel-shifted; see its nightclock.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SleepPrefs {
+    pub enabled: bool,
+    /// Minutes after midnight. The window may wrap midnight (23:00-07:00).
+    pub start_min: u16,
+    pub end_min: u16,
+    /// Pulse a dim clock once a minute while the screen is off in the window.
+    pub pulse: bool,
+}
+
+impl Default for SleepPrefs {
+    fn default() -> Self {
+        SleepPrefs { enabled: false, start_min: 23 * 60, end_min: 7 * 60, pulse: true }
+    }
+}
+
+impl SleepPrefs {
+    /// Whether `minute_of_day` (0..1440) is inside the window. Start
+    /// inclusive, end exclusive; start == end means never (an empty window,
+    /// not all day, so a slip of the slider cannot blank the phone forever).
+    pub fn contains(&self, minute_of_day: u16) -> bool {
+        if !self.enabled || self.start_min == self.end_min {
+            return false;
+        }
+        let m = minute_of_day % 1440;
+        if self.start_min < self.end_min {
+            (self.start_min..self.end_min).contains(&m)
+        } else {
+            m >= self.start_min || m < self.end_min
+        }
+    }
+
+    /// "HH:MM-HH:MM", or "off".
+    pub fn hours_token(&self) -> String {
+        if !self.enabled {
+            return "off".into();
+        }
+        format!("{:02}:{:02}-{:02}:{:02}", self.start_min / 60, self.start_min % 60, self.end_min / 60, self.end_min % 60)
+    }
+
+    pub fn parse_hours(&mut self, v: &str) {
+        let v = v.trim();
+        if v == "off" {
+            self.enabled = false;
+            return;
+        }
+        let hm = |t: &str| -> Option<u16> {
+            let (h, m) = t.trim().split_once(':')?;
+            let (h, m): (u16, u16) = (h.parse().ok()?, m.parse().ok()?);
+            (h < 24 && m < 60).then_some(h * 60 + m)
+        };
+        if let Some((a, b)) = v.split_once('-') {
+            if let (Some(a), Some(b)) = (hm(a), hm(b)) {
+                self.enabled = true;
+                self.start_min = a;
+                self.end_min = b;
+            }
+        }
+    }
+}
+
 /// Lower the white point: scale each channel toward black (white → grey). `wp` in [0,1].
 pub fn apply_white_point(rgb: (f32, f32, f32), wp: f32) -> (f32, f32, f32) {
     let wp = wp.clamp(0.0, 1.0);
@@ -462,6 +526,8 @@ pub struct Prefs {
     /// Directory of shareable model files for the fabric model-storage pool (empty = none). The
     /// logscope fabric daemon serves this dir; peers pull weights from it over the LAN.
     pub pool_dir: String,
+    /// Sleeping hours (bedside clock, OLED care).
+    pub sleep: SleepPrefs,
 }
 
 impl Default for Prefs {
@@ -475,6 +541,7 @@ impl Default for Prefs {
             palette: "Dark".to_string(),
             voice: VoicePrefs::default(),
             pool_dir: String::new(),
+            sleep: SleepPrefs::default(),
         }
     }
 }
@@ -507,6 +574,8 @@ impl Prefs {
             ("voice.speaker_id".into(), self.voice.speaker_id.to_string()),
             ("voice.partners".into(), self.voice.partners.join(",")),
             ("model.pool_dir".into(), self.pool_dir.clone()),
+            ("sleep.hours".into(), self.sleep.hours_token()),
+            ("sleep.pulse".into(), self.sleep.pulse.to_string()),
         ]
     }
 
@@ -546,6 +615,8 @@ impl Prefs {
                 "input.double_tilt" => if let Ok(x) = v.parse() { self.input.double_tilt = x },
                 "input.movement" => self.input.movement = MovementLayout::parse(v),
                 "theme.palette" => self.palette = v.clone(),
+                "sleep.hours" => self.sleep.parse_hours(v),
+                "sleep.pulse" => if let Ok(x) = v.parse() { self.sleep.pulse = x },
                 _ => {}
             }
         }
@@ -908,5 +979,34 @@ mod voice_prefs_tests {
         // mismatch but which is worth stating as one equality over the real type.
         let p = everything_non_default();
         assert_eq!(Prefs::from_kv(&p.to_kv()), p);
+    }
+}
+
+#[cfg(test)]
+mod sleep_tests {
+    use super::*;
+
+    #[test]
+    fn sleeping_hours_wrap_midnight_and_round_trip() {
+        let mut p = Prefs::default();
+        assert!(!p.sleep.contains(0), "off by default");
+        p.apply_kv(&[("sleep.hours".into(), "23:30-06:45".into()), ("sleep.pulse".into(), "false".into())]);
+        assert!(p.sleep.contains(23 * 60 + 30) && p.sleep.contains(0) && p.sleep.contains(6 * 60 + 44));
+        assert!(!p.sleep.contains(6 * 60 + 45) && !p.sleep.contains(12 * 60));
+        assert!(!p.sleep.pulse);
+        let back = Prefs::from_kv(&p.to_kv());
+        assert_eq!(back.sleep, p.sleep);
+        p.apply_kv(&[("sleep.hours".into(), "off".into())]);
+        assert!(!p.sleep.enabled && !p.sleep.contains(0));
+        p.apply_kv(&[("sleep.hours".into(), "25:00-07:00".into())]);
+        assert!(!p.sleep.enabled, "garbage leaves it as it was");
+    }
+
+    #[test]
+    fn a_daytime_window_and_an_empty_one() {
+        let s = SleepPrefs { enabled: true, start_min: 13 * 60, end_min: 14 * 60, pulse: true };
+        assert!(s.contains(13 * 60 + 5) && !s.contains(14 * 60) && !s.contains(12 * 60));
+        let empty = SleepPrefs { enabled: true, start_min: 600, end_min: 600, pulse: true };
+        assert!((0..1440).all(|m| !empty.contains(m)), "start == end is never, not always");
     }
 }

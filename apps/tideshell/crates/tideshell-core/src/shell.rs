@@ -53,6 +53,15 @@ pub struct Shell {
     pub lock: LockScreen,
     /// Power key -> fade -> panel off; triple tap wakes.
     pub sleep: Sleep,
+    /// Is the phone lying face-up? Drives the cover clock's 3D (clock3d.rs).
+    pub flat: crate::clock3d::FlatDetector,
+    /// The cover's depth orbs (orbs.rs), fed by the camera's live window.
+    pub orbs: crate::orbs::Orbs,
+    /// Bedside mode (nightclock.rs) and whether we are inside sleeping hours
+    /// (with pulsing on), as the frontend last read them from settings.
+    pub night: crate::nightclock::NightClock,
+    pub night_window: bool,
+    pub night_pulse: bool,
     pub rotate: crate::rotate::AutoRotate,
     /// The camera pane's world (gyro/gravity/compass) and its anchors.
     pub world: crate::world::World,
@@ -131,6 +140,11 @@ impl Shell {
             settings_requested: false,
             lock: LockScreen::default(),
             sleep: Sleep::default(),
+            flat: crate::clock3d::FlatDetector::default(),
+            orbs: crate::orbs::Orbs::default(),
+            night: crate::nightclock::NightClock::default(),
+            night_window: false,
+            night_pulse: true,
             rotate,
             world: crate::world::World::new(screen.0 * 0.9),
             sound: crate::ambient_sound::AmbientSound::default(),
@@ -354,6 +368,9 @@ impl Shell {
         self.last_tick = Some(now);
         self.drawer.tick(dt.min(100.0));
         self.switcher.tick_anim(dt.min(100.0));
+        if self.flat.tick(dt.min(100.0), now) && !self.flat.is_transitioning() {
+            self.log(format!("cover clock 3D {}", if self.flat.is_flat() { "in" } else { "out" }));
+        }
         let streaking = self.switcher.is_streaking();
         self.switcher.tick(now);
         if streaking && !self.switcher.is_streaking() {
@@ -934,6 +951,16 @@ impl Shell {
             }
         }
         self.world.accel(accel);
+        let was = self.flat.is_flat();
+        self.flat.on_accel(accel, now);
+        if was != self.flat.is_flat() {
+            self.log(if self.flat.is_flat() { "lying flat (accelerometer)" } else { "picked up" });
+        }
+    }
+
+    /// How much of the 3D cover clock to draw now (0..1), per the prefs.
+    pub fn clock_3d_amount(&self) -> f32 {
+        crate::clock3d::amount(self.prefs.clock_3d, &self.flat)
     }
 
     pub fn on_heading(&mut self, degrees: f32) {
@@ -959,6 +986,52 @@ impl Shell {
 
     /// The proximity sensor: near = covered (pocket, face). Touches are
     /// ignored and the triple tap cannot wake while covered.
+    /// Bedside mode, once per loop: light the panel for a dim clock at each
+    /// new minute in sleeping hours, and turn it off again after the pulse.
+    pub fn night_tick(&mut self, now: Millis, minute_of_day: u16) -> Vec<Action> {
+        let asleep = self.sleep.phase == crate::sleep::Phase::Off;
+        let window = self.night_window && self.night_pulse;
+        let out = match self.night.tick(now, minute_of_day, window, asleep) {
+            Some(crate::nightclock::Panel::On) => {
+                self.sleep.glance = true;
+                vec![Action::DisplayPower(true)]
+            }
+            Some(crate::nightclock::Panel::Off) => {
+                self.sleep.glance = false;
+                vec![Action::DisplayPower(false)]
+            }
+            None => vec![],
+        };
+        if !self.night.is_pulsing() {
+            self.sleep.glance = false;
+        }
+        out
+    }
+
+    /// ext-idle-notify fired: sleep the screen the power key's way.
+    pub fn on_idle(&mut self, now: Millis) -> Vec<Action> {
+        self.now = self.now.max(now);
+        let acts = self.sleep.idle();
+        if !acts.is_empty() || self.sleep.phase == crate::sleep::Phase::FadingOut {
+            self.log("idle: screen sleeping");
+        }
+        acts.into_iter().flat_map(|a| self.on_sleep_action(a)).collect()
+    }
+
+    /// The compositor reported the panel's power (whoever changed it).
+    pub fn on_display_reported(&mut self, on: bool, now: Millis) -> Vec<Action> {
+        self.now = self.now.max(now);
+        let acts = self.sleep.display_reported(on);
+        if !acts.is_empty() {
+            self.log(if on {
+                "display lit while asleep without a triple tap (cosmic-idle?): turning it off again"
+            } else {
+                "compositor blanked the display: adopted as screen sleep"
+            });
+        }
+        acts.into_iter().flat_map(|a| self.on_sleep_action(a)).collect()
+    }
+
     pub fn on_proximity(&mut self, near: bool, now: Millis) {
         self.now = self.now.max(now);
         let was = self.sleep.is_covered(now);
@@ -975,6 +1048,11 @@ impl Shell {
 
     /// An orientation reading from iio-sensor-proxy.
     pub fn on_orientation(&mut self, s: &str, now: Millis) -> Vec<Action> {
+        let was = self.flat.is_flat();
+        self.flat.on_orientation(s, now);
+        if was != self.flat.is_flat() {
+            self.log(if self.flat.is_flat() { "lying flat (orientation undefined)" } else { "picked up" });
+        }
         let blocked = self.lock.is_locked() || self.sleep.captures_input();
         match self.rotate.on_reading(s, now, blocked) {
             Some(o) => {

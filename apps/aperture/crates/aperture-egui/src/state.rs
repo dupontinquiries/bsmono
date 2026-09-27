@@ -251,6 +251,12 @@ pub struct AppState {
     pub editor: Editor,
     pub path: Option<PathBuf>,
     pub dirty: bool,
+    /// Where you have jumped from and to (F12, the pickers), as edges —
+    /// `aperture_core::nav`. Alt+Left / Alt+Right walk it.
+    pub nav: aperture_core::nav::NavPath,
+    /// A file switch refused because this buffer has unsaved edits. Asking
+    /// for the SAME file again discards them; anything else re-arms.
+    discard_armed: Option<PathBuf>,
     pub lang: Language,
     pub syntax: Syntax,
     pub find: Option<FindState>,
@@ -580,6 +586,8 @@ impl AppState {
             editor: Editor::from_str(&text),
             path,
             dirty: false,
+            nav: Default::default(),
+            discard_armed: None,
             lang,
             syntax: Syntax::new(lang),
             find: None,
@@ -2404,6 +2412,10 @@ impl AppState {
             (I, true) => self.request_hover(now_ms),
             (Space, true) if shift => self.trigger_completion_now(now_ms),
             (Space, true) => self.refresh_popup(1),
+            // ABOVE every other Left/Right arm: the match is on (key, ctrl)
+            // and a guard-less arm first would take Alt+Left with no warning.
+            (Left, _) if alt => self.nav_go(true, now_ms),
+            (Right, _) if alt => self.nav_go(false, now_ms),
             (Left, true) => self.moved(|s, sh| s.editor.move_word(-1, sh), shift),
             (Right, true) => self.moved(|s, sh| s.editor.move_word(1, sh), shift),
             (Home, true) => self.moved(|s, sh| s.editor.move_doc(false, sh), shift),
@@ -2638,7 +2650,27 @@ impl AppState {
         }
     }
 
-    pub fn open_file(&mut self, path: PathBuf, now_ms: u64) {
+    /// Replace the buffer with `path` from disk. Returns whether it did.
+    ///
+    /// REFUSES while the current buffer has unsaved edits and `path` is a
+    /// different file: this used to reopen unconditionally, so F12 into
+    /// another file, the file picker, a project-search hit or a symbol jump
+    /// all silently threw away whatever had not been saved. The same request
+    /// again goes through (the status line says so), which keeps "yes, drop
+    /// them" one repeat away instead of behind a dialog.
+    pub fn open_file(&mut self, path: PathBuf, now_ms: u64) -> bool {
+        // The SAME file counts too: reopening it reloads from disk, which is
+        // a revert, and the picker offers the current file like any other.
+        let other = self.path.as_ref() != Some(&path);
+        if self.dirty && self.discard_armed.as_ref() != Some(&path) {
+            let name = self.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "this buffer".into());
+            let what = if other { "discard them" } else { "reload it from disk" };
+            self.set_status(&format!("{name} has unsaved changes: Ctrl+S to save, or repeat to {what}"), now_ms);
+            self.discard_armed = Some(path);
+            return false;
+        }
+        self.discard_armed = None;
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 self.lang = Language::from_path(&path);
@@ -2653,8 +2685,102 @@ impl AppState {
                 self.follow_caret = false;
                 self.set_status("opened", now_ms);
                 self.start_lsp_for_current_file(&text);
+                true
             }
-            Err(e) => self.set_status(&format!("open failed: {e}"), now_ms),
+            Err(e) => {
+                self.set_status(&format!("open failed: {e}"), now_ms);
+                false
+            }
+        }
+    }
+
+    // ── navigation path (aperture_core::nav) ───────────────────────────────
+
+    /// Where the caret is, as the nav path names it: the innermost outline
+    /// item around it (a file with no grammar, or code outside every item,
+    /// is the FILE), and the exact line/column as the site.
+    pub fn nav_here(&mut self) -> Option<(aperture_core::entity::EntityId, aperture_core::entity::Site)> {
+        use aperture_core::entity::{EntityId, Site};
+        let path = self.path.clone()?;
+        let root = self.workspace_root();
+        let rel = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+        let pos = self.editor.buffer.char_to_pos(self.editor.sel.head);
+        // The SITE carries the absolute path: it is what back/forward open,
+        // and `workspace_root()` is per-file outside a git repo, so a
+        // relative path recorded in one directory resolves against another
+        // one's root later. The entity stays workspace-relative -- it is an
+        // identity and a label, not a place to open.
+        let site = Site::new(path.to_string_lossy().into_owned(), pos.line as u32, pos.col as u32);
+        let item = self
+            .syntax
+            .outline(&self.editor.buffer)
+            .into_iter()
+            .filter(|it| it.line <= pos.line && pos.line <= it.end_line)
+            .max_by_key(|it| it.line);
+        let id = match item {
+            Some(it) => EntityId::item(rel, format!("{:?}", it.kind).to_lowercase(), it.name),
+            None => EntityId::file(rel),
+        };
+        Some((id, site))
+    }
+
+    /// Record the jump that just happened, from `from` (taken BEFORE it) to
+    /// wherever the caret is now.
+    fn nav_record(&mut self, from: Option<(aperture_core::entity::EntityId, aperture_core::entity::Site)>, rel: aperture_core::entity::Relation) {
+        let (Some((f, fs)), Some((t, ts))) = (from, self.nav_here()) else { return };
+        self.nav.push(aperture_core::nav::NavStep::new(f, rel, t).at(fs).landed(ts));
+    }
+
+    /// Put the caret at `line`/`col` (chars) in `path`, opening it when it is
+    /// not the current file. Same file: move within the OPEN buffer, so
+    /// unsaved edits there are kept. Returns false when the switch was
+    /// refused (unsaved edits elsewhere).
+    fn go_to_site(&mut self, path: PathBuf, line: usize, col: usize, now_ms: u64) -> bool {
+        if self.path.as_ref() != Some(&path) && !self.open_file(path, now_ms) {
+            return false;
+        }
+        let line = line.min(self.editor.buffer.len_lines().saturating_sub(1));
+        let len = self.editor.buffer.line(line).trim_end_matches(['\n', '\r']).chars().count();
+        let at = self.editor.buffer.pos_to_char(aperture_core::buffer::Pos::new(line, col.min(len)));
+        self.discard_extra_cursors();
+        self.editor.sel = Selection::caret(at);
+        self.follow_caret = true;
+        true
+    }
+
+    /// Alt+Left (`back`) / Alt+Right: return to where a jump started — the
+    /// exact callsite — or retake it to where it landed.
+    pub fn nav_go(&mut self, back: bool, now_ms: u64) {
+        let step = if back { self.nav.back().cloned() } else { self.nav.forward().cloned() };
+        let Some(step) = step else {
+            self.set_status(if back { "nothing to go back to" } else { "nothing ahead" }, now_ms);
+            return;
+        };
+        let Some(site) = (if back { step.site.clone() } else { step.landing.clone() }) else {
+            self.set_status("that step has no position recorded", now_ms);
+            return;
+        };
+        let path = PathBuf::from(&site.path);
+        let path = if path.is_absolute() { path } else { self.workspace_root().join(path) };
+        if !self.go_to_site(path, site.line as usize, site.col as usize, now_ms) {
+            // Refused (unsaved edits): the cursor did not really move.
+            if back { self.nav.forward(); } else { self.nav.back(); }
+            return;
+        }
+        let crumb = self.nav.breadcrumb(4);
+        self.set_status(&if crumb.is_empty() { format!("back at {}", step.from.label()) } else { crumb }, now_ms);
+    }
+
+    /// A palette jump (file picker, project search, symbols, route): open,
+    /// land, and record the step so Alt+Left comes back.
+    pub fn palette_jump(&mut self, path: PathBuf, line: Option<usize>, rel: aperture_core::entity::Relation, now_ms: u64) {
+        let from = self.nav_here();
+        let ok = match line {
+            Some(l) => self.go_to_site(path, l, 0, now_ms),
+            None => self.open_file(path, now_ms),
+        };
+        if ok {
+            self.nav_record(from, rel);
         }
     }
 
@@ -2751,8 +2877,9 @@ impl AppState {
         // edits, which `open_file` always does (fresh `Editor::from_str`
         // straight from disk).
         let same_file = self.path.as_ref().is_some_and(|p| Self::file_uri(p) == loc.uri);
-        if !same_file {
-            self.open_file(target_path, now_ms);
+        let from = self.nav_here();
+        if !same_file && !self.open_file(target_path, now_ms) {
+            return; // unsaved edits here; open_file said so
         }
         let line = (loc.line as usize).min(self.editor.buffer.len_lines().saturating_sub(1));
         let line_text = self.editor.buffer.line(line);
@@ -2760,7 +2887,8 @@ impl AppState {
         let at = self.editor.buffer.pos_to_char(aperture_core::buffer::Pos::new(line, col));
         self.editor.sel = Selection::caret(at);
         self.follow_caret = true;
-        self.set_status("jumped to definition", now_ms);
+        self.nav_record(from, aperture_core::entity::Relation::References);
+        self.set_status("jumped to definition (Alt+Left returns)", now_ms);
     }
 
     // ── AI wiring, called from the view's frame tick ────────────────────────
@@ -3398,9 +3526,10 @@ impl AppState {
     /// search's jump-to-hit; `open_file` alone would land at char 0, losing
     /// exactly the thing a search result promised.
     pub fn open_file_at_line(&mut self, path: PathBuf, line: usize, now_ms: u64) {
-        self.open_file(path, now_ms);
-        self.editor.goto_line(line);
-        self.follow_caret = true;
+        if self.open_file(path, now_ms) {
+            self.editor.goto_line(line);
+            self.follow_caret = true;
+        }
     }
 
     /// Caret char index for a click at content-space (x px, y px).
@@ -5309,4 +5438,107 @@ mod strip_defaults_tests {
                     "pinned {id:?} is not a palette command — a dead button");
         }
     }
+}
+
+
+// ── navigation path + unsaved-edit guard ────────────────────────────────────
+#[cfg(test)]
+mod nav_tests {
+    use super::*;
+    fn typed(s: &mut AppState, text: &str, t: u64) {
+        s.handle(Ev::Text(text.into()), t);
+    }
+
+    fn nav_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ap_nav_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("a.txt"), "alpha\nbeta\ngamma\ndelta\n").unwrap();
+        std::fs::write(d.join("sub/b.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        d
+    }
+    fn caret_line_col(s: &AppState) -> (usize, usize) {
+        let p = s.editor.buffer.char_to_pos(s.editor.sel.head);
+        (p.line, p.col)
+    }
+
+    #[test]
+    fn a_file_switch_never_silently_drops_unsaved_edits() {
+        let d = nav_dir("dirty");
+        let mut s = AppState::new(None, false);
+        assert!(s.open_file(d.join("a.txt"), 0));
+        typed(&mut s, "EDIT ", 1);
+        assert!(s.dirty);
+        assert!(!s.open_file(d.join("sub/b.txt"), 2), "refused while dirty");
+        assert!(s.editor.buffer.to_string().starts_with("EDIT "), "the edit is still there");
+        assert!(s.status.as_ref().unwrap().0.contains("unsaved"));
+        assert!(!s.open_file(d.join("a.txt"), 3), "reopening the same file is a revert: refused too");
+        assert!(s.editor.buffer.to_string().starts_with("EDIT "));
+        assert!(!s.open_file(d.join("sub/b.txt"), 4), "a different request re-arms rather than confirms");
+        assert!(s.open_file(d.join("sub/b.txt"), 5), "the same request twice in a row discards, on purpose");
+        assert_eq!(s.path.as_deref(), Some(d.join("sub/b.txt").as_path()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn alt_left_returns_to_the_exact_spot_a_jump_started_and_alt_right_retakes_it() {
+        let d = nav_dir("path");
+        let mut s = AppState::new(None, false);
+        s.open_file(d.join("a.txt"), 0);
+        s.go_to_site(d.join("a.txt"), 2, 3, 1); // "gamma", col 3
+        s.palette_jump(d.join("sub/b.txt"), Some(3), aperture_core::entity::Relation::TextMatch, 2);
+        assert_eq!(s.path.as_deref(), Some(d.join("sub/b.txt").as_path()));
+        assert_eq!(caret_line_col(&s).0, 3);
+        assert!(s.nav.can_go_back());
+
+        s.handle(Ev::Key { key: K::Left, ctrl: false, shift: false, alt: true }, 3);
+        assert_eq!(s.path.as_deref(), Some(d.join("a.txt").as_path()), "back in the file it started in");
+        assert_eq!(caret_line_col(&s), (2, 3), "at the exact line AND column");
+
+        s.handle(Ev::Key { key: K::Right, ctrl: false, shift: false, alt: true }, 4);
+        assert_eq!(s.path.as_deref(), Some(d.join("sub/b.txt").as_path()));
+        assert_eq!(caret_line_col(&s).0, 3, "forward lands where the jump landed");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn alt_left_is_not_swallowed_by_the_plain_left_arm() {
+        // The dispatch matches (key, ctrl); an unguarded (Left, false) above
+        // the Alt arm would move the caret one char and never navigate.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("abc\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(2);
+        s.handle(Ev::Key { key: K::Left, ctrl: false, shift: false, alt: true }, 0);
+        assert_eq!(s.editor.sel.head, 2, "Alt+Left did not move the caret");
+        assert!(s.status.as_ref().unwrap().0.contains("nothing to go back"));
+    }
+
+    #[test]
+    fn going_back_into_another_file_is_refused_while_this_one_is_dirty_and_stays_undone() {
+        let d = nav_dir("backdirty");
+        let mut s = AppState::new(None, false);
+        s.open_file(d.join("a.txt"), 0);
+        s.palette_jump(d.join("sub/b.txt"), Some(1), aperture_core::entity::Relation::Opened, 1);
+        typed(&mut s, "X", 2);
+        s.nav_go(true, 3);
+        assert_eq!(s.path.as_deref(), Some(d.join("sub/b.txt").as_path()), "did not leave the dirty buffer");
+        assert!(s.nav.can_go_back(), "the path cursor did not move either, so Alt+Left still works after saving");
+        assert!(!s.nav.can_go_forward());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_jump_inside_the_same_file_keeps_unsaved_edits_and_can_be_walked_back() {
+        let d = nav_dir("same");
+        let mut s = AppState::new(None, false);
+        s.open_file(d.join("a.txt"), 0);
+        typed(&mut s, "Z", 1); // dirty, caret line 0
+        s.palette_jump(d.join("a.txt"), Some(3), aperture_core::entity::Relation::References, 2);
+        assert!(s.editor.buffer.to_string().starts_with("Zalpha"), "same file: moved within the open buffer");
+        assert_eq!(caret_line_col(&s).0, 3);
+        s.nav_go(true, 3);
+        assert_eq!(caret_line_col(&s), (0, 1), "back to just after the Z");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
 }

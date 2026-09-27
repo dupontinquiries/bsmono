@@ -18,8 +18,46 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+/// Pauses the polling sensor threads while the screen is asleep. A paused
+/// thread blocks on a condvar (no wakeups at all) and, for iio-sensor-proxy
+/// sensors, RELEASES its claim first, so the proxy can stop the sensor itself
+/// instead of streaming readings nobody reads. Proximity is never gated: the
+/// triple-tap wake needs it to reject pocket touches.
+#[derive(Clone)]
+pub struct SensorGate(Arc<(Mutex<bool>, Condvar)>);
+
+impl Default for SensorGate {
+    fn default() -> Self {
+        SensorGate(Arc::new((Mutex::new(true), Condvar::new())))
+    }
+}
+
+impl SensorGate {
+    pub fn set_active(&self, active: bool) {
+        let (m, cv) = &*self.0;
+        let mut g = m.lock().unwrap();
+        if *g != active {
+            *g = active;
+            cv.notify_all();
+        }
+    }
+    pub fn is_active(&self) -> bool {
+        *self.0 .0.lock().unwrap()
+    }
+    /// Block until active. Returns true if it had to wait (the caller re-claims).
+    pub fn wait_active(&self) -> bool {
+        let (m, cv) = &*self.0;
+        let mut g = m.lock().unwrap();
+        let waited = !*g;
+        while !*g {
+            g = cv.wait(g).unwrap();
+        }
+        waited
+    }
+}
 
 // ---- local clock -----------------------------------------------------------
 
@@ -331,6 +369,10 @@ pub struct OrientationFeed {
 
 impl OrientationFeed {
     pub fn spawn(bus: Option<Connection>) -> OrientationFeed {
+        Self::spawn_gated(bus, SensorGate::default())
+    }
+
+    pub fn spawn_gated(bus: Option<Connection>, gate: SensorGate) -> OrientationFeed {
         let (tx, rx) = mpsc::channel();
         let status = Arc::new(Mutex::new("orientation: starting".to_string()));
         let st = status.clone();
@@ -367,6 +409,18 @@ impl OrientationFeed {
                 set("orientation: iio-sensor-proxy accelerometer".into());
                 let mut last = String::new();
                 loop {
+                    if !gate.is_active() {
+                        let _ = p.call_method("ReleaseAccelerometer", &());
+                        set("orientation: paused (screen asleep; claim released)".into());
+                        gate.wait_active();
+                        if let Err(e) = p.call_method("ClaimAccelerometer", &()) {
+                            set(format!("orientation: re-claim: {e}"));
+                            return;
+                        }
+                        set("orientation: iio-sensor-proxy accelerometer".into());
+                        // Re-send whatever it reads now: the phone may have turned while asleep.
+                        last.clear();
+                    }
                     match p.get_property::<String>("AccelerometerOrientation") {
                         Ok(o) => {
                             if o != last {
@@ -494,6 +548,10 @@ pub struct ImuFeed {
 
 impl ImuFeed {
     pub fn spawn(sys: PathBuf) -> ImuFeed {
+        Self::spawn_gated(sys, SensorGate::default())
+    }
+
+    pub fn spawn_gated(sys: PathBuf, gate: SensorGate) -> ImuFeed {
         let (tx, rx) = mpsc::channel();
         let status = Arc::new(Mutex::new(String::new()));
         let st = status.clone();
@@ -512,6 +570,8 @@ impl ImuFeed {
                     return;
                 }
                 loop {
+                    // 50 Hz of sysfs reads is the most frequent timer in the shell; asleep it is all waste.
+                    gate.wait_active();
                     let g = gyro.as_ref().and_then(|g| g.read()).unwrap_or([0.0; 3]);
                     let a = accel.as_ref().and_then(|a| a.read()).unwrap_or([0.0, 0.0, 0.0]);
                     if tx.send((g, a)).is_err() {
@@ -537,6 +597,10 @@ pub struct CompassFeed {
 
 impl CompassFeed {
     pub fn spawn(bus: Option<Connection>) -> CompassFeed {
+        Self::spawn_gated(bus, SensorGate::default())
+    }
+
+    pub fn spawn_gated(bus: Option<Connection>, gate: SensorGate) -> CompassFeed {
         let (tx, rx) = mpsc::channel();
         let status = Arc::new(Mutex::new("compass: starting".to_string()));
         let st = status.clone();
@@ -566,6 +630,17 @@ impl CompassFeed {
                 set("compass: iio-sensor-proxy".into());
                 let mut last = f32::NAN;
                 loop {
+                    if !gate.is_active() {
+                        let _ = p.call_method("ReleaseCompass", &());
+                        set("compass: paused (screen asleep; claim released)".into());
+                        gate.wait_active();
+                        if let Err(e) = p.call_method("ClaimCompass", &()) {
+                            set(format!("compass: re-claim: {e}"));
+                            return;
+                        }
+                        set("compass: iio-sensor-proxy".into());
+                        last = f32::NAN;
+                    }
                     match p.get_property::<f64>("CompassHeading") {
                         Ok(h) => {
                             let h = h as f32;
@@ -669,12 +744,16 @@ pub struct Ambient {
 
 impl Ambient {
     pub fn spawn(sys: PathBuf, bus: Option<Connection>) -> Ambient {
+        Self::spawn_gated(sys, bus, SensorGate::default())
+    }
+
+    pub fn spawn_gated(sys: PathBuf, bus: Option<Connection>, gate: SensorGate) -> Ambient {
         let (tx, rx) = mpsc::channel();
         let status = Arc::new(Mutex::new("ambient: starting".to_string()));
         let st = status.clone();
         std::thread::Builder::new()
             .name("tideshell-ambient".into())
-            .spawn(move || ambient_loop(sys, bus, tx, st))
+            .spawn(move || ambient_loop(sys, bus, tx, st, gate))
             .expect("spawn ambient thread");
         Ambient { rx, status }
     }
@@ -684,13 +763,23 @@ impl Ambient {
     }
 }
 
-fn ambient_loop(sys: PathBuf, bus: Option<Connection>, tx: Sender<f32>, st: Arc<Mutex<String>>) {
+fn ambient_loop(sys: PathBuf, bus: Option<Connection>, tx: Sender<f32>, st: Arc<Mutex<String>>, gate: SensorGate) {
     let set = |s: String| *st.lock().unwrap() = s;
     if let Some(bus) = bus {
         match sensor_proxy_claim(&bus) {
             Ok(unit) => {
                 set(format!("ambient: iio-sensor-proxy ({unit})"));
                 loop {
+                    if !gate.is_active() {
+                        // Nobody reads brightness for a dark panel: let the proxy stop the sensor.
+                        if let Ok(p) = sensor_proxy(&bus) {
+                            let _ = p.call_method("ReleaseLight", &());
+                        }
+                        set("ambient: paused (screen asleep; claim released)".into());
+                        gate.wait_active();
+                        let _ = sensor_proxy_claim(&bus);
+                        set(format!("ambient: iio-sensor-proxy ({unit})"));
+                    }
                     match sensor_proxy_read(&bus) {
                         Ok(v) => {
                             if tx.send(v).is_err() {
@@ -712,6 +801,7 @@ fn ambient_loop(sys: PathBuf, bus: Option<Connection>, tx: Sender<f32>, st: Arc<
         Some(light) => {
             set(format!("ambient: sysfs {}", light.dir.display()));
             loop {
+                gate.wait_active();
                 if let Some(v) = light.read() {
                     if tx.send(v).is_err() {
                         return;
@@ -1568,5 +1658,23 @@ mod backlight_merge_tests {
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(on_panel(&r), level_to_raw(0.9, r.max), "a large step is written before 500 ms of quiet");
         let _ = std::fs::remove_dir_all(&r.dir);
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    #[test]
+    fn a_paused_gate_blocks_until_resumed_and_reports_that_it_waited() {
+        let g = SensorGate::default();
+        assert!(!g.wait_active(), "active: returns at once");
+        g.set_active(false);
+        let g2 = g.clone();
+        let t = std::thread::spawn(move || g2.wait_active());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!t.is_finished(), "still blocked while paused");
+        g.set_active(true);
+        assert!(t.join().unwrap(), "it waited");
     }
 }

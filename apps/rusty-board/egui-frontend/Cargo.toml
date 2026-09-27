@@ -14,19 +14,26 @@ path = "src/bin/rusty_board_egui.rs"
 required-features = ["app"]
 
 [features]
-default = ["app"]
-# THE REAL KEYBOARD. Off by default so the front-end keeps its promise of
-# being buildable on its own — a desktop checkout with no compositor must
-# still compile and run, which is what makes this testable at all. On
-# device (Plasma Mobile, Fairphone) this is the feature that turns taps
-# into input for the FOCUSED window rather than for a preview box.
+# The default IS the deploy binary: the build orchestrator and anyone typing
+# `cargo build --release` get the docked, input-method keyboard. It used to be
+# ["app"] alone, which silently produced a window-only binary with no
+# layer-shell or input-method code in it (`strings` finds no
+# zwlr_layer_shell) — it came up as an app window on the FP5 and typed into
+# its own preview. Neither feature needs a compositor at BUILD time
+# (wayland-backend is `dlopen`), only libxkbcommon's headers; at RUN time
+# with no layer shell the binary falls back to a toplevel window on its own.
+# Preview-only desktop build:
+#   cargo build --no-default-features --features app
+default = ["app", "wayland", "layer"]
+# THE REAL KEYBOARD. On device (Plasma Mobile, COSMIC, Fairphone) this is the
+# feature that turns taps into input for the FOCUSED window rather than for a
+# preview box. Without it the app types into itself.
 wayland = ["dep:board-compositor", "board-compositor/wayland"]
 # THE DOCKED KEYBOARD. A zwlr_layer_shell_v1 surface driven by sctk + EGL
 # (glutin) + egui_glow, no winit: anchored to the bottom edge with an
 # exclusive zone, never focused, mapped on Activate / unmapped on
 # Deactivate. This is what "tucks away like Maliit" means on Phosh, Sway
-# and KWin. Off by default for the same reason as `wayland`: a desktop
-# checkout must build with no compositor. Every crate here is already in
+# and KWin. Every crate here is already in
 # the tree through eframe's Wayland path; `client_system` on
 # wayland-backend is what gives EGL a `wl_proxy*` to bind to.
 layer = [
@@ -38,9 +45,7 @@ layer = [
 # file; the keyboard is fully usable without it, and a phone build that cannot
 # compile is worse than one that cannot dictate.
 voice = ["dep:whisper-rs", "dep:cpal", "dep:audio-kit"]
-# The runnable eframe app is default-on so `cargo build --release` (what the build orchestrator runs,
-# with no extra flags — see manifest/projects.toml) produces the deploy binary directly. A lib-only
-# consumer can still opt out with `default-features = false`.
+# The runnable eframe app. A lib-only consumer opts out with `default-features = false`.
 app = ["dep:eframe"]
 
 [dependencies]

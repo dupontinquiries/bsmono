@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -102,6 +103,9 @@ pub struct LspClient {
     /// update would silently desync its copy of the file, which is a far
     /// worse failure than this client falling back to full sync.
     sync_kind: Mutex<Option<i64>>,
+    /// Set by the reader when the server's stdout closes. A request made
+    /// after that fails at once instead of waiting out `CALL_TIMEOUT`.
+    closed: Arc<AtomicBool>,
     _reader: std::thread::JoinHandle<()>,
 }
 
@@ -149,9 +153,21 @@ impl LspClient {
             Arc::new(Mutex::new(HashMap::new()));
         let reader_pending = Arc::clone(&pending);
         let reader_diagnostics = Arc::clone(&diagnostics);
+        let closed = Arc::new(AtomicBool::new(false));
+        let reader_closed = Arc::clone(&closed);
         let reader = std::thread::Builder::new()
             .name("aperture-lsp-reader".into())
-            .spawn(move || reader_loop(BufReader::new(stdout), reader_pending, reader_diagnostics))
+            .spawn(move || {
+                reader_loop(BufReader::new(stdout), Arc::clone(&reader_pending), reader_diagnostics);
+                // THE SERVER IS GONE: fail every waiting request now. Without
+                // this a server that exits during `initialize` -- rustup's
+                // `rust-analyzer` proxy when the component is not installed
+                // does exactly that, printing an error and exiting 1 -- left
+                // the handshake blocked for the full 90s CALL_TIMEOUT, on the
+                // UI thread, every time a .rs file was opened.
+                reader_closed.store(true, Ordering::SeqCst);
+                reader_pending.lock().unwrap().clear();
+            })
             .expect("spawn LSP reader thread");
 
         let client = LspClient {
@@ -161,6 +177,7 @@ impl LspClient {
             pending,
             diagnostics,
             sync_kind: Mutex::new(None),
+            closed,
             _reader: reader,
         };
 
@@ -344,7 +361,15 @@ impl LspClient {
             id
         };
         let (tx, rx) = channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        {
+            // Checked under the same lock the reader clears with, so a
+            // request can never slip in after the clear and wait forever.
+            let mut pending = self.pending.lock().unwrap();
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(format!("the language server has exited ({method} not sent)"));
+            }
+            pending.insert(id, tx);
+        }
         let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         if let Err(e) = write_message(&mut *self.stdin.lock().unwrap(), &msg) {
             self.pending.lock().unwrap().remove(&id);
@@ -561,6 +586,17 @@ fn parse_completion_result(result: &Value) -> Vec<CompletionItem> {
 
 #[cfg(test)]
 mod tests {
+    /// A "server" that exits during the handshake (rustup's proxy for an
+    /// uninstalled rust-analyzer does) fails spawn promptly, not after
+    /// CALL_TIMEOUT.
+    #[test]
+    fn a_server_that_exits_fails_the_handshake_at_once() {
+        let t = std::time::Instant::now();
+        let r = LspClient::spawn("sh", &["-c", "echo nope >&2; exit 1"], "file:///tmp");
+        assert!(r.is_err());
+        assert!(t.elapsed() < Duration::from_secs(10), "took {:?}", t.elapsed());
+    }
+
     use super::*;
 
     #[test]

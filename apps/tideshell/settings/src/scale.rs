@@ -30,8 +30,15 @@ pub enum ScaleAction {
     MinTarget(f32),
     /// "auto" | "on" | "off".
     Cold(&'static str),
+    /// Screen sleep after this many idle seconds (0 = power key only).
+    SleepIdle(u32),
+    Clock3d(tideshell_core::clock3d::Trigger),
+    Clock3dStyle(tideshell_core::clock3d::Style),
     Reset,
 }
+
+/// Screen sleep choices: seconds, label.
+pub const SLEEP_IDLE: [(u32, &str); 5] = [(0, "Never"), (30, "30 s"), (60, "1 min"), (120, "2 min"), (300, "5 min")];
 
 /// Cold mode's three states. Automatic is not the same as off: it is the
 /// battery temperature deciding, so someone who forces it off indoors still
@@ -71,6 +78,9 @@ pub fn apply(p: &mut ShellPrefs, a: &ScaleAction) {
         ScaleAction::Touch(v) => p.touch_scale = tideshell_core::prefs::parse_scale(&v.to_string()).unwrap_or(1.0),
         ScaleAction::MinTarget(v) => p.min_target = v.clamp(0.0, 96.0),
         ScaleAction::Cold(v) => p.cold = v.to_string(),
+        ScaleAction::SleepIdle(s) => p.sleep_idle_s = s,
+        ScaleAction::Clock3d(t) => p.clock_3d = t,
+        ScaleAction::Clock3dStyle(st) => p.clock_3d_style = st,
         ScaleAction::Reset => {
             let d = ShellPrefs::default();
             p.text_scale = d.text_scale;
@@ -84,6 +94,18 @@ pub fn apply(p: &mut ShellPrefs, a: &ScaleAction) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sleep_and_3d_clock_choices_land_in_the_shell_prefs() {
+        let mut p = ShellPrefs::default();
+        apply(&mut p, &ScaleAction::SleepIdle(120));
+        apply(&mut p, &ScaleAction::Clock3d(tideshell_core::clock3d::Trigger::Always));
+        apply(&mut p, &ScaleAction::Clock3dStyle(tideshell_core::clock3d::Style::Hologram));
+        let kv = p.to_kv();
+        assert!(kv.contains(&("shell.sleep.idle_s".into(), "120".into())));
+        assert!(kv.contains(&("shell.clock.3d".into(), "always".into())));
+        assert!(kv.contains(&("shell.clock.3d_style".into(), "hologram".into())));
+    }
 
     #[test]
     fn the_rows_follow_the_setting_being_edited() {
@@ -253,6 +275,37 @@ pub fn ui(p: &mut ShellPrefs, ui: &mut egui::Ui, status: &mut String) -> Vec<Sca
         }
     });
 
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Screen sleep").size(size));
+    ui.label(egui::RichText::new("Idle this long and the screen fades off; a triple tap or the power key wakes it. Sleeping hours (bsettings) keep it dark with a dim clock each minute.").size(size * 0.8).weak());
+    ui.horizontal_wrapped(|ui| {
+        for (secs, label) in SLEEP_IDLE {
+            if pick(ui, label, h, p.sleep_idle_s == secs, size) {
+                out.push(ScaleAction::SleepIdle(secs));
+            }
+        }
+    });
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("3D clock").size(size));
+    ui.label(egui::RichText::new("The lock-screen clock seems to stand up off the glass when the phone lies flat on a table. \"When lying flat\" needs an orientation sensor; \"Always\" works without one.").size(size * 0.8).weak());
+    ui.horizontal_wrapped(|ui| {
+        for t in tideshell_core::clock3d::Trigger::ALL {
+            if pick(ui, t.label(), h, p.clock_3d == t, size) {
+                out.push(ScaleAction::Clock3d(t));
+            }
+        }
+    });
+    if p.clock_3d != tideshell_core::clock3d::Trigger::Off {
+        ui.horizontal_wrapped(|ui| {
+            for st in tideshell_core::clock3d::Style::ALL {
+                if pick(ui, st.label(), h, p.clock_3d_style == st, size) {
+                    out.push(ScaleAction::Clock3dStyle(st));
+                }
+            }
+        });
+    }
+
     ui.add_space(14.0);
     if pick(ui, "Reset", h, false, size) {
         out.push(ScaleAction::Reset);
@@ -285,6 +338,7 @@ mod file_tests {
 
     #[test]
     fn it_reads_and_writes_the_shell_own_prefs_file() {
+        let _env = crate::env_lock();
         // Not a copy of its own: the shell reads this file, so an edit here
         // has to land in the same place and in the same format.
         let dir = std::env::temp_dir().join(format!("ts-scale-{}", std::process::id()));
@@ -359,6 +413,7 @@ mod nudge_tests {
 
     #[test]
     fn the_nudge_is_the_command_the_shell_parses() {
+        let _env = crate::env_lock();
         // Proved against a real socket, and against the shell's own name for
         // the command rather than a string typed twice.
         let dir = std::env::temp_dir().join(format!("ts-nudge-{}", std::process::id()));
@@ -375,6 +430,7 @@ mod nudge_tests {
 
     #[test]
     fn a_shell_that_is_not_running_does_not_make_this_a_failure_to_save() {
+        let _env = crate::env_lock();
         // The file is the truth; the nudge is only about immediacy.
         let dir = std::env::temp_dir().join(format!("ts-nudge-none-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

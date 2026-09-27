@@ -63,6 +63,10 @@ use wayland_protocols_wlr::output_management::v1::client::{
     zwlr_output_manager_v1::{self, ZwlrOutputManagerV1},
     zwlr_output_mode_v1::ZwlrOutputModeV1,
 };
+use wayland_protocols::ext::idle_notify::v1::client::{
+    ext_idle_notification_v1::{self, ExtIdleNotificationV1},
+    ext_idle_notifier_v1::ExtIdleNotifierV1,
+};
 use wayland_protocols_wlr::output_power_management::v1::client::{
     zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1,
     zwlr_output_power_v1::{self, Mode as PowerMode, ZwlrOutputPowerV1},
@@ -266,6 +270,9 @@ pub struct State {
     /// tideshell did not ask for and otherwise would not know about.
     power_modes: Vec<Option<bool>>,
     pub power_status: String,
+    /// ext-idle-notify: an edge the loop has not consumed yet (true = the user
+    /// went idle for the configured time, false = input resumed).
+    idle_edge: Option<bool>,
     /// wlr-output-management: the heads the compositor listed, the serial
     /// of the latest `done`, and the result of our last configuration.
     out_mgr: Option<ZwlrOutputManagerV1>,
@@ -330,6 +337,10 @@ pub struct Io {
     _outputs: Vec<WlOutput>,
     /// The overlay currently asks for exclusive keyboard focus.
     overlay_keyboard: bool,
+    /// ext-idle-notify: the notifier, the live notification and its timeout (0 = none).
+    idle_notifier: Option<ExtIdleNotifierV1>,
+    idle_note: Option<ExtIdleNotificationV1>,
+    idle_ms: u32,
 }
 
 impl Io {
@@ -350,6 +361,9 @@ impl Io {
             list.iter().filter(|g| g.interface == "wl_output").map(|g| globals.registry().bind::<WlOutput, _, _>(g.name, g.version.min(4), &qh, ())).collect()
         });
         let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
+        // Idle, as the compositor measures it: v1's get_idle_notification HONOURS idle
+        // inhibitors, so a playing video (vidkit's wakelock) keeps the screen up.
+        let idle_notifier: Option<ExtIdleNotifierV1> = globals.bind(&qh, 1..=1, ()).ok();
         let st = State {
             surfs: Vec::new(),
             input: Vec::new(),
@@ -366,6 +380,7 @@ impl Io {
             powers: Vec::new(),
             power_modes: Vec::new(),
             power_status: String::new(),
+            idle_edge: None,
             out_mgr: None,
             heads: Vec::new(),
             out_serial: None,
@@ -376,7 +391,7 @@ impl Io {
             overlay_cursor: CursorWant::Shape(Shape::Default),
             applied: None,
         };
-        let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, frac_mgr, viewporter, strip_px, show_strips, right_enabled: false, side_sizes: HashMap::new(), _outputs: outputs, overlay_keyboard: false };
+        let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, frac_mgr, viewporter, strip_px, show_strips, right_enabled: false, side_sizes: HashMap::new(), _outputs: outputs, overlay_keyboard: false, idle_notifier, idle_note: None, idle_ms: 0 };
         io.st.out_mgr = out_mgr;
         if let Some(m) = &power_mgr {
             io.st.powers = io._outputs.iter().enumerate().map(|(i, o)| m.get_output_power(o, &io.qh, i)).collect();
@@ -639,6 +654,35 @@ impl Io {
         combine(&self.st.power_modes)
     }
 
+    /// Ask to be told when the user has been idle for `ms` (0 = stop asking).
+    /// Cheap to call every iteration: only a change recreates the notification.
+    /// Returns a trace line when something changed.
+    pub fn set_idle_timeout(&mut self, ms: u32) -> Option<String> {
+        if ms == self.idle_ms {
+            return None;
+        }
+        self.idle_ms = ms;
+        if let Some(n) = self.idle_note.take() {
+            n.destroy();
+        }
+        self.st.idle_edge = None;
+        let (Some(notifier), Some(seat)) = (self.idle_notifier.as_ref(), self._seat.as_ref()) else {
+            return Some("idle: ext_idle_notifier_v1 not offered; screen sleep only on the power key".into());
+        };
+        if ms == 0 {
+            self.flush();
+            return Some("idle: screen sleep on idle off".into());
+        }
+        self.idle_note = Some(notifier.get_idle_notification(ms, seat, &self.qh, ()));
+        self.flush();
+        Some(format!("idle: screen sleeps after {} s idle", ms / 1000))
+    }
+
+    /// The idle edge since the last call, if any: `Some(true)` idled, `Some(false)` resumed.
+    pub fn take_idle_edge(&mut self) -> Option<bool> {
+        self.st.idle_edge.take()
+    }
+
     /// Panel on or off (all outputs). Returns what happened, for the trace.
     pub fn set_display_power(&mut self, on: bool) -> String {
         if self.st.powers.is_empty() {
@@ -774,6 +818,17 @@ noop!(ZwlrLayerShellV1);
 noop!(WlCallback);
 noop!(WpCursorShapeManagerV1);
 noop!(ZwlrOutputPowerManagerV1);
+noop!(ExtIdleNotifierV1);
+
+impl Dispatch<ExtIdleNotificationV1, ()> for State {
+    fn event(st: &mut Self, _: &ExtIdleNotificationV1, e: ext_idle_notification_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match e {
+            ext_idle_notification_v1::Event::Idled => st.idle_edge = Some(true),
+            ext_idle_notification_v1::Event::Resumed => st.idle_edge = Some(false),
+            _ => {}
+        }
+    }
+}
 noop!(ZwlrOutputModeV1);
 noop!(ZwlrOutputConfigurationHeadV1);
 

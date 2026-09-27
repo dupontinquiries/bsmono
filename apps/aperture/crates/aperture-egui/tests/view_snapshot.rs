@@ -19,7 +19,12 @@ use aperture_egui::state::AppState;
 use aperture_egui::view;
 use egui_kittest::Harness;
 
-fn harness_for(state: AppState) -> Harness<'static, AppState> {
+fn harness_for(mut state: AppState) -> Harness<'static, AppState> {
+    // A snapshot wants ONE caret frame. The default caret blinks for a few
+    // seconds after input (`camera::CaretPolicy`), asking for repaints the
+    // whole time, which `Harness::run` rightly reports as a UI that never
+    // settles -- and a blink phase in a baseline is a coin flip.
+    state.caret.style = aperture_egui::camera::CaretStyle::Solid;
     let mut harness = Harness::new_ui_state(
         |ui, state: &mut AppState| view::frame(ui, state),
         state,
@@ -77,11 +82,28 @@ fn the_status_bar_hint_still_shows_at_a_normal_desktop_width() {
     // The narrow-width tests above deliberately use 400px to catch the
     // overlap; this one confirms the fix didn't just hide the hint
     // everywhere. 700px is a modest, not generous, desktop width.
-    let mut harness = Harness::new_ui_state(
-        |ui, state: &mut AppState| view::frame(ui, state),
-        AppState::new(None, false),
-    );
+    let mut harness = harness_for(AppState::new(None, false));
     harness.set_size(egui::Vec2::new(700.0, 200.0));
     harness.run();
     harness.snapshot("status_bar_wide");
+}
+
+#[test]
+fn the_way_back_shows_in_the_status_bar_after_a_jump() {
+    // Back/forward chips + breadcrumb, which is the only way back on a
+    // device with no Alt key. File names only in the crumb, so the temp
+    // directory's name does not leak into the baseline.
+    let d = std::env::temp_dir().join(format!("ap_snap_nav_{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("a.txt"), "alpha\nbeta\n").unwrap();
+    std::fs::write(d.join("b.txt"), "one\ntwo\nthree\n").unwrap();
+    let mut s = AppState::new(None, false);
+    s.open_file(d.join("a.txt"), 0);
+    s.palette_jump(d.join("b.txt"), Some(2), aperture_core::entity::Relation::Opened, 0);
+    s.status = None;
+    let mut harness = harness_for(s);
+    harness.set_size(egui::Vec2::new(700.0, 200.0));
+    harness.run();
+    harness.snapshot("nav_status");
+    let _ = std::fs::remove_dir_all(&d);
 }

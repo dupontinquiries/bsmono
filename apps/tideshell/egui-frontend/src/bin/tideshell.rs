@@ -41,6 +41,14 @@ const STRIP_PX: u32 = 28;
 
 struct Shellbox {
     shell: Shell,
+    /// Pauses the polling sensor threads while the panel is off (proximity excepted).
+    sensor_gate: tideshell_egui::sensors::SensorGate,
+    /// Whether the cover wanted the camera last iteration (its rising edge opens a live window).
+    last_want_cam: bool,
+    /// Sleeping hours from bsettings (settingsd's file) and that file's mtime.
+    fleet_sleep: settings_kit::SleepPrefs,
+    fleet_sleep_seen: Option<std::time::SystemTime>,
+    cam_probe: tideshell_egui::camera::CaptureProbe,
     view: ShellView,
     system: System,
     windows: Option<tideshell_egui::wayland::Windows>,
@@ -86,6 +94,7 @@ struct Shellbox {
     last_temp_poll: u64,
     strip_base_px: u32,
     last_place_poll: u64,
+    last_fleet_poll: u64,
     last_color_note: u64,
 }
 
@@ -528,7 +537,13 @@ fn main() {
     );
     let cam_rot = cam_mount.rotate;
     let cam_list = std::process::Command::new("cam").arg("-l").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let sensor_gate = tideshell_egui::sensors::SensorGate::default();
     let mut sb = Shellbox {
+        sensor_gate: sensor_gate.clone(),
+        last_want_cam: false,
+        fleet_sleep: settings_kit::SleepPrefs::default(),
+        fleet_sleep_seen: None,
+        cam_probe: tideshell_egui::camera::CaptureProbe::default(),
         shell: Shell::new(prefs, (0.0, 0.0)),
         view: ShellView::default(),
         system: System::new(),
@@ -536,7 +551,7 @@ fn main() {
         ei: Some(tideshell_egui::ei::EiPointer::spawn()),
         ei_status: None,
         persist,
-        ambient: tideshell_egui::sensors::Ambient::spawn("/sys".into(), zbus::blocking::Connection::system().ok()),
+        ambient: tideshell_egui::sensors::Ambient::spawn_gated("/sys".into(), zbus::blocking::Connection::system().ok(), sensor_gate.clone()),
         backlight,
         sensor_status: (String::new(), String::new()),
         ei_drop_noted: false,
@@ -545,13 +560,13 @@ fn main() {
         pending_display_power: None,
         pending_rotate: None,
         keys: None,
-        orientation: tideshell_egui::sensors::OrientationFeed::spawn(zbus::blocking::Connection::system().ok()),
+        orientation: tideshell_egui::sensors::OrientationFeed::spawn_gated(zbus::blocking::Connection::system().ok(), sensor_gate.clone()),
         orientation_status: String::new(),
         foreground_written: String::new(),
         proximity: tideshell_egui::sensors::ProximityFeed::spawn(zbus::blocking::Connection::system().ok()),
         proximity_status: String::new(),
-        imu: tideshell_egui::sensors::ImuFeed::spawn("/sys".into()),
-        compass: tideshell_egui::sensors::CompassFeed::spawn(zbus::blocking::Connection::system().ok()),
+        imu: tideshell_egui::sensors::ImuFeed::spawn_gated("/sys".into(), sensor_gate.clone()),
+        compass: tideshell_egui::sensors::CompassFeed::spawn_gated(zbus::blocking::Connection::system().ok(), sensor_gate.clone()),
         mic: None,
         camera: None,
         cam_duty: tideshell_egui::camera::DutyCycle::new(tideshell_egui::camera::Duty::default()),
@@ -566,6 +581,7 @@ fn main() {
         last_temp_poll: 0,
         strip_base_px: 0,
         last_place_poll: 0,
+        last_fleet_poll: 0,
         last_color_note: 0,
     };
     sb.view.camera_rot = cam_rot;
@@ -707,12 +723,34 @@ fn main() {
             || sb.shell.sleep.is_animating()
             || sb.shell.ambient.is_animating()
             || (sb.shell.lock.is_locked() && !sb.shell.lock.reveal.is_settled());
+        // The 3D cover clock: tipping in/out, or a style that moves on its own.
+        let clock_3d_moving = sb.shell.lock.is_locked()
+            && sb.shell.prefs.clock_3d != tideshell_core::clock3d::Trigger::Off
+            && (sb.shell.flat.is_transitioning() || (sb.shell.clock_3d_amount() > 0.0 && sb.shell.prefs.clock_3d_style.animates()));
         let busy = !sb.shell.recognizer.is_idle() || sb.shell.switcher.is_streaking() || animating;
+        // The panel is OFF (power key, idle, or the compositor's own blanking,
+        // all adopted as Sleep Off): nothing is drawn, the polling sensors are
+        // parked (proximity excepted, for the pocket check) and the loop waits
+        // on its sockets alone. A touch, the power key or a control command
+        // still wakes it at once; the timeout is only a safety net.
+        let asleep = sb.shell.sleep.phase == tideshell_core::sleep::Phase::Off;
+        sb.sensor_gate.set_active(!asleep);
         // 90 Hz while brightness is moving: one step per panel frame.
-        let timeout = if sb.shell.ambient.is_animating() {
+        let ms_into_minute = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| (d.as_millis() % 60_000) as u64).unwrap_or(0);
+        let night_wake = sb.shell.night.next_wake_ms(t0.elapsed().as_millis() as u64, ms_into_minute, sb.shell.night_window && sb.shell.night_pulse);
+        let timeout = if asleep {
+            // Bedside mode wakes at each minute boundary (and at a pulse's end).
+            night_wake.map_or(30_000, |ms| ms.min(30_000) as i32)
+        } else if sb.cam_duty.is_live(t0.elapsed().as_millis() as u64) {
+            // Camera frames are not a wake fd: poll at the live frame rate.
+            1000 / tideshell_egui::camera::LIVE_FPS as i32
+        } else if sb.shell.ambient.is_animating() {
             11
         } else if busy {
             16
+        } else if clock_3d_moving {
+            // Slow motion at 20 Hz reads as smooth and costs a third of 60.
+            sb.shell.prefs.clock_3d_style.frame_ms().unwrap_or(16) as i32
         } else {
             250
         };
@@ -732,7 +770,42 @@ fn main() {
             std::process::exit(1)
         });
         let now_ms = t0.elapsed().as_millis() as u64;
+        // Screen sleep on idle: the compositor measures idle (and honours
+        // inhibitors such as a playing video); the Sleep model decides.
+        if let Some(note) = io.set_idle_timeout(sb.shell.prefs.sleep_idle_s.saturating_mul(1000)) {
+            sb.shell.note(note);
+        }
+        if io.take_idle_edge() == Some(true) {
+            let out = sb.shell.on_idle(now_ms);
+            sb.execute(out);
+        }
         sb.shell.set_clock(tideshell_egui::sensors::local_minute());
+        // Bedside mode: sleeping hours from bsettings (re-read when the file
+        // changes, checked at most every 10 s), then this minute's pulse.
+        if now_ms.saturating_sub(sb.last_fleet_poll) >= 10_000 || sb.last_fleet_poll == 0 {
+            sb.last_fleet_poll = now_ms.max(1);
+            if let Some((sleep, seen)) = effects::reload_fleet_sleep(sb.fleet_sleep_seen) {
+                if sleep != sb.fleet_sleep {
+                    sb.shell.note(format!("sleeping hours: {} (pulse {})", sleep.hours_token(), if sleep.pulse { "on" } else { "off" }));
+                }
+                sb.fleet_sleep = sleep;
+                sb.fleet_sleep_seen = seen;
+            }
+        }
+        {
+            let lt = tideshell_egui::sensors::local_time();
+            let minute_of_day = lt.hour as u16 * 60 + lt.minute as u16;
+            sb.shell.night_window = sb.fleet_sleep.contains(minute_of_day);
+            sb.shell.night_pulse = sb.fleet_sleep.pulse;
+            let out = sb.shell.night_tick(now_ms, minute_of_day);
+            if !out.is_empty() {
+                sb.execute(out);
+                if let Some(on) = sb.pending_display_power.take() {
+                    let msg = io.set_display_power(on);
+                    sb.shell.note(msg);
+                }
+            }
+        }
         while let Ok(lux) = sb.ambient.rx.try_recv() {
             sb.shell.on_lux(lux, now_ms);
         }
@@ -798,6 +871,16 @@ fn main() {
         // debayer per frame — libcamera has no hardware ISP on this phone —
         // for detail nobody sees.
         let want_cam = sb.shell.camera_wanted();
+        // The cover just appeared on a lit screen: someone is looking. Stream
+        // briefly so the depth orbs have motion to track, then sample again.
+        if want_cam && !sb.last_want_cam {
+            sb.cam_duty.go_live(now_ms, camera::LIVE_MS);
+        }
+        if !want_cam && sb.last_want_cam {
+            sb.shell.orbs.clear();
+        }
+        sb.last_want_cam = want_cam;
+        let cam_live = sb.cam_duty.is_live(now_ms);
         match sb.cam_duty.tick(want_cam, now_ms) {
             camera::DutyAction::Start => {
                 let choice = camera::CameraChoice {
@@ -805,8 +888,12 @@ fn main() {
                     // libcamerasrc's own default is whichever libcamera lists
                     // first, which here is the selfie camera.
                     name: std::env::var("TIDESHELL_CAMERA").ok().filter(|v| !v.trim().is_empty()).or_else(|| sb.rear_camera.clone()),
-                    capture: camera::CameraChoice::from_vars(None, std::env::var("TIDESHELL_CAMERA_CAPTURE").ok().as_deref()).capture,
-                    fps: Some(2),
+                    // An explicit TIDESHELL_CAMERA_CAPTURE wins; otherwise the
+                    // probe asks for a small sensor mode (see CaptureProbe).
+                    capture: camera::CameraChoice::from_vars(None, std::env::var("TIDESHELL_CAMERA_CAPTURE").ok().as_deref())
+                        .capture
+                        .or_else(|| sb.cam_probe.request()),
+                    fps: Some(if cam_live { camera::LIVE_FPS } else { camera::SAMPLE_FPS }),
                     // Frozen, so a dark room looks dark. Auto exposure
                     // exists to make every scene look the same, which is
                     // exactly wrong for a tint that is supposed to mean
@@ -816,6 +903,16 @@ fn main() {
                 sb.camera = Some(camera::ChildSource::start(&camera::gst_command(&choice, camera::FRAME_W, camera::FRAME_H), camera::FRAME_W, camera::FRAME_H));
             }
             camera::DutyAction::Stop => {
+                if let Some(c) = &sb.camera {
+                    if std::env::var_os("TIDESHELL_CAMERA_CAPTURE").is_none() {
+                        if let Some(note) = sb.cam_probe.observe(c.frames) {
+                            sb.shell.note(note);
+                        }
+                    }
+                }
+                if !sb.cam_duty.is_live(now_ms) {
+                    sb.shell.orbs.rest();
+                }
                 sb.camera = None;
                 sb.prev_frame = None;
                 if !want_cam {
@@ -829,6 +926,20 @@ fn main() {
             let gray = track::Frame::from_rgba(f.w, f.h, &f.rgba);
             let (yaw, pitch) = (sb.shell.world.yaw_deg().to_radians(), sb.shell.world.pitch_deg().to_radians());
             if let Some((prev, pts, y0, p0)) = &sb.prev_frame {
+                // Per-corner flow for the depth orbs: each tracked corner and the
+                // room's colour where it landed. Only consecutive LIVE frames get
+                // here (a sample window yields one frame and clears prev_frame).
+                let tracks: Vec<tideshell_core::orbs::Track> = pts
+                    .iter()
+                    .filter_map(|p| {
+                        let (dx, dy) = track::track_point(prev, *p, &gray)?; // a delta, not a position
+                        let (nx, ny) = (p.x + dx, p.y + dy);
+                        let i = ((ny.clamp(0, f.h as i32 - 1) as usize) * f.w + nx.clamp(0, f.w as i32 - 1) as usize) * 4;
+                        let color = [f.rgba[i], f.rgba[i + 1], f.rgba[i + 2]];
+                        Some(tideshell_core::orbs::Track { from: (p.x as f32, p.y as f32), to: (nx as f32, ny as f32), color })
+                    })
+                    .collect();
+                sb.shell.orbs.update(&tracks, f.w as f32, f.h as f32);
                 let m = track::estimate_motion(prev, pts, &gray);
                 if m.tracked >= 8 {
                     let dyaw = ((yaw - y0 + std::f32::consts::PI).rem_euclid(2.0 * std::f32::consts::PI)) - std::f32::consts::PI;
@@ -838,8 +949,12 @@ fn main() {
                     sb.shell.on_image_motion((m.dx * scale, m.dy * scale), predicted);
                 }
             }
-            let pts = track::find_corners(&gray);
-            sb.prev_frame = Some((gray, pts, yaw, pitch));
+            // Corners only matter if another frame follows: i.e. while live.
+            // A one-frame sample used to run the corner search for nothing.
+            if sb.cam_duty.is_live(now_ms) {
+                let pts = track::find_corners(&gray);
+                sb.prev_frame = Some((gray, pts, yaw, pitch));
+            }
             // Has the room changed? The only idle signal on a phone whose
             // accelerometer is unreadable, and the right question anyway:
             // what matters for a tint is the room, not the handset.
@@ -1103,6 +1218,16 @@ fn main() {
             last_display_on = display_on;
             if let Some(on) = display_on {
                 sb.backlight.set_display(on);
+                // Blanking we did not ask for becomes Sleep Off (so the triple
+                // tap, not any touch, wakes it); a panel lit behind our back
+                // while Off is switched off again. See sleep.rs.
+                let out = sb.shell.on_display_reported(on, now_ms);
+                sb.execute(out);
+                // Now, not next iteration: asleep, the next one may be 30 s away.
+                if let Some(on) = sb.pending_display_power.take() {
+                    let msg = io.set_display_power(on);
+                    sb.shell.note(msg);
+                }
             }
         }
         if io.power_status_ref() != last_power_status {
@@ -1112,7 +1237,7 @@ fn main() {
         // Keys go to the overlay only while it shows something typed into.
         io.set_overlay_keyboard(sb.shell.palette.open || sb.view.settings_open());
 
-        if now_ms.saturating_sub(last_poll) >= 100 {
+        if !asleep && now_ms.saturating_sub(last_poll) >= 100 {
             last_poll = now_ms;
             sb.poll_world();
         }
@@ -1141,6 +1266,11 @@ fn main() {
             sb.execute(out);
         }
         for (role, _) in sides {
+            // Panel off: the side surfaces' frames would go to a dark screen.
+            if asleep {
+                side_events.remove(&role);
+                continue;
+            }
             let Some(t) = io.side(role) else {
                 gl.unbind(role);
                 side_events.remove(&role);
@@ -1246,6 +1376,18 @@ fn main() {
                 region.as_ref().map(|v| v.iter().map(|r| (r.left() as i32, r.top() as i32, r.width() as i32, r.height() as i32)).collect());
             io.set_input_region(Role::Overlay, rects.as_deref());
             last_region = Some(region);
+        }
+        // Panel off: route the overlay's touches (the triple-tap detector
+        // lives behind `route_raw`) but run no UI and paint nothing. The last
+        // frame painted was the fully faded black one, which is also the
+        // first thing seen on wake.
+        if sb.shell.sleep.phase == tideshell_core::sleep::Phase::Off && !sb.shell.night.is_pulsing() {
+            let mut events = std::mem::take(&mut overlay_events);
+            if !events.is_empty() {
+                let routed = sb.view.route_raw(&mut sb.shell, &mut events, Pos2::ZERO, t0.elapsed().as_millis() as u64);
+                sb.execute(routed);
+            }
+            continue;
         }
         let Some(t) = io.overlay() else { continue };
         t.prepare(&mut io);

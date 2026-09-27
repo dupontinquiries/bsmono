@@ -44,6 +44,8 @@ pub struct Feel {
     reveal: crate::animations::OneShot,
     /// Last frame's visibility, to detect the hidden→shown edge that starts the reveal.
     was_visible: bool,
+    /// The last `Visible` command sent, so it is sent on change only (see `frame`).
+    sent_visible: Option<bool>,
     /// The layout rail folded to a sliver, so the keys get the full width.
     pub rail_collapsed: bool,
     /// The surface height this frame's content needs -- the keys plus whatever panels are
@@ -273,6 +275,28 @@ impl Feel {
         self.decide_visibility()
     }
 
+    /// The sink's descriptor, readable when `pump_sink` has work. The layer
+    /// shell polls it beside its own socket; `None` means it must fall back
+    /// to a short timer.
+    pub fn sink_wake_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.sink.wake_fd()
+    }
+
+    /// The next frame this screen needs that no input will cause. The eframe
+    /// shells keep their 320 ms tick (winit cannot poll the input-method
+    /// socket); the layer shell gets only real deadlines, clamped to a small
+    /// floor so a deadline already past cannot spin.
+    fn timed_wake(&self, placement: crate::platform::Placement) -> Option<std::time::Duration> {
+        use std::time::Duration;
+        if placement != crate::platform::Placement::LayerShell {
+            return Some(Duration::from_millis(320));
+        }
+        let now_ms = self.started.elapsed().as_millis() as u64;
+        let grace = self.focus.next_timed_change_ms(now_ms).map(Duration::from_millis);
+        let steno = crate::steno::pending_remaining();
+        [grace, steno].into_iter().flatten().min().map(|d| d.max(Duration::from_millis(4)))
+    }
+
     /// The single place the show/hide question is answered, so the idle
     /// path and the frame path cannot drift apart. They did not share one
     /// before; `pump_sink` read the sink directly and `frame` read it
@@ -333,6 +357,7 @@ impl Feel {
             placement: crate::platform::placement(),
             reveal: Default::default(),
             was_visible: false,
+            sent_visible: None,
             rail_collapsed: false,
             desired_h: None,
             asked_h: None,
@@ -449,19 +474,31 @@ impl Feel {
         // reading the sink directly is the cases where the signal exists
         // but is not to be believed — see `focus_policy`.
         let should_show = self.decide_visibility();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(should_show));
+        // ONLY ON CHANGE. egui's `send_viewport_cmd` requests a repaint of the viewport
+        // every time it is called (egui 0.34 context.rs, `send_viewport_cmd_to`), so sending
+        // this every frame made every frame schedule the next: measured on a headless
+        // sway at ~14,000 UI runs a second while HIDDEN under the layer shell, and a
+        // continuously redrawing window under eframe (the ~46% of a core seen on the FP5).
+        if self.sent_visible != Some(should_show) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(should_show));
+            self.sent_visible = Some(should_show);
+        }
         if should_show && !self.was_visible {
             self.reveal.start();
         }
         self.was_visible = should_show;
-        // Keep ticking even while hidden: a hidden/unfocused eframe
-        // window may not otherwise get repainted, which would starve
-        // `pump()` above and mean the NEXT focus event (the one that's
-        // supposed to show the keyboard again) never gets noticed. The
-        // interval matches wayland_backend's own idle-poll ceiling
-        // (see `install_glib_dispatcher`'s IDLE_MS) rather than
-        // inventing an unrelated number.
-        ctx.request_repaint_after(std::time::Duration::from_millis(320));
+        // Keep ticking even while hidden -- BUT ONLY IN AN EFRAME WINDOW. A
+        // hidden/unfocused eframe window may not otherwise get repainted,
+        // which would starve `pump()` above and mean the NEXT focus event
+        // never gets noticed; winit cannot poll the input-method socket for
+        // us. The layer shell can: it sleeps in poll() on BOTH sockets
+        // (`wake_fd`), so a tick there is three full UI runs a second for
+        // nothing, forever. There it asks only for the frames a timer
+        // genuinely owns: a steno stroke's pairing deadline and the focus
+        // grace window.
+        if let Some(d) = self.timed_wake(self.placement) {
+            ctx.request_repaint_after(d);
+        }
 
         // Drain the service queue once per frame. Without this `pending` grows
         // for the life of the process — a queue with no reader is a leak, and

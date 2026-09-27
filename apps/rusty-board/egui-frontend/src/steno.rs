@@ -98,6 +98,14 @@ pub fn feed(button_id: &str, gesture_code: &str) -> Option<engine::StenoCommit> 
 /// draw call) to flush a solo stroke whose pairing window has elapsed.
 /// Returns `None` on every frame there's nothing to flush, which is the
 /// common case — cheap enough to call unconditionally.
+/// How long until `poll_pending` has something to flush, if a stroke is
+/// waiting. A host that sleeps between frames asks for a frame at this
+/// deadline instead of ticking on a timer to find out.
+pub fn pending_remaining() -> Option<Duration> {
+    let slot = PENDING.lock().unwrap();
+    slot.as_ref().map(|p| p.deadline.saturating_duration_since(Instant::now()))
+}
+
 pub fn poll_pending() -> Option<engine::StenoCommit> {
     let mut slot = PENDING.lock().unwrap();
     let ready = matches!(&*slot, Some(p) if Instant::now() >= p.deadline);

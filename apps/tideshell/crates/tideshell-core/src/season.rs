@@ -153,6 +153,20 @@ pub fn mood(day_of_year: u32, minute: u32, southern: bool) -> Mood {
 }
 
 /// The breathing value at time `t` seconds: a raised sine in 0..1 times the amplitude.
+/// Seconds of full breathing after the last interaction (a touch, a wake).
+pub const BREATH_ACTIVE_S: f32 = 20.0;
+/// Then it fades out over this long and holds still.
+pub const BREATH_SETTLE_S: f32 = 3.0;
+
+/// How much of the breath to show `idle_s` seconds after the last
+/// interaction: 1 while someone is around, easing to 0, then exactly 0.
+/// Exactly 0 matters: the frames stop changing, so the shell stops painting.
+/// A lock screen left lit on a desk used to repaint the whole panel four
+/// times a second to animate a gradient nobody was watching.
+pub fn breath_envelope(idle_s: f32) -> f32 {
+    (1.0 - (idle_s - BREATH_ACTIVE_S) / BREATH_SETTLE_S).clamp(0.0, 1.0)
+}
+
 pub fn breath(m: &Mood, t_secs: f32) -> f32 {
     m.breath_amp * 0.5 * (1.0 - (2.0 * PI * t_secs / m.breath_period).cos())
 }
@@ -167,6 +181,16 @@ pub fn day_of_year(year: i32, month: u32, day: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_breath_settles_to_exactly_zero_when_nobody_is_around() {
+        assert_eq!(breath_envelope(0.0), 1.0);
+        assert_eq!(breath_envelope(BREATH_ACTIVE_S), 1.0);
+        let mid = breath_envelope(BREATH_ACTIVE_S + BREATH_SETTLE_S / 2.0);
+        assert!(mid > 0.0 && mid < 1.0);
+        assert_eq!(breath_envelope(BREATH_ACTIVE_S + BREATH_SETTLE_S), 0.0);
+        assert_eq!(breath_envelope(3600.0), 0.0);
+    }
 
     #[test]
     fn the_year_is_a_smooth_mix_that_peaks_at_the_right_times() {

@@ -94,6 +94,12 @@ pub struct ShellPrefs {
     /// Cover clock: digital or analog, and how fuzzy.
     pub clock_style: crate::clock::ClockStyle,
     pub clock_fuzzy: crate::clock::Fuzzy,
+    /// Screen sleep after this many seconds idle (ext-idle-notify; 0 = only
+    /// the power key). Goes through the same fade/lock/triple-tap as the key.
+    pub sleep_idle_s: u32,
+    /// The cover clock in 3D: when, and which way (see clock3d.rs).
+    pub clock_3d: crate::clock3d::Trigger,
+    pub clock_3d_style: crate::clock3d::Style,
 }
 
 impl Default for ShellPrefs {
@@ -126,6 +132,9 @@ impl Default for ShellPrefs {
             rotate_flip: false,
             clock_style: crate::clock::ClockStyle::Digital,
             clock_fuzzy: crate::clock::Fuzzy::Exact,
+            sleep_idle_s: 60,
+            clock_3d: crate::clock3d::Trigger::Auto,
+            clock_3d_style: crate::clock3d::Style::Standing,
         }
     }
 }
@@ -138,7 +147,7 @@ pub fn parse_scale(v: &str) -> Option<f32> {
     v.parse::<f32>().ok().filter(|f| f.is_finite()).map(|f| f.clamp(0.7, 2.0))
 }
 
-pub const KEYS: [&str; 27] = [
+pub const KEYS: [&str; 30] = [
     "shell.layout",
     "shell.bar.widgets",
     "shell.bar.width",
@@ -166,6 +175,9 @@ pub const KEYS: [&str; 27] = [
     "shell.rotate.flip",
     "shell.clock.style",
     "shell.clock.fuzzy",
+    "shell.sleep.idle_s",
+    "shell.clock.3d",
+    "shell.clock.3d_style",
 ];
 
 impl ShellPrefs {
@@ -212,6 +224,9 @@ impl ShellPrefs {
                 .into(),
             ),
             ("shell.clock.fuzzy".into(), self.clock_fuzzy.token().into()),
+            ("shell.sleep.idle_s".into(), self.sleep_idle_s.to_string()),
+            ("shell.clock.3d".into(), self.clock_3d.token().into()),
+            ("shell.clock.3d_style".into(), self.clock_3d_style.token().into()),
         ]
     }
 
@@ -310,6 +325,18 @@ impl ShellPrefs {
             }
             "shell.clock.fuzzy" => {
                 self.clock_fuzzy = crate::clock::Fuzzy::from_token(v).ok_or_else(|| format!("shell.clock.fuzzy: '{v}' is not exact|15|30|hour|weekday"))?
+            }
+            "shell.sleep.idle_s" => {
+                // 0 = off; otherwise at least 10 s, so a mistyped value cannot
+                // make the phone unusable by sleeping between taps.
+                let n: u32 = v.parse().map_err(|_| format!("shell.sleep.idle_s: '{v}' is not a number of seconds"))?;
+                self.sleep_idle_s = if n == 0 { 0 } else { n.clamp(10, 3600) };
+            }
+            "shell.clock.3d" => {
+                self.clock_3d = crate::clock3d::Trigger::from_token(v).ok_or_else(|| format!("shell.clock.3d: '{v}' is not off|auto|always"))?
+            }
+            "shell.clock.3d_style" => {
+                self.clock_3d_style = crate::clock3d::Style::from_token(v).ok_or_else(|| format!("shell.clock.3d_style: '{v}' is not standing|extruded|hologram|carousel"))?
             }
             "shell.cursor" => {
                 self.fat_cursor = match v {

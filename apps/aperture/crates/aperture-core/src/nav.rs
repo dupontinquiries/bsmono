@@ -47,15 +47,35 @@ pub struct NavStep {
     /// Where the relationship was observed — the callsite you would return
     /// to, which is generally NOT the start of `from`.
     pub site: Option<Site>,
+    /// Where the jump LANDED — what [`NavPath::forward`] takes you back to.
+    /// `to` names the entity; an entity is not a position (a file has no
+    /// line, and an item is many lines), so without this forward could only
+    /// open the file at its top.
+    pub landing: Option<Site>,
 }
 
 impl NavStep {
     pub fn new(from: EntityId, rel: Relation, to: EntityId) -> NavStep {
-        NavStep { from, rel, to, site: None }
+        NavStep { from, rel, to, site: None, landing: None }
     }
     pub fn at(mut self, site: Site) -> NavStep {
         self.site = Some(site);
         self
+    }
+    pub fn landed(mut self, site: Site) -> NavStep {
+        self.landing = Some(site);
+        self
+    }
+    /// A jump that went nowhere: same entity, and no two different lines to
+    /// tell it from standing still.
+    fn is_self_loop(&self) -> bool {
+        if self.from != self.to {
+            return false;
+        }
+        match (&self.site, &self.landing) {
+            (Some(a), Some(b)) => a.path == b.path && a.line == b.line,
+            _ => true,
+        }
     }
     /// Reads as "resolve_collision → calls → apply_impulse".
     pub fn label(&self) -> String {
@@ -118,12 +138,18 @@ impl NavPath {
 
     /// Record a traversal.
     ///
-    /// Truncates any rewound tail first. A step whose `from` equals its `to`
-    /// is dropped — several call sites can produce one (accepting the
-    /// symbol you are already on), and a path full of self-loops makes back
-    /// stop working in a way nobody can see the cause of.
+    /// Truncates any rewound tail first. A step that goes nowhere is
+    /// dropped — several call sites can produce one (accepting the symbol
+    /// you are already on), and a path full of self-loops makes back stop
+    /// working in a way nobody can see the cause of.
+    ///
+    /// "Nowhere" is the same entity AND the same line. The same entity alone
+    /// was the old rule, and it dropped every jump inside one file when the
+    /// only entity the caller could name was the FILE (no outline: a
+    /// language without a grammar, or code outside any item) — F12 to a
+    /// definition 400 lines down, and no way back.
     pub fn push(&mut self, step: NavStep) {
-        if step.from == step.to {
+        if step.is_self_loop() {
             return;
         }
         self.steps.truncate(self.at);
@@ -215,6 +241,25 @@ mod tests {
     fn f(name: &str) -> EntityId {
         EntityId::item("src/a.rs", "fn", name)
     }
+    #[test]
+    fn a_jump_within_one_entity_is_kept_when_it_moved_lines() {
+        let file = EntityId::file("src/a.rs");
+        let mut p = NavPath::new();
+        let far = NavStep::new(file.clone(), Relation::References, file.clone())
+            .at(Site::new("src/a.rs", 10, 4))
+            .landed(Site::new("src/a.rs", 410, 0));
+        p.push(far.clone());
+        assert_eq!(p.len(), 1, "a 400-line jump inside one file is a jump");
+        let still = NavStep::new(file.clone(), Relation::References, file)
+            .at(Site::new("src/a.rs", 10, 4))
+            .landed(Site::new("src/a.rs", 10, 9));
+        p.push(still);
+        assert_eq!(p.len(), 1, "same line is standing still");
+        assert_eq!(p.forward(), None);
+        assert_eq!(p.back().unwrap().site, far.site);
+        assert_eq!(p.forward().unwrap().landing, far.landing, "forward knows where it landed");
+    }
+
     fn step(a: &str, b: &str, line: u32) -> NavStep {
         NavStep::new(f(a), Relation::Calls, f(b)).at(Site::new("src/a.rs", line, 0))
     }

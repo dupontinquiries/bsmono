@@ -59,6 +59,13 @@ pub trait Sink {
     /// exists.
     fn pump(&mut self) {}
 
+    /// A descriptor that is readable when `pump` has work. The layer shell
+    /// polls it next to its own socket so an idle keyboard sleeps instead of
+    /// waking on a timer to ask. `None`: nothing to wait on.
+    fn wake_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
+
     /// What this sink knows about focus. The DECISION about visibility
     /// is not made here — see `focus_policy`.
     ///
@@ -169,6 +176,9 @@ impl Sink for crate::wayland::WaylandIntegration {
     }
     fn pump(&mut self) {
         crate::wayland::WaylandIntegration::pump(self);
+    }
+    fn wake_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.vk.poll_fd()
     }
     fn focus_source(&self) -> crate::focus_policy::FocusSource {
         crate::focus_policy::FocusSource::InputMethod {

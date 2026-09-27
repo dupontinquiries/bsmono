@@ -348,6 +348,7 @@ mod send_tests {
 
     #[test]
     fn a_message_reaches_a_listening_socket_and_decodes() {
+        let _env = crate::env_lock();
         // The shell's end of this is ctl.rs; here we prove the datagram is
         // what that decoder expects, using the shared format rather than a
         // second copy of it.
@@ -377,6 +378,7 @@ mod send_tests {
 
     #[test]
     fn with_no_shell_running_it_says_so_rather_than_queueing() {
+        let _env = crate::env_lock();
         let dir = std::env::temp_dir().join(format!("ts-speaker-none-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
@@ -400,6 +402,7 @@ mod state_file_tests {
 
     #[test]
     fn the_chain_survives_a_restart() {
+        let _env = crate::env_lock();
         let d = scratch("restart");
         let mut s = Speaker::default();
         s.apply(SpeakerAction::Set(tideshell_core::chaingraph::Stage::HpTop, "Freq", 250.0));
@@ -421,6 +424,7 @@ mod state_file_tests {
 
     #[test]
     fn with_no_file_it_is_the_defaults_not_an_error() {
+        let _env = crate::env_lock();
         let d = scratch("none");
         let s = load_state();
         assert!(s.bindings.is_empty());
@@ -431,6 +435,7 @@ mod state_file_tests {
 
     #[test]
     fn a_save_failure_and_an_apply_failure_are_told_apart() {
+        let _env = crate::env_lock();
         // They mean different things to the person: one loses the setting,
         // the other only delays it.
         let d = scratch("split");

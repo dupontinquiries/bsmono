@@ -198,6 +198,12 @@ pub enum Relation {
     /// [`EntityId::Frame`].
     ObservedIn,
     Observed,
+    /// No relation in the code at all: you opened it from there (a file
+    /// picker, a symbol search). Navigation records it so the way back
+    /// exists; no [`EdgeSource`] ever produces it, because it is a fact
+    /// about attention, not about the program.
+    Opened,
+    OpenedFrom,
 }
 
 impl Relation {
@@ -220,6 +226,8 @@ impl Relation {
             Tests => TestedBy,
             ObservedIn => Observed,
             Observed => ObservedIn,
+            Opened => OpenedFrom,
+            OpenedFrom => Opened,
         }
     }
 
@@ -244,6 +252,8 @@ impl Relation {
             Tests => "tests",
             ObservedIn => "observed in",
             Observed => "observed",
+            Opened => "then",
+            OpenedFrom => "opened from",
         }
     }
 }

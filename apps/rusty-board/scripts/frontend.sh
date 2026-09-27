@@ -76,8 +76,12 @@ frontend_build() {
     local dir; dir="$(frontend_dir)"
     case "$FRONTEND_NAME" in
         egui)
-            echo "==> cargo build --release --features $FRONTEND_EGUI_FEATURES  (in $dir)"
-            ( cd "$dir" && cargo build --release --features "$FRONTEND_EGUI_FEATURES" )
+            # Explicit feature set, never the crate's defaults: the defaults now
+            # include wayland+layer, so --no-wayland (FRONTEND_EGUI_FEATURES="")
+            # would otherwise build the full keyboard anyway.
+            local feats="app${FRONTEND_EGUI_FEATURES:+,$FRONTEND_EGUI_FEATURES}"
+            echo "==> cargo build --release --no-default-features --features $feats  (in $dir)"
+            ( cd "$dir" && cargo build --release --no-default-features --features "$feats" )
             ;;
         gtk)
             echo "==> cargo build --release  (in $dir)"

@@ -220,6 +220,19 @@ impl FocusPolicy {
         self.ever_activated
     }
 
+    /// When the decision could next change WITHOUT any new input: the end of
+    /// the grace window, while it is still open. `None` otherwise — every
+    /// other transition is driven by a compositor event, which wakes the
+    /// host on its own. Lets an idle host sleep instead of polling.
+    pub fn next_timed_change_ms(&self, now_ms: u64) -> Option<u64> {
+        if self.auto_hide == AutoHide::Never || self.ever_activated {
+            return None;
+        }
+        let (grace, first) = (self.grace_ms?, self.first_seen_ms?);
+        let waited = now_ms.saturating_sub(first);
+        (waited < grace).then(|| grace - waited)
+    }
+
     /// One frame. `now_ms` must be monotonic; its origin does not matter.
     pub fn decide(&mut self, now_ms: u64, source: FocusSource) -> Decision {
         // The escape hatch outranks everything, including a working
@@ -300,6 +313,20 @@ pub fn grace_from_env(raw: Option<&str>) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_only_timed_change_is_the_grace_window_closing() {
+        let im = |a| FocusSource::InputMethod { active: a, unavailable: false };
+        let mut p = FocusPolicy::new(AutoHide::Follow, Some(1_000));
+        assert_eq!(p.next_timed_change_ms(0), None, "nothing seen yet");
+        p.decide(100, im(false));
+        assert_eq!(p.next_timed_change_ms(400), Some(700));
+        assert_eq!(p.next_timed_change_ms(1_200), None, "window already closed");
+        p.decide(500, im(true));
+        assert_eq!(p.next_timed_change_ms(600), None, "activated: only events matter now");
+        let never = FocusPolicy::new(AutoHide::Never, Some(1_000));
+        assert_eq!(never.next_timed_change_ms(0), None);
+    }
+
     use super::*;
 
     fn im(active: bool) -> FocusSource {

@@ -42,5 +42,23 @@ fn main() -> eframe::Result<()> {
             }
         }
     }
+    // A binary built without `layer` can only ever be a toplevel window. Say so, once, on a
+    // Wayland session — otherwise the only symptom is "the keyboard is an app now", with
+    // nothing in the journal to say it was a build flag and not the compositor.
+    #[cfg(not(feature = "layer"))]
+    {
+        use rusty_board_egui::platform::{session, Session};
+        if session() == Session::Wayland {
+            eprintln!(
+                "[rusty-board] built without the `layer` feature; running as a toplevel window. \
+                 Rebuild with default features (or --features wayland,layer) to dock."
+            );
+        }
+    }
+    #[cfg(not(feature = "wayland"))]
+    eprintln!(
+        "[rusty-board] built without the `wayland` feature; keys type into the preview only, \
+         not the focused app."
+    );
     rusty_board_egui::demo_app::run("rusty-board")
 }

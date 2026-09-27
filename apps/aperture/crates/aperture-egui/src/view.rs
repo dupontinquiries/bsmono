@@ -1115,6 +1115,25 @@ fn status_bar(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, now_ms:
             .unwrap_or_else(|| "[scratch]".into());
         let dirty = if state.dirty { " •" } else { "" };
         ui.label(egui::RichText::new(format!("{name}{dirty}")).color(colors.text));
+        // The way back, where a finger can reach it: Alt+Left / Alt+Right
+        // do the same, but a phone has no Alt key.
+        if !state.nav.is_empty() {
+            ui.separator();
+            if ui.add_enabled(state.nav.can_go_back(), egui::Button::new("‹").min_size(egui::vec2(28.0, 0.0)))
+                .on_hover_text("back to where the jump started (Alt+Left)").clicked()
+            {
+                state.nav_go(true, now_ms);
+            }
+            if ui.add_enabled(state.nav.can_go_forward(), egui::Button::new("›").min_size(egui::vec2(28.0, 0.0)))
+                .on_hover_text("forward again (Alt+Right)").clicked()
+            {
+                state.nav_go(false, now_ms);
+            }
+            let crumb = state.nav.breadcrumb(3);
+            if !crumb.is_empty() {
+                ui.label(egui::RichText::new(crumb).color(colors.text_weak).small());
+            }
+        }
         ui.separator();
         let p = state.editor.caret_pos();
         ui.label(
@@ -1236,6 +1255,8 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
     let mut apply: Option<(String, palette_ui::Cmd)> = None;
     let mut open_path: Option<String> = None;
     let mut open_hit: Option<(std::path::PathBuf, usize)> = None;
+    // Which palette produced a hit, for the nav step's relation.
+    let hit_mode = state.palette.as_ref().map(|p| p.mode.clone());
     let mut submit_edit: Option<String> = None;
     let mut submit_voice: Option<String> = None;
 
@@ -1811,13 +1832,16 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
         palette_ui::apply(cmd, state, now_ms);
         return;
     }
+    use aperture_core::entity::Relation;
     if let Some(path) = open_path {
-        state.open_file(std::path::PathBuf::from(path), now_ms);
+        state.palette_jump(std::path::PathBuf::from(path), None, Relation::Opened, now_ms);
         state.palette = None;
         return;
     }
     if let Some((path, line)) = open_hit {
-        state.open_file_at_line(path, line, now_ms);
+        // A search hit is a text match; a symbol or route is a reference.
+        let rel = if hit_mode == Some(Mode::ProjectSearch) { Relation::TextMatch } else { Relation::References };
+        state.palette_jump(path, Some(line), rel, now_ms);
         state.palette = None;
         return;
     }

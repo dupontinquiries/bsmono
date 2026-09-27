@@ -181,6 +181,9 @@ impl SettingsEditor {
                 }
             }
         });
+        ui.add_space(6.0);
+
+        self.sleep_section(ui, &colors);
         ui.add_space(8.0);
 
         if ui.button("reset to defaults").clicked() {
@@ -193,6 +196,32 @@ impl SettingsEditor {
         }
 
         self.pending()
+    }
+
+    /// Sleeping hours: the bedside window. Hour and minute as drag values
+    /// (big targets, no keyboard needed on a phone); the window may wrap midnight.
+    fn sleep_section(&mut self, ui: &mut Ui, colors: &PaletteColors) {
+        ui.label("Sleeping hours");
+        let sp = &mut self.prefs.sleep;
+        ui.checkbox(&mut sp.enabled, "use sleeping hours");
+        ui.add_enabled_ui(sp.enabled, |ui| {
+            let mut hm = |ui: &mut Ui, label: &str, mins: &mut u16| {
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    let (mut h, mut m) = (*mins / 60, *mins % 60);
+                    ui.add(egui::DragValue::new(&mut h).range(0..=23).suffix(" h"));
+                    ui.add(egui::DragValue::new(&mut m).range(0..=59).speed(0.5).suffix(" min"));
+                    *mins = h * 60 + m;
+                });
+            };
+            hm(ui, "from", &mut sp.start_min);
+            hm(ui, "until", &mut sp.end_min);
+            ui.checkbox(&mut sp.pulse, "show a dim clock once a minute (screen off otherwise)");
+            if sp.start_min == sp.end_min {
+                ui.colored_label(colors.text_weak, "from and until are the same: the window is empty");
+            }
+        });
+        ui.colored_label(colors.text_weak, "the phone shell keeps the OLED dark and the clock dim in this window");
     }
 
     /// The voice sub-page: mesh toggles + a reorderable trusted-partner tier list. Edits
