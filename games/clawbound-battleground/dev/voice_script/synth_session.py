@@ -56,9 +56,7 @@ CAST = {
     # a kitten god: a young voice, pitched up with its formants in
     # master_take (sproutkit's chain) until it is small
     'sproutkit': ('am_liam', 1.1),
-    # the stalker of the fog moors: low, slow, close (a stand-in until his
-    # performer's session comes in)
-    'hollowstep': ('am_fenrir', 0.9),
+    # (Hollowstep is recorded: Nelson's session, nelson_take001.json)
 }
 
 
