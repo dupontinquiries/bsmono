@@ -27,9 +27,10 @@ fn load() -> HashMap<String, Clip> {
 fn every_recorded_voice_is_complete_trimmed_and_levelled() {
     let files = load();
     let recorded: Vec<&str> = PARTS.iter().map(|p| p.who).filter(|w| files.keys().any(|f| f.starts_with(&format!("voice/{w}/")))).collect();
-    // the four from Kessler's first take, at least
-    for w in ["goldenmane", "oldroar", "twofang", "windclaw"] {
-        assert!(recorded.contains(&w), "{w} has no recorded lines");
+    // every ancestor speaks: four recorded (Kessler), the rest stand-ins
+    // (dev/voice_script/synth_session.py) until they are
+    for w in PARTS.iter().map(|p| p.who).filter(|w| *w != "narrator" && *w != "announcer") {
+        assert!(recorded.contains(&w), "{w} has no voice lines");
     }
     let mut n = 0;
     for who in &recorded {
@@ -56,5 +57,48 @@ fn every_recorded_voice_is_complete_trimmed_and_levelled() {
             n += 1;
         }
     }
-    assert!(n >= 36, "checked {n} lines");
+    assert!(n >= 14 * 9, "checked {n} lines");
+}
+
+/// The bots speak: over two minutes of a full 5v5 run by bots (the
+/// listener's own cat too), every bank key the voice cues ask for is looked
+/// up in the files the game loads, and the bots' own lines -- casts, kills,
+/// deaths -- are found for many different ancestors, and heard (within the
+/// voice range of the listener) for some.
+#[test]
+fn the_bots_speak_their_own_lines() {
+    use clawbound::cues::{self, cues_for, place};
+    use clawbound::mixer::Bus;
+    use clawbound::sim::{AiBrain, Game};
+    use glam::Vec3;
+    let files = load();
+    let has = |key: &str| files.keys().any(|f| f.strip_suffix(".opus").is_some_and(|s| s == key || s.rsplit_once('.').is_some_and(|(b, n)| b == key && n.parse::<u32>().is_ok())));
+    let blue: Vec<u32> = (0..5).collect();
+    let red: Vec<u32> = (5..10).collect();
+    let mut g = Game::new_teams(&blue, &red);
+    g.gods[0].ai = Some(AiBrain::new(clawbound::consts::Lane::Mid, 0.8));
+    let mut voiced = std::collections::HashSet::new();
+    let (mut heard, mut asked) = (0, 0);
+    for _ in 0..(120 * 30) {
+        g.tick(1.0 / 30.0);
+        let ear = g.gods[0].pos;
+        for ev in std::mem::take(&mut g.events) {
+            for cue in cues_for(&ev, &g) {
+                let Some(sp) = cue.speaker else { continue };
+                if cue.bus != Bus::Voice || sp == 0 {
+                    continue;
+                }
+                asked += 1;
+                if let Some(k) = cue.keys.iter().find(|k| has(k)) {
+                    voiced.insert(k.split('/').nth(1).unwrap().to_string());
+                    if place(&cue, ear, Vec3::X).is_some() {
+                        heard += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(asked >= 20, "the bots asked for only {asked} voice lines in two minutes");
+    assert!(voiced.len() >= 6, "bot lines found for only {} ancestors: {voiced:?}", voiced.len());
+    assert!(heard >= 3, "only {heard} bot lines within earshot (range {})", cues::VOICE_RANGE);
 }
