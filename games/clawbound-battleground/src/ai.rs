@@ -442,7 +442,7 @@ pub fn think(game: &mut Game, gi: usize) {
         let close = (0..game.gods.len()).any(|j| game.gods[j].team != team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(g.pos) < 7.0);
         if close {
             for slot in 0..4usize {
-                let ab = &def.abilities[slot];
+                let Some(ab) = game.ability(gi, slot as u32) else { continue };
                 if let Archetype::Dash { dist, .. } | Archetype::Blink { dist, .. } = ab.arch {
                     if game.gods[gi].cds[slot] <= 0.0 && game.gods[gi].mana >= ab.cost && !ab.ult {
                         let f = team.fountain();
@@ -551,7 +551,11 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
     let is_god_target = matches!(target, TargetRef::God(_));
     let mut best: Option<(u32, f32)> = None; // (slot, priority)
 
-    for (slot, ab) in def.abilities.iter().enumerate() {
+    let _ = def;
+    for slot in 0..4usize {
+        // the ability as the bot's level ranks it; a locked one is not there
+        let Some(ab) = game.ability(gi, slot as u32) else { continue };
+        let ab = &ab;
         if g.cds[slot] > 0.0 || g.mana < ab.cost {
             continue;
         }

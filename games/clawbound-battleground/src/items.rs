@@ -1,7 +1,11 @@
-// Shop catalog — 102 items: 100 across 8 stat categories, and the two Siphon
-// items (brawl: they raise the base Siphon defence every cat has)
-// (Strength, Intelligence, Scaling/Spell Power, Protection, Penetration,
-//  Attack Speed, Health, Stacking) in three tiers.
+// Shop catalog — 110 items: 100 across 8 stat categories (Strength,
+// Intelligence, Scaling/Spell Power, Protection, Penetration, Attack Speed,
+// Health, Stacking) in three tiers, the two Siphon items (brawl: they raise
+// the base Siphon defence every cat has), and 8 Curios -- items with a
+// passive of their own (`Passive`, worked in `curios.rs`).
+//
+// Prices: the numbers written in `build` are the list prices; the shop
+// charges `PRICE_CUT` of them, rounded to 5 gold (`price`).
 
 use std::sync::OnceLock;
 
@@ -15,6 +19,7 @@ pub enum Cat {
     AttackSpeed = 5,
     Health = 6,
     Stacking = 7,
+    Curio = 8,
 }
 
 impl Default for Cat {
@@ -23,7 +28,7 @@ impl Default for Cat {
     }
 }
 
-pub const CATS: [Cat; 8] = [
+pub const CATS: [Cat; 9] = [
     Cat::Strength,
     Cat::Intelligence,
     Cat::Scaling,
@@ -32,6 +37,7 @@ pub const CATS: [Cat; 8] = [
     Cat::AttackSpeed,
     Cat::Health,
     Cat::Stacking,
+    Cat::Curio,
 ];
 
 impl Cat {
@@ -45,6 +51,7 @@ impl Cat {
             Cat::AttackSpeed => "Attack Speed",
             Cat::Health => "Health",
             Cat::Stacking => "Stacking",
+            Cat::Curio => "Curio",
         }
     }
     pub fn color(self) -> [f32; 3] {
@@ -57,6 +64,7 @@ impl Cat {
             Cat::AttackSpeed => [0.5, 1.0, 0.5],
             Cat::Health => [1.0, 0.35, 0.5],
             Cat::Stacking => [1.0, 0.9, 0.45],
+            Cat::Curio => [0.45, 0.95, 0.85],
         }
     }
 }
@@ -104,12 +112,64 @@ pub enum StackKind {
     Time,
 }
 
+/// The stat a trophy grows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Grow {
+    Strength,
+    Intelligence,
+    Power,
+    Protection,
+    Health,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Stacking {
     pub kind: StackKind,
+    pub grows: Grow,
+    /// Stat gained per stack.
     pub per: f32,
+    /// The most the stat grows (the stack count stops at `max / per`).
     pub max: f32,
-    pub interval: f32, // for Time stacks
+    /// Seconds per stack, for Time stacks.
+    pub interval: f32,
+}
+
+impl Stacking {
+    /// Stacks at which it is full.
+    pub fn cap(&self) -> f32 {
+        self.max / self.per
+    }
+    /// The stat it adds at `stacks` (a Time counter counts whole intervals).
+    pub fn gained(&self, stacks: f32) -> f32 {
+        let n = if self.kind == StackKind::Time { stacks.floor() } else { stacks };
+        (n.min(self.cap()) * self.per).min(self.max)
+    }
+}
+
+/// A Curio's passive: what it does beyond its stats (see `curios.rs`, where
+/// each one is worked, and `shopview::explain`, which says it in words).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Passive {
+    /// A blow that would kill the holder leaves it at `hp` of its health
+    /// instead; then not again for `cd` seconds.
+    NinthLife { hp: f32, cd: f32 },
+    /// The holder and allied cats within `radius` move `ms` and strike `atk`
+    /// faster (fractions; several censers do not add up).
+    Censer { radius: f32, ms: f32, atk: f32 },
+    /// Every `every`th basic attack deals `bonus` + `scale` x power more.
+    Pounce { every: u32, bonus: f32, scale: f32 },
+    /// After `after` seconds untouched, regenerate `pct` of max health a
+    /// second (in place of the usual 1.2% after 6 s).
+    Moonmilk { after: f32, pct: f32 },
+    /// `pct` of the damage an enemy cat deals the holder goes back to it, as
+    /// magical damage that ignores protection.
+    Thorns { pct: f32 },
+    /// With no enemy cat within `radius`, move `ms` faster.
+    Wander { radius: f32, ms: f32 },
+    /// Heals the holder for `pct` of the damage its abilities deal to cats.
+    Tide { pct: f32 },
+    /// Basic attacks slow the cat they hit by `slow` for `secs`.
+    Bramble { slow: f32, secs: f32 },
 }
 
 #[derive(Clone, Debug)]
@@ -121,7 +181,17 @@ pub struct Item {
     pub cat: Cat,
     pub stats: Stats,
     pub stack: Option<Stacking>,
+    pub passive: Option<Passive>,
     pub desc: &'static str,
+}
+
+/// The share of the list price the shop charges.
+pub const PRICE_CUT: f32 = 0.85;
+
+/// What the shop charges for an item listed at `list` gold: `PRICE_CUT` of
+/// it, to the nearest 5 gold.
+pub fn price(list: f32) -> f32 {
+    (list * PRICE_CUT / 5.0).round() * 5.0
 }
 
 const fn s(strength: f32, intelligence: f32, power: f32, protection: f32, pen_pct: f32, pen_flat: f32, attack_speed: f32, health: f32, mana: f32, cdr: f32, move_speed: f32) -> Stats {
@@ -132,11 +202,11 @@ fn it(
     id: u16, name: &'static str, tier: u8, cost: f32, cat: Cat, stats: Stats,
     stack: Option<Stacking>, desc: &'static str,
 ) -> Item {
-    Item { id, name, tier, cost, cat, stats, stack, desc }
+    Item { id, name, tier, cost: price(cost), cat, stats, stack, passive: None, desc }
 }
 
-fn st(kind: StackKind, per: f32, max: f32, interval: f32) -> Option<Stacking> {
-    Some(Stacking { kind, per, max, interval })
+fn st(kind: StackKind, grows: Grow, per: f32, max: f32, interval: f32) -> Option<Stacking> {
+    Some(Stacking { kind, grows, per, max, interval })
 }
 
 pub fn all() -> &'static [Item] {
@@ -145,7 +215,7 @@ pub fn all() -> &'static [Item] {
 }
 
 fn build() -> Vec<Item> {
-    let mut v = Vec::with_capacity(100);
+    let mut v = Vec::with_capacity(110);
     let mut id: u16 = 0;
     let mut push = |v: &mut Vec<Item>, name: &'static str, tier: u8, cost: f32, cat: Cat, stats: Stats, stack: Option<Stacking>, desc: &'static str| {
         v.push(it(id, name, tier, cost, cat, stats, stack, desc));
@@ -259,18 +329,48 @@ fn build() -> Vec<Item> {
     push(&mut v, "Undying Colossus", 3, 3100., Cat::Health, s(0.,0.,0.,0.,0.,0.,0.,620.,0.,0.10,0.), None, "+620 HP, +10% CDR.");
 
     // ── Stacking (8) ────────────────────────────────────────────────────────
-    push(&mut v, "Momentum Charm", 2, 1600., Cat::Stacking, s(20.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::MinionKill, 1.0, 40.0, 0.0), "+20 STR. Gains +1 STR per minion kill (max 40).");
-    push(&mut v, "Bloodletter's Pact", 2, 1800., Cat::Stacking, s(0.,0.,25.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::GodKill, 4.0, 60.0, 0.0), "+25 Power. Gains +4 Power per god takedown (max 60).");
-    push(&mut v, "Siege Engine", 2, 1700., Cat::Stacking, s(0.,0.,0.,30.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::TowerKill, 5.0, 30.0, 0.0), "+30 Protection. Gains +5 per tower destroyed (max 30).");
-    push(&mut v, "Sage's Obsession", 2, 1600., Cat::Stacking, s(0.,25.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, 2.0, 40.0, 60.0), "+25 INT. Gains +2 INT every minute (max 40).");
-    push(&mut v, "Warlord's Standard", 3, 2900., Cat::Stacking, s(45.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::MinionKill, 1.5, 75.0, 0.0), "+45 STR. Gains +1.5 STR per minion kill (max 75).");
-    push(&mut v, "Eternal Hunger", 3, 3000., Cat::Stacking, s(0.,0.,45.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::GodKill, 6.0, 90.0, 0.0), "+45 Power. Gains +6 Power per god takedown (max 90).");
-    push(&mut v, "Beacon of Ages", 3, 2800., Cat::Stacking, s(0.,40.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, 3.0, 60.0, 60.0), "+40 INT. Gains +3 INT every minute (max 60).");
-    push(&mut v, "Monument of Ruin", 3, 3100., Cat::Stacking, s(0.,0.,0.,0.,0.,0.,0.,500.,0.,0.,0.), st(StackKind::MinionKill, 4.0, 320.0, 0.0), "+500 HP. Gains +4 HP per minion kill (max 320).");
+    push(&mut v, "Momentum Charm", 2, 1600., Cat::Stacking, s(20.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::MinionKill, Grow::Strength, 1.0, 40.0, 0.0), "+20 STR. Gains +1 STR per minion kill (max 40).");
+    push(&mut v, "Bloodletter's Pact", 2, 1800., Cat::Stacking, s(0.,0.,25.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::GodKill, Grow::Power, 4.0, 60.0, 0.0), "+25 Power. Gains +4 Power per god takedown (max 60).");
+    push(&mut v, "Siege Engine", 2, 1700., Cat::Stacking, s(0.,0.,0.,30.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::TowerKill, Grow::Protection, 5.0, 30.0, 0.0), "+30 Protection. Gains +5 per tower destroyed (max 30).");
+    push(&mut v, "Sage's Obsession", 2, 1600., Cat::Stacking, s(0.,25.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 2.0, 40.0, 60.0), "+25 INT. Gains +2 INT every minute (max 40).");
+    push(&mut v, "Warlord's Standard", 3, 2900., Cat::Stacking, s(45.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::MinionKill, Grow::Strength, 1.5, 75.0, 0.0), "+45 STR. Gains +1.5 STR per minion kill (max 75).");
+    push(&mut v, "Eternal Hunger", 3, 3000., Cat::Stacking, s(0.,0.,45.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::GodKill, Grow::Power, 6.0, 90.0, 0.0), "+45 Power. Gains +6 Power per god takedown (max 90).");
+    push(&mut v, "Beacon of Ages", 3, 2800., Cat::Stacking, s(0.,40.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 3.0, 60.0, 60.0), "+40 INT. Gains +3 INT every minute (max 60).");
+    push(&mut v, "Monument of Ruin", 3, 3100., Cat::Stacking, s(0.,0.,0.,0.,0.,0.,0.,500.,0.,0.,0.), st(StackKind::MinionKill, Grow::Health, 4.0, 320.0, 0.0), "+500 HP. Gains +4 HP per minion kill (max 320).");
 
     // ── Siphon (2): raise the base defence every cat has (brawl) ─────────────
     push(&mut v, "Siphon Charm", 1, 700., Cat::Protection, s(0.,0.,0.,8.,0.,0.,0.,75.,0.,0.,0.), None, "A charm that drinks the storm. Ability damage from enemy ancestors returns 18% as mana (from 10%). +8 Protection, +75 HP.");
     push(&mut v, "Soulwell Talisman", 2, 1900., Cat::Protection, s(0.,0.,0.,22.,0.,0.,0.,200.,150.,0.,0.), None, "A well that fills in a barrage. Ability damage from enemy ancestors returns 30% as mana. +22 Protection, +200 HP, +150 Mana.");
+
+    // ── Curios (8): a passive each (curios.rs) ──────────────────────────────
+    let mut curio = |v: &mut Vec<Item>, name: &'static str, tier: u8, cost: f32, stats: Stats, passive: Passive, desc: &'static str| {
+        push(v, name, tier, cost, Cat::Curio, stats, None, desc);
+        v.last_mut().unwrap().passive = Some(passive);
+    };
+    curio(&mut v, "Ninth Life", 3, 2900., s(0.,0.,0.,20.,0.,0.,0.,250.,0.,0.,0.),
+        Passive::NinthLife { hp: 0.3, cd: 150.0 },
+        "A bell on a frayed collar that has rung eight times. The ninth time a blow would kill you, you land on your feet at 30% health instead. The bell needs 150 s to be ready again. +20 Protection, +250 HP.");
+    curio(&mut v, "Catnip Censer", 2, 2100., s(0.,10.,0.,10.,0.,0.,0.,150.,0.,0.,0.),
+        Passive::Censer { radius: 10.0, ms: 0.08, atk: 0.12 },
+        "A smouldering pouch of the good stuff, swung on a chain. You and every allied cat within 10 u move 8% and strike 12% faster. Two censers do not add up. +10 INT, +10 Protection, +150 HP.");
+    curio(&mut v, "Thrice-Pounce Claws", 3, 2800., s(30.,0.,0.,0.,0.,0.,0.12,0.,0.,0.,0.),
+        Passive::Pounce { every: 3, bonus: 60.0, scale: 0.35 },
+        "Claws filed to a rhythm: tap, tap, POUNCE. Every third basic attack deals 60 + 35% of your power more. +30 STR, +12% Attack Speed.");
+    curio(&mut v, "Moonmilk Flask", 2, 1800., s(0.,0.,0.,0.,0.,0.,0.,300.,120.,0.,0.),
+        Passive::Moonmilk { after: 3.5, pct: 0.035 },
+        "Milk left out under a full moon, still warm. Out of the fight for 3.5 s (not 6), you mend 3.5% of your health a second (not 1.2%). +300 HP, +120 Mana.");
+    curio(&mut v, "Thornpelt Mantle", 3, 2700., s(0.,0.,0.,40.,0.,0.,0.,300.,0.,0.,0.),
+        Passive::Thorns { pct: 0.18 },
+        "A cloak of bramble-fur that bites back. 18% of the damage an enemy cat deals you is dealt back to it, and its protection does not help it. +40 Protection, +300 HP.");
+    curio(&mut v, "Wanderer's Whiskers", 1, 900., s(0.,0.,0.,0.,0.,0.,0.,120.,0.,0.,0.),
+        Passive::Wander { radius: 16.0, ms: 0.14 },
+        "Whiskers that have smelled every path in the jungle. While no enemy cat is within 16 u you move 14% faster -- for roaming, not for chasing. +120 HP.");
+    curio(&mut v, "Tidecaller Pearl", 3, 3000., s(0.,0.,40.,0.,0.,0.,0.,0.,150.,0.05,0.),
+        Passive::Tide { pct: 0.12 },
+        "A pearl from the drowned city that pulls like the tide. Your abilities heal you for 12% of the damage they deal to enemy cats. +40 Power, +150 Mana, +5% CDR.");
+    curio(&mut v, "Bramble Lash", 2, 2000., s(18.,0.,0.,0.,0.,8.,0.10,0.,0.,0.,0.),
+        Passive::Bramble { slow: 0.18, secs: 1.2 },
+        "A thorned tail-wrap. Your basic attacks slow the cat they hit by 18% for 1.2 s, so it cannot run from the next one. +18 STR, +8 flat Penetration, +10% Attack Speed.");
     v
 }
 

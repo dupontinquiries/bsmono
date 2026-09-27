@@ -178,6 +178,9 @@ pub struct GodUnit {
     pub assists: u32,
     pub items: Vec<u16>,
     pub stacks: Vec<f32>, // parallel to items — stack counters
+    /// The Curios' own state (`curios`): the Ninth Life's recharge, the
+    /// pounce count.
+    pub curio: crate::curios::CurioState,
     pub hp: f32,
     pub max_hp: f32,
     pub mana: f32,
@@ -365,6 +368,8 @@ pub struct Projectile {
     pub pen_pct: f32,
     pub pen_flat: f32,
     pub color: [f32; 3],
+    /// A ranged cat's basic attack (not an ability's): see `basic_attack`.
+    pub auto: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -410,9 +415,13 @@ pub struct Game {
     pub cast_queue: Vec<(usize, u32, Vec3)>, // (god idx, slot, aim)
     /// Leap requests: (god idx, aim direction). Drained by `move_gods`.
     pub leap_queue: Vec<(usize, Vec3)>,
-    /// Set around a basic attack's damage: the siphon (brawl) pays back
-    /// ability damage only.
-    pub siphon_off: bool,
+    /// Set around a basic attack's damage (melee, or an auto's arrow
+    /// landing): the siphon (brawl) and the Tidecaller Pearl pay back
+    /// ability damage only; the Bramble Lash slows on basic attacks only.
+    pub basic_attack: bool,
+    /// Set while a Thornpelt Mantle's damage goes back, so it is not
+    /// thrown back again.
+    pub reflecting: bool,
     /// The river crossings. See `logs`.
     pub logs: Vec<crate::logs::RollingLog>,
     pub(crate) logs_seen: usize,
@@ -512,6 +521,7 @@ impl Game {
                 assists: 0,
                 items: Vec::new(),
                 stacks: Vec::new(),
+                curio: Default::default(),
                 hp,
                 max_hp: hp,
                 mana,
@@ -612,7 +622,8 @@ impl Game {
             rng,
             cast_queue: Vec::new(),
             leap_queue: Vec::new(),
-            siphon_off: false,
+            basic_attack: false,
+            reflecting: false,
             logs: crate::logs::crossings().iter().map(crate::logs::RollingLog::across).collect(),
             logs_seen: 0,
             tower_alive: [0, 0], // counted below
@@ -706,21 +717,17 @@ impl Game {
         for (k, id) in god.items.iter().enumerate() {
             let item = &cat[*id as usize];
             s.add(&item.stats);
+            // a trophy's growth, on the stat it names. (This matched on the
+            // item's shelf, and every trophy sits on the Stacking shelf, so
+            // no stack ever reached a stat.)
             if let Some(st) = &item.stack {
-                let stacks = god.stacks.get(k).copied().unwrap_or(0.0);
-                match st.kind {
-                    StackKind::MinionKill | StackKind::GodKill | StackKind::TowerKill => {
-                        let gained = stacks * st.per;
-                        match item.cat {
-                            items::Cat::Strength => s.strength += gained,
-                            items::Cat::Intelligence => s.intelligence += gained,
-                            items::Cat::Scaling => s.power += gained,
-                            items::Cat::Protection => s.protection += gained,
-                            items::Cat::Health => s.health += gained,
-                            _ => {}
-                        }
-                    }
-                    StackKind::Time => {}
+                let gained = st.gained(god.stacks.get(k).copied().unwrap_or(0.0));
+                match st.grows {
+                    items::Grow::Strength => s.strength += gained,
+                    items::Grow::Intelligence => s.intelligence += gained,
+                    items::Grow::Power => s.power += gained,
+                    items::Grow::Protection => s.protection += gained,
+                    items::Grow::Health => s.health += gained,
                 }
             }
         }
@@ -877,7 +884,9 @@ impl Game {
         let g = &self.gods[i];
         let def = self.def(i);
         let bless = if g.blessing_t > 0.0 { BLESSING_MS } else { 0.0 };
-        let base = def.move_speed * (1.0 + g.ms_bonus + g.buff_ms + bless);
+        // the Catnip Censer's air and the Wanderer's Whiskers (curios.rs)
+        let curio = self.curio_move_bonus(i);
+        let base = def.move_speed * (1.0 + g.ms_bonus + g.buff_ms + bless + curio);
         // wading: the rivers are slow going unless you were born to them
         let depth = self.water_depth_now(g.pos.x, g.pos.z);
         let wade = if g.blessing_t > 0.0 || crate::wild::is_riverborn(def) { 1.0 } else { wade_speed_mul(depth) };
@@ -899,7 +908,7 @@ impl Game {
     pub fn auto_interval(&self, i: usize) -> f32 {
         let g = &self.gods[i];
         let bless = if g.blessing_t > 0.0 { BLESSING_AS } else { 0.0 };
-        self.def(i).auto_cd / (1.0 + g.atk_speed + g.buff_atkspd + bless)
+        self.def(i).auto_cd / (1.0 + g.atk_speed + g.buff_atkspd + bless + self.censer_at(i).1)
     }
 
     pub fn auto_damage(&self, i: usize) -> f32 {
@@ -954,7 +963,7 @@ impl Game {
                 g.last_dmg_t = self.t;
                 // the siphon: ability damage from an enemy CAT returns a share
                 // as mana to the one who took it (brawl)
-                let from_enemy_cat = !self.siphon_off && source.is_some_and(|s| s != ti && s < self.gods.len());
+                let from_enemy_cat = !self.basic_attack && source.is_some_and(|s| s != ti && s < self.gods.len());
                 let g = &mut self.gods[ti];
                 if from_enemy_cat && g.hp > 0.0 {
                     let pct = crate::brawl::siphon_pct(&g.items);
@@ -968,10 +977,13 @@ impl Game {
                     }
                 }
                 let _ = pre;
-                if g.hp <= 0.0 {
+                // the Curios that answer a blow (curios.rs)
+                self.curios_on_hit(ti, source, dmg);
+                if self.gods[ti].hp <= 0.0 && !self.ninth_life(ti) {
                     self.on_god_death(ti, source);
                 } else {
-                    self.events.push(Event::Damage { pos: g.pos + Vec3::Y * 1.6, amount: dmg, big: dmg > 120.0 });
+                    let pos = self.gods[ti].pos;
+                    self.events.push(Event::Damage { pos: pos + Vec3::Y * 1.6, amount: dmg, big: dmg > 120.0 });
                 }
             }
             TargetRef::Minion(mi) => {
@@ -1123,6 +1135,14 @@ impl Game {
         }
     }
 
+    /// Put cat `gi` at `level` (XP cleared), its stats and ability ranks
+    /// with it. For tests and shots that need a kit unlocked.
+    pub fn set_level(&mut self, gi: usize, level: u32) {
+        self.gods[gi].level = level.clamp(1, MAX_LEVEL);
+        self.gods[gi].xp = 0.0;
+        self.recalc(gi);
+    }
+
     pub fn grant_xp(&mut self, gi: usize, mut xp: f32) {
         xp *= 1.0 + 0.02 * (self.t / 60.0).min(8.0); // late-game scaling
         let g = &mut self.gods[gi];
@@ -1143,14 +1163,18 @@ impl Game {
         }
     }
 
+    /// `n` more stacks on every held trophy of `kind` (to its cap), and the
+    /// stats follow when a stack lands.
     pub fn add_stacks(&mut self, gi: usize, kind: StackKind, n: f32) {
         let cat = items::all();
         let g = &mut self.gods[gi];
+        let mut changed = false;
         for (k, id) in g.items.clone().iter().enumerate() {
             if let Some(st) = &cat[*id as usize].stack {
                 if st.kind == kind {
                     let cur = g.stacks.get(k).copied().unwrap_or(0.0);
-                    let next = (cur + n).min(st.max);
+                    let next = (cur + n).min(st.cap());
+                    changed |= st.gained(next) != st.gained(cur);
                     if k < g.stacks.len() {
                         g.stacks[k] = next;
                     } else {
@@ -1158,6 +1182,9 @@ impl Game {
                     }
                 }
             }
+        }
+        if changed {
+            self.recalc(gi);
         }
     }
 
@@ -1243,7 +1270,8 @@ mod shop_tests {
         assert!(g.buy_item(0, item.id));
         assert_eq!(g.gods[0].items.len(), 1);
         let refund = g.sell_item(0, 0).expect("a real slot");
-        assert!((refund - item.cost * SELL_REFUND).abs() < 1e-3);
+        // the refund is rounded to whole gold (425 x 0.7 = 297.5 -> 298)
+        assert_eq!(refund, (item.cost * SELL_REFUND).round());
         assert_eq!(g.gods[0].gold, refund, "sold with nothing else bought, gold is exactly the refund");
         assert!(g.gods[0].items.is_empty());
         assert!(g.sell_item(0, 0).is_none(), "an empty slot sells nothing");

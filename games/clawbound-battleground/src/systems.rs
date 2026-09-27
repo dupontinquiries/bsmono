@@ -754,7 +754,8 @@ impl Game {
             }
             // fire!
             let interval = self.auto_interval(i);
-            let dmg = self.auto_damage(i);
+            // the Thrice-Pounce Claws count this blow (curios.rs)
+            let dmg = self.auto_damage(i) + self.pounce_bonus(i);
             let (pen_pct, pen_flat) = (self.gods[i].pen_pct, self.gods[i].pen_flat);
             let team = self.gods[i].team;
             let from = self.gods[i].pos + Vec3::Y * 1.4;
@@ -779,14 +780,14 @@ impl Game {
                         }
                     }
                     let extra = profile.map(|m| self.cleave_targets(i, main, def.auto_range * 1.15, m)).unwrap_or_default();
-                    self.siphon_off = true;
+                    self.basic_attack = true;
                     self.deal_damage(main, dmg, magic, Some(i), pen_pct, pen_flat);
                     // the sweep or cleave catches those beside it
                     let splash = profile.map_or(0.0, |m| m.splash);
                     for t in extra {
                         self.deal_damage(t, dmg * splash, magic, Some(i), pen_pct, pen_flat);
                     }
-                    self.siphon_off = false;
+                    self.basic_attack = false;
                 }
                 AutoKind::Ranged => {
                     let to = self.target_pos(target.unwrap());
@@ -804,6 +805,7 @@ impl Game {
                         pen_pct,
                         pen_flat,
                         color: team.rgb(),
+                        auto: true,
                     });
                 }
             }
@@ -920,6 +922,7 @@ impl Game {
             pen_pct: 0.0,
             pen_flat: 0.0,
             color: team.rgb(),
+            auto: false,
         });
     }
 
@@ -1016,6 +1019,7 @@ impl Game {
                 pen_pct: 0.0,
                 pen_flat: 0.0,
                 color: tw.team.rgb(),
+                auto: false,
             });
         }
     }
@@ -1205,12 +1209,14 @@ impl Game {
                 }
             }
             if let Some(h) = hit {
-                let (pdmg, ppen, ppf, powner, ppos, pcolor) = {
+                let (pdmg, ppen, ppf, powner, ppos, pcolor, pauto) = {
                     let p = &self.projectiles[pi];
-                    (p.dmg, p.pen_pct, p.pen_flat, p.owner, p.pos, p.color)
+                    (p.dmg, p.pen_pct, p.pen_flat, p.owner, p.pos, p.color, p.auto)
                 };
                 let owner = if powner == usize::MAX { None } else { Some(powner) };
+                self.basic_attack = pauto;
                 self.deal_damage(h, pdmg, false, owner, ppen, ppf);
+                self.basic_attack = false;
                 self.events.push(Event::Explosion { pos: ppos, radius: 0.9, color: pcolor });
                 dead[pi] = true;
             }
@@ -1377,6 +1383,12 @@ impl Game {
             let was_dead = self.gods[i].respawn_t > 0.0;
             let last_dmg = self.gods[i].last_dmg_t;
             let now = self.t;
+            // out of the fight: after 6 s, 1.2% a second -- or the Moonmilk
+            // Flask's quicker, deeper mending (curios.rs)
+            let (mend_after, mend_pct) = self.mending(i);
+            if !was_dead {
+                self.curios_tick(i, dt);
+            }
 
             {
                 let g = &mut self.gods[i];
@@ -1421,8 +1433,8 @@ impl Game {
                 } else {
                     // regen
                     g.mana = (g.mana + (2.6 + 0.5 * g.level as f32) * dt).min(g.max_mana);
-                    if now - last_dmg > 6.0 {
-                        g.hp = (g.hp + g.max_hp * 0.012 * dt).min(g.max_hp);
+                    if now - last_dmg > mend_after {
+                        g.hp = (g.hp + g.max_hp * mend_pct * dt).min(g.max_hp);
                     }
                     let f = g.team.fountain();
                     if g.pos.distance(f) < FOUNTAIN_RADIUS {

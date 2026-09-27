@@ -169,6 +169,22 @@ pub fn glyph(p: &egui::Painter, c: Pos2, s: f32, g: Glyph, col: Color32) {
             let pts = vec![c + Vec2::new(-r * 1.75, -r * 0.15), c + Vec2::new(r * 1.75, -r * 0.15), c + Vec2::new(0.0, h * 0.9)];
             p.add(Shape::convex_polygon(pts, col, Stroke::NONE));
         }
+        Glyph::Curio => {
+            // a little stoppered bottle with a spark inside
+            let body = Rect::from_center_size(c + Vec2::new(0.0, h * 0.2), Vec2::new(h * 1.1, h * 1.1));
+            p.circle_stroke(body.center(), h * 0.55, st);
+            p.rect_filled(Rect::from_center_size(c + Vec2::new(0.0, -h * 0.55), Vec2::new(h * 0.42, h * 0.32)), 2.0, col);
+            let sc = body.center();
+            let spark: Vec<Pos2> = (0..8)
+                .map(|i| {
+                    let a = i as f32 * std::f32::consts::FRAC_PI_4;
+                    let r = if i % 2 == 0 { h * 0.34 } else { h * 0.1 };
+                    sc + Vec2::new(a.cos(), a.sin()) * r
+                })
+                .collect();
+            p.add(Shape::convex_polygon(spark.clone(), col, Stroke::NONE));
+            p.add(Shape::closed_line(spark, Stroke::new(1.0, col)));
+        }
         Glyph::Trophy => {
             let a = c + Vec2::new(-h * 0.7, h * 0.5);
             let b = c + Vec2::new(h * 0.7, -h * 0.5);
@@ -279,10 +295,11 @@ fn shelves_row(ui: &mut egui::Ui, game: &Game, player: usize, st: &mut UiState, 
     let rec = shopview::recommended(game, player);
     let dens = shopview::dens();
     let w = ui.available_width();
-    // A stone per shelf; on a phone, glyph-only stones so all eight fit one row.
+    // A stone per shelf; on a phone, glyph-only stones so all nine fit one row.
     let named = layout == Layout::Wide;
+    let n = dens.len() as f32;
     let gap = 6.0;
-    let stone_w = ((w - gap * 7.0) / 8.0).max(34.0);
+    let stone_w = ((w - gap * (n - 1.0)) / n).max(30.0);
     let stone_h = if named { 58.0 } else { 44.0 };
     let (row, _) = ui.allocate_exact_size(Vec2::new(w, stone_h + 4.0), Sense::hover());
     for (k, d) in dens.iter().enumerate() {
@@ -391,7 +408,10 @@ fn shelf(ui: &mut egui::Ui, game: &mut Game, player: usize, st: &mut UiState, la
                 for (col, &i) in chunk.iter().enumerate() {
                     let cell = row * cols + col;
                     let o = offers[i];
-                    let clicked = card(ui, &o, Vec2::new(card_w, card_h), st.shop_pick.cursor == cell, suggested == Some(o.item.id));
+                    let (clicked, hovered) = card(ui, game, player, &o, Vec2::new(card_w, card_h), st.shop_pick.cursor == cell, suggested == Some(o.item.id), layout);
+                    if hovered || st.shop_pick.cursor == cell && st.shop_study.is_none() {
+                        st.shop_study = Some(o.item.id);
+                    }
                     if clicked {
                         st.shop_pick.point(cell, shown.len());
                         buy(ui.ctx(), game, player, &o);
@@ -413,8 +433,9 @@ fn buy(ctx: &egui::Context, game: &mut Game, player: usize, o: &Offer) {
     }
 }
 
-/// One plaque. Returns whether it was clicked.
-fn card(ui: &mut egui::Ui, o: &Offer, size: Vec2, cursor: bool, suggested: bool) -> bool {
+/// One plaque. Returns whether it was clicked, and whether it is pointed at.
+#[allow(clippy::too_many_arguments)]
+fn card(ui: &mut egui::Ui, game: &Game, player: usize, o: &Offer, size: Vec2, cursor: bool, suggested: bool, layout: Layout) -> (bool, bool) {
     let (base, resp) = ui.allocate_exact_size(size, Sense::click());
     let id = egui::Id::new("hoard_card").with(o.item.id);
     let t = hover_t(ui.ctx(), id, resp.hovered() || cursor);
@@ -469,7 +490,8 @@ fn card(ui: &mut egui::Ui, o: &Offer, size: Vec2, cursor: bool, suggested: bool)
             Refusal::Full => EMBER,
             Refusal::Gold { .. } => EMBER.linear_multiply(0.85),
         }),
-        _ => (o.item.desc.to_string(), INK_DIM),
+        // one sentence on the card; the study pane has the rest
+        _ => (shopview::first_sentence(o.item.desc).to_string(), INK_DIM),
     };
     let wrap = p.layout(line, FontId::proportional(11.0), lc, (r.right() - x0 - 10.0).max(40.0));
     p.galley(Pos2::new(x0, r.bottom() - 10.0 - wrap.size().y.min(28.0)), wrap, lc);
@@ -477,12 +499,49 @@ fn card(ui: &mut egui::Ui, o: &Offer, size: Vec2, cursor: bool, suggested: bool)
         p.text(r.right_bottom() + Vec2::new(-10.0, -8.0), Align2::RIGHT_BOTTOM, format!("{} (to {})", shopview::stack_kind_name(s.kind), s.max), FontId::proportional(10.0), GOLD.linear_multiply(0.8));
     }
     let clicked = resp.clicked();
+    let hovered = resp.hovered();
     let tip = match o.refusal {
         None => format!("{} — tap to trade {} gold", o.item.name, o.item.cost),
         Some(r) => format!("{} — {}", o.item.name, r.text()),
     };
-    resp.on_hover_text(tip);
-    clicked
+    // a phone has no study pane beside the shelf: the whole explanation
+    // goes in the tooltip (a long press) instead
+    if layout == Layout::Narrow {
+        let body: Vec<String> = shopview::explain(game, player, o.item).into_iter().map(|p| format!("{}: {}", p.head, p.text)).collect();
+        resp.on_hover_text(format!("{tip}\n\n{}", body.join("\n\n")));
+    } else {
+        resp.on_hover_text(tip);
+    }
+    (clicked, hovered)
+}
+
+/// The study pane: the item last pointed at, explained in full
+/// (`shopview::explain`), above the player's hoard.
+fn study(ui: &mut egui::Ui, game: &Game, player: usize, st: &UiState) {
+    let Some(item) = st.shop_study.or_else(|| shopview::suggestion(game, player).map(|i| i.id)).and_then(|id| items::all().get(id as usize)) else {
+        ui.label(egui::RichText::new("Point at a gift to study it.").size(12.0).color(INK_DIM));
+        return;
+    };
+    let d = shopview::den(item.cat);
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(Vec2::new(22.0, 22.0), Sense::hover());
+        glyph(ui.painter(), r.center(), 20.0, d.glyph, c32(d.color));
+        ui.label(egui::RichText::new(item.name).size(16.0).color(INK).strong());
+    });
+    ui.label(
+        egui::RichText::new(format!("{} {} · {} · {:.0} gold", shopview::tier_name(item.tier), d.name, shopview::stat_tokens(&item.stats).join("  "), item.cost))
+            .size(11.5)
+            .color(Color32::from_rgb(196, 206, 176)),
+    );
+    for part in shopview::explain(game, player, item) {
+        ui.add_space(3.0);
+        ui.label(egui::RichText::new(part.head).size(11.0).color(GOLD.linear_multiply(0.85)).strong());
+        ui.label(egui::RichText::new(part.text).size(11.5).color(INK_DIM));
+    }
+    ui.add_space(8.0);
+    let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(1.0, BARK_LIGHT));
+    ui.add_space(6.0);
 }
 
 /// The player's six slots, as hollows in the bark, and the sell flow
@@ -493,6 +552,7 @@ fn hoard(ui: &mut egui::Ui, game: &mut Game, player: usize, st: &mut UiState) {
 }
 
 fn hoard_inner(ui: &mut egui::Ui, game: &mut Game, player: usize, st: &mut UiState) {
+    study(ui, game, player, st);
     ui.label(egui::RichText::new("YOUR HOARD").size(15.0).color(GOLD).strong());
     let stats = Game::item_stats(&game.gods[player]);
     ui.label(
@@ -536,7 +596,7 @@ fn hoard_inner(ui: &mut egui::Ui, game: &mut Game, player: usize, st: &mut UiSta
                 let label = if armed { format!("trade back for {refund:.0}? tap again") } else { item.name.to_string() };
                 p.text(r.left_center() + Vec2::new(38.0, -6.0), Align2::LEFT_CENTER, label, FontId::proportional(13.5), if armed { EMBER } else { INK });
                 let sub = match &item.stack {
-                    Some(s) => format!("{} stacks of {}", game.gods[player].stacks.get(i).copied().unwrap_or(0.0), s.max),
+                    Some(s) => format!("grown +{:.0} of +{:.0}", s.gained(game.gods[player].stacks.get(i).copied().unwrap_or(0.0)), s.max),
                     None => shopview::tier_name(item.tier).to_string(),
                 };
                 p.text(r.left_center() + Vec2::new(38.0, 9.0), Align2::LEFT_CENTER, sub, FontId::proportional(10.5), INK_DIM);

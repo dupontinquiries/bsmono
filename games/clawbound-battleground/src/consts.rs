@@ -375,7 +375,8 @@ pub const XP_MELEE: f32 = 43.0;
 pub const XP_CASTER: f32 = 56.0;
 pub const XP_GOD: f32 = 340.0;
 pub const XP_SHARE_RADIUS: f32 = 14.0;
-pub const MAX_LEVEL: u32 = 20;
+/// Levels run 1 to 15 (`ranks`: every level ranks up an ability).
+pub const MAX_LEVEL: u32 = crate::ranks::MAX;
 
 pub const MINION_HP: f32 = 320.0;
 pub const MINION_HP_SCALE: f32 = 1.0; // per minute factor
@@ -385,8 +386,11 @@ pub const MINION_RANGE_MELEE: f32 = 2.2;
 pub const MINION_RANGE_CASTER: f32 = 9.0;
 pub const MINION_ATK_CD: f32 = 1.4;
 
-pub const TOWER_HP: f32 = 1450.0;
-pub const TOWER_DMG: f32 = 168.0;
+/// Towers: 25% tougher and 25% harder-hitting than the 1450 / 168 they had
+/// (a lane held a while longer, a dive under one paid for).
+pub const TOWER_BUFF: f32 = 1.25;
+pub const TOWER_HP: f32 = 1450.0 * TOWER_BUFF;
+pub const TOWER_DMG: f32 = 168.0 * TOWER_BUFF;
 /// Was 16. Measured against what it has to answer: ranged autos reach 14.4
 /// (1.6 u inside the old line), lobs 20, beams 22-32, and at 12.4 u/s a cat
 /// crossed the old 32 u zone in 2.6 s -- two shots. At 24 the zone is 48 u
@@ -416,8 +420,11 @@ pub fn in_tower_clearing(x: f32, z: f32) -> bool {
 pub const TOWER_ATK_CD: f32 = 1.1;
 pub const TOWER_RAMP: f32 = 1.25;
 
-pub const TITAN_HP: f32 = 4600.0;
-pub const TITAN_DMG: f32 = 260.0;
+/// The Elders (titans): 75% more health and damage than the 4600 / 260
+/// they had -- the last stand should be one.
+pub const TITAN_BUFF: f32 = 1.75;
+pub const TITAN_HP: f32 = 4600.0 * TITAN_BUFF;
+pub const TITAN_DMG: f32 = 260.0 * TITAN_BUFF;
 pub const TITAN_RANGE: f32 = 6.5;
 pub const TITAN_ATK_CD: f32 = 1.0;
 /// The Elder's ground (`Game::titan_zone`): it may step this far from its

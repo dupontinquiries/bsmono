@@ -112,6 +112,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("sprout") {
         return run_sprout_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("hud") {
+        return run_hud_shots();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("sky") {
         return crate::skyshots::run();
     }
@@ -805,6 +808,20 @@ pub fn run_shop_shots() -> Result<(), String> {
         save_shot(&renderer.device, &renderer.queue, &target, name)?;
         println!("saved {name}");
     }
+    // The Curio shelf, one of them in the study pane.
+    ui_state.shop_tab = crate::items::Cat::Curio;
+    ui_state.shop_study = crate::items::all().iter().find(|i| i.name == "Thrice-Pounce Claws").map(|i| i.id);
+    {
+        renderer.atmosphere = game.weather.atmosphere();
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.render_frame(&view, cam, 1.0);
+        let out = shop_frame(&egui_ctx, &mut game, &mut ui_state, W, H, 1.0);
+        draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &egui_ctx, out, W, H);
+        save_shot(&renderer.device, &renderer.queue, &target, "clawbound_shop_curios.png")?;
+        println!("saved clawbound_shop_curios.png");
+    }
+    ui_state.shop_tab = rec[0];
+    ui_state.shop_study = None;
     // Portrait phone: the shop alone on a cleared frame, on its Shelves
     // tab and then its Hoard tab.
     let (pw, ph) = (576u32, 1248u32); // width*4 must be a multiple of 256 for the readback
@@ -1975,7 +1992,7 @@ pub fn run_settings_shot() -> Result<(), String> {
             time: Some(k as f64 * 0.016),
             ..Default::default()
         };
-        let mut panel = ui::ControlsPanel { close: false, capture: None, clear: None, scheme: None, reset: false };
+        let mut panel = ui::ControlsPanel { in_match: true, leave: false, close: false, capture: None, clear: None, scheme: None, reset: false };
         let o = ctx.run(raw, |c| {
             ui::draw_fps(c, 60.0, 16.7);
             ui::draw_controls(c, &mut cfg, None, false, &mut panel);
@@ -2113,6 +2130,72 @@ pub fn run_quality_shots() -> Result<(), String> {
         let name = format!("quality_{}.png", q.key());
         save_shot(&renderer.device, &renderer.queue, &target, &name)?;
         println!("saved {name}: shadow map {} px", renderer.shadow_size);
+    }
+    Ok(())
+}
+
+
+/// The HUD's level track and ability ranks (`ranks`): a cat at level 4 with
+/// the ultimate still locked, then the same cat just reaching 5 (the toast),
+/// then at 15 with every ability at its top.
+fn run_hud_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("hud"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let mut game = Game::new(14, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    game.blockers = scene.blockers.clone();
+    let mut vfx = Vfx::default();
+    for _ in 0..60 {
+        game.tick(1.0 / 60.0);
+    }
+    let p = game.gods[0].pos;
+    let cam = Camera { eye: p + Vec3::new(6.0, 9.0, -10.0), target: p + Vec3::Y * 1.2, fov_y: 0.95 };
+    let mut egui_renderer = egui_wgpu::Renderer::new(&renderer.device, wgpu::TextureFormat::Rgba8UnormSrgb, None, 1);
+    let ctx = egui::Context::default();
+    let mut st = UiState::new();
+    for (name, level, xp_frac, toast) in [("hud_level4.png", 4u32, 0.6f32, false), ("hud_level5_toast.png", 5, 0.05, true), ("hud_level15.png", 15, 0.0, false)] {
+        game.set_level(0, level);
+        game.gods[0].xp = crate::consts::xp_for_level(level) * xp_frac;
+        game.gods[0].cds = [0.0, 3.2, 0.0, 0.0];
+        if !toast {
+            st.level_seen = level;
+            st.level_toast_t = 0.0;
+        } else {
+            st.level_seen = level - 1;
+        }
+        renderer.clear_queues();
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        let vp = cam.view_proj(W as f32 / H as f32);
+        let mut textures = egui::TexturesDelta::default();
+        let mut out = None;
+        for k in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W as f32, H as f32))),
+                time: Some(1.0 + k as f64 * 0.016),
+                ..Default::default()
+            };
+            let o = ctx.run(raw, |c| ui::draw_hud(c, &game, 0, vp, W as f32, H as f32, &mut st, renderer.camera.eye));
+            textures.append(o.textures_delta.clone());
+            out = Some(o);
+        }
+        let mut out = out.expect("ran");
+        out.textures_delta = textures;
+        draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
     }
     Ok(())
 }
