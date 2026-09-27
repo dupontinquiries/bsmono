@@ -71,6 +71,10 @@ pub mod clancamp;
 /// The starlight lifts between the sky map's islands and the Aerie.
 pub mod lift;
 pub mod kit;
+/// Hollowstep: the other of him, the terror radius, the heavy tread.
+pub mod stalker;
+/// Brasshowl: the lamp, the flight from it, the shown-up.
+pub mod lantern;
 /// The Curio shelf's passives, worked (items::Passive).
 pub mod curios;
 /// Levels 1-15: when abilities unlock, what each rank and mastery adds.

@@ -50,7 +50,7 @@ pub struct Ancestor {
     pub instruments: &'static str,
 }
 
-pub const ANCESTORS: [Ancestor; 15] = [
+pub const ANCESTORS: [Ancestor; 17] = [
     Ancestor {
         name: "Goldenmane",
         species: "lion",
@@ -185,6 +185,24 @@ pub const ANCESTORS: [Ancestor; 15] = [
         gender: Gender::Male,
         story: "The youngest of the ancestors, and the only one who never grew up. Every litter born in every clan is a little of him, so there is always more of him than anyone counted. He turns every fight into a game, and every game into a dance -- and what dances cannot fight. Where he naps, the first green of the year comes up through the snow.",
         instruments: "toy piano, music box, ukulele, kazoo, handclaps, a disco beat; birdsong, a spring brook",
+    },
+    Ancestor {
+        name: "Hollowstep",
+        species: "wildcat",
+        age: "the long nights",
+        land: "the fog moors",
+        gender: Gender::Male,
+        story: "Nobody on the moors ever saw Hollowstep arrive. His tread was heard on one side of the heath and he was found on the other, and the clans learned to count their own shadows before they slept. He never ran after anything in his life; he never had to. They say another of him is still out on the moor tonight, walking, and that you will hear it long before you see it.",
+        instruments: "bowed saw, low cello drones, a slow bass drum like a heartbeat, held breath; wind over heather, a curlew far off",
+    },
+    Ancestor {
+        name: "Brasshowl",
+        species: "sand cat",
+        age: "the caravan years",
+        land: "the salt roads",
+        gender: Gender::Male,
+        story: "The smallest of the ancestors, with the biggest voice. He walked ahead of the caravans on the salt roads at night with a brass lantern, and when something moved at the edge of its light he raised the lamp and bellowed, and whatever it was did not come in. It is said that Hollowstep has never once stood in Brasshowl's light, and that the two of them know exactly why.",
+        instruments: "frame drum, oud, a brass bell, clapping hands, a caravan's camel bells; desert wind, a crackling lamp",
     },
 ];
 

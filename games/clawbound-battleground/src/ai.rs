@@ -575,6 +575,12 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             Archetype::Litter { .. } => crate::kit::SEEK * 1.6,
             Archetype::Giggle { radius, .. } => radius * 0.85,
             Archetype::DanceParty { radius, .. } => crate::kit::PARTY_RANGE + radius * 0.5,
+            Archetype::Swap { .. } => f32::INFINITY,
+            // sent from where he stands, clamped to its range: prey further
+            // off is still worth sending it toward
+            Archetype::Send { .. } => f32::INFINITY,
+            Archetype::Echoes { .. } => 12.0,
+            Archetype::Lantern { radius, .. } => radius * 0.8,
         };
         let pri = match ab.arch {
             Archetype::Nova { .. } => {
@@ -612,6 +618,28 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             }
             Archetype::DanceParty { .. } => {
                 if is_god_target && dist < range { 0.95 } else { 0.0 }
+            }
+            // Hollowstep (`stalker`): step in when his other is closer to
+            // the prey than he is and the prey is far; send the other at
+            // prey he cannot reach; every shadow on a fight
+            Archetype::Swap { .. } => {
+                // his other is well closer to the prey than he is
+                let other = game.main_other(gi).map(|k| game.others[k].pos.distance(tpos)).unwrap_or(f32::MAX);
+                if is_god_target && other + 5.0 < dist && other < 12.0 { 0.9 } else { 0.0 }
+            }
+            Archetype::Send { .. } => {
+                // his other is far from the prey (and not already on its way)
+                let far = game.main_other(gi).is_some_and(|k| game.others[k].goal.is_none() && game.others[k].pos.distance(tpos) > dist + 6.0);
+                if is_god_target && far { 0.6 } else { 0.0 }
+            }
+            Archetype::Echoes { .. } => {
+                if engage && is_god_target && dist < range { 0.93 } else { 0.0 }
+            }
+            // the lamp on a cat in its light, or on a shadow of
+            // Hollowstep's standing in it
+            Archetype::Lantern { radius, .. } => {
+                let shadow = game.others.iter().any(|o| o.team != g.team && o.pos.distance(g.pos) < radius * 0.8);
+                if (is_god_target && dist < range) || shadow { 0.95 } else { 0.0 }
             }
             Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } => {
                 let hurt = g.hp / g.max_hp;

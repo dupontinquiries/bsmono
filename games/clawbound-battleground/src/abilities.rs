@@ -36,6 +36,13 @@ pub fn cast_timing(ab: &crate::gods::AbilityDef) -> (f32, f32) {
         Archetype::Litter { .. } => (0.12, 0.8),
         Archetype::Giggle { .. } => (0.2, 0.6),
         Archetype::DanceParty { .. } => (0.4, 0.0),
+        // the step is a held breath; the other goes at a gesture; the echoes
+        // take a moment to rise
+        Archetype::Swap { .. } => (0.12, 0.0),
+        Archetype::Send { .. } => (0.1, 0.8),
+        Archetype::Echoes { .. } => (0.35, 0.0),
+        // the lamp goes up with the breath for the bellow
+        Archetype::Lantern { .. } => (0.4, 0.0),
     };
     if ab.ult && w > 0.0 {
         ((w * 1.5).max(0.45), 0.0)
@@ -343,6 +350,22 @@ impl Game {
                 let at = Vec3::new(at.x, crate::map::ground_y(at.x, at.z), at.z);
                 self.events.push(Event::StormFx { pos: at, radius, color: ab.color, dur: duration });
                 self.dance_party(gi, at, radius, duration, slow, slow_secs, ab.color);
+            }
+            Archetype::Swap { radius, dmg, slow, secs } => {
+                let d = if dmg > 0.0 { dmg_scale(dmg, ab.power_scale) } else { 0.0 };
+                self.step_between(gi, aim_flat, radius, d, slow, secs);
+            }
+            Archetype::Send { range, speed } => {
+                let to = Vec3::new(from.x, 0.0, from.z) + dir * dist.min(range);
+                self.send_other(gi, to, speed);
+            }
+            Archetype::Echoes { each, life, dmg } => {
+                let d = dmg_scale(dmg, ab.power_scale);
+                self.every_shadow(gi, each, life, d);
+            }
+            Archetype::Lantern { radius, dmg, flee, reveal } => {
+                let d = dmg_scale(dmg, ab.power_scale);
+                self.raise_the_lamp(gi, radius, d, flee, reveal);
             }
             Archetype::Blink { dist: dd, dmg } => {
                 let d = if dmg > 0.0 { dmg_scale(dmg, ab.power_scale) } else { 0.0 };

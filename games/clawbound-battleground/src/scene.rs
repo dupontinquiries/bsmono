@@ -91,6 +91,8 @@ pub struct Scene {
     /// Sproutkit's litter (his own body, drawn small), by team, and his
     /// glitter-ball.
     pub kitling: [u64; 2],
+    /// Hollowstep's body, by team, for the others of him (`stalker`).
+    pub hollow: [u64; 2],
     pub disco: u64,
     /// The sky map's drifting stone and cloud (`skydrift`), and their meshes
     /// by kind (anchor, fragment, puff) and variant.
@@ -380,6 +382,8 @@ impl Scene {
         let kit_def = ROSTER.iter().find(|d| matches!(d.pelt, crate::gods::PeltKind::Kit)).expect("Sproutkit on the roster");
         let kitling = [r.upload_mesh(&models::build_god(kit_def, Team::Blue)), r.upload_mesh(&models::build_god(kit_def, Team::Red))];
         let disco = r.upload_mesh(&models::disco_ball());
+        let hollow_def = ROSTER.iter().find(|d| matches!(d.pelt, crate::gods::PeltKind::Hollow)).expect("Hollowstep on the roster");
+        let hollow = [r.upload_mesh(&models::build_god(hollow_def, Team::Blue)), r.upload_mesh(&models::build_god(hollow_def, Team::Red))];
         let sky = crate::map::active() == crate::map::MapId::Sky;
         let drift = if sky { crate::skydrift::placements() } else { Vec::new() };
         let mut drift_mesh = [[0u64; DRIFT_VARIANTS]; 3];
@@ -434,6 +438,7 @@ impl Scene {
             wyrm_seg,
             star,
             kitling,
+            hollow,
             disco,
             drift,
             drift_mesh,
@@ -1019,6 +1024,34 @@ impl Scene {
             r.queue_draw(mesh, base, [1.0; 4], 0.0, 0.09, false);
         }
 
+        // shown up by Brasshowl's lamp (`lantern`): a small flame over the
+        // cat, bobbing, for everyone to see
+        for g in &game.gods {
+            if g.revealed_t > 0.0 && g.respawn_t <= 0.0 {
+                let p = g.pos + Vec3::Y * (2.6 + (vfx.time * 3.0).sin() * 0.08);
+                let a = g.revealed_t.min(1.0);
+                r.queue_draw(self.orb, Mat4::from_translation(p) * Mat4::from_scale(Vec3::splat(1.6)), [1.0, 0.72, 0.30, a], 2.5, 0.05, false);
+            }
+        }
+        // Hollowstep's others (`stalker`): his standing other is him, a
+        // shade darker, gliding rather than walking (it does not move its
+        // legs -- the tell, for whoever looks long enough); his echoes are
+        // his shape in smoke, see-through
+        for o in &game.others {
+            if !sphere_in_frustum(&vp, o.pos, ACTOR_CULL_R) {
+                continue;
+            }
+            let bob = (o.age * 2.1).sin() * 0.05;
+            let m = Mat4::from_translation(o.pos + Vec3::Y * bob) * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - o.yaw);
+            let mesh = self.hollow[o.team as usize];
+            if o.echo {
+                // fading in over half a second and out over the last one
+                let a = (o.age * 2.0).min(1.0) * o.life.clamp(0.0, 1.0);
+                r.queue_draw(mesh, m, [0.16, 0.17, 0.22, 0.55 * a], 0.05, models::GOD_DRAW_VOXEL, true);
+            } else {
+                r.queue_draw(mesh, m, [0.78, 0.78, 0.82, 1.0], 0.0, models::GOD_DRAW_VOXEL, false);
+            }
+        }
         // Sproutkit's litter: his own body, small, hopping as it runs
         for k in &game.kitlings {
             if !sphere_in_frustum(&vp, k.pos, ACTOR_CULL_R) {

@@ -82,6 +82,8 @@ voice note contradicts its ancestor. Seven are female, six male.
 | Stonewhisper | snow leopard | the long winters | the high crags | she |
 | Cometail | caracal | the elder dawn | the glacier-sky above the cloud sea | he |
 | Sproutkit | a kitten, of every clan | every spring | wherever something is being born | he |
+| Hollowstep | wildcat | the long nights | the fog moors | he |
+| Brasshowl | sand cat | the caravan years | the salt roads | he |
 
 **Goldenmane.** First of the lion-clan to lead a pride that was not his by
 birth. He taught that a cat alone is a whisker and a pride is a storm, and
@@ -149,6 +151,20 @@ always more of him than anyone counted. He turns every fight into a game,
 and every game into a dance -- and what dances cannot fight. Where he naps,
 the first green of the year comes up through the snow.
 
+**Hollowstep.** Nobody on the moors ever saw Hollowstep arrive. His tread
+was heard on one side of the heath and he was found on the other, and the
+clans learned to count their own shadows before they slept. He never ran
+after anything in his life; he never had to. They say another of him is
+still out on the moor tonight, walking, and that you will hear it long
+before you see it.
+
+**Brasshowl.** The smallest of the ancestors, with the biggest voice. He
+walked ahead of the caravans on the salt roads at night with a brass
+lantern, and when something moved at the edge of its light he raised the
+lamp and bellowed, and whatever it was did not come in. It is said that
+Hollowstep has never once stood in Brasshowl's light, and that the two of
+them know exactly why.
+
 ## The music of the clans
 
 For scoring and sound design: each clan's culture has a sound, and the two
@@ -173,6 +189,8 @@ side.
 | Stonewhisper | long mountain horns, singing bowls, damaru, low chant | high wind, falling scree |
 | Cometail | glass harmonica, crystal bowls, frame drum, overtone singing | the hiss of a meteor, ice cracking in the cold |
 | Sproutkit | toy piano, music box, ukulele, kazoo, handclaps, a disco beat | birdsong, a spring brook |
+| Hollowstep | bowed saw, low cello drones, a slow bass drum like a heartbeat, held breath | wind over heather, a curlew far off |
+| Brasshowl | frame drum, oud, a brass bell, clapping hands, a caravan's camel bells | desert wind, a crackling lamp |
 
 **Frostfang** colours: long horns, hardanger fiddle and nyckelharpa, kulning,
 bone flute, singing bowls, wind over ice. **Emberclaw** colours: kora,

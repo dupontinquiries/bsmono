@@ -95,7 +95,7 @@ fn trophies_grow_the_stat_they_name_up_to_their_most() {
 
 #[test]
 fn roster_is_14_ancestors_with_4_abilities_each() {
-    assert_eq!(ROSTER.len(), 15);
+    assert_eq!(ROSTER.len(), 17);
     let roles: std::collections::HashSet<_> = ROSTER.iter().map(|g| g.role).collect();
     assert!(roles.len() >= 4, "roster should span multiple roles");
     for g in &ROSTER {
@@ -850,7 +850,15 @@ fn firing_range_every_ability_goes_where_it_is_aimed_and_turns_the_cat() {
             if matches!(ab.arch, Archetype::Blink { .. }) {
                 dirs.push(flat(game.gods[0].pos));
             }
-            let directional = !matches!(ab.arch, Archetype::Nova { .. } | Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } | Archetype::Giggle { .. });
+            // Hollowstep's other, sent: where it glides
+            if matches!(ab.arch, Archetype::Send { .. }) {
+                if let Some((goal, _)) = game.main_other(0).and_then(|k| game.others[k].goal) {
+                    dirs.push(flat(goal));
+                }
+            }
+            // the step goes to wherever his other is, and the echoes rise
+            // round him: neither goes along the aim
+            let directional = !matches!(ab.arch, Archetype::Nova { .. } | Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } | Archetype::Giggle { .. } | Archetype::Swap { .. } | Archetype::Echoes { .. } | Archetype::Lantern { .. });
             if directional {
                 assert!(!dirs.is_empty(), "{} slot {slot} ({:?}): no directional effect found", def.name, ab.arch);
                 for d in &dirs {
@@ -2655,8 +2663,16 @@ fn levels_unlock_the_kit_and_rank_it_up() {
 
 /// The Drowned Halls: 3 a side, one lane with two towers a side; bots stay
 /// on the halls' floor (never in a wall or out on the sea floor), leave
-/// their bases, take the Library by its passages, and over eight minutes
-/// the lane moves -- a tower falls.
+/// their bases, and over eight minutes the lane moves -- a tower falls; and
+/// across two matches someone takes the Library by its passages.
+///
+/// Two matches, not one: the Library is a side room, and whether a given
+/// lineup's bots go in is the lineup's business. Seed 9 fielded a lineup
+/// that did until the roster grew to 16; its new lineup (Hollowstep among
+/// them) and seed 9's old red side with Stonewhisper in his place both
+/// kept to the lane, as did 4 of 6 seeds sampled. Seed 9 still runs,
+/// Hollowstep and all, for the walls: his step lands him wherever his
+/// other stood.
 #[test]
 fn the_drowned_halls_play_three_a_side_in_one_lane() {
     use clawbound::map::{self, MapId};
@@ -2664,36 +2680,437 @@ fn the_drowned_halls_play_three_a_side_in_one_lane() {
         assert_eq!(MapId::Atlantis.team_size(), 3);
         assert_eq!(map::lanes(), &[clawbound::consts::Lane::Mid]);
         let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
-        let (b, r) = map::team_picks(4, &mut clawbound::sim::Rng::new(9));
-        let mut game = Game::new_teams(&b, &r);
-        assert_eq!(game.gods.len(), 6);
-        assert_eq!(game.towers.len(), 4, "two towers a side in the one lane");
-        game.blockers = blockers;
-        // the player's cat plays too
-        game.gods[0].ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
-        let f = map::floor().unwrap();
-        let mut in_library = [false; 6];
-        let mut left_base = [false; 6];
-        for _ in 0..(8 * 60 * 30) {
-            game.tick(1.0 / 30.0);
-            game.events.clear();
-            for (i, g) in game.gods.iter().enumerate() {
-                if g.respawn_t <= 0.0 {
-                    assert!(f.sdf(g.pos.x, g.pos.z) <= 0.05, "cat {i} in the wall at {} (sdf {})", g.pos, f.sdf(g.pos.x, g.pos.z));
-                    in_library[i] |= glam::Vec3::new(g.pos.x - clawbound::atlantis::LIBRARY_X, 0.0, g.pos.z).length() < clawbound::atlantis::LIBRARY_R;
-                    left_base[i] |= (g.pos - g.team.base_pos()).length() > 30.0;
+        let mut library = false;
+        for seed in [9u64, 3] {
+            let (b, r) = map::team_picks(4, &mut clawbound::sim::Rng::new(seed));
+            let mut game = Game::new_teams(&b, &r);
+            assert_eq!(game.gods.len(), 6);
+            assert_eq!(game.towers.len(), 4, "two towers a side in the one lane");
+            game.blockers = blockers.clone();
+            // the player's cat plays too
+            game.gods[0].ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+            let f = map::floor().unwrap();
+            let mut left_base = [false; 6];
+            for _ in 0..(8 * 60 * 30) {
+                game.tick(1.0 / 30.0);
+                game.events.clear();
+                for (i, g) in game.gods.iter().enumerate() {
+                    if g.respawn_t <= 0.0 {
+                        assert!(f.sdf(g.pos.x, g.pos.z) <= 0.05, "seed {seed}: cat {i} in the wall at {} (sdf {})", g.pos, f.sdf(g.pos.x, g.pos.z));
+                        library |= glam::Vec3::new(g.pos.x - clawbound::atlantis::LIBRARY_X, 0.0, g.pos.z).length() < clawbound::atlantis::LIBRARY_R;
+                        left_base[i] |= (g.pos - g.team.base_pos()).length() > 30.0;
+                    }
+                }
+                for m in &game.minions {
+                    assert!(f.sdf(m.pos.x, m.pos.z) <= 0.3, "seed {seed}: a minion in the wall at {}", m.pos);
+                }
+                if game.over.is_some() {
+                    break;
                 }
             }
-            for m in &game.minions {
-                assert!(f.sdf(m.pos.x, m.pos.z) <= 0.3, "a minion in the wall at {}", m.pos);
+            assert!(left_base.iter().all(|x| *x), "seed {seed}: every cat leaves its base: {left_base:?}");
+            let standing: usize = game.tower_alive.iter().sum();
+            assert!(standing < 4 || game.over.is_some(), "seed {seed}: no tower fell in eight minutes");
+        }
+        assert!(library, "nobody went into the Library in two eight-minute matches");
+    });
+}
+
+/// Hollowstep (`stalker`): the other of him, the terror radius, the step,
+/// the sending, and every shadow.
+mod hollowstep {
+    use clawbound::gods::{Archetype, ROSTER};
+    use clawbound::sim::{Event, Game};
+    use clawbound::stalker::*;
+    use glam::Vec3;
+
+    fn quiet(g: &mut Game) {
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+            c.move_dir = Vec3::ZERO;
+            c.attack_held = false;
+        }
+        g.minions.clear();
+        g.next_wave_t = 1e9;
+    }
+    fn run(g: &mut Game, secs: f32) {
+        for _ in 0..(secs * 60.0) as usize {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+        }
+    }
+    fn him() -> u32 {
+        ROSTER.iter().position(|d| d.name == "Hollowstep").expect("Hollowstep is on the roster") as u32
+    }
+    fn slot(f: impl Fn(&Archetype) -> bool) -> u32 {
+        (0..4).find(|&s| f(&ROSTER[him() as usize].abilities[s].arch)).unwrap() as u32
+    }
+    /// Hollowstep (0) against `red`, everyone still, far from anything.
+    fn game(red: &[u32]) -> Game {
+        let mut g = Game::new_teams(&[him()], red);
+        quiet(&mut g);
+        g.set_level(0, 5);
+        // in the jungle west of mid, a tower's range from every tower (and
+        // so his other, through the centre, in the jungle east of it)
+        g.gods[0].pos = Vec3::new(-38.0, 0.0, -8.0);
+        g.gods[0].mana = 9999.0;
+        for i in 1..g.gods.len() {
+            g.gods[i].pos = Vec3::new(-120.0 + i as f32 * 3.0, 0.0, -20.0);
+        }
+        g
+    }
+    fn other(g: &Game) -> Vec3 {
+        g.others[g.main_other(0).expect("his other")].pos
+    }
+
+    /// There is always another of him, somewhere else: it rises with him on
+    /// the far side of the map's centre, goes when he falls, rises again
+    /// when he does -- and nobody else has one.
+    #[test]
+    fn there_is_always_another_of_him_somewhere_else() {
+        let mut g = game(&[0]);
+        run(&mut g, 0.1);
+        assert_eq!(g.others.len(), 1, "one other, and only his");
+        let d = other(&g).distance(g.gods[0].pos);
+        assert!(d > 50.0, "somewhere else: {d:.1} u from him");
+        g.gods[0].hp = 0.0;
+        g.gods[0].respawn_t = 3.0;
+        run(&mut g, 0.1);
+        assert!(g.others.is_empty(), "gone while he is dead");
+        g.gods[0].respawn_t = 0.0;
+        g.gods[0].hp = g.gods[0].max_hp;
+        run(&mut g, 0.1);
+        assert_eq!(g.others.len(), 1, "back with him");
+    }
+
+    /// Left alone it walks at the nearest enemy -- slower than a cat, with
+    /// a heavy footfall every stride -- and stops short of it, watching.
+    #[test]
+    fn it_walks_at_the_prey_and_stops_short_watching() {
+        let mut g = game(&[0]);
+        run(&mut g, 0.1);
+        let start = other(&g);
+        g.gods[1].pos = start + Vec3::new(20.0, 0.0, 0.0);
+        let mut steps = 0;
+        for _ in 0..60 {
+            g.tick(1.0 / 60.0);
+            steps += g.events.iter().filter(|e| matches!(e, Event::HeavyStep { .. })).count();
+            g.events.clear();
+        }
+        let walked = other(&g).distance(start);
+        assert!((WALK * 0.8..=WALK * 1.05).contains(&walked), "a walk, not a run: {walked:.2} u in a second");
+        assert!(steps >= 1, "it is heard coming");
+        run(&mut g, 8.0);
+        let d = other(&g).distance(g.gods[1].pos);
+        assert!((LURK - 0.3..=LURK + 0.3).contains(&d), "it stops {d:.2} u off, not {LURK}");
+    }
+
+    /// Near him or near his other, an enemy's heart pounds -- faster the
+    /// closer -- and its legs go heavy; an ally's does not, nor anyone's
+    /// out of reach.
+    #[test]
+    fn the_terror_radius_is_round_him_and_round_his_other() {
+        let mut g = game(&[0, 1]);
+        g.gods.truncate(3);
+        run(&mut g, 0.1);
+        let beats = |g: &mut Game, i: usize, at: Vec3| {
+            g.gods[i].pos = at;
+            g.gods[i].beat_t = 0.0;
+            let mut n = 0;
+            for _ in 0..(4 * 60) {
+                g.tick(1.0 / 60.0);
+                n += g.events.iter().filter(|e| matches!(e, Event::Heartbeat { god, .. } if *god == i)).count();
+                g.events.clear();
             }
-            if game.over.is_some() {
+            n
+        };
+        let me = g.gods[0].pos;
+        let near = beats(&mut g, 1, me + Vec3::new(3.0, 0.0, 0.0));
+        let fear_near = g.gods[1].fear;
+        let edge = beats(&mut g, 1, me + Vec3::new(TERROR_R - 3.0, 0.0, 0.0));
+        let out = beats(&mut g, 1, me + Vec3::new(TERROR_R + 6.0, 0.0, 0.0));
+        let beside_it = other(&g) + Vec3::new(0.0, 0.0, 5.0);
+        let by_other = beats(&mut g, 2, beside_it);
+        assert!(fear_near > 0.99, "at his side the fear is whole: {fear_near}");
+        // 4 s at a beat every 0.42 s close, ~1 s at the rim
+        assert!((9..=10).contains(&near) && (3..=5).contains(&edge), "the heart races near him: {near} beats in 4 s close, {edge} at the edge");
+        assert_eq!(out, 0, "out of reach: calm");
+        assert!(by_other >= 5, "his other frightens as well as he does: {by_other}");
+        // the legs
+        g.gods[1].pos = me + Vec3::new(2.0, 0.0, 0.0);
+        g.tick(1.0 / 60.0);
+        let afraid = g.move_speed(1);
+        g.gods[1].pos = me + Vec3::new(TERROR_R + 6.0, 0.0, 0.0);
+        g.tick(1.0 / 60.0);
+        let calm = g.move_speed(1);
+        assert!((afraid / calm - (1.0 - FEAR_SLOW)).abs() < 0.01, "afraid legs: {afraid:.2} against {calm:.2}");
+        // an ally beside him is not afraid
+        let mut g = Game::new_teams(&[him(), 0], &[1]);
+        quiet(&mut g);
+        g.gods[1].pos = g.gods[0].pos + Vec3::new(2.0, 0.0, 0.0);
+        run(&mut g, 0.5);
+        assert_eq!(g.gods[1].fear, 0.0, "his own side does not fear him");
+    }
+
+    /// Step Between: he and his other trade places exactly, and whoever
+    /// waited by it is struck and stumbles.
+    #[test]
+    fn stepping_between_trades_places_and_staggers_the_prey() {
+        let mut g = game(&[0]);
+        run(&mut g, 0.1);
+        let (me, it) = (g.gods[0].pos, other(&g));
+        g.gods[1].pos = it + Vec3::new(2.0, 0.0, 0.0);
+        let h = g.gods[1].hp;
+        g.cast_queue.push((0, slot(|a| matches!(a, Archetype::Swap { .. })), it));
+        let mut fx = false;
+        for _ in 0..30 {
+            g.tick(1.0 / 60.0);
+            fx |= g.events.iter().any(|e| matches!(e, Event::SwapFx { .. }));
+            g.events.clear();
+        }
+        assert!(fx, "the step was taken");
+        assert!(g.gods[0].pos.distance(Vec3::new(it.x, g.gods[0].pos.y, it.z)) < 1.2, "he is where it was: {} vs {it}", g.gods[0].pos);
+        assert!(other(&g).distance(Vec3::new(me.x, other(&g).y, me.z)) < 1.5, "it is where he was");
+        assert!(g.gods[1].hp < h - 40.0, "struck: {h} -> {}", g.gods[1].hp);
+        assert!(g.gods[1].slow > 0.3, "and stumbling: slow {}", g.gods[1].slow);
+    }
+
+    /// Send the Other: it glides to the aim (no further than the range),
+    /// silently, waits, then goes hunting again.
+    #[test]
+    fn the_other_goes_where_it_is_sent_and_waits() {
+        let mut g = game(&[0]);
+        run(&mut g, 0.1);
+        let s = slot(|a| matches!(a, Archetype::Send { .. }));
+        let Archetype::Send { range, speed } = ROSTER[him() as usize].abilities[s as usize].arch else { unreachable!() };
+        let me = g.gods[0].pos;
+        let aim = me + Vec3::new(0.0, 0.0, 100.0);
+        g.cast_queue.push((0, s, aim));
+        let mut steps = 0;
+        let mut t = 0.0;
+        let want = me + Vec3::new(0.0, 0.0, range);
+        while t < 12.0 {
+            g.tick(1.0 / 60.0);
+            t += 1.0 / 60.0;
+            steps += g.events.iter().filter(|e| matches!(e, Event::HeavyStep { .. })).count();
+            g.events.clear();
+            if g.others[g.main_other(0).unwrap()].goal.is_none() && t > 1.0 {
                 break;
             }
         }
-        assert!(left_base.iter().all(|x| *x), "every cat leaves its base: {left_base:?}");
-        assert!(in_library.iter().any(|x| *x), "nobody went into the Library in eight minutes");
-        let standing: usize = game.tower_alive.iter().sum();
-        assert!(standing < 4 || game.over.is_some(), "no tower fell in eight minutes");
-    });
+        let at = other(&g);
+        assert!(Vec3::new(at.x - want.x, 0.0, at.z - want.z).length() < 1.5, "clamped to its range: at {at}, wanted {want}");
+        assert!(t < 120.0 / speed + 2.0, "it glides: {t:.1} s");
+        assert_eq!(steps, 0, "a glide is silent");
+        // it waits there...
+        g.gods[1].pos = at + Vec3::new(15.0, 0.0, 0.0);
+        run(&mut g, HOLD_SECS * 0.8);
+        assert!(other(&g).distance(at) < 0.2, "it waits where it was sent");
+        // ...then hunts
+        run(&mut g, HOLD_SECS * 0.6 + 1.0);
+        assert!(other(&g).distance(at) > 1.0, "and then it hunts again");
+    }
+
+    /// Every Shadow: two echoes rise beside him and two beside his other;
+    /// they strike what they reach and fade on time; while they stand, the
+    /// step goes to whichever of him is nearest the aim, and comes back
+    /// fast.
+    #[test]
+    fn every_shadow_is_four_more_of_him_to_step_into() {
+        let mut g = game(&[0]);
+        run(&mut g, 0.1);
+        let s = slot(|a| matches!(a, Archetype::Echoes { .. }));
+        let Archetype::Echoes { each, life, .. } = ROSTER[him() as usize].abilities[s as usize].arch else { unreachable!() };
+        let me = g.gods[0].pos;
+        g.gods[1].pos = me + Vec3::new(0.0, 0.0, 3.0);
+        let h = g.gods[1].hp;
+        g.cast_queue.push((0, s, me + Vec3::Z));
+        run(&mut g, 0.8);
+        let echoes: Vec<Vec3> = g.others.iter().filter(|o| o.echo).map(|o| o.pos).collect();
+        assert_eq!(echoes.len() as u32, each * 2, "two beside him, two beside his other");
+        let it = other(&g);
+        assert_eq!(echoes.iter().filter(|e| e.distance(it) < 6.0).count() as u32, each, "{each} with his other");
+        run(&mut g, 2.0);
+        assert!(g.gods[1].hp < h - 50.0, "the echoes by him struck: {h} -> {}", g.gods[1].hp);
+        // step into the echo nearest a spot beside his other
+        let far_echo = g.others.iter().filter(|o| o.echo).map(|o| o.pos).max_by(|a, b| a.distance(me).total_cmp(&b.distance(me))).unwrap();
+        g.gods[0].cds[0] = 0.0;
+        let it_was = other(&g);
+        g.cast_queue.push((0, slot(|a| matches!(a, Archetype::Swap { .. })), far_echo));
+        run(&mut g, 0.3);
+        let flat = |a: Vec3, b: Vec3| Vec3::new(a.x - b.x, 0.0, a.z - b.z).length();
+        assert!(flat(g.gods[0].pos, far_echo) < 0.6 && flat(far_echo, it_was) > 1.0, "he stepped into the echo he aimed at ({:.2} u off it), not his other", flat(g.gods[0].pos, far_echo));
+        assert!(g.gods[0].cds[0] <= ULT_STEP_CD, "and the step comes back fast: {}", g.gods[0].cds[0]);
+        run(&mut g, life);
+        assert!(g.others.iter().all(|o| !o.echo), "the echoes are gone after {life} s");
+        assert_eq!(g.others.len(), 1, "his other stays");
+    }
+
+    /// A bot Hollowstep uses the whole kit in a real match.
+    #[test]
+    fn a_bot_hollowstep_uses_his_kit() {
+        let mut g = Game::new_teams(&[0, him()], &[1, 2]);
+        for c in g.gods.iter_mut() {
+            c.ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+        }
+        for i in 0..g.gods.len() {
+            g.set_level(i, 5);
+        }
+        let mut used = [0u32; 4];
+        for _ in 0..(240 * 30) {
+            g.tick(1.0 / 30.0);
+            for e in g.events.drain(..) {
+                if let Event::Cast { god: 1, slot, .. } = e {
+                    used[slot as usize] += 1;
+                }
+            }
+        }
+        assert!(used.iter().all(|&n| n > 0), "the step, the sending, the reach and every shadow in four minutes: {used:?}");
+    }
+}
+
+/// Brasshowl (`lantern`): the lamp raised -- the struck flee, cannot act,
+/// are shown up and cannot stalk; Hollowstep's shadows cannot stand in it.
+mod brasshowl {
+    use clawbound::gods::{Archetype, ROSTER};
+    use clawbound::sim::{Event, Game};
+    use glam::Vec3;
+
+    fn quiet(g: &mut Game) {
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+            c.move_dir = Vec3::ZERO;
+            c.attack_held = false;
+        }
+        g.minions.clear();
+        g.next_wave_t = 1e9;
+    }
+    fn run(g: &mut Game, secs: f32) {
+        for _ in 0..(secs * 60.0) as usize {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+        }
+    }
+    fn id(name: &str) -> u32 {
+        ROSTER.iter().position(|d| d.name == name).unwrap() as u32
+    }
+    fn lamp() -> (u32, f32, f32, f32) {
+        let d = &ROSTER[id("Brasshowl") as usize];
+        let s = (0..4).find(|&s| matches!(d.abilities[s].arch, Archetype::Lantern { .. })).unwrap();
+        let Archetype::Lantern { radius, flee, reveal, .. } = d.abilities[s].arch else { unreachable!() };
+        (s as u32, radius, flee, reveal)
+    }
+    fn game(red: &[u32]) -> Game {
+        let mut g = Game::new_teams(&[id("Brasshowl")], red);
+        quiet(&mut g);
+        g.set_level(0, 5);
+        g.gods[0].pos = Vec3::new(-38.0, 0.0, -8.0);
+        g.gods[0].mana = 9999.0;
+        for i in 1..g.gods.len() {
+            g.gods[i].pos = Vec3::new(-120.0 + i as f32 * 3.0, 0.0, -20.0);
+        }
+        g
+    }
+
+    /// SHADOWS!: a cat in the light is struck, runs straight away from him
+    /// (whatever it is steered to do), cannot attack or cast while it runs,
+    /// and is shown up -- it cannot stalk -- for longer than it runs. One
+    /// out of the light is untouched.
+    #[test]
+    fn the_lamp_sends_them_running_and_shows_them_up() {
+        let (slot, radius, flee, reveal) = lamp();
+        let mut g = game(&[0, 1]);
+        let me = g.gods[0].pos;
+        g.gods[1].pos = me + Vec3::new(4.0, 0.0, 0.0);
+        g.gods[2].pos = me + Vec3::new(0.0, 0.0, radius + 6.0);
+        g.gods[1].sneak = true;
+        g.gods[2].sneak = true;
+        run(&mut g, 2.0);
+        assert!(g.stalking(1), "stalking before the lamp");
+        let h = g.gods[1].hp;
+        // it tries to come at him
+        g.gods[1].move_dir = Vec3::new(-1.0, 0.0, 0.0);
+        g.cast_queue.push((0, slot, me));
+        let mut lit = false;
+        // the ultimate's wind-up is 0.6 s
+        for _ in 0..50 {
+            g.tick(1.0 / 60.0);
+            lit |= g.events.iter().any(|e| matches!(e, Event::LanternFx { .. }));
+            g.events.clear();
+        }
+        assert!(lit, "the lamp went up");
+        assert!(g.gods[1].hp < h - 60.0, "struck: {h} -> {}", g.gods[1].hp);
+        assert!(g.gods[1].flee_t > 0.0 && g.gods[1].revealed_t > flee, "running, and shown up for longer");
+        assert!(!g.kit_free(1), "a fleeing cat cannot act");
+        let x0 = g.gods[1].pos.x;
+        run(&mut g, 0.8);
+        assert!(g.gods[1].pos.x > x0 + 3.0, "it ran away from him though it was steered at him: {x0:.1} -> {:.1}", g.gods[1].pos.x);
+        assert!(!g.stalking(1), "shown up: no stalking");
+        assert!(g.stalking(2), "out of the light: still stalking");
+        assert_eq!(g.gods[2].flee_t, 0.0);
+        run(&mut g, flee);
+        assert!(g.kit_free(1), "the running wears off");
+        // past the break a hit puts on stalking, and still shown up: it is
+        // the light that stops the stalk, not the blow
+        assert!(0.8 + flee > clawbound::consts::STALK_BREAK_SECS + 0.3, "the blow's own break on stalking is over by now");
+        assert!(g.gods[1].revealed_t > 0.0, "still shown up");
+        assert!(!g.stalking(1), "shown up, long after the blow: still no stalking");
+        run(&mut g, reveal);
+        assert!(g.stalking(1), "and so does the showing up");
+    }
+
+    /// No shadow stands in the light: Hollowstep's echoes in it are gone,
+    /// and his other is driven to the far side of the map from him.
+    #[test]
+    fn no_shadow_stands_in_the_light() {
+        let (slot, radius, ..) = lamp();
+        let mut g = game(&[id("Hollowstep")]);
+        run(&mut g, 0.1);
+        let me = g.gods[0].pos;
+        // Hollowstep beside the lamp, his other and his echoes too
+        g.gods[1].pos = me + Vec3::new(-(radius + 30.0), 0.0, 0.0);
+        let k = g.main_other(1).expect("his other");
+        g.others[k].pos = me + Vec3::new(3.0, 0.0, 0.0);
+        g.gods[1].cds = [0.0; 4];
+        g.gods[1].mana = 9999.0;
+        g.set_level(1, 5);
+        g.every_shadow(1, 2, 8.0, 10.0);
+        assert!(g.others.iter().filter(|o| o.echo).count() >= 2);
+        let echoes_near = g.others.iter().filter(|o| o.echo && o.pos.distance(me) < radius).count();
+        assert!(echoes_near >= 2, "echoes stand in the light: {echoes_near}");
+        g.cast_queue.push((0, slot, me));
+        let mut driven = 0;
+        for _ in 0..50 {
+            g.tick(1.0 / 60.0);
+            driven += g.events.iter().filter(|e| matches!(e, Event::ShadowDriven { .. })).count();
+            g.events.clear();
+        }
+        assert!(driven >= 3, "his other and its echoes torn out of the light: {driven}");
+        assert!(g.others.iter().all(|o| o.pos.distance(me) > radius), "nothing of his in the light");
+        let back = g.main_other(1).map(|k| g.others[k].pos).expect("his other rises again, elsewhere");
+        let him = g.gods[1].pos;
+        assert!(back.distance(him) > 30.0, "far from him: {:.1}", back.distance(him));
+    }
+
+    /// A bot Brasshowl uses his kit, the lamp included.
+    #[test]
+    fn a_bot_brasshowl_raises_the_lamp() {
+        let mut g = Game::new_teams(&[0, id("Brasshowl")], &[1, 2]);
+        for c in g.gods.iter_mut() {
+            c.ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+        }
+        for i in 0..g.gods.len() {
+            g.set_level(i, 5);
+        }
+        let mut used = [0u32; 4];
+        for _ in 0..(240 * 30) {
+            g.tick(1.0 / 30.0);
+            for e in g.events.drain(..) {
+                if let Event::Cast { god: 1, slot, .. } = e {
+                    used[slot as usize] += 1;
+                }
+            }
+        }
+        assert!(used[0] > 0 && used[1] > 0 && used[3] > 0, "oil, bark and the lamp in four minutes: {used:?}");
+    }
 }

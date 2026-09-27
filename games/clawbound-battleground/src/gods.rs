@@ -95,6 +95,25 @@ pub enum Archetype {
     /// dances (no attacks, no casts, a shuffle), and when the music stops
     /// for it, it drags its paws -- `slow` for `slow_secs` (`kit`).
     DanceParty { radius: f32, duration: f32, slow: f32, slow_secs: f32 },
+    /// Hollowstep's step: trade places with his other -- or, while his
+    /// echoes stand, with whichever of them is nearest the aim. Enemies
+    /// within `radius` of where he arrives are struck (`dmg`) and slowed
+    /// (`slow`, `secs`) (`stalker`).
+    Swap { radius: f32, dmg: f32, slow: f32, secs: f32 },
+    /// Send his other gliding to the aim (within `range` of him) at
+    /// `speed`; there it waits a while before it goes hunting again.
+    Send { range: f32, speed: f32 },
+    /// Every shadow: `each` echoes rise beside him and `each` beside his
+    /// other, for `life` seconds. Each hunts the nearest enemy close by
+    /// and strikes it (`dmg`) when it is within reach, and he can step into
+    /// any of them (`stalker`).
+    Echoes { each: u32, life: f32, dmg: f32 },
+    /// Brasshowl's lamp, raised with a bellow: every enemy within `radius`
+    /// is struck (`dmg`), flees from him for `flee` seconds (no attacks, no
+    /// casts, running away), and is shown up for `reveal` seconds (seen
+    /// through cloud, no stalking); any shadow of Hollowstep's in the light
+    /// is driven off to the far side of the map (`lantern`).
+    Lantern { radius: f32, dmg: f32, flee: f32, reveal: f32 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -118,7 +137,9 @@ impl AbilityDef {
     /// direction" is the whole aim — never a substitute for precise casts,
     /// and never an ultimate (see touch.rs's drag-to-aim, which uses this).
     pub fn quick_aimable(&self) -> bool {
-        !self.ult && matches!(self.arch, Archetype::Dash { .. } | Archetype::Blink { .. })
+        // (Hollowstep's step goes to whichever of him is nearest the aim:
+        // a drag picks which)
+        !self.ult && matches!(self.arch, Archetype::Dash { .. } | Archetype::Blink { .. } | Archetype::Swap { .. })
     }
 }
 
@@ -177,6 +198,8 @@ pub enum PeltKind {
     Crag,      // Stonewhisper — thick grey pelt, no markings
     Comet,     // Cometail — night-blue, starred back, a tail that streams light
     Kit,       // Sproutkit — a kitten: round head, huge eyes, a sprout on the brow
+    Hollow,    // Hollowstep — gaunt ash-grey, a dark hood of fur over the eyes, notched ears
+    Lamp,      // Brasshowl — a sand cat: pale, broad low ears, a brass lantern at the breast
 }
 
 /// Each level's growth in base stats, as a multiple of the per-level
@@ -212,7 +235,7 @@ const fn ab(
     AbilityDef { name, desc, arch, cooldown: cd, cost, color, key, ult, power_scale: scale }
 }
 
-pub const ROSTER_LEN: usize = 15;
+pub const ROSTER_LEN: usize = 17;
 
 pub const ROSTER: [GodDef; ROSTER_LEN] = [
     // ── GOLDENMANE — the lion-clan of legend ──
@@ -468,6 +491,45 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
             ab("Giggle Fit", "His laugh is catching: everyone near collapses into giggles -- they cannot strike or cast, and their paws go where they please.", Archetype::Giggle { radius: 7.0, dmg: 60.0, secs: 1.8 }, 14.0, 80.0, [1.00, 0.60, 0.85], 1, false, 0.35),
             ab("First Spring", "The green of the first spring: for a moment he and his friends are young again, and wounds close.", Archetype::Heal { amount: 150.0, radius: 9.0 }, 12.0, 75.0, [0.55, 0.95, 0.50], 2, false, 0.50),
             ab("Dance Party", "A glitter-ball rises over the fight and nobody can help it: every enemy under it dances, and long after the music stops they drag their paws.", Archetype::DanceParty { radius: 9.0, duration: 5.0, slow: 0.45, slow_secs: 6.0 }, 90.0, 140.0, [0.85, 0.55, 1.00], 3, true, 0.0),
+        ],
+    },
+    // ── HOLLOWSTEP — the stalker of the fog moors, who is always already there ──
+    // Never runs. There is always another of him somewhere else on the map
+    // (`stalker`), and near either one the prey's heart starts to pound.
+    GodDef {
+        id: 15, name: "Hollowstep", title: "the stalker of the fog moors, who is always already there",
+        philosophy: "Run if you like. I am already where you are going.",
+        role: Role::Assassin, auto: AutoKind::Melee, dmg_type: DmgType::Physical,
+        palette: [[0.44, 0.44, 0.46], [0.09, 0.09, 0.11], [0.60, 0.60, 0.62], [0.80, 0.88, 0.95]],
+        weapon: WeaponKind::None, pelt: PeltKind::Hollow,
+        hp: 610.0, hp_growth: 98.0, mana: 300.0, mana_growth: 32.0,
+        auto_dmg: 58.0, auto_growth: 4.3, power: 8.0, power_growth: 2.4,
+        protection: 20.0, prot_growth: 2.2, move_speed: 11.6, auto_range: 3.4, auto_cd: 1.05,
+        abilities: [
+            ab("Step Between", "He is where his other was, and his other where he stood. Whoever waited by it is struck and stumbles.", Archetype::Swap { radius: 4.0, dmg: 70.0, slow: 0.4, secs: 1.0 }, 10.0, 60.0, [0.55, 0.60, 0.72], 0, false, 0.40),
+            ab("Send the Other", "His other goes where he points, without a sound, and waits there.", Archetype::Send { range: 36.0, speed: 20.0 }, 14.0, 50.0, [0.30, 0.32, 0.42], 1, false, 0.0),
+            ab("The Long Reach", "An arm longer than it has any right to be, out of the fog.", Archetype::Beam { length: 6.0, width: 3.4, dmg: 140.0 }, 8.0, 65.0, [0.70, 0.74, 0.84], 2, false, 0.60),
+            ab("Every Shadow", "For a few breaths there are six of him -- three here, three with his other -- and every one is hunting. He can step into any of them.", Archetype::Echoes { each: 2, life: 8.0, dmg: 45.0 }, 85.0, 130.0, [0.40, 0.45, 0.62], 3, true, 0.30),
+        ],
+    },
+    // ── BRASSHOWL — the lamp-keeper of the salt roads ──
+    // The smallest of the ancestors with the biggest voice: a sand cat who
+    // walked the caravans' night roads with a brass lantern, and whose
+    // bellow drove back whatever waited outside its light (`lantern`).
+    GodDef {
+        id: 16, name: "Brasshowl", title: "the lamp-keeper of the salt roads, whose bellow drives back the dark",
+        philosophy: "Keep to the light. I will deal with what is outside it.",
+        role: Role::Guardian, auto: AutoKind::Melee, dmg_type: DmgType::Magical,
+        palette: [[0.86, 0.74, 0.54], [0.52, 0.40, 0.26], [0.97, 0.92, 0.82], [1.00, 0.70, 0.25]],
+        weapon: WeaponKind::None, pelt: PeltKind::Lamp,
+        hp: 680.0, hp_growth: 108.0, mana: 320.0, mana_growth: 36.0,
+        auto_dmg: 44.0, auto_growth: 3.3, power: 10.0, power_growth: 2.8,
+        protection: 28.0, prot_growth: 3.1, move_speed: 12.3, auto_range: 3.4, auto_cd: 1.0,
+        abilities: [
+            ab("Lamp Oil", "A splash of the lantern's oil, alight: the ground where it lands burns.", Archetype::Lob { radius: 4.0, dmg: 95.0 }, 7.0, 60.0, [1.00, 0.62, 0.20], 0, false, 0.55),
+            ab("Bark", "The sand cat's bark, far too big for him: everything near staggers back, slowed.", Archetype::Nova { radius: 5.5, dmg: 70.0, slow: 0.35 }, 9.0, 55.0, [0.95, 0.80, 0.45], 1, false, 0.40),
+            ab("Watchfire", "He sets the lamp down beside a friend: its warmth turns blows aside.", Archetype::Shield { amount: 220.0, duration: 5.0 }, 14.0, 70.0, [1.00, 0.78, 0.40], 2, false, 0.40),
+            ab("SHADOWS!", "He raises the lamp and bellows: everything in its light is struck, runs from him, and is shown up for all to see -- and no shadow can stand in it.", Archetype::Lantern { radius: 13.0, dmg: 130.0, flee: 1.6, reveal: 6.0 }, 80.0, 120.0, [1.00, 0.85, 0.50], 3, true, 0.50),
         ],
     },
 ];

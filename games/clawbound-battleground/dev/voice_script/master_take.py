@@ -165,6 +165,19 @@ CHAINS = {
                "chorus=0.7:0.9:18|29:0.25|0.2:0.6|0.9:1.5|1.8,"
                "acompressor=threshold=-24dB:ratio=3:attack=5:release=90:makeup=2,"
                "aecho=0.8:0.35:28|52:0.10|0.06",
+ # the stalker of the fog moors: down with the formants (a bigger, older
+ # throat), dark, very close and dry -- a small dead room, no hall: he is
+ # right beside you
+ 'hollowstep': "rubberband=pitch=0.9:formant=shifted:pitchq=quality,"
+               "equalizer=f=140:t=q:w=1:g=3,equalizer=f=3000:t=q:w=1.4:g=-2,lowpass=f=7000,"
+               "acompressor=threshold=-28dB:ratio=3:attack=10:release=180:makeup=3,"
+               "aecho=0.8:0.35:14|27:0.10|0.05",
+ # the lamp-keeper of the salt roads: a big warm voice out in the open
+ # desert night -- warmth low down, a little presence, a long slap back
+ # off the dunes; no pitch shift (the voice is already the size it is)
+ 'brasshowl':  "equalizer=f=180:t=q:w=1:g=2,equalizer=f=2600:t=q:w=1.2:g=1.5,"
+               "acompressor=threshold=-22dB:ratio=3:attack=8:release=160:makeup=2,"
+               "aecho=0.8:0.5:130|260:0.16|0.08",
  # a young daredevil: bright and quick, a short slap
  'cometail':   "rubberband=pitch=1.04:tempo=1.03:formant=preserved:pitchq=quality,"
                "highpass=f=120,treble=g=4:f=6000,"
@@ -241,7 +254,14 @@ def sproutkit_post(y, key):
     return y.astype(np.float32)
 
 
-POST = {'twofang': lambda y, key: viper(y), 'sproutkit': sproutkit_post}
+def hollowstep_post(y, key):
+    # the phantom (phantom.py): a reversed echo swelling into the words,
+    # detuned doubles a sixth-tone either side, a faint tritone under
+    import phantom
+    return phantom.post(y, key)
+
+
+POST = {'twofang': lambda y, key: viper(y), 'sproutkit': sproutkit_post, 'hollowstep': hollowstep_post}
 
 # The god and the beast under each voice, laid in BEFORE the chain so the
 # chain's pitch, EQ, compression and room glue them to the voice (beast.py).
@@ -388,6 +408,14 @@ def cometail_layers(c, key):
     return y.astype(np.float32)
 
 
+def hollowstep_layers(c, key):
+    # a stalker: the words breathed as much as spoken (a whispered double
+    # under the voice), and a shadow an octave down that swells only on the
+    # ultimate's roar
+    shadow = B.at(-15, B.octave(c, 0.5), c) * (0.4 + 1.2 * B.loud_gate(c, 10) ** 2)
+    return (c + _breath(c, 900, 7500, -11, 33) + shadow).astype(np.float32)
+
+
 def sproutkit_layers(c, key):
     # a kitten: a soft purr under every word (the real baby's squeals, coos
     # and babble go in after the chain: sproutkit_post)
@@ -398,7 +426,8 @@ def sproutkit_layers(c, key):
 PRE = {'sproutkit': sproutkit_layers, 'goldenmane': goldenmane_layers, 'oldroar': oldroar_layers, 'twofang': twofang_layers, 'windclaw': windclaw_layers,
        'duskstripe': duskstripe_layers, 'rainspots': rainspots_layers, 'nightpelt': nightpelt_layers, 'faryowl': faryowl_layers,
        'suneye': suneye_layers, 'snowhush': snowhush_layers, 'stonewhisper': stonewhisper_layers, 'riptail': riptail_layers,
-       'stillsmoke': stillsmoke_layers, 'cometail': cometail_layers}
+       'stillsmoke': stillsmoke_layers, 'cometail': cometail_layers,
+       'hollowstep': hollowstep_layers}
 sheet = {}
 for row in csv.DictReader(open(os.path.join(HERE, 'recording_sheet.tsv')), delimiter='\t'):
     sheet[row['file']] = row

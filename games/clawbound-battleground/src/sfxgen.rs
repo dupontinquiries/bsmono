@@ -411,6 +411,46 @@ pub fn ability(def: &GodDef, slot: usize) -> Vec<f32> {
             let sparkle = tones(0.9, &[b * 16.0, b * 20.2, b * 24.0], 0.005, 0.3, 1.2, 0.8);
             mix_at(&mut x, &sparkle, 0.12, 0.25);
         }
+        Archetype::Swap { .. } => {
+            // a breath drawn in backwards (a swelling hiss), cut off by a
+            // low, heavy arrival
+            let len = 0.32;
+            let mut w = whoosh(len, 900.0, 3800.0, 1.8, &mut n);
+            let m = w.len() as f32;
+            for (i, v) in w.iter_mut().enumerate() {
+                *v *= (i as f32 / m).powf(2.2) * 2.2;
+            }
+            mix_at(&mut x, &w, 0.0, 0.9);
+            let t = thud(0.4, b * 0.9, b * 0.28, fl.grit + 0.3, &mut n);
+            mix_at(&mut x, &t, len - 0.01, 1.0);
+        }
+        Archetype::Send { .. } => {
+            // a cold exhale going away from you, and a low note under it
+            let w = whoosh(0.7, 2400.0, 380.0, 1.2, &mut n);
+            mix_at(&mut x, &w, 0.0, 0.7);
+            let low = tones(0.7, &[b * 0.75, b * 0.8], 0.15, 0.4, 0.05, 0.3);
+            mix_at(&mut x, &low, 0.0, 0.5);
+        }
+        Archetype::Lantern { .. } => {
+            // the lamp going up: a brass chime (a bell's out-of-tune
+            // partials), a flare of flame rising, and a warm chord under it
+            let chime = tones(1.1, &[b * 8.0, b * 8.0 * 2.76, b * 8.0 * 5.40], 0.002, 0.5, 0.0, 0.0);
+            mix_at(&mut x, &chime, 0.0, 0.55);
+            let flare = whoosh(0.6, 500.0, 5200.0, 1.3, &mut n);
+            mix_at(&mut x, &flare, 0.02, 0.7);
+            let warm = tones(1.2, &[b * 2.0, b * 2.5, b * 3.0], 0.12, 0.7, 0.1, 0.2);
+            mix_at(&mut x, &warm, 0.1, 0.6);
+        }
+        Archetype::Echoes { .. } => {
+            // a low cluster a semitone apart, trembling, and heavy steps
+            // coming from everywhere at once
+            let cl = tones(1.2, &[b * 0.5, b * 0.53, b * 0.75, b * 1.06], 0.3, 0.8, 0.05, 0.6);
+            mix_at(&mut x, &cl, 0.0, 0.8);
+            for k in 0..6 {
+                let st = thud(0.22, 85.0 - 6.0 * (k % 3) as f32, 38.0, 0.6, &mut n);
+                mix_at(&mut x, &st, 0.1 + k as f32 * 0.14 + 0.03 * (k % 2) as f32, 0.55);
+            }
+        }
     }
     let mut x = tail(x);
     if ab.ult {
@@ -428,7 +468,12 @@ pub fn ability(def: &GodDef, slot: usize) -> Vec<f32> {
 }
 
 /// The shared sounds, by bank key.
-pub const GENERIC: [&str; 6] = ["sfx/hit", "sfx/hit_big", "sfx/whiff", "sfx/levelup", "sfx/tower_down", "sfx/cast"];
+pub const GENERIC: [&str; 9] = [
+    "sfx/hit", "sfx/hit_big", "sfx/whiff", "sfx/levelup", "sfx/tower_down", "sfx/cast",
+    // Hollowstep's world (`stalker`): a pounding heart, his heavy tread,
+    // and the air closing where he left
+    "sfx/stalker/heart", "sfx/stalker/step", "sfx/stalker/swap",
+];
 
 pub fn generic(key: &str) -> Vec<f32> {
     let mut n = Noise(0xC0FF_EE11 ^ (key.len() as u32).wrapping_mul(7919));
@@ -465,6 +510,41 @@ pub fn generic(key: &str) -> Vec<f32> {
             let t = thud(0.5, 90.0, 30.0, 0.9, &mut n);
             mix_at(&mut x, &t, 0.0, 1.0);
             x
+        }
+        "sfx/stalker/heart" => {
+            // lub-dub: two soft, deep thumps, the second a little lower
+            let mut x = vec![0.0; secs(0.5)];
+            let lub = thud(0.16, 70.0, 42.0, 0.05, &mut n);
+            mix_at(&mut x, &lub, 0.0, 1.0);
+            let dub = thud(0.2, 58.0, 36.0, 0.05, &mut n);
+            mix_at(&mut x, &dub, 0.2, 0.8);
+            x
+        }
+        "sfx/stalker/step" => {
+            // a heavy paw put down, and the grit it drags
+            let mut x = thud(0.3, 95.0, 38.0, 0.6, &mut n);
+            let len = 0.28;
+            let mut sc = vec![0.0; secs(len)];
+            let mut lp = Svf::default();
+            for (i, o) in sc.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let (l, _, _) = lp.run(n.next(), 900.0, 0.8);
+                *o = l * env(t, 0.02, 0.12) * 0.8;
+            }
+            mix_at(&mut x, &sc, 0.03, 0.6);
+            x
+        }
+        "sfx/stalker/swap" => {
+            // the air closing where he stood: a short suck, then nothing
+            let len = 0.25;
+            let mut w = whoosh(len, 4200.0, 700.0, 1.5, &mut n);
+            let m = w.len() as f32;
+            for (i, v) in w.iter_mut().enumerate() {
+                *v *= (1.0 - i as f32 / m).powf(0.5);
+            }
+            let t = thud(0.18, 60.0, 30.0, 0.2, &mut n);
+            mix_at(&mut w, &t, 0.05, 0.8);
+            w
         }
         _ => {
             let fl = Flavor { base: 180.0, bright: 0.6, grit: 0.3, seed: 1 };

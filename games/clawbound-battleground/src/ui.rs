@@ -457,6 +457,35 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
     let g = &game.gods[player];
     let def = game.def(player);
 
+    // afraid (Hollowstep's terror radius, `stalker`): the edges of the
+    // screen close in, dark red at the rim, pulsing with the heart
+    let dark = crate::stalker::vignette(g.fear, g.beat_t);
+    if dark > 0.01 {
+        let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("fear")));
+        let full = ctx.screen_rect();
+        let band = full.width().min(full.height()) * 0.36;
+        // one mesh, colour graded per vertex from the rim inward: three
+        // nested frames (the rim, a third of the way in, the inner edge)
+        // so the fall-off bends. (Stacked strokes or strips drew seams.)
+        let col = |a: f32| Color32::from_rgba_unmultiplied(34, 0, 6, (dark * a * 250.0).round() as u8);
+        let frames = [(full, col(1.0)), (full.shrink(band * 0.33), col(0.38)), (full.shrink(band), col(0.0))];
+        let mut mesh = egui::epaint::Mesh::default();
+        for f in 0..2 {
+            let (a, ca) = frames[f];
+            let (b, cb) = frames[f + 1];
+            let base = mesh.vertices.len() as u32;
+            for (pt, c) in [(a.left_top(), ca), (a.right_top(), ca), (a.right_bottom(), ca), (a.left_bottom(), ca), (b.left_top(), cb), (b.right_top(), cb), (b.right_bottom(), cb), (b.left_bottom(), cb)] {
+                mesh.colored_vertex(pt, c);
+            }
+            for e in 0..4u32 {
+                let (o0, o1, i0, i1) = (base + e, base + (e + 1) % 4, base + 4 + e, base + 4 + (e + 1) % 4);
+                mesh.add_triangle(o0, o1, i1);
+                mesh.add_triangle(o0, i1, i0);
+            }
+        }
+        p.add(egui::Shape::mesh(mesh));
+    }
+
     // health / mana / xp bottom-left
     egui::Area::new(egui::Id::new("vitals")).anchor(egui::Align2::LEFT_BOTTOM, [16.0, -16.0]).show(ctx, |ui| {
         ui.horizontal(|ui| {
