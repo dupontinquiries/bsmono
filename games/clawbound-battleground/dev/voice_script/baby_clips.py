@@ -56,12 +56,26 @@ CLIPS = {
     # (ends at 112.45: from 1.2 s in, an adult's voice at ~210-250 Hz
     # talked over it -- one of the two bleeds heard in the game)
     'babble.1': ('book', 111.25, 112.45),
+    # (from the other recording, a lower-voiced baby: all 48 s of it sits
+    # at 180-300 Hz, so the adult guard below measures it against its own
+    # range, not the book's)
+    'babble.2': ('coo', 28.90, 30.22),
+    'babble.3': ('coo', 4.68, 5.95),
     # soft, falling -- sleepy, or a pout
     # (starts at 475.00: the first 0.1 s is the onset gliding up from 236 Hz)
     'fall.1': ('book', 475.00, 475.90),
     # (was 426.00-426.52: the reader's voice, 194 Hz -- the other bleed)
     'fall.2': ('book', 457.20, 457.60),
 }
+
+
+# Per recording, the pitch under which a voice is taken for an adult. The
+# book's baby sings at 400-1000 Hz over a reader at ~194; the squeal file's
+# squeal is followed by a voice falling 222 -> 164 Hz (coo.4, dropped as
+# one of the two bleeds). The coo recording is a different, lower-voiced
+# baby throughout (180-300 Hz, no reader), so there the guard only refuses
+# a man's range.
+ADULT_BELOW = {'book': 330, 'squeal': 330, 'coo': 165}
 
 
 HOP = 480      # 10 ms: one pyin frame per STFT frame
@@ -165,8 +179,9 @@ def main():
         # quarter-second at 210-250 in the middle of a babble).
         f0 = pitch(y)
         vf0 = f0[f0 > 0]
-        low = float((vf0 < 330).mean()) if len(vf0) else 1.0
-        assert len(vf0) and np.median(vf0) > 330 and low < 0.12, f'{name}: {low:.0%} of its voice is in an adult range (median {np.median(vf0) if len(vf0) else 0:.0f} Hz)'
+        floor = ADULT_BELOW[s]
+        low = float((vf0 < floor).mean()) if len(vf0) else 1.0
+        assert len(vf0) and np.median(vf0) > floor and low < 0.12, f'{name}: {low:.0%} of its voice is in an adult range (median {np.median(vf0) if len(vf0) else 0:.0f} Hz)'
         sf.write(os.path.join(OUT, name + '.opus'), y, SR, format='OGG', subtype='OPUS')
         print(name, f'{len(y) / SR:.2f} s, voiced {v:.0%}', flush=True)
 

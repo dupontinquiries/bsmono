@@ -46,10 +46,8 @@ def note(semis_from_a4):
 SWARM = {
     # Litter: the kittens burst out -- bright "ah!"s, A major
     1: (['ah.1', 'ah.2', 'ah.3', 'ah.4', 'ah.5', 'ah.6', 'ah.7'], [-5, 0, 4, 7, 12], 6, ('scatter', 0.35), 0.8),
-    # Giggle Fit: babble tumbling over itself, A major pentatonic (seven
-    # clips for six babies: with babble.2/.3 gone -- adult bleed -- five
-    # meant one clip sang twice a take and the crowd bunched on its note)
-    2: (['babble.1', 'ah.3', 'ah.7', 'ah.4', 'coo.5', 'ah.2', 'squeal.2'], [0, 2, 4, 7, 9], 6, ('scatter', 0.5), 0.75),
+    # Giggle Fit: babble tumbling over itself, A major pentatonic
+    2: (['babble.1', 'babble.2', 'babble.3', 'ah.3', 'ah.7'], [0, 2, 4, 7, 9], 6, ('scatter', 0.5), 0.75),
     # First Spring: soft coos, a D major chord with the ninth
     3: (['coo.1', 'coo.2', 'coo.3', 'coo.5', 'fall.1'], [-7, -3, 0, 5, 7], 5, ('scatter', 0.6), 0.6),
     # Dance Party: squeals and "ah!"s on the beat, A major over two octaves
@@ -60,25 +58,9 @@ MAX_SHIFT = 7
 
 
 def f0_of(x):
-    """The note a clip is heard at: the loudest-weighted mode of its voiced
-    frames in half-semitone bins. (The median was wrong for a clip that
-    glides -- coo.5's median was 510 Hz while it sang mostly near 440, so
-    'shifted to B' it was heard a semitone and more away from B.)"""
     f = C.pitch(x)
-    hop = C.HOP
-    e = np.array([float(np.sum(x[i * hop:(i + 1) * hop] ** 2)) for i in range(len(f))])
-    m = f > 0
-    if not m.any():
-        return 0.0
-    semis = 12 * np.log2(f[m] / A4)
-    bins = np.round(semis * 2).astype(int)
-    w = e[m]
-    uniq = np.unique(bins)
-    # smooth over a semitone either side so a vibrato counts as one note
-    score = [w[np.abs(bins - b) <= 2].sum() for b in uniq]
-    best = uniq[int(np.argmax(score))]
-    near = np.abs(bins - best) <= 2
-    return float(A4 * 2 ** (np.average(semis[near], weights=w[near] + 1e-12) / 12))
+    f = f[f > 0]
+    return float(np.median(f)) if len(f) else 0.0
 
 
 def shift(x, ratio):
