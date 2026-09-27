@@ -13,6 +13,7 @@
 //! |------------------|-------------------------------------------------------------|-------|
 //! | wind-up          | `voice/<ancestor>/cast<N>`, `voice/<ancestor>/cast`         | voice |
 //! | cast fires       | `sfx/cast/<ancestor>/<N>`, `sfx/cast/<archetype>`, `sfx/cast` | sfx |
+//! | ...and its crowd | `sfx/swarm/<ancestor>/<N>/b<k>`, each round the caster      | sfx   |
 //! | attack, nothing  | `sfx/whiff`                                                 | sfx   |
 //! | hit              | `sfx/hit_big` (big), `sfx/hit`                              | sfx   |
 //! | kill             | `voice/<killer>/kill`; `voice/<victim>/death`               | voice |
@@ -64,7 +65,13 @@ pub fn cues_for(ev: &Event, game: &Game) -> Vec<Cue> {
         Event::Cast { god, slot, .. } => {
             let a = ancestor_key(game, *god);
             let arch = archetype_key(&game.def(*god).abilities[*slot as usize].arch);
-            vec![Cue { keys: vec![format!("sfx/cast/{a}/{}", slot + 1), format!("sfx/cast/{arch}"), "sfx/cast".into()], bus: Bus::Sfx, gain: 0.9, pos: god_pos(*god), speaker: None, priority: 5 }]
+            let mut v = vec![Cue { keys: vec![format!("sfx/cast/{a}/{}", slot + 1), format!("sfx/cast/{arch}"), "sfx/cast".into()], bus: Bus::Sfx, gain: 0.9, pos: god_pos(*god), speaker: None, priority: 5 }];
+            if let Some(at) = god_pos(*god) {
+                for k in 0..SWARM_MAX {
+                    v.push(Cue { keys: vec![format!("sfx/swarm/{a}/{}/b{k}", slot + 1)], bus: Bus::Sfx, gain: SWARM_GAIN, pos: Some(swarm_spot(at, *slot, k)), speaker: None, priority: 2 });
+                }
+            }
+            v
         }
         Event::Whiff { god } => vec![Cue { keys: vec!["sfx/whiff".into()], bus: Bus::Sfx, gain: 0.6, pos: god_pos(*god), speaker: None, priority: 2 }],
         Event::Damage { pos, big, .. } => {
@@ -85,6 +92,25 @@ pub fn cues_for(ev: &Event, game: &Game) -> Vec<Cue> {
         Event::LevelUp { pos } => vec![Cue { keys: vec!["sfx/levelup".into()], bus: Bus::Sfx, gain: 0.7, pos: Some(*pos), speaker: None, priority: 3 }],
         _ => Vec::new(),
     }
+}
+
+/// The most voices in an ancestor's swarm (`sfx/swarm/<ancestor>/<N>/b<k>`,
+/// k < SWARM_MAX): a crowd that answers an ability -- Sproutkit's babies.
+/// Each is placed at its own spot round the caster ([`swarm_spot`]), so the
+/// ordinary panning spreads the crowd around him. A missing key is silence,
+/// so an ancestor with no swarm files has none.
+pub const SWARM_MAX: usize = 8;
+/// How far round the caster the swarm stands.
+pub const SWARM_RING: f32 = 3.0;
+/// One swarm voice's gain (a crowd of them, under the cast sound).
+pub const SWARM_GAIN: f32 = 0.5;
+
+/// Where swarm voice `k` of ability `slot` stands round `at`: on a ring,
+/// a golden angle apart (so any first few are spread round, not bunched),
+/// turned a little per ability.
+pub fn swarm_spot(at: Vec3, slot: u32, k: usize) -> Vec3 {
+    let a = k as f32 * 2.399_963 + slot as f32 * 0.7;
+    at + Vec3::new(a.cos(), 0.0, a.sin()) * SWARM_RING
 }
 
 /// Voice lines further than this from the listener are not spoken.
@@ -153,6 +179,43 @@ mod tests {
         let c = cues_for(&Event::Cast { god: 0, slot: 0, aim: Vec3::ZERO }, &g);
         assert_eq!(c[0].keys[0], format!("sfx/cast/{a}/1"));
         assert!(c[0].keys[1].starts_with("sfx/cast/") && c[0].keys[2] == "sfx/cast");
+    }
+
+    /// A cast asks for its swarm: SWARM_MAX voices, each its own key, each
+    /// on the ring round the caster, spread all round -- a listener at the
+    /// caster hears them on both sides and in front and behind.
+    #[test]
+    fn a_cast_brings_its_swarm_round_the_caster() {
+        let g = game();
+        let a = ancestor_key(&g, 0);
+        let at = g.gods[0].pos;
+        let c = cues_for(&Event::Cast { god: 0, slot: 3, aim: Vec3::ZERO }, &g);
+        let swarm: Vec<&Cue> = c.iter().filter(|c| c.keys[0].starts_with("sfx/swarm/")).collect();
+        assert_eq!(swarm.len(), SWARM_MAX);
+        let keys: std::collections::HashSet<_> = swarm.iter().map(|c| c.keys[0].clone()).collect();
+        assert_eq!(keys.len(), SWARM_MAX, "one voice per key");
+        assert!(keys.contains(&format!("sfx/swarm/{a}/4/b0")));
+        let (mut left, mut right, mut ahead, mut behind) = (0, 0, 0, 0);
+        for s in &swarm {
+            assert_eq!(s.bus, Bus::Sfx);
+            assert!(s.priority < c[0].priority, "the crowd gives way before the cast sound");
+            let p = s.pos.unwrap();
+            let r = Vec3::new(p.x - at.x, 0.0, p.z - at.z).length();
+            assert!((r - SWARM_RING).abs() < 1e-3, "on the ring: {r}");
+            let (_, pan) = place(s, at, Vec3::X).unwrap();
+            left += (pan < -0.3) as i32;
+            right += (pan > 0.3) as i32;
+            ahead += (p.z - at.z > 0.5) as i32;
+            behind += (p.z - at.z < -0.5) as i32;
+        }
+        assert!(left >= 2 && right >= 2 && ahead >= 2 && behind >= 2, "all round: {left} {right} {ahead} {behind}");
+        // the first three already spread (golden angle): no two within 60 deg
+        for i in 0..3 {
+            for j in 0..i {
+                let (a, b) = (swarm_spot(at, 3, i) - at, swarm_spot(at, 3, j) - at);
+                assert!(a.normalize().dot(b.normalize()) < 0.5, "voices {i} and {j} bunched");
+            }
+        }
     }
 
     #[test]
