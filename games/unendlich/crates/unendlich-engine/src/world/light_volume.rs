@@ -349,15 +349,15 @@ pub fn light_signature(blocks: &[BlockId]) -> u64 {
     h | 1
 }
 
-/// Emission with fire put out by bad air: a torch whose cell is in a CO₂
-/// basin (world::cave_gas) too deep for combustion (sim::cave_air) gives no
-/// light. The glows (crystal, glowshroom, the basin's lichen) and lava do not
+/// Emission with fire put out by bad air: a torch whose cell has too little
+/// O₂ for combustion (sim::cave_air), deep in a CO₂ basin or in a depleted
+/// pocket of the geothermal band (world::cave_gas), gives no light. The glows (crystal, glowshroom, the basin's lichen) and lava do not
 /// need air.
 pub fn gas_aware_emission(w: [i32; 3], b: BlockId, gas_seed: Option<u32>) -> [u8; 3] {
     if b == BlockId::Torch {
         if let Some(seed) = gas_seed {
-            let d = super::cave_gas::co2_density(w[0], w[1], w[2], seed);
-            if super::cave_gas::o2_for_density(d) < crate::sim::cave_air::FLAME_O2_MIN {
+            let c = |v: i32| v as f32 + 0.5;
+            if super::cave_gas::o2_air_at(c(w[0]), c(w[1]), c(w[2]), seed) < crate::sim::cave_air::FLAME_O2_MIN {
                 return [0, 0, 0];
             }
         }
@@ -779,6 +779,35 @@ mod tests {
         assert_eq!(gas_aware_emission(high, BlockId::Torch, Some(seed)), BlockId::Torch.light_emission());
         assert_eq!(gas_aware_emission(deep, BlockId::Torch, None), BlockId::Torch.light_emission(), "gas off");
         assert_eq!(gas_aware_emission(deep, BlockId::Glowshroom, Some(seed)), BlockId::Glowshroom.light_emission(), "glows need no air");
+    }
+
+    #[test]
+    fn a_torch_in_a_thin_air_pocket_of_the_deep_gives_no_light_and_one_in_good_air_does() {
+        use crate::world::cave_gas as cg;
+        let seed = 77;
+        let c = |v: i32| v as f32 + 0.5;
+        // Cells in the geothermal band, clear of any CO2 basin, one in a
+        // depleted pocket and one in adequate air.
+        let mut bad = None;
+        let mut good = None;
+        for x in (-300..300).step_by(7) {
+            for z in (-300..300).step_by(9) {
+                let w = [x, 8, z];
+                if cg::o2_at(c(w[0]), c(w[1]), c(w[2]), seed) < cg::O2_AIR {
+                    continue;
+                }
+                let o = cg::deep_o2(c(w[0]), c(w[1]), c(w[2]), seed);
+                if o < 0.10 && bad.is_none() {
+                    bad = Some(w);
+                }
+                if o > 0.17 && good.is_none() {
+                    good = Some(w);
+                }
+            }
+        }
+        let (bad, good) = (bad.expect("a depleted pocket"), good.expect("a good pocket"));
+        assert_eq!(gas_aware_emission(bad, BlockId::Torch, Some(seed)), [0, 0, 0]);
+        assert_eq!(gas_aware_emission(good, BlockId::Torch, Some(seed)), BlockId::Torch.light_emission());
     }
 
     #[test]

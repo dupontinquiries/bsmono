@@ -18,7 +18,7 @@
 //! point of each cave (the docx's `min_height_in_radius`); a basin is where
 //! the hash puts it, and a passage that leaves the disk leaves the gas at a
 //! vertical boundary. The gas does not move or fill over time.
-use super::noise::hash_2d;
+use super::noise::{hash_2d, noise_3d};
 
 /// Basin grid cell, in blocks.
 pub const REGION: i32 = 64;
@@ -126,7 +126,38 @@ pub fn sense(x: f32, y: f32, z: f32, seed: u32, radius: f32) -> Option<Sensed> {
     best
 }
 
-/// O₂ fraction at a point.
+/// Thin air in the geothermal band (`cave_biomes.docx`, Geothermal Deep:
+/// "O₂: 5-18%. Chemosynthetic bacteria consume oxygen but also produce it in
+/// some zones. O₂ is spatially variable — pockets of adequate O₂ adjacent to
+/// depleted zones."). A slow 3D noise over the band below
+/// `world::underground::GEOTHERMAL_Y`, eased back to open air over the band's
+/// top three blocks. Not CO₂: it does not hush sound or cap the other bending
+/// fields (see [`o2_air_at`] for the combined figure).
+pub fn deep_o2(x: f32, y: f32, z: f32, seed: u32) -> f32 {
+    let top = super::underground::GEOTHERMAL_Y as f32 + 1.0;
+    if y >= top {
+        return O2_AIR;
+    }
+    let n = noise_3d(x as f64 / 20.0, y as f64 / 14.0, z as f64 / 20.0, seed ^ DEEP_SALT) as f32;
+    let t = ((n - 0.08) / 0.72).clamp(0.0, 1.0);
+    let deep = DEEP_O2_MIN + (DEEP_O2_MAX - DEEP_O2_MIN) * t * t * (3.0 - 2.0 * t);
+    // Ease in over the band's top three blocks.
+    let k = ((top - y) / 3.0).clamp(0.0, 1.0);
+    O2_AIR + (deep - O2_AIR) * k
+}
+
+/// The docx's geothermal O₂ range.
+pub const DEEP_O2_MIN: f32 = 0.05;
+pub const DEEP_O2_MAX: f32 = 0.18;
+const DEEP_SALT: u32 = 0x6e07_4a11;
+
+/// O₂ at a point from every cause: CO₂ basins and the geothermal band's thin
+/// air. What breathing and fire use.
+pub fn o2_air_at(x: f32, y: f32, z: f32, seed: u32) -> f32 {
+    o2_at(x, y, z, seed).min(deep_o2(x, y, z, seed))
+}
+
+/// O₂ at a point from CO₂ basins only.
 pub fn o2_at(x: f32, y: f32, z: f32, seed: u32) -> f32 {
     o2_for_density(co2_density_at(x, y, z, seed))
 }
@@ -234,6 +265,91 @@ mod tests {
             let s = sense(p.0, p.1, p.2, SEED, 24.0).unwrap();
             assert_eq!(s.distance == 0.0, co2_density_at(p.0, p.1, p.2, SEED) > 0.0, "dy {dy}");
         }
+    }
+
+    #[test]
+    fn the_geothermal_band_has_thin_air_in_pockets_and_open_air_above() {
+        let top = crate::world::underground::GEOTHERMAL_Y as f32 + 1.0;
+        let (mut n, mut adequate, mut weak, mut lethal) = (0, 0, 0, 0);
+        let (mut lo, mut hi) = (1.0f32, 0.0f32);
+        for x in (-400..400).step_by(9) {
+            for z in (-400..400).step_by(11) {
+                for y in [2.0f32, 8.0, 13.0] {
+                    let o = deep_o2(x as f32, y, z as f32, SEED);
+                    lo = lo.min(o);
+                    hi = hi.max(o);
+                    n += 1;
+                    if o >= 0.16 {
+                        adequate += 1;
+                    } else if o >= 0.08 {
+                        weak += 1;
+                    } else {
+                        lethal += 1;
+                    }
+                }
+            }
+        }
+        let share = |k: i32| k as f32 / n as f32;
+        eprintln!(
+            "deep O2 {lo:.3}..{hi:.3}: adequate {:.2} weak {:.2} lethal {:.2}",
+            share(adequate), share(weak), share(lethal)
+        );
+        assert!(lo >= DEEP_O2_MIN - 1e-6 && hi <= DEEP_O2_MAX + 1e-6, "{lo}..{hi} outside the docx 5-18%");
+        assert!(hi - lo > 0.1, "barely varies: {lo}..{hi}");
+        // Measured at this seed: adequate 0.29, weak 0.52, lethal 0.19.
+        assert!((0.2..0.45).contains(&share(adequate)), "adequate {}", share(adequate));
+        assert!((0.1..0.3).contains(&share(lethal)), "lethal {}", share(lethal));
+        assert!((0.35..0.7).contains(&share(weak)), "weak {}", share(weak));
+        // Above the band: plain air. The band's top eases in.
+        assert_eq!(deep_o2(5.0, top, 5.0, SEED), O2_AIR);
+        assert_eq!(deep_o2(5.0, 60.0, 5.0, SEED), O2_AIR);
+        let near_top = deep_o2(5.0, top - 1.0, 5.0, SEED);
+        let deeper = deep_o2(5.0, top - 4.0, 5.0, SEED);
+        assert!((near_top - O2_AIR).abs() <= (deeper - O2_AIR).abs() + 1e-6);
+        // Pockets are adjacent: from a lethal cell, adequate air is found
+        // within 16 blocks somewhere.
+        let mut found = 0;
+        let mut tried = 0;
+        'outer: for x in (-400..400).step_by(37) {
+            for z in (-400..400).step_by(41) {
+                if deep_o2(x as f32, 8.0, z as f32, SEED) >= 0.08 {
+                    continue;
+                }
+                tried += 1;
+                for dx in (-16..=16).step_by(4) {
+                    for dz in (-16..=16).step_by(4) {
+                        if deep_o2((x + dx) as f32, 8.0, (z + dz) as f32, SEED) >= 0.16 {
+                            found += 1;
+                            if tried >= 20 {
+                                break 'outer;
+                            }
+                            continue 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(tried >= 5, "only {tried} lethal cells sampled");
+        assert!(found as f32 >= tried as f32 * 0.5, "{found}/{tried} lethal cells have good air nearby");
+    }
+
+    #[test]
+    fn the_combined_air_is_the_worse_of_basin_and_band() {
+        let b = any_basin();
+        let (x, z) = (b.center[0] as f32 + 0.5, b.center[1] as f32 + 0.5);
+        for y in [5.0f32, b.surface_y as f32 - 1.5, b.surface_y as f32 + 3.0, 40.0] {
+            let all = o2_air_at(x, y, z, SEED);
+            assert_eq!(all, o2_at(x, y, z, SEED).min(deep_o2(x, y, z, SEED)));
+            assert!(all <= o2_at(x, y, z, SEED) && all <= deep_o2(x, y, z, SEED));
+        }
+        assert_eq!(o2_air_at(0.5, 70.0, 0.5, SEED), O2_AIR, "open air far above everything");
+        // Outside every basin, deep in the band: the thin air is what counts.
+        let (px, pz) = (-200..200)
+            .step_by(13)
+            .flat_map(|x| (-200..200).step_by(17).map(move |z| (x as f32 + 0.5, z as f32 + 0.5)))
+            .find(|&(x, z)| o2_at(x, 8.5, z, SEED) == O2_AIR && deep_o2(x, 8.5, z, SEED) < 0.12)
+            .expect("a thin pocket clear of basins");
+        assert!(o2_air_at(px, 8.5, pz, SEED) < 0.12, "the band's thin air is part of the combined O2");
     }
 
     #[test]
