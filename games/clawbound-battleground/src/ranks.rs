@@ -97,6 +97,10 @@ pub fn mastery_text(arch: &Archetype) -> &'static str {
         Archetype::SendBack { .. } => "Mastery: reaches 20% further",
         Archetype::WindForward { .. } => "Mastery: winds a second further on",
         Archetype::LongLook { .. } => "Mastery: the look lingers 2 s longer",
+        Archetype::Remold { .. } => "Mastery: a quarter more clay pressed back",
+        Archetype::Quicken { .. } => "Mastery: quick 40% longer",
+        Archetype::Spin { .. } => "Mastery: spins 20% further, a wider slick",
+        Archetype::Mudslide { .. } => "Mastery: two more kittens in the mud",
     }
 }
 
@@ -131,6 +135,10 @@ pub fn mastery(arch: Archetype) -> Archetype {
         SendBack { range, dmg, secs } => SendBack { range: range * 1.2, dmg, secs },
         WindForward { radius, secs } => WindForward { radius, secs: secs + 1.0 },
         LongLook { range, flight, reveal, exposed } => LongLook { range, flight, reveal: reveal + 2.0, exposed },
+        Remold { heal } => Remold { heal: heal * 1.25 },
+        Quicken { secs } => Quicken { secs: secs * 1.4 },
+        Spin { dist, dmg, radius, secs } => Spin { dist: dist * 1.2, dmg, radius: radius * 1.25, secs },
+        Mudslide { len, width, push, secs, kits } => Mudslide { len, width, push, secs, kits: kits + 2 },
     }
 }
 
@@ -171,6 +179,10 @@ fn scale_amounts(arch: Archetype, m: f32) -> Archetype {
         SendBack { range, dmg, secs } => SendBack { range, dmg: dmg * m, secs },
         WindForward { radius, secs } => WindForward { radius, secs: secs * (1.0 + (m - 1.0) * 0.5) },
         LongLook { range, flight, reveal, exposed } => LongLook { range, flight, reveal: reveal * (1.0 + (m - 1.0) * 0.5), exposed },
+        Remold { heal } => Remold { heal: heal * m },
+        Quicken { secs } => Quicken { secs: secs * (1.0 + (m - 1.0) * 0.5) },
+        Spin { dist, dmg, radius, secs } => Spin { dist, dmg: dmg * m, radius, secs },
+        Mudslide { len, width, push, secs, kits } => Mudslide { len, width, push, secs: secs * (1.0 + (m - 1.0) * 0.5), kits },
     }
 }
 

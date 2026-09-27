@@ -182,7 +182,7 @@ impl Game {
                 for gi in 0..self.gods.len() {
                     let g = &mut self.gods[gi];
                     if g.respawn_t <= 0.0 && g.pos.distance(a.pos) <= a.radius {
-                        g.hp = (g.hp + g.max_hp * SWEETRAIN_HEAL_FRAC_PER_S * dt).min(g.max_hp);
+                        g.hp = (g.hp + g.max_hp * SWEETRAIN_HEAL_FRAC_PER_S * dt * g.heal_mul).min(g.max_hp);
                     }
                 }
                 if pulse_t <= 0.0 {

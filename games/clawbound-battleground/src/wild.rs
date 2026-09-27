@@ -265,7 +265,7 @@ impl Game {
                     continue;
                 }
                 let hp0 = g.hp;
-                g.hp = (g.hp + g.max_hp * HEAL_TREE_HP_PER_S * rain_mul * dt).min(g.max_hp);
+                g.hp = (g.hp + g.max_hp * HEAL_TREE_HP_PER_S * rain_mul * dt * g.heal_mul).min(g.max_hp);
                 g.mana = (g.mana + g.max_mana * HEAL_TREE_MP_PER_S * rain_mul * dt).min(g.max_mana);
                 if g.hp > hp0 + 1e-3 {
                     resting += 1.0;
@@ -402,7 +402,7 @@ impl Game {
             {
                 let g = &mut self.gods[hi];
                 g.gold += gold;
-                g.hp = (g.hp + g.max_hp * p.kind.heal_frac()).min(g.max_hp);
+                g.hp = (g.hp + g.max_hp * p.kind.heal_frac() * g.heal_mul).min(g.max_hp);
                 if p.kind == PreyKind::Glowfish {
                     g.blessing_t = BLESSING_SECS;
                 }

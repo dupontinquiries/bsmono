@@ -52,6 +52,11 @@ pub fn cast_timing(ab: &crate::gods::AbilityDef) -> (f32, f32) {
         Archetype::Rewind { .. } | Archetype::WindForward { .. } => (0.0, 1.0),
         Archetype::SendBack { .. } => (0.2, 0.6),
         Archetype::LongLook { .. } => (0.3, 0.3),
+        // Claypaw (`clay`): remolding and wetting are at once (he keeps
+        // moving); the spin is a dash's; the bank gives way after a heave
+        Archetype::Remold { .. } | Archetype::Quicken { .. } => (0.0, 1.0),
+        Archetype::Spin { .. } => (0.08, 1.0),
+        Archetype::Mudslide { .. } => (0.35, 0.0),
     };
     if ab.ult && w > 0.0 {
         ((w * 1.5).max(0.45), 0.0)
@@ -389,6 +394,26 @@ impl Game {
             Archetype::WindForward { radius, secs } => {
                 self.wind_forward(gi, radius, secs);
             }
+            Archetype::Remold { heal } => {
+                self.remold(gi, heal);
+            }
+            Archetype::Quicken { secs } => {
+                self.quicken(gi, secs);
+            }
+            Archetype::Spin { dist: dd, dmg, radius, secs } => {
+                let d = dmg_scale(dmg, ab.power_scale);
+                let dest = clamp_arena(from + dir * dd);
+                let dest = crate::map::onto_floor(dest, crate::consts::GOD_RADIUS);
+                self.events.push(Event::DashFx { pos: from + Vec3::Y * 1.0, dir, color: ab.color });
+                self.gods[gi].dash = Some(DashState { from, to: dest, t: 0.0, dur: 0.32, dmg: d, arc: 0.2, blast: None });
+                self.lay_slick(from, dest, radius, secs, Vec3::ZERO);
+            }
+            Archetype::Mudslide { len, width, push, secs, kits } => {
+                let a = Vec3::new(from.x, 0.0, from.z);
+                let b = crate::map::onto_floor(clamp_arena(a + dir * len), 1.0);
+                self.lay_slick(a, b, width, secs, dir * push);
+                self.shape_kittens(gi, dir, kits);
+            }
             Archetype::LongLook { range, flight, reveal, exposed } => {
                 let dest = clamp_arena(from + dir * dist.min(range));
                 let dest = crate::map::onto_floor(dest, crate::consts::GOD_RADIUS);
@@ -447,11 +472,11 @@ impl Game {
             Archetype::Heal { amount, radius } => {
                 let d = amount + power * ab.power_scale * 0.5;
                 self.events.push(Event::HealFx { pos: from, radius });
-                self.gods[gi].hp = (self.gods[gi].hp + d).min(self.gods[gi].max_hp);
+                self.gods[gi].hp = (self.gods[gi].hp + d * self.gods[gi].heal_mul).min(self.gods[gi].max_hp);
                 for j in 0..self.gods.len() {
                     let e = &self.gods[j];
                     if e.team == team && j != gi && e.pos.distance(from) < radius {
-                        self.gods[j].hp = (self.gods[j].hp + d * 0.5).min(self.gods[j].max_hp);
+                        self.gods[j].hp = (self.gods[j].hp + d * 0.5 * self.gods[j].heal_mul).min(self.gods[j].max_hp);
                     }
                 }
             }

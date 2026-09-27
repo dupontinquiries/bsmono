@@ -330,6 +330,21 @@ pub const PARTS: &[Part] = &[
         ],
     },
     Part {
+        who: "claypaw",
+        voice: "A cheerful, earthy maker with his paws always in something: warm, practical, a little rough, laughs easily. Wet consonants, a round open vowel. The ultimate is a whoop, the bank giving way.",
+        lines: &[
+            l("select", "Fresh from the riverbank!", "cheerful, rolling up his sleeves", 3, SELECT),
+            l("cast1", "Good as new.", "pressing a crack shut, satisfied", 2, "winds up Remold"),
+            l("cast2", "Wet and quick!", "a splash, bright", 3, "winds up Quicken"),
+            l("cast3", "Round we go!", "spinning, gleeful", 4, "winds up Spin"),
+            l("cast4", "Here comes the BANK!", "a whoop, rising on 'bank'", 5, "winds up Mudslide"),
+            l("kill.1", "Back to the mud.", "matter-of-fact", 2, KILL),
+            l("kill.2", "I'll make another.", "cheerful, already moving on", 2, KILL),
+            l("death.1", "Just... cracked...", "surprised, crumbling", 1, DEATH),
+            l("death.2", "I'll set... again...", "unbothered, going soft", 1, DEATH),
+        ],
+    },
+    Part {
         who: "narrator",
         voice: "The storyteller of the clans, over the first match's prologue: unhurried, weighty, a little in awe. Let each line breathe; the music leaves room between them. Record each as its own file.",
         lines: &[

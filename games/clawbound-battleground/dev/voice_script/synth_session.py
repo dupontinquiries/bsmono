@@ -67,6 +67,8 @@ CAST = {
     # the Watcher: dry, amused, a little too calm -- the C+ voice with
     # the most even delivery, at her own pace
     'hourwatch': ('af_aoede', 0.95),
+    # the potter of the river mud: warm and earthy, quick to laugh
+    'claypaw': ('am_fenrir', 1.0),
 }
 
 

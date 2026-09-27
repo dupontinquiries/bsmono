@@ -98,7 +98,7 @@ what else is known-but-unresolved.
   it keeps falling, the wind drifts it from the blown stretches into the lee,
   cats bound through drifts ploughing a trench and leave separate prints on
   powder, and blasts throw craters, fire melts it, frost lays more.
-- **19 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
+- **20 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
   Windclaw, Faryowl, Oldroar, Twofang, Suneye, Snowhush, Riptail, Stillsmoke,
   Stonewhisper, Cometail (the star-fallen caracal: Starshot, Meteor Pounce,
   Flare, and the Falling Star ultimate), Sproutkit (the ever-young kitten,
@@ -137,11 +137,21 @@ what else is known-but-unresolved.
   ultimate leaps her into the stars for 2.6 s, out of reach, and shows up
   every enemy on her own side of the line across the field where she is --
   offside-style: the further forward she flies, the more is behind her --
-  for 6 s, and her too, for 4 s, where she lands; `src/hours.rs`) — across 6 roles (Warrior / Guardian /
+  for 6 s, and her too, for 4 s, where she lands; `src/hours.rs`) and
+  Claypaw (the potter of the river mud, a fishing cat made of clay: he
+  shapes a clay kitten every 6 s, up to 4, that runs off biting; his mana
+  comes only from his claws (14 a landed basic attack, +1 a level); any
+  healing but his own takes on him by half; and he dries, down to 70% of
+  his speed over 20 s. **Remold** presses 22% of his health back;
+  **Quicken** wets him again -- 20% faster, kittens every 2.5 s, for 6 s;
+  **Spin** is a spinning dash that leaves a MUD SLICK down its line, and
+  **Mudslide** (ultimate) a long slick that carries everything on it along
+  the aim, and 4 kittens. On a slick, friend or foe keeps going the way it
+  was going, 30% faster, and turns slowly; `src/clay.rs`) — across 6 roles (Warrior / Guardian /
   Mage / Hunter / Assassin / Sentinel).
   Each is a quadruped feline voxel body with a pelt signature (mane, stripes,
   rosettes, saber fangs, antlers, sun disc, ear tufts…) and its crest colour,
-  plus **4 mechanical abilities** (76 total) built from 26 archetype systems.
+  plus **4 mechanical abilities** (80 total) built from 30 archetype systems.
   Clawbound kits are a passive + two techniques + an ultimate; here the passive
   is reforged as a third short-cooldown technique (see `src/gods.rs`).
 - **Dynamic weather** (`src/weather.rs`) — Clear / Overcast / Rain / Storm /
@@ -434,6 +444,7 @@ src/
 ├── maze.rs        the Quarry: rooms and gates, the labyrinth turning, the waking, the thorns, the pack
 ├── mazeworld.rs   the Quarry's dressing, gate slabs (collision + mesh), thorn spots, gear trains, screws, chutes, pads, boulder
 ├── hours.rs       Hourwatch: every cat's trail; turning back, sending back, winding forward, the long look
+├── clay.rs        Claypaw: his kittens, his drying, his mana from claws, halved healing, the mud slicks
 ├── machine.rs     the Quarry's machine: tracks from hopper to chute to floor, which pair runs each turn, the locks and their pads, the roll, the hit, the fall, the bots' dodge
 ├── bosses.rs      the Elder Boar + Storm Drake: pits, AI, rewards, TargetRef::Boss
 ├── disasters.rs   wildfire / tempest / earthquake / flood / tornado + map scars

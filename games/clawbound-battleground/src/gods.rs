@@ -210,6 +210,19 @@ pub enum Archetype {
     /// up for `reveal` seconds; landed, she is shown up for `exposed`
     /// (`hours`).
     LongLook { range: f32, flight: f32, reveal: f32, exposed: f32 },
+    /// Claypaw's Remold: `heal` of his health back, not halved (`clay`).
+    Remold { heal: f32 },
+    /// Quicken: his clay wet again, and quick for `secs` -- faster, and
+    /// shaping kittens sooner (`clay`).
+    Quicken { secs: f32 },
+    /// Spin: a spinning dash along the aim, `dist`, striking what it passes
+    /// (`dmg`), leaving a mud slick `radius` either side of its line for
+    /// `secs` (`clay`).
+    Spin { dist: f32, dmg: f32, radius: f32, secs: f32 },
+    /// Mudslide: a slick `len` long and `width` across along the aim that
+    /// carries everything in it along at `push` u/s for `secs`, and `kits`
+    /// kittens tumbling out (`clay`).
+    Mudslide { len: f32, width: f32, push: f32, secs: f32, kits: u32 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -235,7 +248,7 @@ impl AbilityDef {
     pub fn quick_aimable(&self) -> bool {
         // (Hollowstep's step goes to whichever of him is nearest the aim:
         // a drag picks which)
-        !self.ult && matches!(self.arch, Archetype::Dash { .. } | Archetype::Blink { .. } | Archetype::Swap { .. })
+        !self.ult && matches!(self.arch, Archetype::Dash { .. } | Archetype::Blink { .. } | Archetype::Swap { .. } | Archetype::Spin { .. })
     }
 }
 
@@ -297,6 +310,7 @@ pub enum PeltKind {
     Hollow,    // Hollowstep — gaunt ash-grey, a dark hood of fur over the eyes, notched ears
     Lamp,      // Brasshowl — a sand cat: pale, broad low ears, a brass lantern at the breast
     Mantle,    // Oremantle — the old snow leopard: huge, a ridge of stone along the spine
+    Clay,      // Claypaw — a fishing cat of river clay: terracotta, cracked where it dries, spotted, short ears
     Hours,     // Hourwatch — a Pallas's cat: long smoky fur, a flat face, low round ears, an hourglass on the back
 }
 
@@ -333,7 +347,7 @@ const fn ab(
     AbilityDef { name, desc, arch, cooldown: cd, cost, color, key, ult, power_scale: scale }
 }
 
-pub const ROSTER_LEN: usize = 19;
+pub const ROSTER_LEN: usize = 20;
 
 pub const ROSTER: [GodDef; ROSTER_LEN] = [
     // ── GOLDENMANE — the lion-clan of legend ──
@@ -670,6 +684,26 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
             ab("Send Back", "She turns someone else's: the enemy she points at is where it was three breaths ago, and whatever it was about to do, it has not done.", Archetype::SendBack { range: 16.0, dmg: 70.0, secs: 3.0 }, 12.0, 75.0, [0.70, 0.62, 0.95], 1, false, 0.45),
             ab("Wind Forward", "She winds her friends' hours on: what they were waiting for comes sooner.", Archetype::WindForward { radius: 9.0, secs: 4.0 }, 18.0, 80.0, [0.98, 0.90, 0.60], 2, false, 0.0),
             ab("The Long Look", "She leaps into the stars and looks back: everything behind her on the field is seen. Coming down, she is seen too.", Archetype::LongLook { range: 34.0, flight: 2.6, reveal: 6.0, exposed: 4.0 }, 75.0, 110.0, [0.80, 0.85, 1.00], 3, true, 0.0),
+        ],
+    },
+    // ── CLAYPAW — the potter of the river mud ──
+    // A fishing cat of the great river's banks, who is made of its clay and
+    // shapes more of it: kittens that run off biting, a body he remolds
+    // when it cracks, and mud that nobody keeps their feet on (`clay`).
+    GodDef {
+        id: 19, name: "Claypaw", title: "the potter of the river mud, who shapes himself anew",
+        philosophy: "Anything that breaks can be made again. Anything that stands can be made to slide.",
+        role: Role::Warrior, auto: AutoKind::Melee, dmg_type: DmgType::Physical,
+        palette: [[0.72, 0.45, 0.30], [0.45, 0.27, 0.17], [0.86, 0.66, 0.50], [0.55, 0.75, 0.80]],
+        weapon: WeaponKind::None, pelt: PeltKind::Clay,
+        hp: 640.0, hp_growth: 104.0, mana: 300.0, mana_growth: 20.0,
+        auto_dmg: 50.0, auto_growth: 3.6, power: 9.0, power_growth: 2.5,
+        protection: 26.0, prot_growth: 3.0, move_speed: 12.8, auto_range: 3.4, auto_cd: 0.95,
+        abilities: [
+            ab("Remold", "He presses the cracks shut with fresh clay: a share of his health back -- his own clay, the only healing that takes on him in full.", Archetype::Remold { heal: 0.22 }, 9.0, 90.0, [0.80, 0.55, 0.38], 0, false, 0.0),
+            ab("Quicken", "River water over him: he is wet clay again, quick, and shaping kittens as fast as he can.", Archetype::Quicken { secs: 6.0 }, 14.0, 60.0, [0.55, 0.78, 0.85], 1, false, 0.0),
+            ab("Spin", "He spins down the aim like clay on the wheel, striking what he passes, and leaves mud behind him that no one keeps their feet on.", Archetype::Spin { dist: 9.0, dmg: 85.0, radius: 4.0, secs: 5.0 }, 10.0, 70.0, [0.62, 0.42, 0.28], 2, false, 0.55),
+            ab("Mudslide", "The bank gives way: a river of mud down the aim carries everything in it along -- friends forward, enemies away -- and his kittens tumble out of it.", Archetype::Mudslide { len: 22.0, width: 6.0, push: 7.0, secs: 5.0, kits: 4 }, 80.0, 120.0, [0.55, 0.38, 0.25], 3, true, 0.0),
         ],
     },
 ];

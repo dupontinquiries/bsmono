@@ -495,6 +495,51 @@ pub fn ability(def: &GodDef, slot: usize) -> Vec<f32> {
             let bell = tones(0.8, &[b * 12.0, b * 12.0 * 1.5, b * 12.0 * 2.01], 0.01, 0.6, 0.0, 0.3);
             mix_at(&mut x, &bell, 0.35, 0.45);
         }
+        // Claypaw (`clay`): wet clay
+        Archetype::Remold { .. } => {
+            // clay pressed and smoothed: squelches (low bandpassed bursts)
+            // and a wet slap
+            let len = 0.6;
+            let mut sq = vec![0.0; secs(len)];
+            let mut bp = Svf::default();
+            for (i, o) in sq.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let (_, b2, _) = bp.run(n.next(), 300.0 + 250.0 * (t * 9.0).sin().abs(), 2.5);
+                *o = b2 * (t * 9.0).sin().abs() * env(t, 0.02, 0.4);
+            }
+            mix_at(&mut x, &sq, 0.0, 0.9);
+            let slap = thud(0.12, b * 1.5, b * 0.8, 0.3, &mut n);
+            mix_at(&mut x, &slap, 0.42, 0.8);
+        }
+        Archetype::Quicken { .. } => {
+            // river water poured over: a splash's hiss, a trickle after
+            let w = whoosh(0.5, 3000.0, 900.0, 0.8, &mut n);
+            mix_at(&mut x, &w, 0.0, 0.8);
+            let drops = tones(0.5, &[b * 9.0, b * 11.0, b * 13.5], 0.003, 0.08, 0.0, 0.0);
+            mix_at(&mut x, &drops, 0.25, 0.4);
+        }
+        Archetype::Spin { .. } => {
+            // the wheel: a whirring swell and a wet spatter off it
+            let len = 0.5;
+            let mut wh = vec![0.0; secs(len)];
+            let mut bp = Svf::default();
+            for (i, o) in wh.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let (_, b2, _) = bp.run(n.next(), 500.0 + 1400.0 * (t / len), 3.0);
+                *o = b2 * (0.6 + 0.4 * (t * 40.0).sin()) * env(t, 0.1, 0.3);
+            }
+            mix_at(&mut x, &wh, 0.0, 0.9);
+            let spat = whoosh(0.25, 2500.0, 700.0, 1.0, &mut n);
+            mix_at(&mut x, &spat, 0.3, 0.5);
+        }
+        Archetype::Mudslide { .. } => {
+            // the bank giving way: a deep wet rumble swelling and a long
+            // sliding hiss over it
+            let r = thud(0.9, 60.0, 30.0, 0.8, &mut n);
+            mix_at(&mut x, &r, 0.0, 0.9);
+            let w = whoosh(1.0, 1800.0, 500.0, 0.7, &mut n);
+            mix_at(&mut x, &w, 0.1, 0.6);
+        }
         Archetype::Field { material, .. } => {
             use crate::gods::Material;
             match material {

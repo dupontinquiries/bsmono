@@ -58,6 +58,9 @@ pub struct Kitling {
     pub life: f32,
     /// Seconds alive, for the scene's hop.
     pub age: f32,
+    /// One of Claypaw's clay kittens (`clay`): no giggle in its nip, and it
+    /// crumbles rather than pops.
+    pub clay: bool,
 }
 
 /// Where a giggling cat actually goes when it means to go `dir`: swung to
@@ -87,7 +90,7 @@ impl Game {
             let u = if count > 1 { k as f32 / (count - 1) as f32 - 0.5 } else { 0.0 };
             let a = base + u * 2.0 * FAN_DEG.to_radians();
             let d = Vec3::new(a.cos(), 0.0, a.sin());
-            self.kitlings.push(Kitling { team, owner: gi, pos: from + d * 0.8, dir: d, speed, dmg, life, age: 0.0 });
+            self.kitlings.push(Kitling { team, owner: gi, pos: from + d * 0.8, dir: d, speed, dmg, life, age: 0.0, clay: false });
         }
     }
 
@@ -227,7 +230,7 @@ impl Game {
         }
         for (kl, t) in nips {
             match t {
-                TargetRef::God(j) => self.gods[j].giggle_t = self.gods[j].giggle_t.max(NIP_GIGGLE),
+                TargetRef::God(j) if !kl.clay => self.gods[j].giggle_t = self.gods[j].giggle_t.max(NIP_GIGGLE),
                 TargetRef::Minion(m) if m < self.minions.len() => self.minions[m].giggle_t = self.minions[m].giggle_t.max(NIP_GIGGLE),
                 _ => {}
             }

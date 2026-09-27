@@ -191,6 +191,11 @@ CHAINS = {
  'hourwatch':  "highpass=f=90,equalizer=f=220:t=q:w=1:g=1,equalizer=f=3600:t=q:w=1.2:g=2,"
                "acompressor=threshold=-24dB:ratio=3:attack=8:release=150:makeup=2,"
                "aecho=0.8:0.45:340|680:0.09|0.04",
+ # the potter of the river mud: warm and close, a little body low down,
+ # and the river bank's short wet slap
+ 'claypaw':    "highpass=f=80,equalizer=f=250:t=q:w=1:g=2,equalizer=f=2800:t=q:w=1.2:g=1,"
+               "acompressor=threshold=-24dB:ratio=3:attack=8:release=150:makeup=2,"
+               "aecho=0.8:0.4:45|90:0.12|0.06",
  # a young daredevil: bright and quick, a short slap
  'cometail':   "rubberband=pitch=1.04:tempo=1.03:formant=preserved:pitchq=quality,"
                "highpass=f=120,treble=g=4:f=6000,"

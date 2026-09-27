@@ -123,6 +123,11 @@ pub enum Event {
     /// The long look: up into the stars, and down where she lands.
     LookUp { god: usize, pos: Vec3, to: Vec3 },
     LookLand { god: usize, pos: Vec3 },
+    /// Claypaw (`clay`): kittens shaped, a remolding (or a wetting), a
+    /// slick laid.
+    ClayShaped { pos: Vec3, n: u32 },
+    ClayRemold { pos: Vec3 },
+    SlickFx { a: Vec3, b: Vec3, r: f32 },
 }
 
 #[derive(Clone, Debug)]
@@ -300,6 +305,16 @@ pub struct GodUnit {
     pub aloft_t: f32,
     pub look_reveal: f32,
     pub look_exposed: f32,
+    /// How much of any healing takes on this cat (Claypaw's clay: half;
+    /// everyone else all of it). Every heal site multiplies by it.
+    pub heal_mul: f32,
+    /// Claypaw (`clay`): how wet his clay is (1 wet .. 0 dry), how long he
+    /// is quick for, and when his next kitten is shaped.
+    pub clay_wet: f32,
+    pub clay_quick_t: f32,
+    pub clay_kit_t: f32,
+    /// The way it is sliding on a mud slick (`clay`); zero off one.
+    pub slide: Vec3,
     /// A Sentinel's coat (`sentinel`): the key she wears, the one a lasting
     /// coat goes back to, and how long the lasting one has left.
     pub field_slot: Option<u32>,
@@ -478,8 +493,10 @@ pub struct Game {
     pub titans: [Titan; 2],
     pub projectiles: Vec<Projectile>,
     pub zones: Vec<Zone>,
-    /// Sproutkit's litters, running (`kit`).
+    /// Sproutkit's litters, running (`kit`), and Claypaw's clay kittens.
     pub kitlings: Vec<crate::kit::Kitling>,
+    /// Claypaw's mud slicks (`clay`).
+    pub slicks: Vec<crate::clay::Slick>,
     /// Hollowstep's others -- his standing one and his echoes (`stalker`).
     pub others: Vec<crate::stalker::Other>,
     pub events: Vec<Event>,
@@ -653,6 +670,11 @@ impl Game {
                 aloft_t: 0.0,
                 look_reveal: 0.0,
                 look_exposed: 0.0,
+                heal_mul: if crate::clay::is_clay(def) { crate::clay::HEAL_MUL } else { 1.0 },
+                clay_wet: 1.0,
+                clay_quick_t: 0.0,
+                clay_kit_t: crate::clay::KIT_EVERY,
+                slide: Vec3::ZERO,
                 field_slot: None,
                 field_back: None,
                 field_t: 0.0,
@@ -709,6 +731,7 @@ impl Game {
             projectiles: Vec::new(),
             zones: Vec::new(),
             kitlings: Vec::new(),
+            slicks: Vec::new(),
             others: Vec::new(),
             events: Vec::new(),
             killfeed: Vec::new(),
@@ -1017,7 +1040,9 @@ impl Game {
         let dance = if g.dance_t > 0.0 { crate::kit::DANCE_MOVE } else { 1.0 };
         // afraid (`stalker`): the legs go heavy
         let fear = 1.0 - crate::stalker::FEAR_SLOW * g.fear;
-        fear * dance * base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk * going * boon
+        // Claypaw's clay dries, and quickens (`clay`)
+        let clay = if crate::clay::is_clay(def) { crate::clay::dry_mul(g.clay_wet) * if g.clay_quick_t > 0.0 { 1.0 + crate::clay::QUICK_SPEED } else { 1.0 } } else { 1.0 };
+        clay * fear * dance * base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk * going * boon
     }
 
     pub fn auto_interval(&self, i: usize) -> f32 {
@@ -1039,6 +1064,12 @@ impl Game {
             return;
         }
         let _ = magic;
+        // Claypaw's mana comes from his claws (`clay`)
+        if self.basic_attack {
+            if let Some(s) = source {
+                self.clay_on_hit(s);
+            }
+        }
         // Stormfire: the Drake's blessing multiplies everything its holders deal
         if let Some(s) = source {
             if s < self.gods.len() {
@@ -1277,7 +1308,7 @@ impl Game {
             self.events.push(Event::LevelUp { pos });
             self.recalc(gi);
             let g = &mut self.gods[gi];
-            g.hp = (g.hp + g.max_hp * 0.22).min(g.max_hp);
+            g.hp = (g.hp + g.max_hp * 0.22 * g.heal_mul).min(g.max_hp);
             g.mana = (g.mana + g.max_mana * 0.3).min(g.max_mana);
         }
     }
