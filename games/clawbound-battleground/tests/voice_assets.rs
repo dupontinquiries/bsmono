@@ -186,3 +186,49 @@ fn sproutkit_brings_a_crowd_of_babies_in_harmony() {
         assert!(off >= 4, "ability {}: only {off} of {} clips off the crowd's note {root}: {classes:?}", slot + 1, classes.len());
     }
 }
+
+/// Hollowstep's phantoms (dev/voice_script/phantom.py): for each ability,
+/// the swarm keys the cast asks for, each a mono whisper in two takes --
+/// and made strange, not copies of the line: the first is the line
+/// reversed (it matches the reversed line better than the line itself),
+/// and none of them lines up with the line sample for sample.
+#[test]
+fn hollowstep_speaks_from_places_he_is_not() {
+    let files = load();
+    let corr = |a: &[f32], b: &[f32]| -> f32 {
+        // best normalised cross-correlation over lags up to 0.3 s, on
+        // 1/8-decimated envelopes-free signals
+        let d = |x: &[f32]| x.iter().step_by(8).copied().collect::<Vec<f32>>();
+        let (a, b) = (d(a), d(b));
+        let n = a.len().min(b.len());
+        let e = |x: &[f32]| x.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
+        let mut best = 0.0f32;
+        for lag in (0..(RATE as usize / 8 * 3 / 10)).step_by(12) {
+            if lag >= n {
+                break;
+            }
+            let dot: f32 = (0..n - lag).map(|i| a[i + lag] * b[i]).sum();
+            best = best.max((dot / (e(&a[lag..n]) * e(&b[..n - lag]))).abs());
+        }
+        best
+    };
+    let mut checked = 0;
+    for slot in 1..=4 {
+        let line = &files[&format!("voice/hollowstep/cast{slot}.opus")].pcm;
+        for k in 0..5 {
+            for t in 1..=2 {
+                let key = format!("sfx/swarm/hollowstep/{slot}/b{k}.{t}.opus");
+                let c = files.get(&key).unwrap_or_else(|| panic!("{key} missing"));
+                assert_eq!(c.channels, 1, "{key}: mono, the cue places it");
+                let peak = c.pcm.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+                assert!((0.3..=0.97).contains(&peak), "{key}: peak {peak:.2}");
+                checked += 1;
+            }
+        }
+        let b0 = &files[&format!("sfx/swarm/hollowstep/{slot}/b0.1.opus")].pcm;
+        let rev: Vec<f32> = line.iter().rev().copied().collect();
+        let (fwd, back) = (corr(b0, line), corr(b0, &rev));
+        assert!(back > fwd, "cast{slot}: the first phantom is the line reversed ({back:.2} against {fwd:.2} forward)");
+    }
+    assert_eq!(checked, 4 * 5 * 2);
+}

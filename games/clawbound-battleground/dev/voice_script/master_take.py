@@ -248,7 +248,14 @@ def sproutkit_post(y, key):
     return y.astype(np.float32)
 
 
-POST = {'twofang': lambda y, key: viper(y), 'sproutkit': sproutkit_post}
+def hollowstep_post(y, key):
+    # the phantom (phantom.py): a reversed echo swelling into the words,
+    # detuned doubles a sixth-tone either side, a faint tritone under
+    import phantom
+    return phantom.post(y, key)
+
+
+POST = {'twofang': lambda y, key: viper(y), 'sproutkit': sproutkit_post, 'hollowstep': hollowstep_post}
 
 # The god and the beast under each voice, laid in BEFORE the chain so the
 # chain's pitch, EQ, compression and room glue them to the voice (beast.py).

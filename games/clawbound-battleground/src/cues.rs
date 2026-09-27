@@ -67,8 +67,17 @@ pub fn cues_for(ev: &Event, game: &Game) -> Vec<Cue> {
             let arch = archetype_key(&game.def(*god).abilities[*slot as usize].arch);
             let mut v = vec![Cue { keys: vec![format!("sfx/cast/{a}/{}", slot + 1), format!("sfx/cast/{arch}"), "sfx/cast".into()], bus: Bus::Sfx, gain: 0.9, pos: god_pos(*god), speaker: None, priority: 5 }];
             if let Some(at) = god_pos(*god) {
+                // the ring turned to a new angle each cast (from the clock:
+                // replays agree), so a swarm -- Sproutkit's babies,
+                // Hollowstep's phantoms -- is somewhere new round him every
+                // time
+                // (a hash of the clock's bits: the sine-of-time trick came
+                // back to the same angle whenever casts fell ~7 pi / 12.99 s
+                // apart, which the test's spacing happened to be)
+                let h = game.t.to_bits().wrapping_mul(2_654_435_761) >> 8;
+                let turn = (h & 0xFFFF) as f32 / 65536.0 * std::f32::consts::TAU;
                 for k in 0..SWARM_MAX {
-                    v.push(Cue { keys: vec![format!("sfx/swarm/{a}/{}/b{k}", slot + 1)], bus: Bus::Sfx, gain: SWARM_GAIN, pos: Some(swarm_spot(at, *slot, k)), speaker: None, priority: 2 });
+                    v.push(Cue { keys: vec![format!("sfx/swarm/{a}/{}/b{k}", slot + 1)], bus: Bus::Sfx, gain: SWARM_GAIN, pos: Some(swarm_spot(at, *slot, k, turn)), speaker: None, priority: 2 });
                 }
             }
             v
@@ -121,9 +130,9 @@ pub const SWARM_GAIN: f32 = 0.5;
 
 /// Where swarm voice `k` of ability `slot` stands round `at`: on a ring,
 /// a golden angle apart (so any first few are spread round, not bunched),
-/// turned a little per ability.
-pub fn swarm_spot(at: Vec3, slot: u32, k: usize) -> Vec3 {
-    let a = k as f32 * 2.399_963 + slot as f32 * 0.7;
+/// turned a little per ability and by `turn` (radians) per cast.
+pub fn swarm_spot(at: Vec3, slot: u32, k: usize, turn: f32) -> Vec3 {
+    let a = k as f32 * 2.399_963 + slot as f32 * 0.7 + turn;
     at + Vec3::new(a.cos(), 0.0, a.sin()) * SWARM_RING
 }
 
@@ -195,6 +204,25 @@ mod tests {
         assert!(c[0].keys[1].starts_with("sfx/cast/") && c[0].keys[2] == "sfx/cast");
     }
 
+    /// The swarm's ring turns cast to cast: Hollowstep's phantoms (and
+    /// Sproutkit's babies) speak from somewhere new round him each time.
+    #[test]
+    fn a_swarm_stands_somewhere_new_each_cast() {
+        let mut g = game();
+        let at = g.gods[0].pos;
+        let spot = |g: &Game| {
+            let c = cues_for(&Event::Cast { god: 0, slot: 0, aim: Vec3::ZERO }, g);
+            c.iter().find(|c| c.keys[0].ends_with("/b0")).unwrap().pos.unwrap() - at
+        };
+        let mut seen = Vec::new();
+        for k in 0..6 {
+            g.t = 3.0 + k as f32 * 1.7;
+            seen.push(spot(&g));
+        }
+        let distinct = (0..seen.len()).filter(|&i| (0..i).all(|j| seen[i].distance(seen[j]) > 0.5)).count();
+        assert!(distinct >= 5, "the first phantom stood in only {distinct} different places over 6 casts: {seen:?}");
+    }
+
     /// A cast asks for its swarm: SWARM_MAX voices, each its own key, each
     /// on the ring round the caster, spread all round -- a listener at the
     /// caster hears them on both sides and in front and behind.
@@ -226,7 +254,7 @@ mod tests {
         // the first three already spread (golden angle): no two within 60 deg
         for i in 0..3 {
             for j in 0..i {
-                let (a, b) = (swarm_spot(at, 3, i) - at, swarm_spot(at, 3, j) - at);
+                let (a, b) = (swarm_spot(at, 3, i, 0.0) - at, swarm_spot(at, 3, j, 0.0) - at);
                 assert!(a.normalize().dot(b.normalize()) < 0.5, "voices {i} and {j} bunched");
             }
         }
