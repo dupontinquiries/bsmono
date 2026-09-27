@@ -3388,10 +3388,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let cave_gas_enabled = std::env::var("UNENDLICH_CAVE_GAS").map_or(true, |v| v != "0");
     let mut breath = unendlich_engine::sim::cave_air::Breath::Normal;
     let mut air_fx = unendlich_engine::sim::cave_air::effects(unendlich_engine::sim::cave_air::Breath::Normal);
+    // Heat stress from the air temperature (sim::cave_air::heat_for).
+    let mut heat = unendlich_engine::sim::cave_air::Heat::None;
+    let mut heat_fx = unendlich_engine::sim::cave_air::heat_effects(heat);
     // O2 at the head last frame (the bending fields read it before the air
     // block runs), how muffled the world sounds, and when the earth last spoke.
     let mut o2_head_last = unendlich_engine::world::cave_gas::O2_AIR;
     let mut air_hush = 0.0f32;
+    // Cave air temperature (world::cave_climate). UNENDLICH_CAVE_CLIMATE=0
+    // keeps the surface climate everywhere, as before.
+    let cave_climate_enabled = std::env::var("UNENDLICH_CAVE_CLIMATE").map_or(true, |v| v != "0");
+    let mut cave_zone_last = unendlich_engine::world::underground::Zone::Soil;
+    let mut ambient_c_last = f32::NAN;
     let mut gas_sensed: Option<[i32; 2]> = None;
     let mut held_flame = unendlich_engine::sim::cave_air::Flame::default();
     let hold_block: Option<BlockId> = std::env::var("UNENDLICH_HOLD").ok().and_then(|v| BlockId::from_id_str(v.trim()));
@@ -8318,8 +8326,34 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     )
                 });
                 let heat_near = heat_sources.total_heat_at(ppx.x, ppx.y, ppx.z);
+                // Cave air (world::cave_climate): below the soil line the
+                // surface climate gives way to the cave zone's own steady
+                // temperature, as the sky closes over (light volume sky level).
+                let surface_c = climate_t * 45.0 - 5.0; // normalized T -> [-5, 40] °C
+                let ambient_c = if cave_climate_enabled {
+                    use unendlich_engine::world::cave_climate as cc;
+                    let m = chunk_manager.model_arc();
+                    let (bx, by, bz) = (ppx.x.floor() as i32, (ppx.y + 0.6).floor() as i32, ppx.z.floor() as i32);
+                    let surf = m.surface_target(bx as f64, bz as f64, 0.0).round() as i32;
+                    let depth = surf - by;
+                    let cave = cc::cave_c(bx, by, bz, depth, m.seed());
+                    let sky01 = light_sys.light_at([bx, by, bz]).map_or(1.0, |l| l[0] as f32 / 15.0);
+                    let zone = unendlich_engine::world::underground::zone_of(bx, by, bz, depth, m.seed());
+                    if zone != cave_zone_last {
+                        log::info!(
+                            "[climate] {:?} -> {:?} at depth {} (cave air {}, weather {:.0}°C)",
+                            cave_zone_last, zone, depth,
+                            cave.map_or("none".to_string(), |c| format!("{c:.0}°C")), surface_c
+                        );
+                        cave_zone_last = zone;
+                    }
+                    cc::ambient_c(surface_c, cave, depth as f32, sky01)
+                } else {
+                    surface_c
+                };
+                ambient_c_last = ambient_c;
                 let cond = sxp::Conditions {
-                    ambient_c: climate_t * 45.0 - 5.0, // normalized T -> [-5, 40] °C
+                    ambient_c,
                     wind01: (wmagx as f32 * 0.2).clamp(0.0, 1.0),
                     // r156: rain soaks you unless the roof holds.
                     wet01: if in_water {
@@ -9656,10 +9690,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // = WALK_SPEED for a default 1.8 character. Sprint multiplies on top.
                 let mut speed = player_stature.move_speed;
                 // sim::cave_air: bad air slows you, and below 8% O₂ you cannot move.
-                speed *= air_fx.move_mult;
+                speed *= air_fx.move_mult * heat_fx.move_mult;
                 // r118: sprint costs stamina — gate on the meter (ticked above).
+                // Heat III (cave_biomes.docx) disables sprint.
                 if bindings.is_action_pressed(GameAction::Sprint, &input)
-                    && fg_app.stamina().sprinting {
+                    && fg_app.stamina().sprinting
+                    && heat_fx.sprint {
                     speed *= physics::constants::SPRINT_MULTIPLIER;
                 }
                 if bindings.is_action_pressed(GameAction::Sneak, &input) {
@@ -17035,12 +17071,23 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             if survival_mode && air_fx.vitality_drain > 0.0 {
                 fg_app.vitality_mut().tick(dt, air_fx.vitality_drain);
             }
-            if survival_mode && air_fx.stamina_regen_mult < 1.0 {
-                // Fatigue: bad air eats into the stamina the meter would recover.
-                let s = fg_app.stamina_mut();
-                s.level = (s.level - (1.0 - air_fx.stamina_regen_mult) * 0.08 * dt).max(0.0);
+            // Heat stress from the air the exposure block computed.
+            if ambient_c_last.is_finite() {
+                let nh = ca::heat_for(ambient_c_last);
+                if nh != heat {
+                    log::info!("[heat] air {:.0}°C: {:?} -> {:?}", ambient_c_last, heat, nh);
+                    heat = nh;
+                }
             }
-            renderer.set_air_vignette(air_fx.vignette);
+            heat_fx = ca::heat_effects(if survival_mode { heat } else { ca::Heat::None });
+            let regen = air_fx.stamina_regen_mult.min(heat_fx.stamina_regen_mult);
+            if survival_mode && regen < 1.0 {
+                // Fatigue: bad air or heat eats into the stamina the meter
+                // would recover.
+                let s = fg_app.stamina_mut();
+                s.level = (s.level - (1.0 - regen) * 0.08 * dt).max(0.0);
+            }
+            renderer.set_air_vignette(air_fx.vignette.max(heat_fx.vignette));
             o2_head_last = o2_head;
             // Dead silence (docx): below the surface the gas swallows sound.
             // Eased so crossing the surface is a fade, not a click. This game
@@ -17210,8 +17257,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     let seed = chunk_manager.model_arc().seed();
                     let best = unendlich_engine::world::cave_gas::sense(e.x, e.y, e.z, seed, 160.0);
                     log::info!(
-                        "light: nearest basin {:?} | breath {:?} (O2 {:.1}%) hush {:.2} flame {:?}",
-                        best, breath, o2_head_last * 100.0, air_hush, held_flame.state
+                        "light: nearest basin {:?} | breath {:?} (O2 {:.1}%) hush {:.2} flame {:?} | air {:.1}°C in {:?}, heat {:?}, body {:.1}°C",
+                        best, breath, o2_head_last * 100.0, air_hush, held_flame.state,
+                        ambient_c_last, cave_zone_last, heat, fg_thermal.body_c
                     );
                 }
                 log::info!(
