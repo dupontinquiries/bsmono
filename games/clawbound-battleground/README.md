@@ -54,7 +54,14 @@ what else is known-but-unresolved.
   Quarry has LINE OF SIGHT: a cat sees 55 u down open floor, not through a
   wall or a shut gate; an enemy nobody on your team sees (and no tower of
   yours reaches) is not drawn, not on the minimap, and not targeted by
-  bots.
+  bots. Carved TABLETS stand against the walls, one to a room: the
+  engineers' own tongue, **Geartooth** (`src/geartooth.rs`), with two clicks
+  (`!` a pop, `|` a tsk) and four vowels the clans lack (ä ö ü y); standing
+  at one, the HUD reads it -- the carving, its meaning, and the piece of
+  grammar it shows (verb last; many by doubling; a click before the verb
+  for past or future; not with -m; whose with -a). The Sentinels speak it:
+  Oremantle's lines are Geartooth, spoken by a formant synthesizer built
+  for its clicks and vowels (`dev/voice_script/geartooth_voice.py`).
 - **The Drowned Halls** (3v3, `--map atlantis`): one colonnaded hall and a
   domed library on the sea floor.
 - **The first three maps** — the jungle valley (5v5, three lanes), Twinfang Pass (15v15
@@ -444,6 +451,7 @@ src/
 ├── maze.rs        the Quarry: rooms and gates, the labyrinth turning, the waking, the thorns, the pack
 ├── mazeworld.rs   the Quarry's dressing, gate slabs (collision + mesh), thorn spots, gear trains, screws, chutes, pads, boulder
 ├── hours.rs       Hourwatch: every cat's trail; turning back, sending back, winding forward, the long look
+├── geartooth.rs   the Geartooth tongue: its lexicon, its grammar, the Quarry's tablets
 ├── clay.rs        Claypaw: his kittens, his drying, his mana from claws, halved healing, the mud slicks
 ├── machine.rs     the Quarry's machine: tracks from hopper to chute to floor, which pair runs each turn, the locks and their pads, the roll, the hit, the fall, the bots' dodge
 ├── bosses.rs      the Elder Boar + Storm Drake: pits, AI, rewards, TargetRef::Boss

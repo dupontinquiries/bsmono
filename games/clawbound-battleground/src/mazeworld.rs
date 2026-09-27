@@ -37,11 +37,14 @@ pub enum Item {
     /// An Archimedes screw at the head of a boulder track (`machine`): it
     /// winds the ball up out of the floor. Drawn turning by `scene`.
     Screw { at: Vec3 },
+    /// A carved tablet of the Geartooth tongue (`geartooth::TABLETS[k]`),
+    /// standing against a wall, its face toward `face` (unit, axis-aligned).
+    Tablet { at: Vec3, face: Vec3, k: u8 },
 }
 
 pub fn item_at(it: &Item) -> Vec3 {
     match *it {
-        Item::Statue { at, .. } | Item::Brazier { at } | Item::Pillar { at, .. } | Item::Screw { at } => at,
+        Item::Statue { at, .. } | Item::Brazier { at } | Item::Pillar { at, .. } | Item::Screw { at } | Item::Tablet { at, .. } => at,
         Item::Stub { a, b } => (a + b) * 0.5,
     }
 }
@@ -54,12 +57,35 @@ fn flip(it: Item) -> Item {
         Item::Pillar { at, variant } => Item::Pillar { at: f(at), variant },
         Item::Stub { a, b } => Item::Stub { a: f(a), b: f(b) },
         Item::Screw { at } => Item::Screw { at: f(at) },
+        Item::Tablet { at, face, k } => Item::Tablet { at: f(at), face: f(face), k },
     }
 }
 
 /// Everything placed in the Quarry. Computed AS that map whatever is
 /// active.
 pub fn placements() -> Vec<Item> {
+    crate::map::with(crate::map::MapId::Maze, || {
+        let mut out = placements_here();
+        // the tablets last: they stand clear of everything, the machine's
+        // pads included -- and the pads are laid clear of the dressing
+        // (`placements_without_tablets`), which is why the tablets cannot
+        // be in it (the pads' one-time setup waited on itself)
+        let both = |out: &mut Vec<Item>, it: Item| {
+            let on_axis = item_at(&it).z.abs() < 0.5;
+            out.push(it);
+            if !on_axis {
+                out.push(flip(it));
+            }
+        };
+        for (at, face, k) in tablet_spots(&out) {
+            both(&mut out, Item::Tablet { at, face, k });
+        }
+        out
+    })
+}
+
+/// The dressing without the tablets (what the machine's pads keep clear of).
+pub fn placements_without_tablets() -> Vec<Item> {
     crate::map::with(crate::map::MapId::Maze, placements_here)
 }
 
@@ -151,6 +177,16 @@ fn placements_here() -> Vec<Item> {
         }
     }
     out
+}
+
+/// The tablets as the HUD reads them: where each stands, and which.
+pub fn tablets() -> Vec<(Vec3, usize)> {
+    placements().into_iter().filter_map(|i| if let Item::Tablet { at, k, .. } = i { Some((at, k as usize)) } else { None }).collect()
+}
+
+/// The tablet a cat at `p` can read (within 5 u), if any.
+pub fn tablet_near(tabs: &[(Vec3, usize)], p: Vec3) -> Option<usize> {
+    tabs.iter().filter(|(at, _)| Vec3::new(at.x - p.x, 0.0, at.z - p.z).length() < 5.0).min_by(|a, b| a.0.distance(p).total_cmp(&b.0.distance(p))).map(|t| t.1)
 }
 
 /// A gate's slab: a wall of stone across passage `g`'s middle, into the
@@ -463,6 +499,12 @@ pub fn build() -> (Vec<Piece>, Blockers) {
                 blockers.push(Blocker { shape: Shape::Circle { x: at.x, z: at.z, r: 1.3 }, top: 6.0, cover: Cover::NONE });
                 pieces.push(Piece { mesh: pillars[variant as usize % 4].clone(), pos: at, quarter: (variant % 4) as u8, vsize: V_MED, sway: 0.0 });
             }
+            Item::Tablet { at, face, k } => {
+                let side = Vec3::new(-face.z, 0.0, face.x) * 1.5;
+                let (a, b) = (at - side, at + side);
+                blockers.push(Blocker { shape: Shape::Segment { x0: a.x, z0: a.z, x1: b.x, z1: b.z, r: 0.35 }, top: 2.6, cover: Cover::NONE });
+                pieces.push(Piece { mesh: tablet_mesh(k as usize, face), pos: at, quarter: 0, vsize: 0.1, sway: 0.0 });
+            }
             Item::Screw { .. } => {
                 // drawn by the scene, turning; up on the hills, off the
                 // floor: nothing to collide with
@@ -479,6 +521,141 @@ pub fn build() -> (Vec<Piece>, Blockers) {
 /// A broken stretch of wall from `a` to `b` (world), centred on their
 /// middle: a low course of stone, ragged along its top. Feet at y = 0,
 /// origin at the middle of `a`..`b`.
+/// Where the tablets stand (blue half and the Heart's row; `both`
+/// mirrors them): rooms in order of their distance from the blue base, one
+/// tablet each, two in the Heart; in each, the first spot against a wall
+/// that is clear of the lanes, the mouths, the springs, the towers, the
+/// machine's tracks and pads, and the dressing already placed.
+fn tablet_spots(placed: &[Item]) -> Vec<(Vec3, Vec3, u8)> {
+    let f = mz::floor();
+    let base = crate::consts::Team::Blue.base_pos();
+    let mut rooms: Vec<Room> = mz::rooms().filter(|r| r.1 <= 0).collect();
+    rooms.sort_by(|a, b| mz::room_pos(*a).distance(base).total_cmp(&mz::room_pos(*b).distance(base)).then(a.0.cmp(&b.0)));
+    let lanes: Vec<Vec<Vec3>> = [Lane::Top, Lane::Bot].map(mz::lane_polyline).into();
+    let lane_d = |c: Vec3| lanes.iter().flat_map(|l| l.windows(2).map(|w| crate::abilities::point_segment_dist(c, w[0], w[1]))).fold(f32::MAX, f32::min);
+    let pads: Vec<Vec3> = (0..crate::machine::pairs().len()).flat_map(|p| crate::machine::pads(p).iter().map(|d| d.at)).collect();
+    let mut out: Vec<(Vec3, Vec3, u8)> = Vec::new();
+    let mut k = 0u8;
+    // (a first pass gives each room one -- the Heart two -- and later
+    // passes put what is left in rooms with more wall to spare: some rooms
+    // have none clear)
+    for pass in 0..3 {
+    for &rm in &rooms {
+        let want = if rm == mz::HEART && pass == 0 { 2 } else { 1 };
+        let c = mz::room_pos(rm);
+        let mut got = 0;
+        'spots: for (normal, tangent) in [(-Vec3::Z, Vec3::X), (Vec3::Z, Vec3::X), (-Vec3::X, Vec3::Z), (Vec3::X, Vec3::Z)] {
+            for along in [-12.0f32, 12.0, -20.0, 20.0, -6.0, 6.0, 0.0] {
+                if got >= want || k as usize >= crate::geartooth::TABLETS.len() {
+                    break 'spots;
+                }
+                // walk out toward that wall until it is right behind
+                let mut p = c + tangent * along;
+                let mut ok = false;
+                for _ in 0..80 {
+                    let next = p + normal * 0.5;
+                    if f.sdf(next.x + normal.x * 1.6, next.z + normal.z * 1.6) > 0.0 {
+                        ok = true;
+                        break;
+                    }
+                    p = next;
+                }
+                let spot = Vec3::new(p.x, 0.0, p.z);
+                let near_placed = placed.iter().any(|it| item_at(it).distance(spot) < 5.0)
+                    || out.iter().any(|(q, _, _)| q.distance(spot) < 8.0 || Vec3::new(q.x, 0.0, -q.z).distance(spot) < 8.0);
+                let clear = ok
+                    && f.fits(spot.x, spot.z, 1.2)
+                    && spot.z <= 0.01
+                    && (spot.z.abs() > 3.0 || spot.z.abs() < 0.01)
+                    && lane_d(spot) > 6.0
+                    && mz::passages().iter().all(|g| g.p0.distance(spot) > 6.0 && g.p1.distance(spot) > 6.0)
+                    && mz::heal_tree_positions().iter().all(|h| h.distance(spot) > 6.0)
+                    && [Lane::Top, Lane::Bot].iter().all(|&l| [crate::consts::Team::Blue, crate::consts::Team::Red].iter().all(|&tm| [false, true].iter().all(|&inner| mz::tower_pos(l, tm, inner).distance(spot) > 7.0)))
+                    && crate::machine::pairs().iter().flatten().all(|t| t.dist(spot, 0.0) > crate::machine::DODGE_OUT + 1.0)
+                    && pads.iter().all(|d| d.distance(spot) > crate::machine::PAD_HALF + 3.0)
+                    && !near_placed;
+                if clear {
+                    out.push((spot, -normal, k));
+                    k += 1;
+                    got += 1;
+                }
+            }
+        }
+    }
+    }
+    out
+}
+
+/// A tablet's stone: a slab 3.2 u wide, 2.6 tall, half a unit deep, on a
+/// low plinth, standing with its face toward `face`; the inscription cut
+/// into the face in rows -- each letter a small hashed glyph, the clicks
+/// inlaid in bronze (they are what a clan cat notices first). Centred on
+/// its foot, y from 0.
+pub fn tablet_mesh(k: usize, face: Vec3) -> VoxelMesh {
+    const V: f32 = 0.1;
+    let (w, h, d) = (32i32, 26i32, 5i32);
+    let along_x = face.z.abs() > 0.5;
+    let (nx, nz) = if along_x { (w + 2, d + 4) } else { (d + 4, w + 2) };
+    let mut g = Grid::new(nx as usize, (h + 2) as usize, nz as usize);
+    let stone = [0.52, 0.49, 0.44, 1.0];
+    let dark = [0.20, 0.18, 0.16, 1.0];
+    let bronze = [0.70, 0.49, 0.21, 1.0];
+    // (u across the face, y up, s from the back (0) to the face (d-1))
+    let front = if along_x { face.z > 0.0 } else { face.x > 0.0 };
+    let mut put = |u: i32, y: i32, s: i32, c: [f32; 4]| {
+        let s2 = if front { s + 2 } else { d + 1 - s };
+        let (x, z) = if along_x { (u + 1, s2) } else { (s2, u + 1) };
+        g.set(x, y, z, c);
+    };
+    for u in 0..w {
+        for y in 0..h {
+            for s in 0..d {
+                let plinth = y < 3;
+                if plinth || (u > 0 && u < w - 1) || s > 0 {
+                    put(u, y, s, if plinth { [0.44, 0.41, 0.37, 1.0] } else { stone });
+                }
+            }
+        }
+    }
+    // the inscription
+    let text = crate::geartooth::TABLETS[k % crate::geartooth::TABLETS.len()].gt;
+    let (mut col, mut row) = (0i32, 0i32);
+    for ch in text.chars() {
+        if ch == ' ' {
+            col += 2;
+        } else {
+            let x0 = 3 + col;
+            if x0 + 3 > w - 3 {
+                col = 0;
+                row += 1;
+            }
+            let x0 = 3 + col;
+            let y0 = h - 5 - row * 6;
+            if y0 < 4 {
+                break;
+            }
+            if ch == '!' || ch == '|' {
+                for dy in 0..4 {
+                    put(x0, y0 - dy, d - 1, bronze);
+                }
+                if ch == '!' {
+                    put(x0, y0 - 2, d - 1, stone);
+                }
+                col += 2;
+            } else {
+                let hsh = (ch as u32).wrapping_mul(2654435761) >> 20;
+                for (b, (dx, dy)) in [(0, 0), (1, 0), (2, 0), (0, 1), (2, 1), (1, 2), (0, 3), (1, 3), (2, 3), (1, 1)].iter().enumerate() {
+                    if hsh >> b & 1 == 1 || b == 9 {
+                        put(x0 + dx, y0 - dy, d - 1, dark);
+                    }
+                }
+                col += 4;
+            }
+        }
+    }
+    g.mesh(V, true)
+}
+
 const CHUTE_V: f32 = 0.4;
 
 /// A track's chute: a wooden trough on trestles from its hopper (a bin
@@ -684,6 +861,33 @@ mod tests {
                     }
                 }
             }
+        });
+    }
+
+    /// Every Geartooth tablet stands somewhere (the first ones nearer the
+    /// blue base than the last), each against a wall with its face to open
+    /// floor, mirrored; and a cat standing in front of one reads it.
+    #[test]
+    fn every_tablet_stands_against_a_wall() {
+        crate::map::with(crate::map::MapId::Maze, || {
+            let f = mz::floor();
+            let items = placements();
+            let tabs: Vec<(Vec3, Vec3, u8)> = items.iter().filter_map(|i| if let Item::Tablet { at, face, k } = *i { Some((at, face, k)) } else { None }).collect();
+            for k in 0..crate::geartooth::TABLETS.len() as u8 {
+                assert!(tabs.iter().any(|t| t.2 == k), "tablet {k} stands nowhere");
+            }
+            for (at, face, k) in &tabs {
+                let behind = *at - *face * 2.2;
+                let before = *at + *face * 3.0;
+                assert!(f.sdf(behind.x, behind.z) > 0.0, "tablet {k} at {at} has no wall behind it");
+                assert!(f.fits(before.x, before.z, 1.0), "tablet {k} at {at} faces no floor");
+                let tl = tablets();
+                assert_eq!(tablet_near(&tl, before), Some(*k as usize), "cannot read tablet {k} from in front of it");
+            }
+            let base = crate::consts::Team::Blue.base_pos();
+            let first = tabs.iter().filter(|t| t.2 == 0 && t.0.z < 0.0).map(|t| t.0.distance(base)).fold(f32::MAX, f32::min);
+            let last = tabs.iter().filter(|t| t.2 as usize == crate::geartooth::TABLETS.len() - 1).map(|t| t.0.distance(base)).fold(f32::MAX, f32::min);
+            assert!(first < last, "the first tablet ({first}) is not nearer the base than the last ({last})");
         });
     }
 

@@ -152,15 +152,15 @@ voice/brasshowl/kill.1.opus	brasshowl	Out you go.	brisk	3	takes down an enemy an
 voice/brasshowl/kill.2.opus	brasshowl	The road is clear.	satisfied, to the caravan	3	takes down an enemy ancestor
 voice/brasshowl/death.1.opus	brasshowl	The lamp... is out...	surprised, quiet	2	falls
 voice/brasshowl/death.2.opus	brasshowl	Keep... it... lit...	a last instruction	1	falls
-voice/oremantle/select.opus	oremantle	The mountain is here.	slow, settling in	2	locked in on the select screen
-voice/oremantle/cast1.opus	oremantle	Stand behind me.	firm, protective	3	shifts to Granite
-voice/oremantle/cast2.opus	oremantle	Cold, now.	quiet, breath misting	2	shifts to Rime
-voice/oremantle/cast3.opus	oremantle	Come here, child.	patient, drawing someone in	2	shifts to Lodestone
-voice/oremantle/cast4.opus	oremantle	The mountain has a HEART!	from a rumble to a roar on 'heart'	5	shifts to The Mountain's Heart
-voice/oremantle/kill.1.opus	oremantle	Rest now.	grandmotherly, almost kind	2	takes down an enemy ancestor
-voice/oremantle/kill.2.opus	oremantle	Stone outlasts.	flat, certain	2	takes down an enemy ancestor
-voice/oremantle/death.1.opus	oremantle	Even mountains... fall...	surprised, slow	1	falls
-voice/oremantle/death.2.opus	oremantle	Back... to the rock...	content, going home	1	falls
+voice/oremantle/select.opus	oremantle	Tharu hy.	slow, settling in [the mountain is here]	2	locked in on the select screen
+voice/oremantle/cast1.opus	oremantle	|Ö, hy!	firm, protective [kin, here -- behind me]	3	shifts to Granite
+voice/oremantle/cast2.opus	oremantle	Yla tam.	quiet, breath misting [the water shuts -- cold now]	2	shifts to Rime
+voice/oremantle/cast3.opus	oremantle	Mi, hy.	patient, drawing someone in [little one, here]	2	shifts to Lodestone
+voice/oremantle/cast4.opus	oremantle	Tharu-a !ÖN!	from a rumble to a roar on the click [the mountain's HEART]	5	shifts to The Mountain's Heart
+voice/oremantle/kill.1.opus	oremantle	Luu.	grandmotherly, almost kind [go down; rest]	2	takes down an enemy ancestor
+voice/oremantle/kill.2.opus	oremantle	Doru ol.	flat, certain [stone, always]	2	takes down an enemy ancestor
+voice/oremantle/death.1.opus	oremantle	Tharu... !luu...	surprised, slow [the mountain... went down...]	1	falls
+voice/oremantle/death.2.opus	oremantle	Doru... |kör...	content, going home [the stone... will turn again...]	1	falls
 voice/hourwatch/select.opus	hourwatch	I have seen how this goes.	dry, faintly amused	2	locked in on the select screen
 voice/hourwatch/cast1.opus	hourwatch	Again.	calm, a correction	2	winds up Turn Back
 voice/hourwatch/cast2.opus	hourwatch	Not yet, you don't.	tart, pointing	3	winds up Send Back

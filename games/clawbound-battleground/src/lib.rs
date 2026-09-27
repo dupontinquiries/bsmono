@@ -80,6 +80,7 @@ pub mod maze;
 pub mod machine;
 pub mod hours;
 pub mod clay;
+pub mod geartooth;
 pub mod mazeworld;
 /// The Curio shelf's passives, worked (items::Passive).
 pub mod curios;

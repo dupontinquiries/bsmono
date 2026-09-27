@@ -11,6 +11,7 @@ use glam::Vec3;
 
 use crate::headless::{make_device, save_shot};
 use crate::maze as mz;
+use crate::mazeworld::Item;
 use crate::render::{Camera, Renderer};
 use crate::scene::Scene;
 use crate::sim::{Game, Rng};
@@ -113,6 +114,10 @@ pub fn run() -> Result<(), String> {
     game.t = t2 + 3.0;
     let rm = mz::room_pos(tr.rooms[1]);
     shoot(&mut renderer, &game, &mut vfx, "maze_machine_armed.png", cam(rm + Vec3::new(-20.0, 34.0, -30.0), rm, 1.0))?;
+    // a Geartooth tablet (`geartooth`), close, from the floor in front of it
+    if let Some(Item::Tablet { at, face, .. }) = crate::mazeworld::placements().into_iter().find(|i| matches!(i, Item::Tablet { k: 2, .. })) {
+        shoot(&mut renderer, &game, &mut vfx, "maze_tablet.png", cam(at + face * 5.5 + Vec3::Y * 2.2, at + Vec3::Y * 1.3, 0.8))?;
+    }
     shoot(&mut renderer, &game, &mut vfx, "maze_gears.png", cam(Vec3::new(-70.0, 55.0, -95.0), Vec3::new(-40.0, 8.0, -55.0), 1.0))?;
     // a section stirring, then biting, the player's cat alone in it
     let class = game.wake.classes(0)[0];

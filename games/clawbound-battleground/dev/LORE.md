@@ -184,7 +184,8 @@ engineers built of stone and ore to keep their works when they were gone.
 They built her in the likeness of Stonewhisper's grandmother, of the old
 snow leopards that were half as big again as any cat since, who lay so long
 on the roots of the crags that the engineers could quarry her shape from the
-mountain itself; and they gave her the grandmother's voice. Her coat is
+mountain itself; and they gave her the grandmother's voice -- though she speaks
+with it only in their own tongue, clicks and all. Her coat is
 plates on the machine's axles, and turned, it shows what the mountain is
 made of: granite in the thaw, rime in the long dark, lodestone where the
 iron veins run, and once, when the clans needed it, the molten heart
@@ -209,6 +210,27 @@ wet, nothing else mends him more than half, and every kitten he shapes out
 of the mud runs off to bite at whatever he is fighting. Where he spins,
 the ground turns to slip; where he is angry, the bank gives way. The clans
 that farm the flood plains leave a lump of wet clay on the doorstep for him.
+
+## Geartooth, the engineers' tongue
+
+The Geartooth clan spoke a tongue of their own, and the Sentinels they
+built still speak it. They carved it on the Quarry's walls, one tablet to a
+room, as if to teach whoever came after -- and read in order from either
+base, the tablets do. (The full lexicon and grammar are in
+`src/geartooth.rs`; the tablets' texts, their readings and what each
+teaches are `geartooth::TABLETS`.)
+
+Its sounds: nine vowels -- a e i o u, and ä ö ü y, which no clan has -- and
+two clicks made with the tongue alone: `!`, a pop, the sound of a gear
+tooth dropping into place, and `|`, a tsk, a ratchet's catch. Its grammar:
+the verb comes last; many is said by doubling the first syllable (`!ük` a
+gear, `!ü!ük` gears); a click before a verb says when (`!kör` turned,
+`|kör` will turn); not is `-m` (`|ö` kin, `|öm` a stranger); whose is `-a`
+(`tharu-a !ön`, the mountain's heart -- Oremantle's cry).
+
+Oremantle speaks only Geartooth: *Tharu hy* (the mountain is here), *|Ö,
+hy!* (kin, here), *Yla tam* (the water shuts), *Mi, hy* (little one,
+here), *Tharu-a !ÖN!*, *Luu* (go down), *Doru ol* (stone, always).
 
 ## The music of the clans
 
