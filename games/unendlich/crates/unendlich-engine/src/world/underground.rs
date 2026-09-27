@@ -69,6 +69,15 @@ pub fn zone_at(depth: i32, y: i32, wobble: f32) -> Zone {
     z.max_soil_guard(depth)
 }
 
+/// The zone of the cell `(x, y, z)` that is `depth` blocks below the
+/// surface: [`zone_at`] with this pass's own boundary wobble. The one place
+/// the wobble is computed, so the world generator and anything that asks
+/// "what cave am I in" (world::cave_climate) agree.
+pub fn zone_of(x: i32, y: i32, z: i32, depth: i32, seed: u32) -> Zone {
+    let wob = noise_2d(x as f64 * 0.05, z as f64 * 0.05, seed.wrapping_add(seeds::WOBBLE)) as f32;
+    zone_at(depth, y, wob)
+}
+
 impl Zone {
     /// `stratum` can wave a cell just below `SOIL_DEPTH` back into band 0; the
     /// soil boundary is a hard line (the backends placed soil to it), so a
@@ -322,8 +331,7 @@ pub fn decorate(
                     rep.ore += 1;
                     continue;
                 }
-                let wob = noise_2d(x as f64 * 0.05, z as f64 * 0.05, seed.wrapping_add(seeds::WOBBLE)) as f32;
-                let zone = zone_at(depth, y, wob);
+                let zone = zone_of(x, y, z, depth, seed);
                 let r = host_rock(zone, x, y, z, seed);
                 if r != BlockId::Stone {
                     blocks[i] = r;
@@ -359,8 +367,7 @@ pub fn decorate(
                 if depth < SOIL_DEPTH || !roofed(lx, ly, lz) {
                     continue;
                 }
-                let wob = noise_2d(x as f64 * 0.05, z as f64 * 0.05, seed.wrapping_add(seeds::WOBBLE)) as f32;
-                let zone = zone_at(depth, y, wob);
+                let zone = zone_of(x, y, z, depth, seed);
                 let below = at(lx, ly - 1, lz);
                 let above = at(lx, ly + 1, lz);
                 let floor = below.map_or(false, is_rock);
