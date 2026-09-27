@@ -1282,6 +1282,11 @@ impl Renderer {
         let lvp = crate::groundfx::fit_shadow(cam.target, sun, half, self.shadow_size);
 
         let fog_color = [atm.fog_color[0], atm.fog_color[1], atm.fog_color[2], 1.0];
+        // the Drowned Halls lie under the sea: caustics on every floor, and
+        // the view graded as seen through water (post.wgsl)
+        let drowned = crate::map::active() == crate::map::MapId::Atlantis;
+        self.sea_map = drowned as u32 as f32;
+        self.underwater = drowned as u32 as f32;
         // caustics by the quality setting (Low: none; they are a per-pixel
         // loop on every lit river bed and sea floor)
         self.caustics = match self.quality {
@@ -1296,7 +1301,12 @@ impl Renderer {
             light_view_proj: lvp.to_cols_array_2d(),
             // w: the spirit sky (Starwell Glacier) -- no mountains on the
             // horizon, aurora, stars to the horizon (sky.wgsl)
-            sun_dir: [sun.x, sun.y, sun.z, if crate::map::active() == crate::map::MapId::Sky { 1.0 } else { 0.0 }],
+            // (2: the sea overhead, the Drowned Halls -- sky.wgsl)
+            sun_dir: [sun.x, sun.y, sun.z, match crate::map::active() {
+                crate::map::MapId::Sky => 1.0,
+                crate::map::MapId::Atlantis => 2.0,
+                _ => 0.0,
+            }],
             cam_pos: [cam.eye.x, cam.eye.y, cam.eye.z, 1.0],
             fog_color,
             params: [time, atm.fog_density, self.exposure, atm.night],
@@ -1908,6 +1918,7 @@ pub fn terrain_height(x: f32, z: f32) -> f32 {
     match crate::map::active() {
         crate::map::MapId::Pass => return crate::pass::terrain_height(x, z),
         crate::map::MapId::Sky => return crate::sky::terrain_height(x, z),
+        crate::map::MapId::Atlantis => return crate::atlantis::terrain_height(x, z),
         crate::map::MapId::Jungle => {}
     }
     use crate::consts::{river_dist, GROUND_HALF, RIVER_HALF_WIDTH, RIVER_DEPTH, ARENA_RADIUS, RIM_RADIUS};
@@ -2037,6 +2048,8 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
                 (color, mat) = pass_ground_color(x, z, h, slope, n1, n2, nm);
             } else if crate::map::active() == crate::map::MapId::Sky {
                 (color, mat) = sky_ground_color(x, z, h, slope, n1, n2, nm);
+            } else if crate::map::active() == crate::map::MapId::Atlantis {
+                (color, mat) = atlantis_ground_color(x, z, h, n1, n2, nm);
             } else if r > crate::consts::RIM_RADIUS + 3.0 && h > 14.0 {
                 // mountain rim: dark jungle rock with forest ledges
                 let rock = [0.24 + n1 * 0.05, 0.24 + n2 * 0.04, 0.22 + n1 * 0.03];
@@ -2297,6 +2310,84 @@ fn sky_ground_color(x: f32, z: f32, h: f32, slope: f32, n1: f32, n2: f32, nm: f3
     ([0.2, 0.24, 0.34], 5.0)
 }
 
+/// The Drowned Halls' ground: sea-marble floors with mosaics (a blue
+/// runner down the lane hall with gold borders; rings of the old palette in
+/// the Library; a medallion in each base), teal basalt walls laid in
+/// courses with a pale coping, and outside them the sea floor -- sand in
+/// dunes, dark rock.
+fn atlantis_ground_color(x: f32, z: f32, h: f32, n1: f32, n2: f32, nm: f32) -> ([f32; 3], f32) {
+    use crate::atlantis as at;
+    let lerp = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    let d = at::floor().sdf(x, z);
+    // the floor's last grid cell before a wall is a basalt skirting: the
+    // wall's face spans a single cell, and is drawn in the colours of its
+    // two edges -- with marble at its foot it read pale as ice
+    if d > -1.7 && d <= 0.2 {
+        return ([0.06 + n1 * 0.03, 0.18 + n1 * 0.04, 0.22 + n2 * 0.04], 5.0);
+    }
+    if d <= 0.2 {
+        let marble = [0.60 + n1 * 0.06, 0.66 + n1 * 0.05, 0.64 + n2 * 0.05];
+        let gold = [0.70, 0.55, 0.22];
+        // flagstone joints, faint, every 2.4 u
+        let joint = (((x * 0.42).fract() < 0.07) || ((z * 0.42).fract() < 0.07)) as i32 as f32;
+        let floor = lerp(marble, [0.42, 0.48, 0.48], joint * 0.35);
+        // the Library: rings of the old palette round a pale medallion
+        let lr = Vec3::new(x - at::LIBRARY_X, 0.0, z).length();
+        if lr < at::LIBRARY_R - 1.5 {
+            let pal = [[0.10, 0.43, 0.54], [0.60, 0.48, 0.18], [0.42, 0.18, 0.35], [0.16, 0.54, 0.42], [0.14, 0.30, 0.53]];
+            if lr < 3.5 {
+                return ([0.91, 0.85, 0.60], 4.0);
+            }
+            let ring = ((lr - 3.5) / 3.2) as usize;
+            let within = ((lr - 3.5) / 3.2).fract();
+            if within < 0.12 || within > 0.88 {
+                return (gold, 4.0);
+            }
+            // every other ring a solid band; the rest the marble floor with
+            // tesserae scattered in the band's colour
+            let c = pal[ring % pal.len()];
+            if ring % 2 == 0 {
+                return (lerp(c, [c[0] * 1.2, c[1] * 1.2, c[2] * 1.2], n2 * 0.4), 4.0);
+            }
+            return (lerp(floor, c, (nm > 0.55) as i32 as f32 * 0.6), 4.0);
+        }
+        // a base's medallion
+        for team in [crate::consts::Team::Blue, crate::consts::Team::Red] {
+            let b = team.base_pos();
+            let br = Vec3::new(x - b.x, 0.0, z - b.z).length();
+            if br < 9.0 {
+                let tc = team.rgb();
+                let within = (br / 3.0).fract();
+                return if within < 0.14 { (gold, 4.0) } else { (lerp(floor, [tc[0] * 0.5, tc[1] * 0.5, tc[2] * 0.5], 0.45), 4.0) };
+            }
+        }
+        // the lane hall's runner: deep blue tiles with gold borders
+        let road = lane_road(x, z);
+        if road < 2.2 {
+            let tile = ((x * 0.8).floor() + (z * 0.8).floor()) as i32 % 2 == 0;
+            return (if tile { [0.13, 0.29, 0.50] } else { [0.16, 0.36, 0.58] }, 4.0);
+        }
+        if road < 2.8 {
+            return (gold, 4.0);
+        }
+        return (floor, 4.0);
+    }
+    if !at::on_seabed(x, z) {
+        // the walls, face and top alike: teal basalt. (The face rises within
+        // one grid cell, so it has no vertices of its own: it is drawn in
+        // the colours of the floor's edge and the wall's top. A pale coping
+        // up there washed the whole face out to glacier white.)
+        let course = ((z * 0.37 + x * 0.21).sin() > 0.93) as i32 as f32;
+        let c = [0.07 + n1 * 0.03, 0.21 + n1 * 0.05, 0.25 + n2 * 0.05];
+        return (lerp(c, [0.03, 0.09, 0.11], course * 0.6), 5.0);
+    }
+    // the sea floor: pale sand in the hollows, dark rock on the rises
+    let sand = [0.46 + n1 * 0.06, 0.44 + n1 * 0.05, 0.34 + n2 * 0.05];
+    let rock = [0.16 + n1 * 0.04, 0.20 + n2 * 0.04, 0.20 + n2 * 0.03];
+    let rocky = smoothstep(at::SEABED_Y + 0.8, at::SEABED_Y + 2.6, h);
+    (lerp(sand, rock, rocky), if rocky > 0.5 { 5.0 } else { 3.0 })
+}
+
 /// An island's underside at (x, z), `depth` below the floor: blue glacier
 /// ice where it curls under the lip, dark rock streaked with ice below, and
 /// paler, misty rock toward the keel, where the cloud takes it.
@@ -2409,6 +2500,9 @@ fn build_water() -> (Vec<WaterVert>, Vec<u32>) {
     match crate::map::active() {
         crate::map::MapId::Pass => return build_pass_water(),
         crate::map::MapId::Sky => return build_sky_water(),
+        // the halls are dry; the sea is the whole world, drawn by the
+        // renderer's sea grade, not a surface
+        crate::map::MapId::Atlantis => return (Vec::new(), Vec::new()),
         crate::map::MapId::Jungle => {}
     }
     use crate::consts::{river_x, GROUND_HALF, RIVER_HALF_WIDTH, WATER_LEVEL};

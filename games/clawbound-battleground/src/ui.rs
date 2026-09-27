@@ -432,7 +432,7 @@ pub fn draw_select(ctx: &egui::Context, ui_state: &mut UiState, locked: &mut boo
         ui.add_space(10.0);
         let lock = ui.add_sized([300.0, 48.0], egui::Button::new(egui::RichText::new("LOCK IN").size(22.0).color(Color32::BLACK).strong()).fill(GOLD));
         glow_hover(ui, &lock, GOLD, 8.0);
-        ui.label(egui::RichText::new("Enter also locks in · type to search · ← → ↑ ↓ to browse").size(11.0).color(Color32::from_rgb(140, 138, 130)));
+        ui.label(egui::RichText::new("Enter also locks in · type to search · arrow keys to browse").size(11.0).color(Color32::from_rgb(140, 138, 130)));
         if lock.clicked() {
             *locked = true;
         }
@@ -1373,6 +1373,7 @@ pub fn map_blurb(m: crate::map::MapId) -> &'static str {
         crate::map::MapId::Jungle => "the valley: three lanes through deep jungle",
         crate::map::MapId::Pass => "the mountains: a canyon between twin peaks",
         crate::map::MapId::Sky => "the spirit sky: two wide lanes, glacier islands, clouds to ride",
+        crate::map::MapId::Atlantis => "the sea floor: one colonnaded hall, a drowned library, glass overhead",
     }
 }
 
@@ -1381,28 +1382,35 @@ pub fn map_picker(ui: &mut egui::Ui, choice: &mut crate::map::MapId) {
     ui.label(egui::RichText::new("BATTLEGROUND").size(16.0).color(GOLD));
     // as many cards as there are maps, sharing the panel's width (three at
     // a fixed 236 ran off the right edge); the blurb wraps onto two lines
-    let n_maps = crate::map::MapId::ALL.len() as f32;
+    let maps = crate::map::MapId::ALL;
+    // cards share the panel's width; when four do not fit at a readable
+    // width (a name and its "N v N" side by side), two rows of two
     let gap = 6.0 + 2.0 * ui.spacing().item_spacing.x;
-    let w = ((ui.available_width() - gap * (n_maps - 1.0) - 4.0) / n_maps).clamp(150.0, 236.0);
-    ui.horizontal(|ui| {
-        for m in crate::map::MapId::ALL {
-            let sel = *choice == m;
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 66.0), Sense::click());
-            let t = hover_t(ui.ctx(), egui::Id::new("map_card").with(m.key()), resp.hovered());
-            let p = ui.painter();
-            p.rect_filled(rect, 8.0, if sel { Color32::from_rgb(58, 52, 36) } else { Color32::from_rgb(34, 33, 40).linear_multiply(1.0 + 0.3 * t) });
-            p.rect_stroke(rect, 8.0, Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { GOLD } else { Color32::from_rgb(80, 78, 70) }));
-            let n = m.team_size();
-            p.text(rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, m.name(), FontId::proportional(15.0), if sel { GOLD } else { Color32::from_rgb(220, 216, 205) });
-            p.text(rect.right_top() + Vec2::new(-10.0, 9.0), Align2::RIGHT_TOP, format!("{n} v {n}"), FontId::proportional(12.0), Color32::from_rgb(180, 176, 165));
-            let blurb = p.layout(map_blurb(m).to_string(), FontId::proportional(10.5), Color32::from_rgb(160, 156, 146), w - 20.0);
-            p.galley(rect.left_top() + Vec2::new(10.0, 30.0), blurb, Color32::from_rgb(160, 156, 146));
-            if resp.clicked() {
-                *choice = m;
+    let avail = ui.available_width();
+    let per_row = if (avail - gap * (maps.len() as f32 - 1.0)) / maps.len() as f32 >= 200.0 { maps.len() } else { maps.len().div_ceil(2) };
+    let w = ((avail - gap * (per_row as f32 - 1.0) - 4.0) / per_row as f32).clamp(150.0, 300.0);
+    for row in maps.chunks(per_row) {
+        ui.horizontal(|ui| {
+            for &m in row {
+                let sel = *choice == m;
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 66.0), Sense::click());
+                let t = hover_t(ui.ctx(), egui::Id::new("map_card").with(m.key()), resp.hovered());
+                let p = ui.painter();
+                p.rect_filled(rect, 8.0, if sel { Color32::from_rgb(58, 52, 36) } else { Color32::from_rgb(34, 33, 40).linear_multiply(1.0 + 0.3 * t) });
+                p.rect_stroke(rect, 8.0, Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { GOLD } else { Color32::from_rgb(80, 78, 70) }));
+                let n = m.team_size();
+                p.text(rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, m.name(), FontId::proportional(15.0), if sel { GOLD } else { Color32::from_rgb(220, 216, 205) });
+                p.text(rect.right_top() + Vec2::new(-10.0, 9.0), Align2::RIGHT_TOP, format!("{n} v {n}"), FontId::proportional(12.0), Color32::from_rgb(180, 176, 165));
+                let blurb = p.layout(map_blurb(m).to_string(), FontId::proportional(10.5), Color32::from_rgb(160, 156, 146), w - 20.0);
+                p.galley(rect.left_top() + Vec2::new(10.0, 30.0), blurb, Color32::from_rgb(160, 156, 146));
+                if resp.clicked() {
+                    *choice = m;
+                }
+                ui.add_space(6.0);
             }
-            ui.add_space(6.0);
-        }
-    });
+        });
+        ui.add_space(4.0);
+    }
 }
 
 #[cfg(test)]

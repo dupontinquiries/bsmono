@@ -71,9 +71,20 @@ pub mod clancamp;
 /// The starlight lifts between the sky map's islands and the Aerie.
 pub mod lift;
 pub mod kit;
+/// The Curio shelf's passives, worked (items::Passive).
 pub mod curios;
+/// Levels 1-15: when abilities unlock, what each rank and mastery adds.
 pub mod ranks;
+/// When and how strongly the sun flares the lens (post.wgsl draws it).
 pub mod lensflare;
+/// The Drowned Halls: 3 a side on the sea floor, one lane, one jungle hall.
+pub mod atlantis;
+/// The Drowned Halls' stonework, glass and sea life, as voxel meshes.
+pub mod atlantisprops;
+/// What stands in, over and around the Drowned Halls.
+pub mod atlantisworld;
+/// Headless screenshots of the Drowned Halls (`CLAWBOUND_SHOTS=atlantis`).
+pub mod atlantisshots;
 /// The generated preparation documents in dev/ (cue cards, recording sheet, cue sheet).
 pub mod devdocs;
 /// Character voxels as smooth surfaces with fur lengths, for the ultra preview.

@@ -36,7 +36,7 @@ pub struct LaunchOptions {
     pub player_name: Option<String>,
     pub player_id: Option<String>,
     pub peer_id: Option<String>,
-    /// `--map <jungle|pass|starwell>` (or `CLAWBOUND_MAP`): which map to play. Chosen
+    /// `--map <jungle|pass|starwell|atlantis>` (or `CLAWBOUND_MAP`): which map to play. Chosen
     /// at launch because the terrain mesh is built with the renderer.
     pub map: crate::map::MapId,
 }

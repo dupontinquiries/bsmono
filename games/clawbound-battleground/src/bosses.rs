@@ -166,6 +166,7 @@ pub fn pit_positions() -> [Vec3; 2] {
     match crate::map::active() {
         crate::map::MapId::Pass => return crate::pass::pit_positions(),
         crate::map::MapId::Sky => return crate::sky::pit_positions(),
+        crate::map::MapId::Atlantis => return crate::atlantis::pit_positions(),
         crate::map::MapId::Jungle => {}
     }
     let mut rng = Rng::new(0xB0A2);

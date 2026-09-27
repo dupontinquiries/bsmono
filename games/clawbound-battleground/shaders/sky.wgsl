@@ -63,6 +63,43 @@ fn fbm(p: vec2<f32>) -> f32 {
     return v;
 }
 
+// The sea overhead (the Drowned Halls, sun_dir.w = 2): dark water all
+// round, lightening upward toward the surface far above; near the zenith
+// the bright disc of Snell's window, rippling with the moving surface; the
+// sun a soft glare in it; shafts of light slanting down from the window;
+// motes of drifting matter.
+fn sea_sky(ray: vec3<f32>, sun: vec3<f32>, t: f32) -> vec3<f32> {
+    let h = clamp(ray.y, -1.0, 1.0);
+    // (the horizon is the fog's colour, weather::under_the_sea, so the sea
+    // floor's far edge melts into the water instead of ending on a line)
+    let deep = vec3(0.010, 0.070, 0.090);
+    let mid = vec3(0.030, 0.190, 0.230);
+    let up = vec3(0.070, 0.330, 0.380);
+    var col = mix(deep, mid, smoothstep(-0.6, 0.05, h));
+    col = mix(col, up, smoothstep(0.05, 0.75, h));
+    // Snell's window: the whole sky above the surface squeezed into a
+    // cone round the zenith, its rim rippling as the surface moves
+    let q = ray.xz / max(ray.y, 0.05);
+    let ripple = fbm(q * 1.6 + vec2(t * 0.15, -t * 0.11)) * 0.12;
+    let window = smoothstep(0.80, 0.90, h + ripple * 0.5);
+    let bright = vec3(0.55, 0.85, 0.90) * (0.8 + 0.6 * fbm(q * 3.0 - vec2(t * 0.3, t * 0.2)));
+    col = mix(col, bright, window);
+    // the sun, a soft glare seen up through the water
+    let d = max(dot(ray, sun), 0.0);
+    col = col + vec3(0.9, 1.0, 0.95) * (pow(d, 60.0) * 1.6 + pow(d, 8.0) * 0.18);
+    // shafts from the window: angular streaks round the zenith that drift
+    if (h > 0.0) {
+        let a = atan2(ray.z, ray.x);
+        let streak = pow(max(noise2(vec2(a * 9.0 + t * 0.07, 0.5)) - 0.35, 0.0) * 1.6, 2.0);
+        col = col + vec3(0.30, 0.60, 0.62) * streak * smoothstep(0.1, 0.8, h) * (1.0 - window) * 0.5;
+    }
+    // drifting motes
+    let cell = floor(ray.xz * 90.0 / max(abs(ray.y) + 0.3, 0.3) + vec2(t * 0.4, t * 0.25));
+    let m = step(0.996, hash21(cell));
+    col = col + vec3(0.35, 0.5, 0.5) * m * 0.4;
+    return col;
+}
+
 @fragment
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // reconstruct view ray
@@ -71,6 +108,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let ray = normalize(world_p.xyz / world_p.w - frame.cam_pos.xyz);
 
     let sun = normalize(frame.sun_dir.xyz);
+    if (frame.sun_dir.w > 1.5) {
+        return vec4(sea_sky(ray, sun, frame.params.x), 1.0);
+    }
     let h = clamp(ray.y, -1.0, 1.0);
     let t = frame.params.x;
     let night = frame.params.w;

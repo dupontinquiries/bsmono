@@ -186,7 +186,16 @@ pub fn space_at(pos: Vec3) -> Space {
         crate::map::MapId::Pass => pass_space(pos),
         crate::map::MapId::Jungle => jungle_space(pos),
         crate::map::MapId::Sky => sky_space(pos),
+        crate::map::MapId::Atlantis => drowned_space(pos),
     }
+}
+
+/// The Drowned Halls: stone and glass all round, under the weight of the
+/// sea. A long, dark, close hall -- the most enclosed room in the game --
+/// and the Library's dome rings longer still.
+fn drowned_space(pos: Vec3) -> Space {
+    let lib = (1.0 - (Vec3::new(pos.x - crate::atlantis::LIBRARY_X, 0.0, pos.z).length() / crate::atlantis::LIBRARY_R)).clamp(0.0, 1.0);
+    Space { room: 0.86 + 0.08 * lib, damp: 0.55, wet: 0.62 + 0.12 * lib, echo_time: 0.16 + 0.1 * lib, echo_fb: 0.3, echo_wet: 0.22 + 0.1 * lib }
 }
 
 /// Open sky: nothing near to answer but the ice. A big, soft hall -- the

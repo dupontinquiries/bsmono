@@ -287,6 +287,14 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         let wob = sin(in.uv.y * 95.0 - t * 6.5 + sin(in.uv.x * 40.0 + t * 2.0) * 1.7);
         bend = bend + vec2(wob * 0.0022, 0.0) * heat * smoothstep(0.0, 0.5, 1.0 - in.uv.y + 0.2);
     }
+    // under the sea (the Drowned Halls): the whole view sways a little, as
+    // seen through moving water
+    let sea = pp.sea.x;
+    if (sea > 0.001) {
+        let tt = pp.a.z;
+        // (gentle: at 0.0011 the colonnade's columns wavered like reeds)
+        bend = bend + vec2(sin(in.uv.y * 9.0 + tt * 0.9) + 0.5 * sin(in.uv.y * 5.0 - tt * 0.5), cos(in.uv.x * 8.0 + tt * 0.8)) * 0.0005 * sea;
+    }
     let uv0 = clamp(in.uv + bend, vec2(0.001), vec2(0.999));
     var col = textureSample(hdr, samp, uv0).rgb;
     if (pp.d.y > 0.5 && pp.d.x > 0.02) {
@@ -374,6 +382,17 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             let f = lens_flare(in.uv, sun_uv, aspect, pp.a.z) * pp.flare.yzw * fl * open;
             col = col + f * (1.0 + lens_dirt(in.uv) * 1.5);
         }
+    }
+
+    // --- under the sea: light falls in slanting shafts from the surface
+    // (brightest at the top of the frame, drifting), and the view is graded
+    // blue-green, its reds drunk by the water
+    if (sea > 0.001) {
+        let tt = pp.a.z;
+        let slant = in.uv.x + in.uv.y * 0.35;
+        let shafts = pow(max(surf_noise(vec2(slant * 7.0 + tt * 0.05, tt * 0.02)) - 0.45, 0.0) * 1.8, 2.0) + 0.5 * pow(max(surf_noise(vec2(slant * 17.0 - tt * 0.08, 3.0)) - 0.55, 0.0) * 2.2, 2.0);
+        col = col + vec3(0.25, 0.55, 0.55) * shafts * smoothstep(0.95, 0.0, in.uv.y) * 0.35 * sea;
+        col = col * mix(vec3(1.0), vec3(0.78, 1.0, 1.04), sea);
     }
 
     // --- lightning: a full-frame flash on top of the lit scene
