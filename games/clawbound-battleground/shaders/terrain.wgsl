@@ -18,6 +18,7 @@ struct FrameData {
     cracks: array<vec4<f32>, 8>,  // x, z, radius, how open
     towers: array<vec4<f32>, 12>, // x, z, range, state (see Game::tower_rings)
     sea: vec4<f32>,               // x all under the sea, y caustic strength, z water surface y, w camera underwater
+    look: vec4<f32>,              // x how far ground detail carries, y dry sheen, zw free (render.rs `look`)
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameData;
@@ -169,13 +170,24 @@ fn noise2(p: vec2<f32>) -> f32 {
 
 // Per-material sub-metre detail. Returns an albedo multiplier (around 1)
 // and a small normal perturbation so the detail catches the sun.
-// mat: 0 grass, 1 dirt lane, 2 riverbed, 3 sand, 4 outcrop, 5 mountain, 6 moss
-fn detail(p: vec2<f32>, m: f32, dist: f32) -> vec4<f32> {
-    // fade the detail out with distance so it never shimmers
-    let fade = smoothstep(120.0, 20.0, dist);
+// mat: 0 grass, 1 dirt lane, 2 riverbed, 3 sand, 4 outcrop, 5 mountain,
+// 6 moss, 7 snow and ice. `top`: the pattern is laid on ground facing up
+// (a rock's strata are for its sides; its top is broken into slabs).
+fn detail(p: vec2<f32>, m: f32, dist: f32, top: bool) -> vec4<f32> {
+    // fade the detail out with distance so it never shimmers; on Ultra
+    // (frame.look.x) the detail carries further
+    let fade = smoothstep(frame.look.x, 20.0, dist);
     var mul = 1.0;
     var bump = vec2(0.0);
-    if (m < 0.5 || m > 5.5) {
+    if (m > 6.5) {
+        // snow and ice: soft wind ripples (sastrugi) and a faint blue in
+        // their troughs -- not grass-blade speckle, which it wore before
+        let w = noise2(p * 0.35) * 5.0;
+        let rip = sin(p.x * 1.9 + p.y * 0.7 + w) * 0.5 + 0.5;
+        let fine = noise2(p * 9.0);
+        mul = 0.91 + rip * 0.13 + (fine - 0.5) * 0.05;
+        bump = vec2(cos(p.x * 1.9 + p.y * 0.7 + w) * 0.14, (noise2(p * 2.1) - 0.5) * 0.08);
+    } else if (m < 0.5 || m > 5.5) {
         // grass / moss: fine blade speckle + broad tuft variation
         let n1 = noise2(p * 3.1);
         let n2 = noise2(p * 11.0 + 4.0);
@@ -204,8 +216,18 @@ fn detail(p: vec2<f32>, m: f32, dist: f32) -> vec4<f32> {
         let rip = sin(p.x * 5.0 + noise2(p * 0.7) * 6.0) * 0.5 + 0.5;
         mul = 0.92 + rip * 0.12 + (noise2(p * 14.0) - 0.5) * 0.10;
         bump = vec2(cos(p.x * 5.0) * 0.08, 0.0);
+    } else if (top) {
+        // rock seen from above: broken into slabs along a cell pattern,
+        // each slab its own tone, the joints dark, lichen on some
+        let e = cell_edge(p * 0.45);
+        let cell = floor(p * 0.45 + 0.5);
+        let tone = hash21(cell) - 0.5;
+        let lichen = smoothstep(0.6, 0.85, noise2(p * 1.3 + 7.0)) * 0.12;
+        mul = 0.92 + tone * 0.16 - smoothstep(0.06, 0.0, e) * 0.35 + lichen + (noise2(p * 7.0) - 0.5) * 0.08;
+        bump = vec2(noise2(p * 7.0 + 5.0) - 0.5, noise2(p * 7.0 + 6.0) - 0.5) * 0.14;
     } else {
-        // rock: strata + chips
+        // rock faces: strata + chips (p.y is world height here: the side
+        // projections put it there, so the bands run level)
         let strata = sin(p.y * 2.0 + noise2(p * 0.9) * 4.0) * 0.5 + 0.5;
         let chip = step(0.94, hash21(floor(p * 4.0))) * 0.25;
         mul = 0.85 + strata * 0.2 + chip + (noise2(p * 7.0) - 0.5) * 0.12;
@@ -221,15 +243,15 @@ fn detail(p: vec2<f32>, m: f32, dist: f32) -> vec4<f32> {
 // second coordinate, so rock strata become horizontal bands on a cliff.
 // Returns (brightness mul, bump as a world-space vec3).
 fn tri_detail(w: vec3<f32>, n: vec3<f32>, m: f32, dist: f32) -> vec4<f32> {
-    let top = detail(w.xz, m, dist);
+    let top = detail(w.xz, m, dist, true);
     var bw = pow(abs(n), vec3(4.0));
     bw = bw / max(bw.x + bw.y + bw.z, 1e-4);
     if (bw.y > 0.96) {
         // flat ground (almost all of it): one projection, as before
         return vec4(top.x, top.y, 0.0, top.z);
     }
-    let sx = detail(w.zy, m, dist); // faces looking along x
-    let sz = detail(w.xy, m, dist); // faces looking along z
+    let sx = detail(w.zy, m, dist, false); // faces looking along x
+    let sz = detail(w.xy, m, dist, false); // faces looking along z
     let mul = top.x * bw.y + sx.x * bw.x + sz.x * bw.z;
     let bump = vec3(top.y, 0.0, top.z) * bw.y + vec3(0.0, sx.z, sx.y) * bw.x + vec3(sz.y, sz.z, 0.0) * bw.z;
     return vec4(mul, bump);
@@ -522,6 +544,21 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // through it)
     let submerged = smoothstep(0.02, 0.12, frame.sea.z - in.world.y) * (1.0 - frame.sea.x);
     lit = lit + (hemi * fres * 0.6 + sun_col * glint * 0.9) * wetness * (1.0 - submerged);
+    // dry sheen, by material: rock and ice catch the sun in a broad soft
+    // lobe, snow brighter and broader, sand and grass barely. (Dry ground
+    // had no specular at all: every material read equally matte.)
+    let nh = max(dot(N, Hv), 0.0);
+    var sheen = 0.0;
+    if (mat_id > 6.5) {
+        sheen = pow(nh, 10.0) * 0.07 + pow(nh, 60.0) * 0.25;
+    } else if (mat_id > 3.5 && mat_id < 5.5) {
+        sheen = pow(nh, 28.0) * 0.10;
+    } else if (mat_id > 2.5 && mat_id < 3.5) {
+        sheen = pow(nh, 18.0) * 0.05;
+    } else {
+        sheen = pow(nh, 12.0) * 0.025;
+    }
+    lit = lit + sun_col * sheen * frame.look.y * shadow * (1.0 - wetness) * (1.0 - night);
     let lum = dot(in.color, vec3(0.299, 0.587, 0.114));
     let haze = frame.fog_color.xyz * (0.45 + 0.55 * lum);
     lit = mix(lit, haze, fog * 0.9);
