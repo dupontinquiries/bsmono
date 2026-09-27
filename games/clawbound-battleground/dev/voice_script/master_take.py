@@ -22,7 +22,7 @@ TAKES holds, per line, the window of the session the chosen take lies in
 recogniser (sherpa-onnx, NVIDIA parakeet-tdt-0.6b-v2) over silero-VAD
 segments; the last clean take of each line in Kessler's first pass through
 each ancestor was chosen. Needs ffmpeg with rubberband and arnndn, numpy,
-soundfile, pyloudnorm.
+soundfile, pyloudnorm (and noisereduce, for a take read very quietly).
 """
 import subprocess, numpy as np, soundfile as sf, pyloudnorm as pyln, os, csv, json, sys, tempfile
 SR = 48000
@@ -144,12 +144,15 @@ CHAINS = {
                "aecho=0.8:0.7:260|520:0.07|0.03",
  # a jaguar of the drowned forest -- she: heavy, a little lower with her
  # formants kept (shifted with them, as when the part was a he, a woman's
- # reading came out a man's), wet and murky
+ # reading came out a man's). Water: a slow, wide chorus -- three voices
+ # 40-70 ms behind, drifting at a fifth of a hertz, so she flows rather
+ # than warbles (the flanger that was here combed her into metal) -- and
+ # a soft wet room after it
  'riptail':    "rubberband=pitch=0.94:formant=preserved:pitchq=quality,"
-               "equalizer=f=120:t=q:w=1:g=3,lowpass=f=5000,"
-               "flanger=delay=2:depth=3:regen=-20:width=60:speed=0.3,"
-               "acompressor=threshold=-26dB:ratio=4:attack=12:release=200:makeup=2,"
-               "aecho=0.8:0.5:45|90:0.18|0.10",
+               "equalizer=f=120:t=q:w=1:g=3,equalizer=f=3200:t=q:w=1.5:g=-1.5,lowpass=f=6500,"
+               "chorus=0.65:0.9:40|55|70:0.38|0.32|0.26:0.13|0.19|0.24:1.4|1.8|2.2,"
+               "acompressor=threshold=-26dB:ratio=3:attack=15:release=220:makeup=2,"
+               "aecho=0.8:0.55:60|110|170:0.16|0.10|0.06",
  # the storm-dragon's ninth son: serene and deep, a mountain valley
  'stillsmoke': "rubberband=pitch=0.93:formant=preserved:pitchq=quality,"
                "equalizer=f=140:t=q:w=1:g=3,"
@@ -430,6 +433,32 @@ def trim(x, pre=0.06, post=0.18, floor_db=-38, start_db=None):
     y = x[a:b].copy(); fi, fo = int(0.01*SR), int(0.06*SR)
     y[:fi] *= np.linspace(0,1,fi); y[-fo:] *= np.linspace(1,0,fo)
     return y
+def quiet_take(c, core, near):
+    """A take read far under the others (Riptail's whispered "Gathered.":
+    its words at -58 dBFS where the rest are -25 to -45) comes up by ~30 dB
+    at levelling, and the room's hiss comes up with it -- under the words,
+    where RNNoise lets it through. Such a take is cleaned first, before
+    RNNoise, by spectral gating (noisereduce, stationary) against the room:
+    the quietest fifth of the 20 ms frames within a few seconds of the take
+    (`near`), which is the session's own hiss and nothing of the voice.
+    Gating with time and frequency smoothing, not bare subtraction: a bare
+    2.5x subtraction was tried first and left the hiss nearly where it was
+    and holes in the whisper. `core` is the take's own window, for its
+    level. A take read at the usual level is returned untouched."""
+    h = int(0.02 * SR)
+    e = np.array([np.sqrt(np.mean(core[i:i + h] ** 2)) + 1e-9 for i in range(0, len(core) - h, h)])
+    db = 20 * np.log10(e)
+    if np.percentile(db, 95) > -50.0:
+        return c
+    import noisereduce as nr
+    fr = [near[i:i + h] for i in range(0, len(near) - h, h)]
+    en = np.array([np.sqrt(np.mean(f ** 2)) for f in fr])
+    room = np.concatenate([f for f, v in zip(fr, en) if v <= np.percentile(en, 20)])
+    print(f'  (a quiet take, words at {np.percentile(db, 95):.0f} dBFS: gated against {len(room) / SR:.1f} s of room first)', flush=True)
+    return nr.reduce_noise(y=c, sr=SR, y_noise=room, stationary=True, prop_decrease=0.92,
+                           n_std_thresh_stationary=1.3, time_mask_smooth_ms=80, freq_mask_smooth_hz=400).astype(np.float32)
+
+
 full, _ = sf.read(TAKE, dtype='float32')
 report = []
 for who, key, s, e in TAKES:
@@ -437,9 +466,18 @@ for who, key, s, e in TAKES:
     rel = f'voice/{who}/{key}.opus'
     energy = int(sheet[rel]['energy'])
     raw = full[int((s-0.5)*SR):int((e+0.5)*SR)]
-    sf.write('tmp_raw.wav', raw, SR)
+    gated = quiet_take(raw, full[int(s*SR):int(e*SR)], full[max(0, int((s-4)*SR)):int((e+4)*SR)])
+    quiet = gated is not raw
+    sf.write('tmp_raw.wav', gated, SR)
+    # a quiet take, after its gating and RNNoise: brought up to a working
+    # level and gated once more (a soft gate, -24 dB of range, not a
+    # mute), so the pauses the levelling will lift are room, not hiss
     ff('tmp_raw.wav', 'tmp_clean.wav', CLEAN)
     c, _ = sf.read('tmp_clean.wav', dtype='float32')
+    if quiet:
+        sf.write('tmp_quiet.wav', c * (0.5 / (float(np.abs(c).max()) + 1e-9)), SR)
+        ff('tmp_quiet.wav', 'tmp_clean.wav', 'agate=threshold=0.02:range=0.063:ratio=3:attack=8:release=160')
+        c, _ = sf.read('tmp_clean.wav', dtype='float32')
     c = c[int(0.5*SR):len(c)-int(0.5*SR)]
     c = trim(c)
     if who in PRE:
