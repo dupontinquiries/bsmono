@@ -1,17 +1,19 @@
 """beast_sfx -- the jungle's big beasts, grown out of a real snore.
 
-    python3 beast_sfx.py SRC.opus [AUDIO_ROOT]
+    python3 beast_sfx.py SRC [AUDIO_ROOT]
 
-SRC is snoring-beast-sounds-1 (156 s, a sleeper recorded at night; not in
-the repo). Speech recognition with a voice-activity gate found no speech in
-it anywhere, so every window below is breath and throat only. Three kinds
-of sound are in it:
+SRC is snoring_teeth_grinding.m4a (241 s, a sleeper snoring and grinding
+their teeth; not in the repo). It replaced an earlier, quieter snore
+recording, whose snores were thin in-breaths that could not be made to
+sound like anything but a person. Every ~4 s there is a snore of about
+1.5 s with a clear harmonic rattle at 100-700 Hz. There are also:
 
-* 53-60 s and on through the file: slow in-breath snores, a clean buzz at
-  ~180 Hz with formants at 500-700 -- a purr, really;
-* 66.7-69.0 s: one heavy rattling snore, broadband under 300 Hz, the
-  soft palate flapping -- this is the growl;
-* 150-153 s: the sleeper stirring, short hard snorts.
+* two voiced grunts. Speech recognition hears both as "Uh"; there are no
+  words anywhere in the file.
+* the loudest event, at 5.5 s: a hard snort that runs straight into a
+  snore.
+* teeth grinding at 221-238 s. It is unused for now, because no event
+  wants a chewing sound yet.
 
 How a person's snore becomes a big animal's (the first version pitched it
 down with a phase vocoder, vocoded a synthetic pulse-train growl under it
@@ -32,9 +34,11 @@ and put it in a comb-filter echo; it read as a processed person):
 * nothing synthetic is layered in: every sound in the output is the
   sleeper's.
 
-    wake   BossSpawn        the rattling snore, at 0.62 speed
-    fall   BossDown         a purring in-breath, at 0.5, fading out
-    snort  TitanVulnerable  a waking snort, at 0.7
+The sounds:
+
+    wake   BossSpawn        the snort and the snore after it, at 0.62 speed
+    fall   BossDown         a long rattling snore, at 0.52, fading out
+    snort  TitanVulnerable  the second grunt, cut off hard, at 0.66
 """
 import os
 import subprocess
@@ -50,14 +54,13 @@ SR = 48000
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # name: (from_s, to_s, speed, chest_speed, chest_db, drive, lowpass Hz, cave seconds)
-# (wake ends at 68.86: at 68.9 the sleeper's bed creaks, a click)
 SOUNDS = {
-    'wake': (66.55, 68.86, 0.62, 0.52, -7, 2.5, 3500, 1.6),
-    'fall': (54.35, 56.20, 0.50, 0.43, -8, 1.8, 1300, 2.2),
-    'snort': (152.30, 152.95, 0.70, 0.60, -6, 3.0, 4500, 1.2),
+    'wake': (5.45, 7.10, 0.62, 0.52, -7, 2.2, 3800, 1.6),
+    'fall': (76.15, 77.95, 0.52, 0.44, -8, 1.8, 2400, 2.2),
+    'snort': (178.85, 179.62, 0.66, 0.56, -6, 2.6, 4200, 1.2),
 }
-# a stretch between breaths: the room, the fridge, nothing of the sleeper
-ROOM_TONE = (60.3, 61.9)
+# a stretch between snores: the room and nothing of the sleeper
+ROOM_TONE = (21.0, 23.5)
 
 
 def sos(kind, f, order=4):
