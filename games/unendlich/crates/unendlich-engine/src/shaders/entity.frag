@@ -47,7 +47,50 @@ layout(set = 0, binding = 0) uniform CameraUbo {
     vec4 wind_params;
     vec4 viewport_rect;    // xy = viewport size px, zw = viewport offset px
     mat4 light_view_proj;
+    // Declared only to reach the light fields after them (chunk.frag's block).
+    vec4 flow_coverage;
+    vec4 flow_grid[128];
+    vec4 fx_params;
+    vec4 water_depth_cov;
+    vec4 water_depth_grid[64];
+    vec4 disturbers[8];
+    vec4 disturber_meta;
+    vec4 light_volume;     // world::light_volume: xyz = window corner, w = enable
+    vec4 point_pos_radius[8];  // render::dynamic_lights: xyz = pos, w = radius
+    vec4 point_color_int[8];   // rgb = colour, a = intensity
+    vec4 point_meta;           // x = live count
 } ubo;
+
+// world::light_volume (binding 4, the image chunk.frag samples): creatures and
+// held items in a dark cave are as dark as the cave, and lit by torches.
+layout(set = 0, binding = 4) uniform sampler3D light_volume_tex;
+const vec3 LV_SIZE = vec3(160.0, 96.0, 160.0);
+
+// render::dynamic_lights, wired: up to POINT_LIGHTS point lights (a held torch,
+// a burning weapon) from the camera UBO. The attenuation lines are the ones
+// `dynamic_lights_frag_glsl` emits and `apply_lights` mirrors on the CPU (a
+// test keeps them identical); a Lambert term against `n` is added on top.
+// No occlusion: a point light shines through a thin wall.
+const int POINT_LIGHTS = 8;
+vec3 point_lights_at(vec3 P, vec3 n) {
+    int count = int(ubo.point_meta.x + 0.5);
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < POINT_LIGHTS; i++) {
+        if (i >= count) { break; }
+        vec3 d = ubo.point_pos_radius[i].xyz - P;
+        float r = max(ubo.point_pos_radius[i].w, 0.000100);
+        float d2 = dot(d, d);
+        float r2 = r * r;
+        float window = clamp(1.0 - d2 / r2, 0.0, 1.0);
+        window = window * window;
+        float a = (1.0 / (1.0 + d2)) * window * max(ubo.point_color_int[i].a, 0.0);
+        // n = 0 means "no surface" (the item in hand): no Lambert term.
+        float lambert = (d2 > 1e-6 && dot(n, n) > 0.25) ? max(dot(n, d * inversesqrt(d2)), 0.0) : 1.0;
+        acc += max(ubo.point_color_int[i].rgb, vec3(0.0)) * a * lambert;
+    }
+    return clamp(acc, 0.0, 1.0);
+}
+
 
 // 3D froxel scattering volume — binding 2 of the shared set (same image
 // chunk.frag samples). Each texel stores cumulative (rgb_scattered,
@@ -84,6 +127,30 @@ void main() {
 
     // Eye→fragment distance in world units (same basis as chunk.frag).
     float dist = length(ubo.camera_pos.xyz - v_world_pos);
+
+    // Scene light (world::light_volume + dynamic point lights), as on the
+    // terrain: a creature deep in a cave is dark unless a torch is near, and the
+    // item in hand takes the light at the eye. Built from the cross product
+    // without normalize() so nothing here can be NaN; oriented to the camera.
+    bool at_eye_l = v_alpha > 1.5;
+    vec3 ecr = cross(dFdx(v_world_pos), dFdy(v_world_pos));
+    float ecr2 = dot(ecr, ecr);
+    vec3 en = ecr2 > 1e-20 ? ecr * inversesqrt(ecr2) : vec3(0.0, 1.0, 0.0);
+    if (dot(en, ubo.camera_pos.xyz - v_world_pos) < 0.0) en = -en;
+    if (ubo.light_volume.w > 0.5) {
+        vec3 lp = at_eye_l ? ubo.camera_pos.xyz : v_world_pos + en * 0.4;
+        vec3 rel = lp - ubo.light_volume.xyz;
+        float e_sky = 1.0;
+        vec3  e_blk = vec3(0.0);
+        if (all(greaterThanEqual(rel, vec3(0.5))) && all(lessThan(rel, LV_SIZE - 0.5))) {
+            vec4 lv = texture(light_volume_tex, lp / LV_SIZE);
+            e_sky = lv.r;
+            e_blk = lv.gba;
+        }
+        float e_bi = max(max(e_blk.r, e_blk.g), e_blk.b);
+        color = color * mix(0.03, 1.0, e_sky * e_sky) + v_color * e_blk * e_bi * 1.2;
+    }
+    color += v_color * point_lights_at(v_world_pos, at_eye_l ? vec3(0.0) : en) * 1.2;
 
     // r-fp-nearclip: dithered "screen door" cutout for very-close entity
     // geometry. Specifically for the player's own first-person avatar

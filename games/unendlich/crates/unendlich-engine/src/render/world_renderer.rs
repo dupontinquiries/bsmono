@@ -199,7 +199,18 @@ struct CameraUbo {
     /// Light volume (binding 4): xyz = world position of the window's lowest
     /// corner, w = enable. Appended last; w = 0 renders exactly as before.
     light_volume: [f32; 4],
+    /// Dynamic point lights (render::dynamic_lights): xyz = world position,
+    /// w = radius, for up to MAX_POINT_LIGHTS lights nearest the camera.
+    point_pos_radius: [[f32; 4]; MAX_POINT_LIGHTS],
+    /// rgb = colour, a = intensity.
+    point_color_int: [[f32; 4]; MAX_POINT_LIGHTS],
+    /// x = live count.
+    point_meta: [f32; 4],
 }
+
+/// Point lights the chunk and entity shaders read per frame (must match
+/// `POINT_LIGHTS` in chunk.frag and entity.frag).
+pub const MAX_POINT_LIGHTS: usize = 8;
 
 /// Per-frame atmosphere/climate state, sampled by the bin and passed to
 /// the renderer for upload to the fragment shader. Decouples "how the
@@ -830,6 +841,10 @@ pub struct WorldRenderer {
     /// UBO `light_volume`: window corner + enable (see `set_light_volume`).
     light_volume_params: [f32; 4],
     light_debug: u8,
+    /// sim::cave_air vignette 0..1 (fx_params.w).
+    air_vignette: f32,
+    /// (pos_radius, color_intensity, count) for the UBO; see `set_point_lights`.
+    point_lights: ([[f32; 4]; MAX_POINT_LIGHTS], [[f32; 4]; MAX_POINT_LIGHTS], usize),
     /// Compute pipeline that fills the froxel volume each frame.
     froxel_fill_pipeline: FroxelFillPipeline,
     /// One descriptor set per frame-in-flight for the compute pass.
@@ -1975,6 +1990,8 @@ impl WorldRenderer {
             light_volume,
             light_volume_params: [0.0; 4],
             light_debug: 0,
+            air_vignette: 0.0,
+            point_lights: ([[0.0; 4]; MAX_POINT_LIGHTS], [[0.0; 4]; MAX_POINT_LIGHTS], 0),
             froxel_fill_pipeline,
             froxel_compute_descriptor_sets,
             last_cascade: None,
@@ -3619,6 +3636,25 @@ impl WorldRenderer {
     pub fn set_light_volume(&mut self, origin: [i32; 3], enable: bool) {
         let w = if !enable { 0.0 } else { 1.0 + self.light_debug as u8 as f32 };
         self.light_volume_params = [origin[0] as f32, origin[1] as f32, origin[2] as f32, w];
+    }
+
+    /// Edge darkening from bad air (sim::cave_air::Effects::vignette), 0..1.
+    pub fn set_air_vignette(&mut self, v: f32) {
+        self.air_vignette = v.clamp(0.0, 1.0);
+    }
+
+    /// This frame's dynamic point lights (a held torch, a burning weapon). The
+    /// `MAX_POINT_LIGHTS` nearest `eye` are kept (`dynamic_lights::gather_nearest`).
+    pub fn set_point_lights(&mut self, eye: [f32; 3], lights: &[crate::render::dynamic_lights::PointLight]) {
+        let keep = crate::render::dynamic_lights::gather_nearest(eye, lights, MAX_POINT_LIGHTS);
+        let mut pr = [[0.0f32; 4]; MAX_POINT_LIGHTS];
+        let mut ci = [[0.0f32; 4]; MAX_POINT_LIGHTS];
+        for (k, &i) in keep.iter().enumerate() {
+            let l = &lights[i];
+            pr[k] = [l.pos[0], l.pos[1], l.pos[2], l.radius];
+            ci[k] = [l.color[0], l.color[1], l.color[2], l.intensity];
+        }
+        self.point_lights = (pr, ci, keep.len());
     }
 
     /// Show the light inputs instead of the scene (UNENDLICH_LIGHT_DEBUG=1).
@@ -6380,6 +6416,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             fx_params: {
                 let mut f = self.fx_params;
                 f[2] = self.world_season01; // r499: season for foliage tint
+                f[3] = self.air_vignette; // sim::cave_air edge darkening
                 f
             },
             water_depth_cov: self.water_depth_cov,
@@ -6387,6 +6424,9 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             disturbers: self.foliage_disturbers,
             disturber_meta: [self.foliage_disturber_count as f32, 0.0, 0.0, 0.0],
             light_volume: self.light_volume_params,
+            point_pos_radius: self.point_lights.0,
+            point_color_int: self.point_lights.1,
+            point_meta: [self.point_lights.2 as f32, 0.0, 0.0, 0.0],
         };
         unsafe {
             std::ptr::copy_nonoverlapping(

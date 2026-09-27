@@ -72,7 +72,36 @@ layout(set = 0, binding = 0) uniform CameraUbo {
     vec4 disturbers[8];      // r595 (declared only to reach the fields after it)
     vec4 disturber_meta;
     vec4 light_volume;       // world::light_volume: xyz = window corner (blocks), w = enable
+    vec4 point_pos_radius[8];  // render::dynamic_lights: xyz = pos, w = radius
+    vec4 point_color_int[8];   // rgb = colour, a = intensity
+    vec4 point_meta;           // x = live count
 } ubo;
+
+// render::dynamic_lights, wired: up to POINT_LIGHTS point lights (a held torch,
+// a burning weapon) from the camera UBO. The attenuation lines are the ones
+// `dynamic_lights_frag_glsl` emits and `apply_lights` mirrors on the CPU (a
+// test keeps them identical); a Lambert term against `n` is added on top.
+// No occlusion: a point light shines through a thin wall.
+const int POINT_LIGHTS = 8;
+vec3 point_lights_at(vec3 P, vec3 n) {
+    int count = int(ubo.point_meta.x + 0.5);
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < POINT_LIGHTS; i++) {
+        if (i >= count) { break; }
+        vec3 d = ubo.point_pos_radius[i].xyz - P;
+        float r = max(ubo.point_pos_radius[i].w, 0.000100);
+        float d2 = dot(d, d);
+        float r2 = r * r;
+        float window = clamp(1.0 - d2 / r2, 0.0, 1.0);
+        window = window * window;
+        float a = (1.0 / (1.0 + d2)) * window * max(ubo.point_color_int[i].a, 0.0);
+        // n = 0 means "no surface" (the item in hand): no Lambert term.
+        float lambert = (d2 > 1e-6 && dot(n, n) > 0.25) ? max(dot(n, d * inversesqrt(d2)), 0.0) : 1.0;
+        acc += max(ubo.point_color_int[i].rgb, vec3(0.0)) * a * lambert;
+    }
+    return clamp(acc, 0.0, 1.0);
+}
+
 
 // Shadow map sampler. The Vulkan side uses a sampler with comparison
 // enabled (LESS_OR_EQUAL) — so `texture(shadow_map, vec3(uv, ref_z))`
@@ -905,6 +934,13 @@ void main() {
     float lv_bi = max(max(lv_blk.r, lv_blk.g), lv_blk.b);
     vec3  lv_bl = lv_blk * lv_bi;
     color += albedo * lv_bl * 1.2;
+#if CHUNK_DYNAMIC_LIGHTS
+    {
+        vec3 pn = normal;
+        if (dot(pn, ubo.camera_pos.xyz - v_world_pos) < 0.0) pn = -pn;
+        color += albedo * point_lights_at(v_world_pos, pn) * 1.2;
+    }
+#endif
     // The faint floor below shrinks from 12% outdoors to 1.5% in the dark
     // (cave_biomes.docx: L = 0.00-0.05 with no torch).
     color = max(color, albedo * mix(0.015, 0.12, lv_sky));
@@ -1718,6 +1754,9 @@ void main() {
     float vignette_dist = dot(vv, vv);
     float vignette = 1.0 - smoothstep(0.40, 1.65, vignette_dist) * 0.32; // r476: deeper frame
     color *= vignette;
+    // sim::cave_air: bad air darkens the edges of vision (the docx's Weakness II
+    // and worse). fx_params.w = 0 (clean air) leaves the frame as it was.
+    color *= 1.0 - smoothstep(0.15, 1.2, vignette_dist) * clamp(ubo.fx_params.w, 0.0, 1.0);
 
     // No film-grain dither in v0.11.2: the previous attempt at
     // ±0.5/255 dither was correct in amplitude (truly invisible),
