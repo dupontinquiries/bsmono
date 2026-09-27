@@ -60,6 +60,7 @@ impl Game {
         self.projectiles_tick(dt);
         self.zones_tick(dt);
         self.kit_tick(dt);
+        self.stalker_tick(dt);
 
         // 6b. sky + map events (weather.rs / map_events.rs)
         self.atmosphere_tick(dt);

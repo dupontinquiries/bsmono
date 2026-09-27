@@ -1265,6 +1265,26 @@ impl Vfx {
                         self.particles.push(Particle { pos: *pos + Vec3::new(a.cos() * r, 0.8, a.sin() * r), vel: Vec3::new(a.cos(), 4.0 + (k % 4) as f32, a.sin()), life: 0.8, max_life: 0.8, size: 0.22, color: c, alpha: 0.9, gravity: 5.0, drag: 1.0 });
                     }
                 }
+                Event::SwapFx { from, to } => {
+                    // Hollowstep steps between: where he was, the fog closes
+                    // in on the empty spot; where he is, it is thrown off him
+                    for (at, inward) in [(*from, true), (*to, false)] {
+                        for k in 0..26 {
+                            let a = k as f32 * 2.399;
+                            let r = 1.6 + (k % 5) as f32 * 0.35;
+                            let d = Vec3::new(a.cos(), 0.0, a.sin());
+                            let (p, v) = if inward { (at + d * r + Vec3::Y * 0.4, -d * 2.4) } else { (at + d * 0.4 + Vec3::Y * 0.5, d * 3.2 + Vec3::Y * 0.3) };
+                            self.particles.push(Particle { pos: p, vel: v, life: 1.3, max_life: 1.3, size: 0.42, color: [0.30, 0.31, 0.36], alpha: 0.5, gravity: 0.0, drag: 1.2 });
+                        }
+                    }
+                }
+                Event::EchoRise { pos, .. } => {
+                    // an echo stands up out of the ground fog
+                    for k in 0..16 {
+                        let a = k as f32 * 2.399;
+                        self.particles.push(Particle { pos: *pos + Vec3::new(a.cos() * 0.8, 0.2, a.sin() * 0.8), vel: Vec3::new(a.cos() * 0.6, 1.4 + (k % 3) as f32 * 0.4, a.sin() * 0.6), life: 1.1, max_life: 1.1, size: 0.36, color: [0.20, 0.21, 0.26], alpha: 0.55, gravity: -0.4, drag: 1.0 });
+                    }
+                }
                 Event::KitlingPop { pos } => {
                     // a kitten pops: a puff of confetti
                     let cols = [[1.4, 0.7, 1.0], [0.7, 1.3, 0.6], [1.4, 1.2, 0.5], [0.6, 1.0, 1.4]];

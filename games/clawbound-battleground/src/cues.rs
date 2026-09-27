@@ -97,6 +97,13 @@ pub fn cues_for(ev: &Event, game: &Game) -> Vec<Cue> {
         Event::BossSpawn { pos, .. } => vec![Cue { keys: vec!["sfx/beast/wake".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 6 }],
         Event::BossDown { pos, .. } => vec![Cue { keys: vec!["sfx/beast/fall".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 6 }],
         Event::TitanVulnerable { .. } => vec![Cue { keys: vec!["sfx/beast/snort".into()], bus: Bus::Sfx, gain: 0.8, pos: None, speaker: None, priority: 5 }],
+        // Hollowstep (`stalker`): his tread, loud and carrying, from him
+        // and from every other of him; the air closing where he stepped
+        // from; and a cat's own heart, pounding at it, harder the closer
+        // he is (heard near the cat: loud to whoever IS that cat)
+        Event::HeavyStep { pos } => vec![Cue { keys: vec!["sfx/stalker/step".into()], bus: Bus::Sfx, gain: 0.95, pos: Some(*pos), speaker: None, priority: 3 }],
+        Event::SwapFx { from, .. } => vec![Cue { keys: vec!["sfx/stalker/swap".into()], bus: Bus::Sfx, gain: 0.9, pos: Some(*from), speaker: None, priority: 4 }],
+        Event::Heartbeat { god, fear } => vec![Cue { keys: vec!["sfx/stalker/heart".into()], bus: Bus::Sfx, gain: 0.45 + 0.55 * fear, pos: god_pos(*god), speaker: None, priority: 4 }],
         _ => Vec::new(),
     }
 }

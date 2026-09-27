@@ -88,6 +88,9 @@ pub fn mastery_text(arch: &Archetype) -> &'static str {
         Archetype::Litter { .. } => "Mastery: two more kittens",
         Archetype::Giggle { .. } => "Mastery: the giggles last 35% longer",
         Archetype::DanceParty { .. } => "Mastery: the party goes on 30% longer",
+        Archetype::Swap { .. } => "Mastery: arriving staggers a 35% wider ring",
+        Archetype::Send { .. } => "Mastery: the other goes 40% farther, and faster",
+        Archetype::Echoes { .. } => "Mastery: the echoes linger 30% longer",
     }
 }
 
@@ -112,6 +115,9 @@ pub fn mastery(arch: Archetype) -> Archetype {
         Litter { count, dmg, speed, life } => Litter { count: count + 2, dmg, speed, life },
         Giggle { radius, dmg, secs } => Giggle { radius, dmg, secs: secs * 1.35 },
         DanceParty { radius, duration, slow, slow_secs } => DanceParty { radius, duration: duration * 1.3, slow, slow_secs },
+        Swap { radius, dmg, slow, secs } => Swap { radius: radius * 1.35, dmg, slow, secs },
+        Send { range, speed } => Send { range: range * 1.4, speed: speed * 1.25 },
+        Echoes { each, life, dmg } => Echoes { each, life: life * 1.3, dmg },
     }
 }
 
@@ -138,6 +144,10 @@ fn scale_amounts(arch: Archetype, m: f32) -> Archetype {
         Litter { count, dmg, speed, life } => Litter { count, dmg: dmg * m, speed, life },
         Giggle { radius, dmg, secs } => Giggle { radius, dmg: dmg * m, secs },
         DanceParty { radius, duration, slow, slow_secs } => DanceParty { radius, duration, slow, slow_secs: slow_secs * (1.0 + (m - 1.0) * 0.5) },
+        Swap { radius, dmg, slow, secs } => Swap { radius, dmg: dmg * m, slow, secs },
+        // a sending has no amount: the other glides a little faster instead
+        Send { range, speed } => Send { range, speed: speed * (1.0 + (m - 1.0) * 0.5) },
+        Echoes { each, life, dmg } => Echoes { each, life, dmg: dmg * m },
     }
 }
 

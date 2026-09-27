@@ -975,11 +975,11 @@ impl Troupe {
 pub fn cast_style(arch: &crate::gods::Archetype, ult: bool) -> CastStyle {
     use crate::gods::Archetype as A;
     match arch {
-        A::Dash { .. } | A::Blink { .. } | A::Meteor { .. } => CastStyle::Spring,
+        A::Dash { .. } | A::Blink { .. } | A::Meteor { .. } | A::Swap { .. } => CastStyle::Spring,
         _ if ult => CastStyle::Rear,
         A::Bolt { .. } | A::Volley { .. } | A::Beam { .. } | A::Litter { .. } => CastStyle::Spit,
-        A::Lob { .. } | A::Ring { .. } | A::Pull { .. } | A::DanceParty { .. } => CastStyle::Stomp,
-        A::Nova { .. } | A::Storm { .. } | A::Shield { .. } | A::Heal { .. } | A::Buff { .. } | A::Giggle { .. } => CastStyle::Arch,
+        A::Lob { .. } | A::Ring { .. } | A::Pull { .. } | A::DanceParty { .. } | A::Send { .. } => CastStyle::Stomp,
+        A::Nova { .. } | A::Storm { .. } | A::Shield { .. } | A::Heal { .. } | A::Buff { .. } | A::Giggle { .. } | A::Echoes { .. } => CastStyle::Arch,
     }
 }
 

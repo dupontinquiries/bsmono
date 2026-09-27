@@ -121,6 +121,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("glades") {
         return run_glade_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("hollow") {
+        return run_hollow_shots();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("hud") {
         return run_hud_shots();
     }
@@ -2347,5 +2350,104 @@ pub fn run_glade_shots() -> Result<(), String> {
         save_shot(&renderer.device, &renderer.queue, &target, name)?;
         println!("saved {name}");
     }
+    Ok(())
+}
+
+/// Hollowstep (`stalker`): close up; his other stalking a foe across a
+/// clearing; every shadow risen; and the prey's own screen, afraid, with
+/// him close. `CLAWBOUND_SHOTS=hollow`.
+pub fn run_hollow_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("hollow"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let him = crate::gods::ROSTER.iter().position(|d| matches!(d.pelt, crate::gods::PeltKind::Hollow)).unwrap() as u32;
+    // the prey is the "player" (index 0), for the HUD shot
+    let mut game = Game::new_teams(&[0], &[him]);
+    game.blockers = scene.blockers.clone();
+    game.next_wave_t = 1e9;
+    game.set_level(1, 5);
+    for g in game.gods.iter_mut() {
+        g.ai = None;
+        g.mana = 9999.0;
+    }
+    // on mid lane between the towers: open ground to see them on
+    let at = Vec3::new(0.0, 0.0, -24.0);
+    game.gods[1].pos = at;
+    game.gods[1].yaw = std::f32::consts::FRAC_PI_2;
+    game.gods[0].pos = at + Vec3::new(0.0, 0.0, 30.0);
+    game.gods[0].yaw = -std::f32::consts::FRAC_PI_2;
+    let mut vfx = Vfx::default();
+    let step = |game: &mut Game, vfx: &mut Vfx, secs: f32| {
+        for _ in 0..(secs * 60.0) as usize {
+            game.tick(1.0 / 60.0);
+            let ev = std::mem::take(&mut game.events);
+            vfx.update(1.0 / 60.0, &ev, game);
+        }
+    };
+    let mut egui_renderer = egui_wgpu::Renderer::new(&renderer.device, wgpu::TextureFormat::Rgba8UnormSrgb, None, 1);
+    let ctx = egui::Context::default();
+    let mut st = UiState::new();
+    let mut shoot = |renderer: &mut Renderer, game: &Game, vfx: &mut Vfx, name: &str, cam: Camera, hud: bool| -> Result<(), String> {
+        renderer.clear_queues();
+        scene.draw(renderer, game, vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        if hud {
+            let vp = cam.view_proj(W as f32 / H as f32);
+            let mut textures = egui::TexturesDelta::default();
+            let mut out = None;
+            for k in 0..2 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W as f32, H as f32))),
+                    time: Some(1.0 + k as f64 * 0.016),
+                    ..Default::default()
+                };
+                let o = ctx.run(raw, |c| ui::draw_hud(c, game, 0, vp, W as f32, H as f32, &mut st, renderer.camera.eye));
+                textures.append(o.textures_delta.clone());
+                out = Some(o);
+            }
+            let mut out = out.expect("ran");
+            out.textures_delta = textures;
+            draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
+        }
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+        Ok(())
+    };
+    step(&mut game, &mut vfx, 0.3);
+    shoot(&mut renderer, &game, &mut vfx, "hollow_close.png", Camera { eye: at + Vec3::new(2.2, 1.5, 2.8), target: at + Vec3::Y * 1.2, fov_y: 0.8 }, false)?;
+    // his other, walking at the prey across the jungle
+    let k = game.main_other(1).expect("his other");
+    let prey = game.gods[0].pos;
+    game.others[k].pos = prey + Vec3::new(0.0, 0.0, -16.0);
+    game.gods[1].pos = prey + Vec3::new(0.0, 0.0, 40.0);
+    step(&mut game, &mut vfx, 1.5);
+    let o = game.others[k].pos;
+    shoot(&mut renderer, &game, &mut vfx, "hollow_other.png", Camera { eye: prey + Vec3::new(1.5, 2.2, 3.5), target: o + Vec3::Y * 1.0, fov_y: 0.9 }, false)?;
+    game.gods[1].pos = at;
+    // every shadow
+    game.gods[1].cds = [0.0; 4];
+    game.cast_queue.push((1, 3, at + Vec3::Z * 3.0));
+    step(&mut game, &mut vfx, 0.9);
+    shoot(&mut renderer, &game, &mut vfx, "hollow_every_shadow.png", Camera { eye: at + Vec3::new(-6.0, 3.5, -6.0), target: at + Vec3::new(0.0, 1.0, 1.0), fov_y: 0.9 }, false)?;
+    // afraid: the prey's own screen, him a few paces off
+    game.others.retain(|o| !o.echo);
+    game.gods[1].pos = prey + Vec3::new(0.0, 0.0, -5.0);
+    step(&mut game, &mut vfx, 0.02);
+    // on the beat
+    game.gods[0].beat_t = crate::stalker::beat_every(game.gods[0].fear);
+    let p = game.gods[0].pos;
+    shoot(&mut renderer, &game, &mut vfx, "hollow_afraid_hud.png", Camera { eye: p + Vec3::new(0.0, 5.0, 9.0), target: p + Vec3::new(0.0, 1.0, -4.0), fov_y: 0.95 }, true)?;
     Ok(())
 }

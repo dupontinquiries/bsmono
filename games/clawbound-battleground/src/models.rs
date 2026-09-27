@@ -218,6 +218,8 @@ fn god_grid(def: &GodDef, team: Team) -> Grid {
     let (ear_h, ear_w, tuft): (i32, i32, bool) = match def.pelt {
         PeltKind::EarTufts => (5, 1, true),
         PeltKind::BigEars => (7, 2, false),
+        // long, lean ears (one notched, below)
+        PeltKind::Hollow => (5, 1, false),
         _ => (3, 1, false),
     };
     for sx in [-1i32, 1] {
@@ -297,6 +299,21 @@ fn god_grid(def: &GodDef, team: Team) -> Grid {
                 let r = 1.4 * (1.0 - t * 0.6);
                 g.ellipsoid(x, y, z, r, r, r * 1.3, solid(mix(accent, second, t)));
             }
+        }
+        PeltKind::Hollow => {
+            // a hood of dark fur over the brow and the eyes, falling back
+            // over the crown; two pale eyes looking out of it; the left
+            // ear notched; a thin dark line down the spine
+            let hood = solid(mix(dark, pelt, 0.12));
+            g.ellipsoid(cxf, hy + 2.2, hz + 0.5, 5.3 + bf * 0.5, 2.6, 5.2, hood);
+            g.ellipsoid(cxf, hy + 1.0, hz + 3.8, 3.8, 1.5, 1.8, hood);
+            for sx in [-1i32, 1] {
+                g.set(cx + sx * 2, hy as i32 + 1, hz as i32 + 5, solid([0.86, 0.93, 1.0]));
+                g.set(cx + sx * 2, hy as i32 + 1, hz as i32 + 6, solid([0.86, 0.93, 1.0]));
+            }
+            let ex = cx - (3 + bulk.max(0) / 2);
+            g.carve_sphere(ex as f32, hy + 6.5, hz - 0.5, 0.9);
+            paint_shell(&mut g, |x, y, _z| (x - cx).abs() <= 0 && y >= 27, solid(dark));
         }
         PeltKind::Kit => {
             // a kitten: the head rounder and bigger than any grown cat's
@@ -388,7 +405,7 @@ mod rig_tests {
     /// a hole that only shows in one pose.
     #[test]
     fn every_ancestor_cuts_into_ten_nonempty_parts_and_loses_nothing() {
-        assert_eq!(ROSTER.len(), 15);
+        assert_eq!(ROSTER.len(), 16);
         for def in ROSTER.iter() {
             let grid = god_grid(def, Team::Blue);
             let plan = feline_cut_plan(role_bulk(def.role), matches!(def.pelt, PeltKind::Antlers));

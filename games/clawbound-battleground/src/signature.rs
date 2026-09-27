@@ -68,12 +68,15 @@ pub enum Motif {
     /// Sproutkit -- blossom and confetti: popped up out of the ground,
     /// then drifting down slowly, fluttering, in every spring colour.
     Bloom,
+    /// Hollowstep -- moor fog: a flat, cold bank creeping out along the
+    /// ground, knee-high and slow, taking a long time to go.
+    Fog,
 }
 
-pub const MOTIFS: [Motif; 15] = [
+pub const MOTIFS: [Motif; 16] = [
     Motif::Sunroar, Motif::Rake, Motif::Rainfall, Motif::Umbra, Motif::Gyre, Motif::Yowl, Motif::Rime,
     Motif::Fangs, Motif::Halo, Motif::Hush, Motif::Lash, Motif::Thunderhead, Motif::Scree, Motif::Starfall,
-    Motif::Bloom,
+    Motif::Bloom, Motif::Fog,
 ];
 
 impl Motif {
@@ -100,6 +103,7 @@ impl Motif {
             Motif::Scree => [[0.78, 0.76, 0.70], [0.48, 0.46, 0.43], [0.30, 0.27, 0.22]],
             Motif::Starfall => [[1.0, 1.0, 0.95], [1.0, 0.86, 0.45], [0.45, 0.55, 1.0]],
             Motif::Bloom => [[1.0, 0.70, 0.85], [0.55, 0.92, 0.45], [1.0, 0.92, 0.55]],
+            Motif::Fog => [[0.46, 0.48, 0.53], [0.30, 0.32, 0.36], [0.15, 0.16, 0.19]],
         }
     }
 }
@@ -121,9 +125,9 @@ impl Gesture {
     pub fn of(arch: &Archetype) -> Gesture {
         use Archetype as A;
         match arch {
-            A::Nova { .. } | A::Storm { .. } | A::Pull { .. } | A::Giggle { .. } => Gesture::Burst,
-            A::Bolt { .. } | A::Volley { .. } | A::Beam { .. } | A::Dash { .. } | A::Litter { .. } => Gesture::Line,
-            A::Lob { .. } | A::Ring { .. } | A::Blink { .. } | A::Meteor { .. } | A::DanceParty { .. } => Gesture::Mark,
+            A::Nova { .. } | A::Storm { .. } | A::Pull { .. } | A::Giggle { .. } | A::Echoes { .. } => Gesture::Burst,
+            A::Bolt { .. } | A::Volley { .. } | A::Beam { .. } | A::Dash { .. } | A::Litter { .. } | A::Send { .. } => Gesture::Line,
+            A::Lob { .. } | A::Ring { .. } | A::Blink { .. } | A::Meteor { .. } | A::DanceParty { .. } | A::Swap { .. } => Gesture::Mark,
             A::Shield { .. } | A::Buff { .. } | A::Heal { .. } => Gesture::Mantle,
         }
     }
@@ -287,6 +291,13 @@ pub fn emit(motif: Motif, gesture: Gesture, origin: Vec3, aim: Vec3, ult: bool, 
                     push(high, fall * (17.0 + 5.0 * rng.f()), 0.35, 0.15, (i % 2) as usize + (i % 7 == 0) as usize, 1.0, 0.0, 0.0);
                 }
             }
+            Motif::Fog => {
+                // Low and flat, creeping OUT slowly along the ground, and
+                // slow to go: height is what it does not have.
+                let base = if gesture == Gesture::Line { origin + dir * (u * span) + side * rng.s() * 1.2 } else { centre + ring * rng.f() * span * 0.3 };
+                let out = if gesture == Gesture::Line { side * rng.s() } else { ring };
+                push(Vec3::new(base.x, 0.15 + 0.35 * rng.f(), base.z), out * (1.2 + 1.3 * rng.f()) + Vec3::Y * 0.08, 2.6, 0.2 + 0.12 * rng.f(), (i % 3).min(2), 0.35, 0.0, 0.9);
+            }
             Motif::Bloom => {
                 // Popped up low out of the ground, then drifting down slowly
                 // and wandering sideways: petals and confetti.
@@ -374,7 +385,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(pairs, 2 * 15 * 14 / 2);
+        assert_eq!(pairs, 2 * 16 * 15 / 2);
         eprintln!("closest pair: {closest:?}");
     }
 
@@ -413,7 +424,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(total, 15 * 4 * 2);
+        assert_eq!(total, 16 * 4 * 2);
         // Aim on top of the caster, and garbage: no panic, no NaN.
         assert!(emit(Motif::Yowl, Gesture::Line, o, o, false, &mut Rng(1)).iter().all(|p| p.pos.is_finite()));
         assert!(emit(Motif::Rake, Gesture::Line, Vec3::splat(f32::NAN), o, false, &mut Rng(1)).is_empty());

@@ -381,12 +381,20 @@ mod tests {
             assert_eq!((b.len(), r.len()), (15, 15));
             assert_eq!(b[0], (seed % 13) as u32);
             let n = crate::gods::ROSTER_LEN as u32;
+            // with more lines than a side has cats (16 to 15), a line sits
+            // the match out -- and when it is the player's own line that
+            // was left out of the once-each deal, the player's cat takes a
+            // blue seat and one more line is on red alone
+            let (mut absent, mut one_sided) = (0, 0);
             for line in 0..n {
                 let cb = b.iter().filter(|&&x| x == line).count() as i32;
                 let cr = r.iter().filter(|&&x| x == line).count() as i32;
-                assert!(cb + cr >= 2 && cb + cr <= 4, "line {line}: {cb}+{cr}");
+                assert!(cb + cr <= 4, "line {line}: {cb}+{cr}");
+                absent += (cb + cr == 0) as u32;
+                one_sided += (cb + cr == 1) as u32;
                 assert!((cb - cr).abs() <= 1, "seed {seed}: line {line} lopsided: {cb} v {cr}");
             }
+            assert!(absent <= n.saturating_sub(15) && one_sided <= 2, "seed {seed}: {absent} lines sat out, {one_sided} on one side");
             }
         });
     }
