@@ -82,12 +82,15 @@ pub enum Motif {
     /// waist height, turning slowly round it, and a few blue starpoints
     /// hanging above: still, measured, gone all at once.
     Hours,
+    /// Claypaw -- mud: heavy wet gobs flung out low and fast, dropping
+    /// hard, and a few slow flat smears sliding along the ground.
+    Mud,
 }
 
-pub const MOTIFS: [Motif; 19] = [
+pub const MOTIFS: [Motif; 20] = [
     Motif::Sunroar, Motif::Rake, Motif::Rainfall, Motif::Umbra, Motif::Gyre, Motif::Yowl, Motif::Rime,
     Motif::Fangs, Motif::Halo, Motif::Hush, Motif::Lash, Motif::Thunderhead, Motif::Scree, Motif::Starfall,
-    Motif::Bloom, Motif::Fog, Motif::Lamplight, Motif::Strata, Motif::Hours,
+    Motif::Bloom, Motif::Fog, Motif::Lamplight, Motif::Strata, Motif::Hours, Motif::Mud,
 ];
 
 impl Motif {
@@ -118,6 +121,7 @@ impl Motif {
             Motif::Lamplight => [[1.0, 0.92, 0.65], [1.0, 0.65, 0.22], [0.75, 0.30, 0.08]],
             Motif::Strata => [[0.90, 0.84, 0.70], [0.62, 0.54, 0.42], [0.42, 0.36, 0.30]],
             Motif::Hours => [[1.0, 0.96, 0.80], [0.95, 0.78, 0.38], [0.55, 0.62, 1.0]],
+            Motif::Mud => [[0.72, 0.52, 0.36], [0.46, 0.30, 0.19], [0.28, 0.18, 0.11]],
         }
     }
 }
@@ -139,10 +143,10 @@ impl Gesture {
     pub fn of(arch: &Archetype) -> Gesture {
         use Archetype as A;
         match arch {
-            A::Nova { .. } | A::Storm { .. } | A::Pull { .. } | A::Giggle { .. } | A::Echoes { .. } | A::Lantern { .. } | A::WindForward { .. } => Gesture::Burst,
-            A::Bolt { .. } | A::Volley { .. } | A::Beam { .. } | A::Dash { .. } | A::Litter { .. } | A::Send { .. } => Gesture::Line,
+            A::Nova { .. } | A::Storm { .. } | A::Pull { .. } | A::Giggle { .. } | A::Echoes { .. } | A::Lantern { .. } | A::WindForward { .. } | A::Mudslide { .. } => Gesture::Burst,
+            A::Bolt { .. } | A::Volley { .. } | A::Beam { .. } | A::Dash { .. } | A::Litter { .. } | A::Send { .. } | A::Spin { .. } => Gesture::Line,
             A::Lob { .. } | A::Ring { .. } | A::Blink { .. } | A::Meteor { .. } | A::DanceParty { .. } | A::Swap { .. } | A::SendBack { .. } | A::LongLook { .. } => Gesture::Mark,
-            A::Shield { .. } | A::Buff { .. } | A::Heal { .. } | A::Field { .. } | A::Rewind { .. } => Gesture::Mantle,
+            A::Shield { .. } | A::Buff { .. } | A::Heal { .. } | A::Field { .. } | A::Rewind { .. } | A::Remold { .. } | A::Quicken { .. } => Gesture::Mantle,
         }
     }
 }
@@ -339,6 +343,17 @@ pub fn emit(motif: Motif, gesture: Gesture, origin: Vec3, aim: Vec3, ult: bool, 
                         (centre + face + Vec3::Y * 1.0, Vec3::new(-ring.z, 0.0, ring.x) * 2.2)
                     };
                     push(base, turn, 1.3, 0.1 + 0.05 * rng.f(), (i % 2) as usize, 1.0, 0.0, 0.2);
+                }
+            }
+            Motif::Mud => {
+                // Three in four gobs flung out low and fast, dropping hard;
+                // the fourth a flat smear sliding along the ground.
+                let base = if gesture == Gesture::Line { origin + dir * (u * span) } else { centre };
+                let out = if gesture == Gesture::Line { (side * rng.s() + dir * 0.4).normalize_or_zero() } else { ring };
+                if i % 4 == 3 {
+                    push(Vec3::new(base.x, 0.08, base.z), out * (3.0 + 2.0 * rng.f()), 1.1, 0.24, 2, 1.0, 0.0, 2.5);
+                } else {
+                    push(base + Vec3::Y * (0.6 + 0.4 * rng.f()), out * (7.0 + 4.0 * rng.f()) + Vec3::Y * (2.5 + 1.5 * rng.f()), 0.7, 0.13 + 0.07 * rng.f(), (i % 2) as usize, 1.0, 16.0, 0.4);
                 }
             }
             Motif::Fog => {

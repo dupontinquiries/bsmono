@@ -91,6 +91,10 @@ pub struct Scene {
     /// Sproutkit's litter (his own body, drawn small), by team, and his
     /// glitter-ball.
     pub kitling: [u64; 2],
+    /// Claypaw's clay kittens (his own body, small), by team, and a puddle
+    /// of his mud (`clay`).
+    pub clay_kit: [u64; 2],
+    pub puddle: u64,
     /// Hollowstep's body, by team, for the others of him (`stalker`).
     pub hollow: [u64; 2],
     /// The Engineer's Quarry's thorns (three clumps), and where they rise, by the
@@ -397,6 +401,9 @@ impl Scene {
         let star = r.upload_mesh(&crate::skyprops::star_mote());
         let kit_def = ROSTER.iter().find(|d| matches!(d.pelt, crate::gods::PeltKind::Kit)).expect("Sproutkit on the roster");
         let kitling = [r.upload_mesh(&models::build_god(kit_def, Team::Blue)), r.upload_mesh(&models::build_god(kit_def, Team::Red))];
+        let clay_def = ROSTER.iter().find(|d| crate::clay::is_clay(d)).expect("Claypaw on the roster");
+        let clay_kit = [r.upload_mesh(&models::build_god(clay_def, Team::Blue)), r.upload_mesh(&models::build_god(clay_def, Team::Red))];
+        let puddle = r.upload_mesh(&crate::clay::puddle_mesh());
         let disco = r.upload_mesh(&models::disco_ball());
         let hollow_def = ROSTER.iter().find(|d| matches!(d.pelt, crate::gods::PeltKind::Hollow)).expect("Hollowstep on the roster");
         let hollow = [r.upload_mesh(&models::build_god(hollow_def, Team::Blue)), r.upload_mesh(&models::build_god(hollow_def, Team::Red))];
@@ -477,6 +484,8 @@ impl Scene {
             wyrm_seg,
             star,
             kitling,
+            clay_kit,
+            puddle,
             hollow,
             thorns,
             thorn_spots,
@@ -1237,7 +1246,28 @@ impl Scene {
             let m = Mat4::from_translation(k.pos + Vec3::Y * hop)
                 * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - yaw)
                 * Mat4::from_scale(Vec3::splat(crate::kit::KITLING_SCALE));
-            r.queue_draw(self.kitling[k.team as usize], m, [1.0; 4], 0.15, models::GOD_DRAW_VOXEL, false);
+            let mesh = if k.clay { self.clay_kit[k.team as usize] } else { self.kitling[k.team as usize] };
+            r.queue_draw(mesh, m, [1.0; 4], 0.15, models::GOD_DRAW_VOXEL, false);
+        }
+        // Claypaw's mud: puddles down each slick's line, shrinking as it
+        // dries; a mudslide's darker, and sliding along its way
+        for s in &game.slicks {
+            let len = Vec3::new(s.b.x - s.a.x, 0.0, s.b.z - s.a.z).length();
+            let n = ((len / (s.r * 0.9)).ceil() as usize).max(1);
+            let fade = (s.left / s.secs.max(0.01)).clamp(0.0, 1.0);
+            let flow = if s.push.length_squared() > 0.0 { (vfx.time * 0.8).fract() } else { 0.0 };
+            for k in 0..=n {
+                let u = ((k as f32 + flow) / n as f32).min(1.0);
+                let p = s.a + (s.b - s.a) * u;
+                let p = Vec3::new(p.x, crate::map::ground_y(p.x, p.z) + 0.03, p.z);
+                if !sphere_in_frustum(&vp, p, s.r) {
+                    continue;
+                }
+                let r0 = s.r * (0.55 + 0.45 * fade) * (1.0 + 0.08 * ((k * 7) % 3) as f32);
+                let m = Mat4::from_translation(p) * Mat4::from_axis_angle(Vec3::Y, k as f32 * 1.3) * Mat4::from_scale(Vec3::new(r0, 1.0, r0));
+                let tint = if s.push.length_squared() > 0.0 { [0.8, 0.75, 0.7, 1.0] } else { [1.0; 4] };
+                r.queue_draw(self.puddle, m, tint, 0.0, 0.1, false);
+            }
         }
         // and his glitter-ball, turning over the dance floor
         for z in &game.zones {

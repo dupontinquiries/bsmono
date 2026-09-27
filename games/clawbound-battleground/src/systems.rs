@@ -67,6 +67,7 @@ impl Game {
         self.maze_tick(dt);
         self.machine_tick(dt);
         self.hours_tick(dt);
+        self.clay_tick(dt);
 
         // 6b. sky + map events (weather.rs / map_events.rs)
         self.atmosphere_tick(dt);
@@ -313,6 +314,8 @@ impl Game {
         // moved since last tick (riders are carried by that), and which pier
         // it is docked at.
         let ferries = self.ferries.clone();
+        // Claypaw's mud (`clay`): on a slick a cat slides
+        let slicks = self.slicks.clone();
         let clouds: Vec<(Vec3, Vec3, Option<u8>)> = ferries
             .iter()
             .map(|f| {
@@ -453,8 +456,19 @@ impl Game {
                     g.dash = None;
                 }
                 g.walk_anim += dt * 12.0;
+            } else if let Some(s) = slicks.iter().rev().find(|s| g.perch.is_none() && s.covers(g.pos)) {
+                // on a slick: it keeps going the way it went, faster, and
+                // turns slowly; a mudslide carries it too
+                let want = if dir.length_squared() > 0.0001 { dir.normalize() } else { Vec3::ZERO };
+                g.slide = crate::clay::slide_step(g.slide, want, speed, dt);
+                g.pos += (g.slide + s.push) * dt;
+                if g.slide.length_squared() > 0.5 && g.face_hold <= 0.0 {
+                    g.yaw = g.slide.z.atan2(g.slide.x);
+                }
+                g.walk_anim += dt * 6.0;
             } else if dir.length_squared() > 0.0001 {
                 let on_ridge = g.perch.is_some() && g.perch_narrow;
+                g.slide = dir.normalize() * speed;
                 g.pos += dir.normalize() * speed * if on_ridge { crate::leap::NARROW_SPEED } else { 1.0 } * dt;
                 // Facing: toward the move, within a cone round where the
                 // player looks (`face_ref`, the camera's forward): strafing
@@ -474,6 +488,7 @@ impl Game {
                 }
                 g.walk_anim += dt * 9.0;
             } else {
+                g.slide = Vec3::ZERO;
                 g.walk_anim += dt * 1.5;
             }
             // Prop collision. Runs AFTER the move and BEFORE the arena clamp:
@@ -1464,13 +1479,15 @@ impl Game {
                     }
                 } else {
                     // regen
-                    g.mana = (g.mana + (2.6 + 0.5 * g.level as f32) * dt).min(g.max_mana);
+                    // (Claypaw's mana comes only from his claws: `clay`)
+                    let regen = if crate::clay::is_clay(crate::gods::god(g.def_id)) { 0.0 } else { 1.0 };
+                    g.mana = (g.mana + (2.6 + 0.5 * g.level as f32) * dt * regen).min(g.max_mana);
                     if now - last_dmg > mend_after {
-                        g.hp = (g.hp + g.max_hp * mend_pct * dt).min(g.max_hp);
+                        g.hp = (g.hp + g.max_hp * mend_pct * dt * g.heal_mul).min(g.max_hp);
                     }
                     let f = g.team.fountain();
                     if g.pos.distance(f) < FOUNTAIN_RADIUS {
-                        g.hp = (g.hp + g.max_hp * FOUNTAIN_REGEN * dt * 4.0).min(g.max_hp);
+                        g.hp = (g.hp + g.max_hp * FOUNTAIN_REGEN * dt * 4.0 * g.heal_mul).min(g.max_hp);
                         g.mana = (g.mana + g.max_mana * FOUNTAIN_REGEN * dt * 4.0).min(g.max_mana);
                     }
                 }

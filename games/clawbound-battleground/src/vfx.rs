@@ -1352,6 +1352,23 @@ impl Vfx {
                 Event::LookLand { pos, .. } => {
                     self.rings.push(Ring { pos: *pos + Vec3::Y * 0.05, r0: 0.5, r1: 7.0, until: 0.7, dur: 0.7, color: [0.9, 1.0, 1.6], thick: 0.3 });
                 }
+                // Claypaw (`clay`): kittens shaped in a puff of clay dust;
+                // clay pressed and slip flicked off; mud flung along a slick
+                Event::ClayShaped { pos, .. } | Event::ClayRemold { pos } => {
+                    for k in 0..14 {
+                        let a = k as f32 * 2.399;
+                        self.dust.push(Particle { pos: *pos + Vec3::new(a.cos() * 0.6, 0.5 + (k % 3) as f32 * 0.3, a.sin() * 0.6), vel: Vec3::new(a.cos() * 1.8, 1.2, a.sin() * 1.8), life: 0.6, max_life: 0.6, size: 0.14, color: [0.62, 0.42, 0.30], alpha: 0.9, gravity: 6.0, drag: 1.2 });
+                    }
+                }
+                Event::SlickFx { a, b, .. } => {
+                    for k in 0..24 {
+                        let u = k as f32 / 23.0;
+                        let p = *a + (*b - *a) * u;
+                        let s = if k % 2 == 0 { 1.0 } else { -1.0 };
+                        let side = Vec3::new(-(b.z - a.z), 0.0, b.x - a.x).normalize_or_zero() * s;
+                        self.dust.push(Particle { pos: p + Vec3::Y * 0.3, vel: side * 3.0 + Vec3::Y * 2.5, life: 0.6, max_life: 0.6, size: 0.16, color: [0.40, 0.27, 0.17], alpha: 1.0, gravity: 14.0, drag: 0.5 });
+                    }
+                }
                 Event::BoulderLand { pos } | Event::CatFell { pos } => {
                     // a ring of dust off the flags
                     for k in 0..32 {

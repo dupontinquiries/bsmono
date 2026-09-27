@@ -170,6 +170,15 @@ voice/hourwatch/kill.1.opus	hourwatch	I saw that coming.	unsurprised	2	takes dow
 voice/hourwatch/kill.2.opus	hourwatch	Right on time.	satisfied, checking a clock	2	takes down an enemy ancestor
 voice/hourwatch/death.1.opus	hourwatch	I didn't see... this one...	genuinely surprised	1	falls
 voice/hourwatch/death.2.opus	hourwatch	Out of... time...	a last dry joke	1	falls
+voice/claypaw/select.opus	claypaw	Fresh from the riverbank!	cheerful, rolling up his sleeves	3	locked in on the select screen
+voice/claypaw/cast1.opus	claypaw	Good as new.	pressing a crack shut, satisfied	2	winds up Remold
+voice/claypaw/cast2.opus	claypaw	Wet and quick!	a splash, bright	3	winds up Quicken
+voice/claypaw/cast3.opus	claypaw	Round we go!	spinning, gleeful	4	winds up Spin
+voice/claypaw/cast4.opus	claypaw	Here comes the BANK!	a whoop, rising on 'bank'	5	winds up Mudslide
+voice/claypaw/kill.1.opus	claypaw	Back to the mud.	matter-of-fact	2	takes down an enemy ancestor
+voice/claypaw/kill.2.opus	claypaw	I'll make another.	cheerful, already moving on	2	takes down an enemy ancestor
+voice/claypaw/death.1.opus	claypaw	Just... cracked...	surprised, crumbling	1	falls
+voice/claypaw/death.2.opus	claypaw	I'll set... again...	unbothered, going soft	1	falls
 narrator/prologue1.opus	narrator	Before any word was written, the world belonged to the clans.	hushed, as if starting an old story	2	the prologue opens, line 1 of 8 (first match of a session)
 narrator/prologue2.opus	narrator	No hand raised a wall. No fire burned but the lightning's.	slow, each sentence its own image	2	the prologue, line 2 of 8
 narrator/prologue3.opus	narrator	From the frozen long-ago to the endless dunes, the great cats kept it.	growing, sweeping	3	the prologue, line 3 of 8

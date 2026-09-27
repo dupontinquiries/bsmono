@@ -614,6 +614,10 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             Archetype::Rewind { .. } | Archetype::WindForward { .. } => f32::INFINITY,
             Archetype::SendBack { range, .. } => range,
             Archetype::LongLook { range, .. } => range,
+            // Claypaw (`clay`)
+            Archetype::Remold { .. } | Archetype::Quicken { .. } => f32::INFINITY,
+            Archetype::Spin { dist: dd, .. } => dd + 2.0,
+            Archetype::Mudslide { len, .. } => len * 0.7,
         };
         let pri = match ab.arch {
             Archetype::Nova { .. } => {
@@ -693,6 +697,21 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             }
             Archetype::LongLook { .. } => {
                 if is_god_target && dist > 10.0 && dist < range { 0.5 } else { 0.0 }
+            }
+            // Claypaw (`clay`): remold when cracked (half his health gone);
+            // quicken when he has dried (or to chase); spin in on a cat
+            // (or through a fight); the mudslide on a fight in front of him
+            Archetype::Remold { .. } => {
+                if g.hp / g.max_hp < 0.5 { 0.96 } else { 0.0 }
+            }
+            Archetype::Quicken { .. } => {
+                if g.clay_wet < 0.4 || (engage && is_god_target && dist > 6.0) { 0.55 } else { 0.0 }
+            }
+            Archetype::Spin { .. } => {
+                if is_god_target && dist < range { 0.7 } else { 0.0 }
+            }
+            Archetype::Mudslide { .. } => {
+                if is_god_target && dist < range { 0.9 } else { 0.0 }
             }
             Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } => {
                 let hurt = g.hp / g.max_hp;

@@ -50,7 +50,7 @@ pub struct Ancestor {
     pub instruments: &'static str,
 }
 
-pub const ANCESTORS: [Ancestor; 19] = [
+pub const ANCESTORS: [Ancestor; 20] = [
     Ancestor {
         name: "Goldenmane",
         species: "lion",
@@ -221,6 +221,15 @@ pub const ANCESTORS: [Ancestor; 19] = [
         gender: Gender::Female,
         story: "The Watcher. A Pallas's cat of the high steppe, who sat out whole nights on the rocks counting the stars round until she knew the sky's clock better than her own heartbeat -- and found that an hour, once you have watched enough of them, can be turned like any other thing. She turns her own back when it goes badly, her enemies' when they get ahead of themselves, and her friends' forward when they are waiting. When the clans need to know what is coming, she leaps into the stars and looks back at the whole field, and everything behind her is seen. Nobody has ever surprised her. She says.",
         instruments: "a music box's comb, ticking clocks, a glass harmonica, a high drone of steppe throat-singing, a single temple bell; wind over grass at night",
+    },
+    Ancestor {
+        name: "Claypaw",
+        species: "fishing cat",
+        age: "the flood years",
+        land: "the banks of the great river",
+        gender: Gender::Male,
+        story: "The potter of the river mud. A fishing cat who waded the great river's banks so long that the clay took his shape and kept it -- and when the flood tore him apart he pressed himself back together out of the bank. He has been clay ever since: he cracks as he dries and remolds himself wet, nothing else mends him more than half, and every kitten he shapes out of the mud runs off to bite at whatever he is fighting. Where he spins, the ground turns to slip; where he is angry, the bank gives way. The clans that farm the flood plains leave a lump of wet clay on the doorstep for him.",
+        instruments: "clay pot drums (udu), a water drum, a potter's wheel's hum, low reed pipes; the river running, mud sucking at paws",
     },
 ];
 

@@ -120,7 +120,7 @@ impl Game {
                 Passive::Tide { pct } if !basic && !self.reflecting => {
                     let g = &mut self.gods[s];
                     if g.respawn_t <= 0.0 {
-                        g.hp = (g.hp + dmg * pct).min(g.max_hp);
+                        g.hp = (g.hp + dmg * pct * g.heal_mul).min(g.max_hp);
                     }
                 }
                 Passive::Bramble { slow, secs } if basic => {

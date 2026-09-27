@@ -975,11 +975,11 @@ impl Troupe {
 pub fn cast_style(arch: &crate::gods::Archetype, ult: bool) -> CastStyle {
     use crate::gods::Archetype as A;
     match arch {
-        A::Dash { .. } | A::Blink { .. } | A::Meteor { .. } | A::Swap { .. } | A::LongLook { .. } => CastStyle::Spring,
+        A::Dash { .. } | A::Blink { .. } | A::Meteor { .. } | A::Swap { .. } | A::LongLook { .. } | A::Spin { .. } => CastStyle::Spring,
         _ if ult => CastStyle::Rear,
         A::Bolt { .. } | A::Volley { .. } | A::Beam { .. } | A::Litter { .. } => CastStyle::Spit,
-        A::Lob { .. } | A::Ring { .. } | A::Pull { .. } | A::DanceParty { .. } | A::Send { .. } | A::SendBack { .. } => CastStyle::Stomp,
-        A::Nova { .. } | A::Storm { .. } | A::Shield { .. } | A::Heal { .. } | A::Buff { .. } | A::Giggle { .. } | A::Echoes { .. } | A::Lantern { .. } | A::Field { .. } | A::Rewind { .. } | A::WindForward { .. } => CastStyle::Arch,
+        A::Lob { .. } | A::Ring { .. } | A::Pull { .. } | A::DanceParty { .. } | A::Send { .. } | A::SendBack { .. } | A::Mudslide { .. } => CastStyle::Stomp,
+        A::Nova { .. } | A::Storm { .. } | A::Shield { .. } | A::Heal { .. } | A::Buff { .. } | A::Giggle { .. } | A::Echoes { .. } | A::Lantern { .. } | A::Field { .. } | A::Rewind { .. } | A::WindForward { .. } | A::Remold { .. } | A::Quicken { .. } => CastStyle::Arch,
     }
 }
 

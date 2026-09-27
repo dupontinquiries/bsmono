@@ -95,7 +95,7 @@ fn trophies_grow_the_stat_they_name_up_to_their_most() {
 
 #[test]
 fn roster_is_14_ancestors_with_4_abilities_each() {
-    assert_eq!(ROSTER.len(), 19);
+    assert_eq!(ROSTER.len(), 20);
     let roles: std::collections::HashSet<_> = ROSTER.iter().map(|g| g.role).collect();
     assert!(roles.len() >= 4, "roster should span multiple roles");
     for g in &ROSTER {
@@ -841,6 +841,8 @@ fn firing_range_every_ability_goes_where_it_is_aimed_and_turns_the_cat() {
                             dirs.push(flat(pos));
                         }
                     }
+                    // Claypaw's mud (`clay`): the way its slick runs
+                    Event::SlickFx { a, b, .. } => dirs.push(Vec3::new(b.x - a.x, 0.0, b.z - a.z).normalize_or_zero()),
                     _ => {}
                 }
             }
@@ -860,7 +862,7 @@ fn firing_range_every_ability_goes_where_it_is_aimed_and_turns_the_cat() {
             // round him: neither goes along the aim
             // (Hourwatch's hours go where the cat WAS, or to friends round
             // her, or -- sent back -- to an enemy, and this range is empty)
-            let directional = !matches!(ab.arch, Archetype::Nova { .. } | Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } | Archetype::Giggle { .. } | Archetype::Swap { .. } | Archetype::Echoes { .. } | Archetype::Lantern { .. } | Archetype::Field { .. } | Archetype::Rewind { .. } | Archetype::WindForward { .. } | Archetype::SendBack { .. });
+            let directional = !matches!(ab.arch, Archetype::Nova { .. } | Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } | Archetype::Giggle { .. } | Archetype::Swap { .. } | Archetype::Echoes { .. } | Archetype::Lantern { .. } | Archetype::Field { .. } | Archetype::Rewind { .. } | Archetype::WindForward { .. } | Archetype::SendBack { .. } | Archetype::Remold { .. } | Archetype::Quicken { .. });
             if directional {
                 assert!(!dirs.is_empty(), "{} slot {slot} ({:?}): no directional effect found", def.name, ab.arch);
                 for d in &dirs {
@@ -3190,6 +3192,121 @@ mod hourwatch {
             }
             assert!(seen, "the long look did not show the one behind her");
         });
+    }
+}
+
+mod claypaw {
+    use clawbound::gods::ROSTER;
+    use clawbound::sim::{Event, Game};
+    use glam::Vec3;
+
+    fn id() -> u32 {
+        ROSTER.iter().position(|d| d.name == "Claypaw").unwrap() as u32
+    }
+
+    /// A bot Claypaw in a real match: shapes kittens, spins, quickens and
+    /// brings the bank down, in four minutes -- and his mana comes (it
+    /// never refills by itself), so his kit keeps going.
+    #[test]
+    fn a_bot_claypaw_works_his_clay() {
+        let mut g = Game::new_teams(&[0, id(), 3], &[1, 2, 4]);
+        for c in g.gods.iter_mut() {
+            c.ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+        }
+        for i in 0..g.gods.len() {
+            g.set_level(i, 6);
+        }
+        let mut used = [0u32; 4];
+        let mut shaped = 0;
+        for _ in 0..(240 * 30) {
+            g.tick(1.0 / 30.0);
+            for e in g.events.drain(..) {
+                match e {
+                    Event::Cast { god: 1, slot, .. } => used[slot as usize] += 1,
+                    Event::ClayShaped { n, .. } => shaped += n,
+                    _ => {}
+                }
+            }
+        }
+        assert!(shaped >= 10, "only {shaped} kittens in four minutes");
+        assert!(used[2] > 0 && used[3] > 0 && used[0] + used[1] > 0, "his kit in four minutes: {used:?}");
+    }
+
+    /// In a real game: his basic attacks on a cat in reach bring his mana
+    /// (none comes by itself); and his Spin lays mud down the aim.
+    #[test]
+    fn his_claws_bring_mana_and_his_spin_lays_mud() {
+        let mut g = Game::new_teams(&[id()], &[1]);
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+        }
+        g.minions.clear();
+        g.next_wave_t = 1e9;
+        let at = Vec3::new(0.0, 0.0, -40.0);
+        g.gods[0].pos = at;
+        g.gods[1].pos = at + Vec3::X * 2.5;
+        g.gods[1].max_hp = 1e6;
+        g.gods[1].hp = 1e6;
+        g.gods[0].mana = 0.0;
+        for _ in 0..(3 * 60) {
+            g.gods[0].attack_held = true;
+            g.tick(1.0 / 60.0);
+        }
+        assert!(g.gods[1].hp < 1e6, "no blow landed");
+        assert!(g.gods[0].mana >= clawbound::clay::MANA_PER_HIT, "his claws brought {} mana", g.gods[0].mana);
+        // the spin, aimed north: mud down the aim
+        g.gods[0].mana = 999.0;
+        g.gods[0].attack_held = false;
+        g.gods[1].pos = at + Vec3::new(0.0, 0.0, -60.0);
+        g.set_level(0, 5);
+        g.cast_queue.push((0, 2, at + Vec3::Z * 10.0));
+        for _ in 0..20 {
+            g.tick(1.0 / 60.0);
+        }
+        let s = g.slicks.first().expect("no mud after the spin");
+        let d = Vec3::new(s.b.x - s.a.x, 0.0, s.b.z - s.a.z).normalize_or_zero();
+        assert!(d.dot(Vec3::Z) > 0.95, "the mud runs {d}, the spin went north");
+    }
+
+    /// A real slick, in the real mover: a cat walking onto it keeps going
+    /// faster than it walks; told to turn round on it, it is still carried
+    /// on a while; a mudslide carries a cat standing still on it along.
+    #[test]
+    fn the_mud_carries_friend_and_foe() {
+        let mut g = Game::new_teams(&[0], &[1]);
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+        }
+        g.minions.clear();
+        g.next_wave_t = 1e9;
+        let at = Vec3::new(0.0, 0.0, -40.0);
+        g.gods[0].pos = at;
+        g.gods[1].pos = at + Vec3::new(0.0, 0.0, 8.0);
+        g.lay_slick(at - Vec3::X * 30.0, at + Vec3::X * 30.0, 12.0, 30.0, Vec3::ZERO);
+        let walk = g.move_speed(0);
+        for _ in 0..90 {
+            g.gods[0].move_dir = Vec3::X;
+            g.tick(1.0 / 60.0);
+        }
+        let x0 = g.gods[0].pos.x;
+        g.gods[0].move_dir = Vec3::X;
+        g.tick(1.0 / 60.0);
+        let v = (g.gods[0].pos.x - x0) * 60.0;
+        assert!(v > walk * 1.15, "on the slick at {v:.1}, walking {walk:.1}");
+        for _ in 0..6 {
+            g.gods[0].move_dir = -Vec3::X;
+            g.tick(1.0 / 60.0);
+        }
+        assert!(g.gods[0].pos.x > x0, "turned round on the mud at once");
+        // a mudslide: the other one, standing still, is carried along
+        let z0 = g.gods[1].pos.z;
+        g.slicks.clear();
+        g.lay_slick(at + Vec3::new(-20.0, 0.0, 8.0), at + Vec3::new(20.0, 0.0, 8.0), 5.0, 10.0, Vec3::Z * 7.0);
+        for _ in 0..60 {
+            g.gods[1].move_dir = Vec3::ZERO;
+            g.tick(1.0 / 60.0);
+        }
+        assert!(g.gods[1].pos.z - z0 > 4.0, "a mudslide carried it {:.1}", g.gods[1].pos.z - z0);
     }
 }
 

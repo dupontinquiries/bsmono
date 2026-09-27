@@ -245,6 +245,8 @@ fn god_grid(def: &GodDef, team: Team) -> Grid {
         PeltKind::Lamp => (3, 2, false),
         // a Pallas's cat's: small, round, set low and wide on a flat head
         PeltKind::Hours => (2, 2, false),
+        // a fishing cat's: short and rounded
+        PeltKind::Clay => (2, 1, false),
         _ => (3, 1, false),
     };
     for sx in [-1i32, 1] {
@@ -336,6 +338,27 @@ fn god_grid(def: &GodDef, team: Team) -> Grid {
             g.set(cx, 24, lz + 1, brass);
             g.set(cx, 25, lz + 1, brass);
             paint_shell(&mut g, |_x, y, _z| (6..=12).contains(&y) && y % 3 == 0, solid(mix(pelt, dark, 0.35)));
+        }
+        PeltKind::Clay => {
+            // river clay: dark spots in rows down the flanks (a fishing
+            // cat's), the cracks of drying clay over the back, and a wet
+            // gleam of fresh slip at the shoulders and paws
+            paint_shell(&mut g, |x, y, z| {
+                if !(12..=28).contains(&y) {
+                    return false;
+                }
+                (z + 40).rem_euclid(4) == 0 && (y + x + 40).rem_euclid(4) == 1
+            }, solid(mix(pelt, dark, 0.55)));
+            paint_shell(&mut g, |x, y, z| {
+                if y < 26 {
+                    return false;
+                }
+                // a crack: a thin wandering line (where two hashes meet)
+                let h = ((x * 7 + z * 3) as u32).wrapping_mul(2654435761) >> 26;
+                (z + (h as i32 % 3) + 40).rem_euclid(7) == 0
+            }, solid(mix(dark, pelt, 0.2)));
+            let slip = solid(mix(pelt, [0.95, 0.85, 0.75], 0.35));
+            paint_shell(&mut g, |_x, y, z| (y <= 2) || ((29..=31).contains(&y) && (z - cz - 12).abs() <= 3), slip);
         }
         PeltKind::Hours => {
             // a Pallas's cat: frosted tips all over the long smoky coat;
@@ -520,7 +543,7 @@ mod rig_tests {
     /// a hole that only shows in one pose.
     #[test]
     fn every_ancestor_cuts_into_ten_nonempty_parts_and_loses_nothing() {
-        assert_eq!(ROSTER.len(), 19);
+        assert_eq!(ROSTER.len(), 20);
         for def in ROSTER.iter() {
             let grid = god_grid(def, Team::Blue);
             let plan = feline_cut_plan(role_bulk(def.role), matches!(def.pelt, PeltKind::Antlers));

@@ -97,6 +97,7 @@ voice note contradicts its ancestor. Seven are female, six male.
 | Brasshowl | sand cat | the caravan years | the salt roads | he |
 | Oremantle | a Sentinel: a snow leopard of stone and ore, built by the Geartooth clan | the first winters | the roots of the high crags | she |
 | Hourwatch | Pallas's cat | the long nights | the high steppe, where the sky is widest | she |
+| Claypaw | fishing cat | the flood years | the banks of the great river | he |
 
 **Goldenmane.** First of the lion-clan to lead a pride that was not his by
 birth. He taught that a cat alone is a whisker and a pride is a storm, and
@@ -200,6 +201,15 @@ need to know what is coming, she leaps into the stars and looks back at the
 whole field, and everything behind her is seen. Nobody has ever surprised
 her. She says.
 
+**Claypaw.** The potter of the river mud. A fishing cat who waded the great
+river's banks so long that the clay took his shape and kept it -- and when
+the flood tore him apart he pressed himself back together out of the bank.
+He has been clay ever since: he cracks as he dries and remolds himself
+wet, nothing else mends him more than half, and every kitten he shapes out
+of the mud runs off to bite at whatever he is fighting. Where he spins,
+the ground turns to slip; where he is angry, the bank gives way. The clans
+that farm the flood plains leave a lump of wet clay on the doorstep for him.
+
 ## The music of the clans
 
 For scoring and sound design: each clan's culture has a sound, and the two
@@ -228,6 +238,7 @@ side.
 | Brasshowl | frame drum, oud, a brass bell, clapping hands, a caravan's camel bells | desert wind, a crackling lamp |
 | Oremantle | the deepest mountain horns, stone chimes, a slow frame drum like footfalls, overtone throat-singing | wind in a cave mouth, rock settling |
 | Hourwatch | a music box's comb, ticking clocks, a glass harmonica, steppe throat-singing, a single temple bell | wind over grass at night |
+| Claypaw | clay pot drums (udu), a water drum, a potter's wheel's hum, low reed pipes | the river running, mud sucking at paws |
 
 **Frostfang** colours: long horns, hardanger fiddle and nyckelharpa, kulning,
 bone flute, singing bowls, wind over ice. **Emberclaw** colours: kora,

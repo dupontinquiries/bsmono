@@ -133,6 +133,11 @@ pub fn guide_for(ab: &AbilityDef, from: Vec3, aim: Vec3) -> Guide {
         Archetype::SendBack { range, .. } => Guide::Circle { at: at(range), radius: 5.0 },
         Archetype::WindForward { radius, .. } => Guide::Around { at: from, radius },
         Archetype::LongLook { range, .. } => Guide::Circle { at: at(range), radius: 2.0 },
+        // Claypaw (`clay`): his own clay, round him; the spin's line; the
+        // mudslide's run
+        Archetype::Remold { .. } | Archetype::Quicken { .. } => Guide::Around { at: from, radius: 1.6 },
+        Archetype::Spin { dist, .. } => Guide::Line { from, dir, len: dist },
+        Archetype::Mudslide { len, .. } => Guide::Line { from, dir, len },
     }
 }
 
