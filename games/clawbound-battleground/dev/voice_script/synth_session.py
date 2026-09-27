@@ -37,23 +37,18 @@ SR = 48000
 # the flattest and the most garbled under the chains. Speeds stay at 0.9 or
 # above: below that Kokoro's durations stretch vowels unevenly, which read
 # as a machine drawling.
+# (Riptail, Stonewhisper, Rainspots and Faryowl are recorded now: Wendy's
+# session, wendy_take001.json. Their stand-ins are gone from the cast so a
+# re-run cannot overwrite the performance.)
 CAST = {
     # a tiger: low, unhurried, close -- British, slowed
     'duskstripe': ('bf_emma', 0.92),
-    # a leopard: easy, fluid, amused
-    'rainspots': ('af_bella', 1.0),
     # the moonless woods: hushed, breathy
     'nightpelt': ('af_nicole', 0.9),
-    # projected, singing, theatrical
-    'faryowl': ('af_aoede', 0.95),
     # radiant, ceremonial: the warmest voice in the model
     'suneye': ('af_heart', 0.92),
     # quiet authority, cold and clear
     'snowhush': ('af_kore', 0.95),
-    # a grey ghost of the crags: dry, sparse
-    'stonewhisper': ('bf_isabella', 0.92),
-    # a jaguar of the drowned forest: heavy, deep
-    'riptail': ('am_fenrir', 0.92),
     # serene, faintly amused
     'stillsmoke': ('bm_george', 0.9),
     # a young daredevil: bright, quick

@@ -6,7 +6,9 @@ clean them, give each ancestor its own vocal chain, level and encode them.
 
 The second form takes a manifest ({"session", "clean", "takes"}) in place
 of a recorded session and the TAKES table below -- synth_session.py writes
-one for the stand-in voices; "clean": false skips the noise clean-up.
+one for the stand-in voices; "clean": false skips the noise clean-up. A
+manifest for a real session names its RNNoise model as "rnnoise"
+(wendy_take001.json is one).
 
 SESSION is the performer's take (anything ffmpeg reads). RNNOISE_MODEL is an
 RNNoise model for ffmpeg's arnndn (used: GregorR/rnnoise-models,
@@ -27,7 +29,11 @@ SR = 48000
 MANIFEST = None
 if sys.argv[1].endswith('.json'):
     MANIFEST = json.load(open(sys.argv[1]))
-    SESSION, RNN, ROOT = MANIFEST['session'], None, os.path.abspath(sys.argv[2])
+    # a real session names its RNNoise model; a synthesised one has none
+    # paths in a manifest are relative to it, unless absolute
+    here = os.path.dirname(os.path.abspath(sys.argv[1]))
+    at = lambda p: p if p is None or os.path.isabs(p) else os.path.join(here, p)
+    SESSION, RNN, ROOT = at(MANIFEST['session']), at(MANIFEST.get('rnnoise')), os.path.abspath(sys.argv[2])
     ONLY = sys.argv[3:]
 else:
     SESSION, RNN, ROOT = (os.path.abspath(a) for a in sys.argv[1:4])
@@ -436,7 +442,16 @@ for who, key, s, e in TAKES:
     c = c[int(0.5*SR):len(c)-int(0.5*SR)]
     c = trim(c)
     if who in PRE:
-        c = PRE[who](c, key).astype(np.float32)
+        # the animal under the voice. A manifest can turn it down
+        # ("layers_db"): the layers were set against synthesised stand-ins,
+        # and a performer's own reading carries the character they supplied
+        layered = PRE[who](c, key).astype(np.float32)
+        g = 10 ** ((MANIFEST or {}).get('layers_db', 0.0) / 20)
+        n = min(len(layered), len(c))
+        extra = layered.copy()
+        extra[:n] -= c[:n]
+        c = np.concatenate([c, np.zeros(len(layered) - len(c), np.float32)]) if len(layered) > len(c) else c
+        c = (c[:len(layered)] + g * extra).astype(np.float32)
         c /= max(1.0, float(np.abs(c).max()) / 0.9)
     sf.write('tmp_cut.wav', c, SR)
     # the chain, then room for the tail to ring out
