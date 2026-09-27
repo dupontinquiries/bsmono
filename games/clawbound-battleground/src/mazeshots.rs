@@ -89,23 +89,30 @@ pub fn run() -> Result<(), String> {
     shoot(&mut renderer, &game, &mut vfx, "maze_gates_warn.png", cam(Vec3::new(-40.0, 60.0, -120.0), Vec3::new(-10.0, 0.0, -40.0), 1.0))?;
     game.t = mz::FIRST_TURN + mz::TURN * 2.0 + mz::GATE_MOVE + 1.0;
     shoot(&mut renderer, &game, &mut vfx, "maze_top_turned.png", cam(Vec3::new(0.0, 420.0, -70.0), Vec3::new(0.0, 0.0, -4.0), 1.0))?;
-    // the machine (`machine`): a boulder winding up at its screws, then
-    // rolling its track; the gear trains on the walls from close
+    // the machine (`machine`): a stone winding up out of its hopper in the
+    // hills, coming down its chute, then rolling a sealed lock with the pads
+    // dropping open behind it; the gear trains on the walls from close
     let t2 = mz::FIRST_TURN + mz::TURN; // turn 2
-    game.t = t2 + crate::machine::ROLL_AT - 1.5;
     vfx.machine_turn = 3.0;
+    let p2 = crate::machine::pair_for(game.wake.seed, 2).unwrap_or(0);
+    let tr = crate::machine::pairs()[p2][0].clone();
+    let (h, l) = (tr.hopper(), tr.lip());
+    let d = Vec3::new(l.x - h.x, 0.0, l.z - h.z).normalize_or_zero();
+    let side = Vec3::new(-d.z, 0.0, d.x);
+    game.t = t2 + crate::machine::ROLL_AT - 1.5;
+    shoot(&mut renderer, &game, &mut vfx, "maze_machine_winding.png", cam(l + d * 14.0 + side * 12.0 + Vec3::Y * 14.0, (h + l) * 0.5, 1.0))?;
+    game.t = t2 + crate::machine::ROLL_AT + 0.9;
+    shoot(&mut renderer, &game, &mut vfx, "maze_machine_chute.png", cam((h + l) * 0.5 + side * 30.0 + Vec3::Y * 6.0, (h + l) * 0.5, 1.0))?;
+    game.t = t2 + crate::machine::ROLL_AT + tr.floor_from / crate::machine::SPEED + 3.0;
     if let Some(b) = crate::machine::boulders_at(game.wake.seed, game.t).first().copied() {
-        let side = Vec3::new(-b.dir.z, 0.0, b.dir.x);
         let p = Vec3::new(b.pos.x, 0.0, b.pos.z);
-        shoot(&mut renderer, &game, &mut vfx, "maze_machine_winding.png", cam(p + b.dir * 16.0 + Vec3::Y * 20.0, p + Vec3::Y * 2.0, 1.0))?;
+        shoot(&mut renderer, &game, &mut vfx, "maze_machine_rolling.png", cam(p - b.dir * 34.0 + side * 18.0 + Vec3::Y * 26.0, p - b.dir * 10.0, 1.0))?;
+        shoot(&mut renderer, &game, &mut vfx, "maze_machine_play.png", play(p + b.dir * 4.0 + side * 12.0, (-b.dir.x).atan2(-b.dir.z)))?;
     }
-    game.t = t2 + crate::machine::ROLL_AT + 2.0;
-    if let Some(b) = crate::machine::boulders_at(game.wake.seed, game.t).first().copied() {
-        let side = Vec3::new(-b.dir.z, 0.0, b.dir.x);
-        let p = Vec3::new(b.pos.x, 0.0, b.pos.z);
-        shoot(&mut renderer, &game, &mut vfx, "maze_machine_rolling.png", cam(p + side * 16.0 + b.dir * 14.0 + Vec3::Y * 18.0, p + Vec3::Y * 2.0, 1.0))?;
-        shoot(&mut renderer, &game, &mut vfx, "maze_machine_play.png", play(p + b.dir * 4.0 + side * 2.0, (-b.dir.x).atan2(-b.dir.z)))?;
-    }
+    // a lock armed: its pads' rims lit, before the stone is let go
+    game.t = t2 + 3.0;
+    let rm = mz::room_pos(tr.rooms[1]);
+    shoot(&mut renderer, &game, &mut vfx, "maze_machine_armed.png", cam(rm + Vec3::new(-20.0, 34.0, -30.0), rm, 1.0))?;
     shoot(&mut renderer, &game, &mut vfx, "maze_gears.png", cam(Vec3::new(-70.0, 55.0, -95.0), Vec3::new(-40.0, 8.0, -55.0), 1.0))?;
     // a section stirring, then biting, the player's cat alone in it
     let class = game.wake.classes(0)[0];

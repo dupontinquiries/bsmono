@@ -127,6 +127,9 @@ pub fn cues_for(ev: &Event, game: &Game) -> Vec<Cue> {
         // the Thornmaze's machine (`machine`): a boulder let go, and a cat
         // it runs down
         Event::BoulderRoll { pos } => vec![Cue { keys: vec!["sfx/maze/boulder".into()], bus: Bus::Sfx, gain: 0.95, pos: Some(*pos), speaker: None, priority: 4 }],
+        Event::BoulderLand { pos } => vec![Cue { keys: vec!["sfx/maze/land".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 4 }],
+        Event::PadDrop { pos } => vec![Cue { keys: vec!["sfx/maze/trapdoor".into()], bus: Bus::Sfx, gain: 0.7, pos: Some(*pos), speaker: None, priority: 2 }],
+        Event::CatFell { pos } => vec![Cue { keys: vec!["sfx/hit_big".into()], bus: Bus::Sfx, gain: 0.9, pos: Some(*pos), speaker: None, priority: 5 }],
         Event::BoulderHit { pos } => vec![Cue { keys: vec!["sfx/hit_big".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 5 }],
         // the labyrinth turning: heard everywhere
         Event::LabyrinthTurns => vec![Cue { keys: vec!["sfx/maze/turn".into()], bus: Bus::Sfx, gain: 0.8, pos: None, speaker: None, priority: 5 }],

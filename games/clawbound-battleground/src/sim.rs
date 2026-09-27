@@ -109,6 +109,12 @@ pub enum Event {
     /// A boulder was let go (`machine`), and one rolled over a cat.
     BoulderRoll { pos: Vec3 },
     BoulderHit { pos: Vec3 },
+    /// A stone landing off its chute's lip.
+    BoulderLand { pos: Vec3 },
+    /// A lock's pad swinging open as the stone passes it.
+    PadDrop { pos: Vec3 },
+    /// A cat falling through an open pad.
+    CatFell { pos: Vec3 },
 }
 
 #[derive(Clone, Debug)]
