@@ -728,6 +728,16 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
         });
     }
 
+    // the Thornmaze (`maze::banner`): what the ground under the player's
+    // cat is doing, and what its pack means there
+    if let Some((text, rgb)) = crate::maze::banner(game, player) {
+        egui::Area::new(egui::Id::new("maze_banner")).anchor(egui::Align2::CENTER_CENTER, [0.0, -96.0]).show(ctx, |ui| {
+            let c = ui.painter().clip_rect().center() + Vec2::new(0.0, -96.0);
+            ui.painter().text(c + Vec2::new(1.5, 1.5), Align2::CENTER_CENTER, &text, FontId::proportional(22.0), Color32::from_black_alpha(200));
+            ui.painter().text(c, Align2::CENTER_CENTER, &text, FontId::proportional(22.0), Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+        });
+    }
+
     // sky + map-event chip (top centre)
     {
         let wk = game.weather.kind.name();
@@ -739,6 +749,12 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
         }
         if g.blessing_t > 0.0 {
             line = format!("{}   ·   RIVERBLESSED {:.0}s", line, g.blessing_t);
+        }
+        // the Thornmaze: the pack you have (two friends close: a tenth less
+        // from every blow, and the thorns let you be)
+        if crate::map::active() == crate::map::MapId::Maze && g.respawn_t <= 0.0 {
+            let pack = game.pack(player);
+            line = format!("{}   ·   PACK {}{}", line, pack, if pack >= 2 { " (warded)" } else { "" });
         }
         for b in &game.bosses.list {
             let short = match b.kind { crate::bosses::BossKind::Boar => "BOAR", crate::bosses::BossKind::Drake => "DRAKE", crate::bosses::BossKind::Moonwyrm => "WYRM" };
@@ -1413,6 +1429,7 @@ pub fn map_blurb(m: crate::map::MapId) -> &'static str {
         crate::map::MapId::Pass => "the mountains: a canyon between twin peaks",
         crate::map::MapId::Sky => "the spirit sky: two wide lanes, glacier islands, clouds to ride",
         crate::map::MapId::Atlantis => "the sea floor: one colonnaded hall, a drowned library, glass overhead",
+        crate::map::MapId::Maze => "a great labyrinth: two winding lanes, and ground that wakes against whoever walks it alone",
     }
 }
 

@@ -527,13 +527,17 @@ pub fn ability(def: &GodDef, slot: usize) -> Vec<f32> {
 }
 
 /// The shared sounds, by bank key.
-pub const GENERIC: [&str; 10] = [
+pub const GENERIC: [&str; 12] = [
     "sfx/hit", "sfx/hit_big", "sfx/whiff", "sfx/levelup", "sfx/tower_down", "sfx/cast",
     // Hollowstep's world (`stalker`): a pounding heart, his heavy tread,
     // and the air closing where he left
     "sfx/stalker/heart", "sfx/stalker/step", "sfx/stalker/swap",
     // a Sentinel's footfall (`sentinel`): the ground takes her weight
     "sfx/sentinel/tread",
+    // the Thornmaze's thorns raking a cat (`maze`)
+    "sfx/maze/thorns",
+    // the labyrinth turning: stone grinding on stone, far off
+    "sfx/maze/turn",
 ];
 
 pub fn generic(key: &str) -> Vec<f32> {
@@ -611,6 +615,39 @@ pub fn generic(key: &str) -> Vec<f32> {
                 *o = b * env(t, 0.01, 0.2);
             }
             mix_at(&mut x, &gr, 0.02, 0.5);
+            x
+        }
+        "sfx/maze/turn" => {
+            // slabs grinding in their slots: a low rumble that swells and
+            // settles, rough grit over it, and a deep knock as they seat
+            let len = 1.6;
+            let mut x = vec![0.0; secs(len)];
+            let (mut lp, mut bp) = (Svf::default(), Svf::default());
+            for (i, o) in x.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let u = t / len;
+                let (l, _, _) = lp.run(n.next(), 70.0 + 30.0 * (u * 9.0).sin().abs(), 0.9);
+                let (_, b, _) = bp.run(n.next(), 900.0, 1.5);
+                let swell = (u * 4.0).min(1.0) * (1.0 - u).powf(0.7);
+                *o = drive(l * 3.0, 0.7) * swell + b * 0.25 * swell;
+            }
+            let knock = thud(0.35, 55.0, 30.0, 0.6, &mut n);
+            mix_at(&mut x, &knock, len - 0.45, 0.9);
+            x
+        }
+        "sfx/maze/thorns" => {
+            // a rake of thorns: dry crackles through a bright band, over a
+            // short scrape
+            let len = 0.45;
+            let mut x = vec![0.0; secs(len)];
+            let (mut bp, mut hp) = (Svf::default(), Svf::default());
+            for (i, o) in x.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let crack = if n.next() > 0.992 { n.next() * 3.0 } else { 0.0 };
+                let (_, b, _) = bp.run(crack, 3200.0, 3.0);
+                let (_, _, h) = hp.run(n.next(), 2400.0, 0.7);
+                *o = b * env(t, 0.005, 0.3) + h * 0.35 * env(t, 0.02, 0.12);
+            }
             x
         }
         "sfx/stalker/swap" => {

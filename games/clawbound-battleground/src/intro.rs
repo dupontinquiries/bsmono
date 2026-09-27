@@ -323,15 +323,22 @@ impl Intro {
                 let drowned = crate::map::active() == crate::map::MapId::Atlantis;
                 // (and the Drowned Halls are flown over their walls, through
                 // the glass: the halls are too narrow to fly down)
+                // (the Thornmaze too: its corridors wind too tightly to fly)
+                let maze = crate::map::active() == crate::map::MapId::Maze;
                 let over = if sky && lane == Lane::Mid {
                     crate::sky::UPPER_Y + 6.0
                 } else if drowned {
                     crate::atlantis::WALL_H - 1.0
+                } else if maze {
+                    crate::maze::WALL_H + 4.0
                 } else {
                     0.0
                 };
                 let shot = Shot { eye: p + Vec3::Y * (7.0 + over) + side * 3.0, target: ahead + Vec3::Y * (2.0 + over * 0.7), fov_y: 0.95 };
                 o.caption = Some(match (lane, sky) {
+                    (Lane::Top, false) if maze => "THE WEST WAY",
+                    (Lane::Mid, false) if maze => "THE HEART OF THE MAZE",
+                    (Lane::Bot, false) if maze => "THE EAST WAY",
                     // one lane; the other two runs are the halls beside it
                     (Lane::Top, false) if drowned => "THE GALLERIES",
                     (Lane::Mid, false) if drowned => "THE GREAT HALL",

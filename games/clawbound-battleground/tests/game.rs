@@ -3244,3 +3244,93 @@ mod oremantle {
         assert!(hit > 0.0, "nothing ever struck her");
     }
 }
+
+mod thornmaze {
+    use clawbound::map::{self, MapId};
+    use clawbound::maze::{self as mz, Mood};
+    use clawbound::sim::{Event, Game};
+
+    /// Eight minutes of bots on the Thornmaze, one seed: nobody in a wall,
+    /// every cat out of its base, the thorns biting, and no cat left alone
+    /// in biting ground for long (the bots walk out of it: `maze::bot_goal`).
+    pub fn play(seed: u64, secs: f32) -> (f32, usize, [usize; 2], u32, f32, u32) {
+        map::with(MapId::Maze, || {
+            let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+            let (b, r) = map::team_picks(4, &mut clawbound::sim::Rng::new(seed));
+            let mut game = Game::new_teams(&b, &r);
+            assert_eq!(game.gods.len(), 10);
+            game.blockers = blockers;
+            game.gods[0].ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Top, 0.9));
+            let f = map::floor().unwrap();
+            let mut left_base = vec![false; game.gods.len()];
+            let mut alone_for = vec![0.0f32; game.gods.len()];
+            let (mut worst, mut bites, mut alone_total) = (0.0f32, 0usize, 0.0f32);
+            // stuck: wanting to move (a move direction), alive, not
+            // fighting, yet not 1.5 u from where it was 5 s ago
+            let mut anchor: Vec<(glam::Vec3, f32)> = game.gods.iter().map(|g| (g.pos, 0.0)).collect();
+            let mut stuck = 0u32;
+            let dt = 1.0 / 30.0;
+            for _ in 0..(secs / dt) as usize {
+                game.tick(dt);
+                bites += game.events.iter().filter(|e| matches!(e, Event::ThornBite { .. })).count();
+                game.events.clear();
+                for i in 0..game.gods.len() {
+                    let g = &game.gods[i];
+                    if g.respawn_t > 0.0 {
+                        alone_for[i] = 0.0;
+                        continue;
+                    }
+                    assert!(f.sdf(g.pos.x, g.pos.z) <= 0.05, "seed {seed}: cat {i} in the wall at {}", g.pos);
+                    left_base[i] |= (g.pos - g.team.base_pos()).length() > 40.0;
+                    // (waiting at an uncovered enemy tower's edge for minions
+                    // is the tower discipline, not stuck: seed 9 stood at
+                    // exactly TOWER_RANGE + 1 from blue's inner Top tower)
+                    let at_tower = game.towers.iter().any(|tw| tw.team != g.team && tw.hp > 0.0 && tw.pos.distance(g.pos) < clawbound::consts::TOWER_RANGE + 3.0);
+                    let wants = !at_tower && g.move_dir.length_squared() > 0.01 && !matches!(g.ai.as_ref().map(|b| b.state), Some(clawbound::sim::AiState::Fight));
+                    if !wants || (g.pos - anchor[i].0).length() > 1.5 {
+                        anchor[i] = (g.pos, game.t);
+                    } else if game.t - anchor[i].1 > 5.0 {
+                        stuck += 1;
+                        eprintln!("seed {seed}: cat {i} stuck at {} since {:.0}s (t {:.0})", g.pos, anchor[i].1, game.t);
+                        anchor[i] = (g.pos, game.t);
+                    }
+                    let biting = matches!(game.wake.mood_at(g.pos.x, g.pos.z, game.t), Mood::Hostile(_));
+                    let fighting = matches!(g.ai.as_ref().map(|b| b.state), Some(clawbound::sim::AiState::Fight));
+                    if biting && game.pack(i) == 0 && !fighting {
+                        alone_for[i] += dt;
+                        alone_total += dt;
+                        worst = worst.max(alone_for[i]);
+                    } else {
+                        alone_for[i] = 0.0;
+                    }
+                }
+                if game.over.is_some() {
+                    break;
+                }
+            }
+            assert!(left_base.iter().all(|x| *x), "seed {seed}: every cat leaves its base: {left_base:?}");
+            (worst, bites, game.tower_alive, game.gods.iter().map(|g| g.kills).sum(), alone_total, stuck)
+        })
+    }
+
+    #[test]
+    fn eight_minutes_in_the_thornmaze() {
+        let t0 = std::time::Instant::now();
+        for seed in [5u64, 9] {
+            let (worst, bites, towers, kills, alone, stuck) = play(seed, 8.0 * 60.0);
+            eprintln!("thornmaze seed {seed}: worst alone-in-thorns {worst:.1}s, total {alone:.1}s, {bites} bites, towers {towers:?}, {kills} kills, {stuck} stuck, in {:.1}s", t0.elapsed().as_secs_f32());
+            assert!(bites > 0, "seed {seed}: the thorns never bit");
+            assert_eq!(stuck, 0, "seed {seed}: a bot stood stuck (against a shut gate?)");
+            // measured with the bots' rule: 9.1 s worst (seed 5); without
+            // it, 9.1 s worst but 849 bites to 318 -- the rule is what keeps
+            // a lone bot from walking its lane into biting ground
+            assert!(worst < 15.0, "seed {seed}: a cat alone in the thorns for {worst:.1} s");
+            // the bots' rule (walk out of waking ground; hold at its edge) is
+            // what keeps the bites down: 318 and 358 with it; 849 (seed 5)
+            // with no rule at all
+            assert!(bites < 600, "seed {seed}: {bites} thorn bites: bots are walking into the thorns");
+            assert!(towers.iter().sum::<usize>() < 8, "seed {seed}: no tower fell in eight minutes");
+        }
+        let _ = mz::CYCLE;
+    }
+}

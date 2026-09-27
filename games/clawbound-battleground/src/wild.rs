@@ -50,6 +50,7 @@ pub fn heal_tree_positions() -> [Vec3; 6] {
         crate::map::MapId::Pass => return crate::pass::heal_tree_positions(),
         crate::map::MapId::Sky => return crate::sky::heal_tree_positions(),
         crate::map::MapId::Atlantis => return crate::atlantis::heal_tree_positions(),
+        crate::map::MapId::Maze => return crate::maze::heal_tree_positions(),
         crate::map::MapId::Jungle => {}
     }
     let mut rng = Rng::new(0x7EE5);

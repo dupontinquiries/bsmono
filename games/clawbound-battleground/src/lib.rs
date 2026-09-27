@@ -76,6 +76,8 @@ pub mod stalker;
 /// Brasshowl: the lamp, the flight from it, the shown-up.
 pub mod lantern;
 pub mod sentinel;
+pub mod maze;
+pub mod mazeworld;
 /// The Curio shelf's passives, worked (items::Passive).
 pub mod curios;
 /// Levels 1-15: when abilities unlock, what each rank and mastery adds.
@@ -90,6 +92,7 @@ pub mod atlantisprops;
 pub mod atlantisworld;
 /// Headless screenshots of the Drowned Halls (`CLAWBOUND_SHOTS=atlantis`).
 pub mod atlantisshots;
+pub mod mazeshots;
 /// The generated preparation documents in dev/ (cue cards, recording sheet, cue sheet).
 pub mod devdocs;
 /// Character voxels as smooth surfaces with fur lengths, for the ultra preview.

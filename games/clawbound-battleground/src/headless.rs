@@ -112,6 +112,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("sprout") {
         return run_sprout_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("maze") {
+        return crate::mazeshots::run();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("atlantis") {
         return crate::atlantisshots::run();
     }

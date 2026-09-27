@@ -102,6 +102,10 @@ pub enum Event {
     CoatShift { god: usize, pos: Vec3, material: crate::gods::Material, radius: f32 },
     /// A Sentinel's footfall.
     Tread { pos: Vec3 },
+    /// The Thornmaze's thorns bit a cat (`maze`); `alone`: the heavy bite.
+    ThornBite { pos: Vec3, alone: bool },
+    /// The Thornmaze's labyrinth turned: gates rise and sink (`maze`).
+    LabyrinthTurns,
 }
 
 #[derive(Clone, Debug)]
@@ -280,8 +284,11 @@ pub struct GodUnit {
     /// Seconds toward her next magma burn.
     pub burn_t: f32,
     /// The share of each blow this cat takes, this tick: under 1 inside a
-    /// friend's granite (`sentinel`), 1 otherwise.
+    /// friend's granite (`sentinel`) or in a pack on the Thornmaze
+    /// (`maze`), 1 otherwise. Reset by `sentinel_tick`, which runs first.
     pub ward: f32,
+    /// Seconds toward the next thorn bite (`maze`).
+    pub thorn_t: f32,
     /// A cast winding up or channelling: fires when `t` reaches `dur`.
     pub casting: Option<Casting>,
     /// Seconds during which movement does not turn the cat: after a cast
@@ -504,6 +511,8 @@ pub struct Game {
     /// A bot's dive on an enemy god, for its teammates to answer:
     /// (target god, when). Indexed by the diving team.
     pub calls: [Option<(usize, f32)>; 2],
+    /// The Thornmaze's waking order (`maze`); unused on other maps.
+    pub wake: crate::maze::Wake,
 }
 
 impl Game {
@@ -619,6 +628,7 @@ impl Game {
                 field_t: 0.0,
                 burn_t: 0.0,
                 ward: 1.0,
+                thorn_t: 0.0,
                 last_act_t: -99.0,
                 ai: if is_player { None } else { Some(AiBrain::new(lane, 0.45 + rng.f32() * 0.5)) },
                 prot,
@@ -692,6 +702,9 @@ impl Game {
             plans_this_tick: 0,
             styles: [crate::playbook::even_keel(), crate::playbook::even_keel()],
             calls: [None, None],
+            // its own seed from the match's (not drawn from `rng`, so every
+            // other random thing in a match stays as it was)
+            wake: crate::maze::Wake::new(&mut Rng::new((player_god as u64 + 1).wrapping_mul(0xD6E8_FEB8_6659_FD93) ^ 0x7A0E)),
             ferries: crate::ferry::for_map(),
             star_bolts: Vec::new(),
             starfalls: Vec::new(),

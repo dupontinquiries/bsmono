@@ -1315,6 +1315,15 @@ impl Vfx {
                         self.particles.push(Particle { pos: p, vel: v, life: 1.0, max_life: 1.0, size, color: col, alpha: 1.0, gravity: grav, drag: 1.0 });
                     }
                 }
+                Event::ThornBite { pos, alone } => {
+                    // thorns rake: dark splinters and a few red flecks
+                    let n = if *alone { 12 } else { 6 };
+                    for k in 0..n {
+                        let a = k as f32 * 2.399;
+                        let col = if k % 4 == 0 { [0.7, 0.08, 0.1] } else { [0.12, 0.10, 0.07] };
+                        self.particles.push(Particle { pos: *pos + Vec3::new(a.cos() * 0.5, 0.4 + (k % 3) as f32 * 0.4, a.sin() * 0.5), vel: Vec3::new(a.cos() * 2.0, 1.5, a.sin() * 2.0), life: 0.5, max_life: 0.5, size: 0.08, color: col, alpha: 1.0, gravity: 6.0, drag: 1.5 });
+                    }
+                }
                 Event::ShadowDriven { pos } => {
                     // a shadow torn to rags in the light
                     for k in 0..24 {
