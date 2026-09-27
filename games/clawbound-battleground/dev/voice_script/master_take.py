@@ -195,7 +195,7 @@ SPROUT_BABY = {
     'cast2':  [('babble.1', 'under', 0.15, 0.7)],
     'cast3':  [('coo.2', 'after', 0.06, 0.7)],
     'cast4':  [('squeal.1', 'after', -0.05, 1.0)],
-    'kill.1': [('babble.2', 'after', 0.06, 0.75)],
+    'kill.1': [('ah.6', 'after', 0.06, 0.75)],
     'kill.2': [('coo.1', 'after', 0.08, 0.6)],
     'death.1': [('fall.2', 'after', 0.08, 0.6)],
     'death.2': [('fall.1', 'after', 0.10, 0.55)],

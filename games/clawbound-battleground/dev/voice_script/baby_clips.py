@@ -50,16 +50,17 @@ CLIPS = {
     'coo.1': ('book', 469.50, 470.66),
     'coo.2': ('book', 546.20, 546.92),
     'coo.3': ('book', 379.28, 380.10),
-    'coo.4': ('squeal', 2.66, 3.28),
     'coo.5': ('book', 388.00, 388.95),
     # a run of babble syllables (babble.1: quick even bursts, ~6 a second
     # -- the nearest thing to a laugh in the recordings)
-    'babble.1': ('book', 111.25, 112.92),
-    'babble.2': ('coo', 28.90, 30.22),
-    'babble.3': ('coo', 4.68, 5.95),
+    # (ends at 112.45: from 1.2 s in, an adult's voice at ~210-250 Hz
+    # talked over it -- one of the two bleeds heard in the game)
+    'babble.1': ('book', 111.25, 112.45),
     # soft, falling -- sleepy, or a pout
-    'fall.1': ('book', 474.90, 475.90),
-    'fall.2': ('book', 426.00, 426.52),
+    # (starts at 475.00: the first 0.1 s is the onset gliding up from 236 Hz)
+    'fall.1': ('book', 475.00, 475.90),
+    # (was 426.00-426.52: the reader's voice, 194 Hz -- the other bleed)
+    'fall.2': ('book', 457.20, 457.60),
 }
 
 
@@ -158,6 +159,14 @@ def main():
         y[:fi] *= np.linspace(0, 1, fi)
         y[-fo:] *= np.linspace(1, 0, fo)
         y *= 0.9 / (np.abs(y).max() + 1e-9)
+        # A baby, not an adult: an adult speaks at 100-300 Hz, this baby at
+        # 400-1000. Refuse a window whose voiced frames sit low (the two
+        # adult bleeds heard in the game were 194 Hz throughout, and a
+        # quarter-second at 210-250 in the middle of a babble).
+        f0 = pitch(y)
+        vf0 = f0[f0 > 0]
+        low = float((vf0 < 330).mean()) if len(vf0) else 1.0
+        assert len(vf0) and np.median(vf0) > 330 and low < 0.12, f'{name}: {low:.0%} of its voice is in an adult range (median {np.median(vf0) if len(vf0) else 0:.0f} Hz)'
         sf.write(os.path.join(OUT, name + '.opus'), y, SR, format='OGG', subtype='OPUS')
         print(name, f'{len(y) / SR:.2f} s, voiced {v:.0%}', flush=True)
 
