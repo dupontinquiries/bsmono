@@ -2974,6 +2974,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // with set_block. For soaks that need a torch in a cave or a hole in a wall.
     let place_file: Option<String> = std::env::var("UNENDLICH_PLACE").ok();
     let mut place_file_seen: Option<std::time::SystemTime> = None;
+    let mut place_pending: Vec<(i32, i32, i32, BlockId)> = Vec::new();
     // r534: third-person / cinematic camera-distance zoom (+/- keys). 1.0 = default
     // pull-back; clamped so the camera can't clip into the player or fly too far.
     let mut cam_zoom: f32 = 1.0;
@@ -3313,6 +3314,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         element: 2, // Fire-leaning by default; match01 drives actual progress
         tier: 2,
     };
+    // UNENDLICH_IMBUE=<element 0..5>: start with a fully attuned artifact of
+    // that element (3 = Dust/earth sense in CO2 basins, 4 = Fire), to test
+    // attunement effects without the attuning.
+    // Applied again on every world launch, which resets the imbue.
+    let imbue_knob = std::env::var("UNENDLICH_IMBUE").ok().and_then(|v| v.parse::<u8>().ok()).map(|e| e.min(5));
+    if let Some(el) = imbue_knob {
+        fg_imbue.element = el;
+        fg_imbue.counter = 1.0;
+        log::info!("[imbue] UNENDLICH_IMBUE: element {} fully attuned", fg_imbue.element);
+    }
     // r150: dragon daily life — activity (sleep/forage/alert) + hunt state.
     let mut scroll_accum: f32 = 0.0;
     let mut scroll_accum_x: f32 = 0.0; // r318: horizontal (trackpad) scroll
@@ -3371,6 +3382,19 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         std::env::var("UNENDLICH_LIGHT_AUDIT").ok().and_then(|v| v.parse().ok());
     let mut light_audit_last = std::time::Instant::now();
     let mut light_sys = unendlich_engine::world::light_volume::LightVolumeSys::new();
+    // CO₂ basins (world::cave_gas) and the breath/flame model (sim::cave_air):
+    // the stage at the player's head, what it does, and the carried flame.
+    // UNENDLICH_CAVE_GAS=0 turns the basins off (no gas anywhere).
+    let cave_gas_enabled = std::env::var("UNENDLICH_CAVE_GAS").map_or(true, |v| v != "0");
+    let mut breath = unendlich_engine::sim::cave_air::Breath::Normal;
+    let mut air_fx = unendlich_engine::sim::cave_air::effects(unendlich_engine::sim::cave_air::Breath::Normal);
+    // O2 at the head last frame (the bending fields read it before the air
+    // block runs), how muffled the world sounds, and when the earth last spoke.
+    let mut o2_head_last = unendlich_engine::world::cave_gas::O2_AIR;
+    let mut air_hush = 0.0f32;
+    let mut gas_sensed: Option<[i32; 2]> = None;
+    let mut held_flame = unendlich_engine::sim::cave_air::Flame::default();
+    let hold_block: Option<BlockId> = std::env::var("UNENDLICH_HOLD").ok().and_then(|v| BlockId::from_id_str(v.trim()));
     let mut light_trace_last = std::time::Instant::now();
     let mut lava_tick: u32 = 0;
     // r637: DEFAULT ON. Water lateral spread (settle toward level) was gated off since
@@ -4408,11 +4432,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let mut fg_roar_stagger = unendlich_engine::sim::sound_render::Stagger::default();
     #[cfg(feature = "audio")]
     let fg_sfx_clock = Instant::now();
+    // The configured effects volume; the air block scales it down while the
+    // player's head is in a CO2 basin (the docx's "dead silence").
+    let fg_sfx_vol = std::env::var("UNENDLICH_SFX_VOL").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
     #[cfg(feature = "audio")]
     let fg_sfx = {
         let sfx = unendlich_engine::audio::Sfx::start();
-        let vol = std::env::var("UNENDLICH_SFX_VOL").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
-        sfx.set_master_volume(vol);
+        sfx.set_master_volume(fg_sfx_vol);
         sfx
     };
 
@@ -5462,6 +5488,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // The weapon out of the hand leaves it empty (creative_in_hand).
             creative_in_hand(renderer.creative_place_item, &thrown).map(|kind| unendlich_engine::items::ItemId(kind.to_item_id()))
         };
+        // UNENDLICH_HOLD=<block id name>: put that block in the hand (soaks: a
+        // torch into a cave).
+        if let Some(b) = hold_block {
+            hand_item = Some(unendlich_engine::items::ItemId(b as u32));
+        }
         // r509: keep the equipped-weapon durability tracker in sync with what's held —
         // (re)initialise to full when a different forged weapon becomes the hand item, clear
         // when the hand isn't a weapon. Holding the same weapon preserves its current wear.
@@ -8520,6 +8551,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         log::info!("[imbue] the ingot in your hand is fully attuned (tier {})", fg_imbue.tier);
                     }
                 }
+                // CO2 basins (cave_biomes.docx): no fire below 16% O2, no
+                // wind, little water, no light or life to draw on. After the canopy
+                // and artifact boosts: an attuned ingot does not make fire burn in CO2.
+                unendlich_engine::sim::cave_air::gas_fields(&mut fields, o2_head_last);
                 // fly mode <=> no physics body attached (see flight toggle docs).
                 let airborne_now = body.is_none() || fg_app.swimming();
                 let stance = if airborne_now {
@@ -8632,7 +8667,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 ability_chain, 1.0, 0.25, 2.0,
                             );
                             let charge = (spent * mult).max(0.0);
-                            let eff = unendlich_engine::sim::ability_cast::cast(fg_imbue.element, charge);
+                            let mut eff = unendlich_engine::sim::ability_cast::cast(fg_imbue.element, charge);
+                            // Fire cannot burn below 16% O2 (cave_biomes.docx).
+                            if fg_imbue.element == 4
+                                && o2_head_last < unendlich_engine::sim::cave_air::FLAME_O2_MIN
+                                && eff.kind != unendlich_engine::sim::ability_cast::KIND_NONE
+                            {
+                                log::info!("[ability] the flame will not catch: O2 {:.1}%", o2_head_last * 100.0);
+                                eff.kind = unendlich_engine::sim::ability_cast::KIND_NONE;
+                            }
                             if eff.kind != unendlich_engine::sim::ability_cast::KIND_NONE {
                                 log::info!(
                                     "[ability] cast kind={} power={:.1} radius={:.1} (combo x{} ×{:.2})",
@@ -9612,6 +9655,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // r561: base walk speed scales with stature (longer stride);
                 // = WALK_SPEED for a default 1.8 character. Sprint multiplies on top.
                 let mut speed = player_stature.move_speed;
+                // sim::cave_air: bad air slows you, and below 8% O₂ you cannot move.
+                speed *= air_fx.move_mult;
                 // r118: sprint costs stamina — gate on the meter (ticked above).
                 if bindings.is_action_pressed(GameAction::Sprint, &input)
                     && fg_app.stamina().sprinting {
@@ -13193,14 +13238,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         let (Ok(x), Ok(y), Ok(z)) = (f[0].parse::<i32>(), f[1].parse::<i32>(), f[2].parse::<i32>()) else {
                             continue;
                         };
-                        let b = if f[3] == "air" { Some(BlockId::Air) } else { BlockId::from_id_str(f[3]) };
-                        match b {
-                            Some(b) => {
-                                let ok = chunk_manager.set_block(x, y, z, b);
-                                log::info!("[place] {:?} at ({x},{y},{z}): {}", b, if ok { "set" } else { "chunk not loaded" });
-                            }
+                        match if f[3] == "air" { Some(BlockId::Air) } else { BlockId::from_id_str(f[3]) } {
+                            Some(b) => place_pending.push((x, y, z, b)),
                             None => log::warn!("[place] unknown block '{}'", f[3]),
                         }
+                    }
+                }
+                // Lines whose chunk is not loaded yet wait for it (a soak's
+                // place file is read before the world around it streams in).
+                if !place_pending.is_empty() {
+                    let before = place_pending.len();
+                    place_pending.retain(|&(x, y, z, b)| !chunk_manager.set_block(x, y, z, b));
+                    let done = before - place_pending.len();
+                    if done > 0 {
+                        log::info!("[place] set {} block(s), {} waiting for their chunks", done, place_pending.len());
                     }
                 }
             }
@@ -16958,6 +17009,118 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 start.elapsed().as_secs_f32(),
             );
         }
+        // ---- Air and flame (world::cave_gas, sim::cave_air) ----
+        {
+            use unendlich_engine::sim::cave_air as ca;
+            use unendlich_engine::world::cave_gas as cg;
+            let seed = chunk_manager.model_arc().seed();
+            let gas = cave_gas_enabled.then_some(seed);
+            light_sys.gas_seed = gas;
+            let o2_at = |p: [f32; 3]| -> f32 {
+                let Some(seed) = gas else { return cg::O2_AIR };
+                // Gas is only breathed (or burned) in open cells.
+                if chunk_manager.block_at(p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32).is_solid() {
+                    return cg::O2_AIR;
+                }
+                cg::o2_at(p[0], p[1], p[2], seed)
+            };
+            let e = local_player.view.position;
+            let o2_head = o2_at([e.x, e.y, e.z]);
+            let nb = ca::breath_for(o2_head);
+            if nb != breath {
+                log::info!("[air] O2 {:.1}% at the head: {:?} -> {:?}", o2_head * 100.0, breath, nb);
+                breath = nb;
+            }
+            air_fx = ca::effects(if survival_mode { breath } else { ca::Breath::Normal });
+            if survival_mode && air_fx.vitality_drain > 0.0 {
+                fg_app.vitality_mut().tick(dt, air_fx.vitality_drain);
+            }
+            if survival_mode && air_fx.stamina_regen_mult < 1.0 {
+                // Fatigue: bad air eats into the stamina the meter would recover.
+                let s = fg_app.stamina_mut();
+                s.level = (s.level - (1.0 - air_fx.stamina_regen_mult) * 0.08 * dt).max(0.0);
+            }
+            renderer.set_air_vignette(air_fx.vignette);
+            o2_head_last = o2_head;
+            // Dead silence (docx): below the surface the gas swallows sound.
+            // Eased so crossing the surface is a fade, not a click. This game
+            // has no drip/insect bed yet, so what goes quiet is the effects
+            // bus (roars and the like).
+            let hush_target = ca::hush_for(o2_head);
+            air_hush += (hush_target - air_hush) * (dt * 2.0).min(1.0);
+            #[cfg(feature = "audio")]
+            if lifetime_frame % 6 == 0 {
+                fg_sfx.set_master_volume(fg_sfx_vol * (1.0 - air_hush));
+            }
+            // Earth sensing (docx): an earth-attuned player feels the gas in
+            // the rock pores before walking into it. There is no HUD text
+            // channel yet, so it speaks through the log.
+            let earth_attuned = fg_imbue.element == 3 && fg_imbue.counter > 0.5;
+            if let (true, Some(seed)) = (earth_attuned, gas) {
+                let s = cg::sense(e.x, e.y, e.z, seed, 24.0);
+                let key = s.map(|s| s.basin.center);
+                if key != gas_sensed {
+                    if let Some(s) = s {
+                        log::info!(
+                            "[bending] the stone tells of dead air {:.0} blocks off, below y={} (earth sense)",
+                            s.distance, s.basin.surface_y + 1
+                        );
+                    }
+                    gas_sensed = key;
+                }
+            } else {
+                gas_sensed = None;
+            }
+
+            // Dynamic point lights: what the player carries, and burning
+            // weapons in flight. Fire needs air: a torch is the canary.
+            let now_s = start.elapsed().as_secs_f32();
+            let mut lights: Vec<unendlich_engine::render::dynamic_lights::PointLight> = Vec::new();
+            let held = hand_item.and_then(|h| {
+                unendlich_engine::world::blocks::BlockId::ALL.iter().copied().find(|b| *b as u32 == h.0 && h.0 != 0)
+            });
+            if let Some(b) = held {
+                let em = b.light_emission();
+                if em != [0, 0, 0] {
+                    let f = local_player.forward();
+                    let lp = [e.x + f.x * 0.6, e.y - 0.35, e.z + f.z * 0.6];
+                    let mut k = 1.0;
+                    if b == unendlich_engine::world::blocks::BlockId::Torch {
+                        match held_flame.tick(o2_at(lp), dt) {
+                            ca::FlameEvent::StartedSputtering => log::info!("[air] your torch sputters"),
+                            ca::FlameEvent::Died => log::info!("[air] your torch goes out"),
+                            ca::FlameEvent::Recovered => log::info!("[air] your torch steadies"),
+                            ca::FlameEvent::Rekindled => log::info!("[air] your torch rekindles"),
+                            ca::FlameEvent::None => {}
+                        }
+                        k = held_flame.intensity(now_s);
+                    }
+                    if k > 0.0 {
+                        let torch = b == unendlich_engine::world::blocks::BlockId::Torch;
+                        lights.push(unendlich_engine::render::dynamic_lights::PointLight {
+                            pos: lp,
+                            color: [em[0] as f32 / 15.0, em[1] as f32 / 15.0, em[2] as f32 / 15.0],
+                            // 1/(1+d²) falls off fast: 12 keeps a carried
+                            // torch readable ~8 blocks out (0.12 at d = 8).
+                            intensity: if torch { 12.0 } else { 3.0 } * k,
+                            radius: if torch { 12.0 } else { 6.0 },
+                        });
+                    }
+                }
+            }
+            if let Some(t) = thrown.as_ref() {
+                // 4 = Fire in the weapon palette (sim::artifact_imbue).
+                if t.threat.element == Some(4) && o2_at(t.t.pos) >= ca::FLAME_O2_MIN {
+                    lights.push(unendlich_engine::render::dynamic_lights::PointLight {
+                        pos: t.t.pos,
+                        color: [1.0, 0.55, 0.2],
+                        intensity: 2.0 * (0.9 + 0.1 * (now_s * 17.0).sin()),
+                        radius: 8.0,
+                    });
+                }
+            }
+            renderer.set_point_lights([e.x, e.y, e.z], &lights);
+        }
         if block_light_enabled {
             let e = local_player.view.position;
             let cs = unendlich_engine::constants::CHUNK_SIZE;
@@ -17041,6 +17204,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             other => stale.push((c, other.map(|o| o.0))),
                         }
                     }
+                }
+                {
+                    // The nearest CO₂ basin (world::cave_gas), to find one to walk into.
+                    let seed = chunk_manager.model_arc().seed();
+                    let best = unendlich_engine::world::cave_gas::sense(e.x, e.y, e.z, seed, 160.0);
+                    log::info!(
+                        "light: nearest basin {:?} | breath {:?} (O2 {:.1}%) hush {:.2} flame {:?}",
+                        best, breath, o2_head_last * 100.0, air_hush, held_flame.state
+                    );
                 }
                 log::info!(
                     "light: gpu boxes stale {}: {:?}",
@@ -18483,6 +18655,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     element: 2,
                                     tier: 2,
                                 };
+                                if let Some(el) = imbue_knob {
+                                    fg_imbue.element = el;
+                                    fg_imbue.counter = 1.0;
+                                }
                                 bend_resonance =
                                     unendlich_engine::sim::bending_charge::Resonance::full();
                                 fg_app.stamina_mut().level = 1.0;
