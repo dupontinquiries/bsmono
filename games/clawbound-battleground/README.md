@@ -24,7 +24,7 @@ what else is known-but-unresolved.
   waves of four (five every third: 3 melee + 1–2 casters) that hold targets,
   answer a hit on their cats, and chase within a leash; 12 towers, two Elders
   gated behind tower kills.
-- **The Thornmaze** (5v5, `--map thornmaze`; `src/maze.rs`): a great walled
+- **The Engineer's Quarry** (5v5, `--map quarry`; `src/maze.rs`): a great walled
   labyrinth of fifteen rooms -- courtyards, colonnades, the round Heart with
   its stone cat, the beasts' pits -- joined by short passages. Two lanes wind
   room to room down the west and east sides through passages that never
@@ -39,14 +39,18 @@ what else is known-but-unresolved.
   route round shut gates, walk out of waking rooms they are alone in, and
   hold at the edge rather than walk into one alone. The labyrinth is a
   MACHINE, built by the Geartooth clan of engineer-cats (`src/machine.rs`):
-  wooden gear trains turn on every wall top, spinning up as the gates move;
-  and from each turn but the first, Archimedes screws at one pair of track
-  heads wind a stone boulder up out of the floor (it glows while it winds,
-  for 4 s) and let it roll the track at 15 u/s -- a cat in its way takes
-  18% of its health, is thrown aside and slowed, once a run. The track's
-  gates are held open for that turn. Bots step off a track when a ball is
-  due within 1.5 s. The machine knows its own: a Sentinel is hurt but not
-  thrown.
+  wooden gear trains turn on every wall top, spinning up as the gates move.
+  From each turn but the first it works one pair of tracks: Archimedes
+  screws wind a stone up out of a hopper in the western hills (or on the
+  wall by a base) for 4 s, it comes down a trestle chute, drops off the lip
+  into the labyrinth and rolls on at 15 u/s -- a cat in its way takes 18% of
+  its health, is thrown aside and slowed, once a run. The rooms a track runs
+  through are LOCKS for the turn: their other gates seal (never a lane's),
+  their pads -- stone trapdoors either side of the track, rims glowing while
+  armed -- swing open as the stone passes, and a cat standing on an open
+  pad falls to its death. Bots leave a lock the machine is working and step
+  off a track when a ball is due within 1.5 s. The machine knows its own: a
+  Sentinel is hurt by a stone but not thrown, and braces across a pad.
 - **The Drowned Halls** (3v3, `--map atlantis`): one colonnaded hall and a
   domed library on the sea floor.
 - **The first three maps** — the jungle valley (5v5, three lanes), Twinfang Pass (15v15
@@ -415,9 +419,9 @@ src/
 ├── stalker.rs     Hollowstep's other, the terror radius, the step and every shadow
 ├── lantern.rs     Brasshowl's lamp: the flight from it, the shown-up, no shadows in it
 ├── sentinel.rs    the Sentinel role: coats instead of casts, the four fields, the bot's choice
-├── maze.rs        the Thornmaze: rooms and gates, the labyrinth turning, the waking, the thorns, the pack
-├── mazeworld.rs   the Thornmaze's dressing, gate slabs (collision + mesh), thorn spots, gear trains, screws, boulder
-├── machine.rs     the Thornmaze's machine: boulder tracks, which pair runs each turn, the roll, the hit, the bots' dodge
+├── maze.rs        the Quarry: rooms and gates, the labyrinth turning, the waking, the thorns, the pack
+├── mazeworld.rs   the Quarry's dressing, gate slabs (collision + mesh), thorn spots, gear trains, screws, chutes, pads, boulder
+├── machine.rs     the Quarry's machine: tracks from hopper to chute to floor, which pair runs each turn, the locks and their pads, the roll, the hit, the fall, the bots' dodge
 ├── bosses.rs      the Elder Boar + Storm Drake: pits, AI, rewards, TargetRef::Boss
 ├── disasters.rs   wildfire / tempest / earthquake / flood / tornado + map scars
 ├── audio.rs       acoustics_at(pos) → howl/reverb voicing; WindSynth DSP; cpal shell

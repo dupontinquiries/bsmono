@@ -1,4 +1,4 @@
-//! maze — the Thornmaze: 5 a side in a great walled labyrinth of SECTIONS
+//! maze — the Quarry: 5 a side in a great walled labyrinth of SECTIONS
 //! (rooms) joined by gates, where the labyrinth turns -- gates rise and
 //! sink -- and sections wake and turn on whoever walks them alone.
 //!
@@ -584,8 +584,15 @@ impl Wake {
                 shut[m] = true;
             }
         }
-        // the machine's tracks for this turn run through open gates
-        // (`machine::held_open`)
+        // the machine's locks seal for the turn: every gate of a room its
+        // tracks run through (`machine::lock_rooms`), but a lane's...
+        let locks = crate::machine::lock_rooms(self.seed, k);
+        for (g, p) in ps.iter().enumerate() {
+            if p.lane.is_none() && (locks.contains(&p.a) || locks.contains(&p.b)) {
+                shut[g] = true;
+            }
+        }
+        // ...and its tracks' own, which it holds open (`machine::held_open`)
         for g in crate::machine::held_open(self.seed, k) {
             shut[g] = false;
         }
@@ -658,7 +665,7 @@ impl Game {
     }
 
     /// May the floor router go through floor shape `s` now? Not through a
-    /// shut gate's passage (on the Thornmaze; every shape elsewhere).
+    /// shut gate's passage (on the Quarry; every shape elsewhere).
     pub fn route_open(&self, s: usize) -> bool {
         if crate::map::active() != crate::map::MapId::Maze {
             return true;
@@ -683,7 +690,7 @@ impl Game {
         if p.p0.distance(pos) < p.p1.distance(pos) { p.p0 } else { p.p1 }
     }
 
-    /// Once a tick, on the Thornmaze only: the gates set from the clock, the
+    /// Once a tick, on the Quarry only: the gates set from the clock, the
     /// pack's ward, the thorns, and the announcements.
     pub fn maze_tick(&mut self, dt: f32) {
         if crate::map::active() != crate::map::MapId::Maze {
@@ -757,6 +764,9 @@ pub fn banner(game: &Game, i: usize) -> Option<(String, [u8; 3])> {
     }
     let p = game.gods[i].pos;
     let pack = game.pack(i);
+    if crate::machine::locked(game.wake.seed, game.t, p.x, p.z) {
+        return Some(("A SEALED LOCK -- THE STONES ARE COMING, THE FLOOR WILL DROP".to_string(), [235, 120, 50]));
+    }
     match game.wake.mood_at(p.x, p.z, game.t) {
         Mood::Calm => None,
         Mood::Stirring(f) => Some((format!("THIS GROUND IS WAKING -- {:.0}s", (1.0 - f) * WARN), [240, 180, 60])),
@@ -768,7 +778,7 @@ pub fn banner(game: &Game, i: usize) -> Option<(String, [u8; 3])> {
     }
 }
 
-/// Where a bot should go instead of its lane, on the Thornmaze (None: carry
+/// Where a bot should go instead of its lane, on the Quarry (None: carry
 /// on). A cat in a pack (two friends close) goes where it likes. Otherwise:
 ///
 /// * in a section that is waking or biting: out of it, to the nearest room
@@ -789,10 +799,13 @@ pub fn bot_goal(game: &Game, gi: usize) -> Option<Vec3> {
     if let Some(p) = crate::machine::dodge(game, gi) {
         return Some(p);
     }
-    if game.pack(gi) >= 2 {
+    // a lock the machine is working: out, pack or no pack (the pads do not
+    // care how many stand on them)
+    let locked = |p: Vec3| crate::machine::locked(game.wake.seed, t, p.x, p.z);
+    if game.pack(gi) >= 2 && !locked(me.pos) {
         return None;
     }
-    let waking = |p: Vec3| !matches!(game.wake.mood_at(p.x, p.z, t), Mood::Calm);
+    let waking = |p: Vec3| !matches!(game.wake.mood_at(p.x, p.z, t), Mood::Calm) || locked(p);
     if !waking(me.pos) {
         let brain = me.ai.as_ref()?;
         let path = crate::consts::lane_path(brain.lane, me.team);
@@ -802,7 +815,7 @@ pub fn bot_goal(game: &Game, gi: usize) -> Option<Vec3> {
     let here = section_at(me.pos.x, me.pos.z)?;
     let calm = |rm: Room| {
         let p = room_pos(rm);
-        matches!(game.wake.mood_at(p.x, p.z, t + 2.0), Mood::Calm)
+        matches!(game.wake.mood_at(p.x, p.z, t + 2.0), Mood::Calm) && !crate::machine::locked(game.wake.seed, t, p.x, p.z)
     };
     let friend_in = |rm: Room| {
         game.gods.iter().enumerate().any(|(k, o)| k != gi && o.team == me.team && o.respawn_t <= 0.0 && section_at(o.pos.x, o.pos.z).is_some_and(|s| s.room() == rm))
@@ -811,7 +824,7 @@ pub fn bot_goal(game: &Game, gi: usize) -> Option<Vec3> {
     let mut seen = std::collections::HashSet::from([start]);
     let mut q = std::collections::VecDeque::from([start]);
     while let Some(rm) = q.pop_front() {
-        if rm != start && (calm(rm) || friend_in(rm)) {
+        if rm != start && (calm(rm) || (friend_in(rm) && !locked(room_pos(rm)))) {
             return Some(room_pos(rm));
         }
         for (g, p) in passages().iter().enumerate() {
@@ -988,7 +1001,9 @@ mod tests {
         for k in 0..40 {
             let s = w.closed(k);
             let shut = s.iter().filter(|x| **x).count();
-            assert!(shut as f32 >= gates as f32 * 0.15 && shut as f32 <= gates as f32 * 0.7, "turn {k}: {shut} of {gates} shut");
+            // (up to 0.8: the machine's locks seal on top of the random share --
+            // 26 of 36 in turn 4 of seed 7 -- and connectivity still holds)
+            assert!(shut as f32 >= gates as f32 * 0.15 && shut as f32 <= gates as f32 * 0.8, "turn {k}: {shut} of {gates} shut");
             assert_eq!(reachable(&|i| !s[i]).len(), 15, "turn {k} cuts a room off");
             for g in 0..ps.len() {
                 assert!(!(ps[g].lane.is_some() && s[g]), "turn {k} shuts lane passage {g}");

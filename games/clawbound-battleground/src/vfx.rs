@@ -104,7 +104,7 @@ pub struct Vfx {
     pub beams: Vec<Beam>,
     pub rings: Vec<Ring>,
     pub time: f32,
-    /// How far the Thornmaze's machinery has turned (radians of a unit
+    /// How far the Quarry's machinery has turned (radians of a unit
     /// wheel): its drive (`machine::drive`) integrated, so the gears spin
     /// up and settle rather than jump.
     pub machine_turn: f32,
@@ -1320,6 +1320,21 @@ impl Vfx {
                             Material::Magma => (*pos + d * 1.0 + Vec3::Y * h, d * 1.8 + Vec3::Y * 3.0, 0.12, [2.0, 0.8, 0.25], 2.0),
                         };
                         self.particles.push(Particle { pos: p, vel: v, life: 1.0, max_life: 1.0, size, color: col, alpha: 1.0, gravity: grav, drag: 1.0 });
+                    }
+                }
+                Event::BoulderLand { pos } | Event::CatFell { pos } => {
+                    // a ring of dust off the flags
+                    for k in 0..32 {
+                        let a = k as f32 * std::f32::consts::TAU / 32.0;
+                        let d = Vec3::new(a.cos(), 0.0, a.sin());
+                        self.dust.push(Particle { pos: Vec3::new(pos.x, 0.3, pos.z) + d * 1.5, vel: d * 6.0 + Vec3::Y * 1.2, life: 1.0, max_life: 1.0, size: 0.3, color: [0.55, 0.51, 0.45], alpha: 0.7, gravity: 1.0, drag: 2.0 });
+                    }
+                }
+                Event::PadDrop { pos } => {
+                    // grit off the pad's edges as it swings
+                    for k in 0..10 {
+                        let a = k as f32 * 2.399;
+                        self.dust.push(Particle { pos: *pos + Vec3::new(a.cos() * 2.3, 0.2, a.sin() * 2.3), vel: Vec3::new(a.cos(), 0.8, a.sin()), life: 0.6, max_life: 0.6, size: 0.18, color: [0.50, 0.47, 0.42], alpha: 0.7, gravity: 4.0, drag: 1.5 });
                     }
                 }
                 Event::BoulderHit { pos } => {

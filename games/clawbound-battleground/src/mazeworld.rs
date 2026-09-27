@@ -1,4 +1,4 @@
-//! mazeworld — what stands in the Thornmaze's rooms, its gates, and where
+//! mazeworld — what stands in the Quarry's rooms, its gates, and where
 //! its thorns grow.
 //!
 //! `maze` is the ground; this is the dressing, for `scene` to draw and
@@ -57,7 +57,7 @@ fn flip(it: Item) -> Item {
     }
 }
 
-/// Everything placed in the Thornmaze. Computed AS that map whatever is
+/// Everything placed in the Quarry. Computed AS that map whatever is
 /// active.
 pub fn placements() -> Vec<Item> {
     crate::map::with(crate::map::MapId::Maze, placements_here)
@@ -116,20 +116,15 @@ fn placements_here() -> Vec<Item> {
             }
         }
     }
-    // a screw at the head of every boulder track (both of each pair: the
-    // tracks are already mirrored), beside where the ball comes up, on
-    // whichever side has floor for it
-    let f = mz::floor();
-    // (chosen on each pair's blue track and mirrored, so the two halves
-    // agree even where both sides have floor)
+    // a screw beside every track's hopper, up in the hills or on the wall
+    // top, standing on the ground there (placed on each pair's blue track
+    // and mirrored)
     for pair in crate::machine::pairs() {
         let tr = &pair[0];
-        let (s, d) = (tr.pts[0], (tr.pts[1] - tr.pts[0]).normalize_or_zero());
+        let d = tr.dir_at(0.0);
         let side = Vec3::new(-d.z, 0.0, d.x);
-        let spot = [1.0f32, -1.0].into_iter().map(|k| s + side * k * (crate::machine::BOULDER_R + 2.4)).find(|p| f.fits(p.x, p.z, 2.0));
-        if let Some(at) = spot {
-            both(&mut out, Item::Screw { at });
-        }
+        let h = tr.hopper() + side * (crate::machine::BOULDER_R + 2.6);
+        both(&mut out, Item::Screw { at: Vec3::new(h.x, mz::terrain_height(h.x, h.z), h.z) });
     }
     // braziers round the pit (blue; mirrored), on its diagonals
     let pit = mz::pit_positions()[0];
@@ -444,6 +439,13 @@ pub fn build() -> (Vec<Piece>, Blockers) {
         assert_eq!(id, g, "gate ids are the passages'");
     }
     let mut pieces = Vec::new();
+    // the chutes, from each hopper down to its lip, on their trestles
+    for pair in crate::machine::pairs() {
+        for tr in pair {
+            let (mesh, pos) = chute_mesh(tr);
+            pieces.push(Piece { mesh, pos, quarter: 0, vsize: CHUTE_V, sway: 0.0 });
+        }
+    }
     let pillars: Vec<VoxelMesh> = (0..4).map(|v| crate::props::ruin_pillar(1.0, v)).collect();
     let brazier = crate::props::brazier();
     for it in placements() {
@@ -461,9 +463,9 @@ pub fn build() -> (Vec<Piece>, Blockers) {
                 blockers.push(Blocker { shape: Shape::Circle { x: at.x, z: at.z, r: 1.3 }, top: 6.0, cover: Cover::NONE });
                 pieces.push(Piece { mesh: pillars[variant as usize % 4].clone(), pos: at, quarter: (variant % 4) as u8, vsize: V_MED, sway: 0.0 });
             }
-            Item::Screw { at } => {
-                // drawn by the scene, turning; here only its collision
-                blockers.push(Blocker { shape: Shape::Circle { x: at.x, z: at.z, r: 1.6 }, top: 7.0, cover: Cover::NONE });
+            Item::Screw { .. } => {
+                // drawn by the scene, turning; up on the hills, off the
+                // floor: nothing to collide with
             }
             Item::Stub { a, b } => {
                 blockers.push(Blocker { shape: Shape::Segment { x0: a.x, z0: a.z, x1: b.x, z1: b.z, r: 0.8 }, top: 3.2, cover: Cover::NONE });
@@ -477,6 +479,127 @@ pub fn build() -> (Vec<Piece>, Blockers) {
 /// A broken stretch of wall from `a` to `b` (world), centred on their
 /// middle: a low course of stone, ragged along its top. Feet at y = 0,
 /// origin at the middle of `a`..`b`.
+const CHUTE_V: f32 = 0.4;
+
+/// A track's chute: a wooden trough on trestles from its hopper (a bin
+/// with bronze bands, up in the hills or on a wall top) down to its lip,
+/// the legs standing on the ground beneath. Built in world units round its
+/// middle; returns the mesh and where its origin goes (feet at the lowest
+/// ground under it).
+pub fn chute_mesh(tr: &crate::machine::Track) -> (VoxelMesh, Vec3) {
+    const V: f32 = CHUTE_V;
+    let (h, l) = (tr.hopper(), tr.lip());
+    let r = crate::machine::BOULDER_R;
+    let dir = Vec3::new(l.x - h.x, 0.0, l.z - h.z).normalize_or_zero();
+    let side = Vec3::new(-dir.z, 0.0, dir.x);
+    let n = ((l - h).length() / 0.15) as i32;
+    let ground = |p: Vec3| mz::terrain_height(p.x, p.z);
+    let base = (0..=n).map(|k| ground(h + (l - h) * (k as f32 / n as f32))).fold(f32::MAX, f32::min) - 0.4;
+    let mid = (h + l) * 0.5;
+    let half = (l - h).abs() * 0.5 + Vec3::splat(r + 3.0);
+    let (nx, nz) = ((half.x * 2.0 / V) as i32 + 4, (half.z * 2.0 / V) as i32 + 4);
+    let ny = ((h.y.max(l.y) + 4.0 - base) / V) as i32 + 2;
+    let mut g = Grid::new(nx as usize, ny as usize, nz as usize);
+    let cell = |p: Vec3| (((p.x - mid.x) / V).round() as i32 + nx / 2, ((p.y - base) / V).round() as i32, ((p.z - mid.z) / V).round() as i32 + nz / 2);
+    let wood = [0.44, 0.29, 0.15, 1.0];
+    let dark = [0.28, 0.18, 0.09, 1.0];
+    let bronze = [0.68, 0.47, 0.21, 1.0];
+    let mut put = |p: Vec3, c: [f32; 4]| {
+        let (x, y, z) = cell(p);
+        if x >= 0 && y >= 0 && z >= 0 && x < nx && y < ny && z < nz {
+            g.set(x, y, z, c);
+        }
+    };
+    // the trough: a floor under the ball's path and a rail either side
+    for k in 0..=n {
+        let c = h + (l - h) * (k as f32 / n as f32);
+        let mut w = -(r + 0.4);
+        while w <= r + 0.4 {
+            put(c + side * w - Vec3::Y * 0.3, if k % 12 < 1 { dark } else { wood });
+            w += V * 0.9;
+        }
+        for sgn in [-1.0f32, 1.0] {
+            let mut y = -0.3;
+            while y <= 1.2 {
+                put(c + side * (sgn * (r + 0.5)) + Vec3::Y * y, wood);
+                y += V * 0.9;
+            }
+        }
+        // the trestles: a pair of legs every ~4 u, down to the ground, and a
+        // brace across between them
+        if k % 27 == 0 {
+            for sgn in [-1.0f32, 1.0] {
+                let foot = c + side * (sgn * (r + 0.5));
+                let gy = ground(foot);
+                let mut y = c.y - 0.6;
+                while y >= gy - 0.2 {
+                    put(Vec3::new(foot.x, y, foot.z), dark);
+                    y -= V * 0.9;
+                }
+            }
+            let by = (c.y - 0.6 + ground(c)) * 0.5;
+            let mut w = -(r + 0.5);
+            while w <= r + 0.5 {
+                put(Vec3::new(c.x, by, c.z) + side * w, dark);
+                w += V * 0.9;
+            }
+        }
+    }
+    // the hopper: an open bin round where the stone comes up, banded
+    let gy = ground(h);
+    let mut y = gy;
+    while y <= h.y + 1.6 {
+        let band = ((y - gy) / V) as i32 % 5 == 0;
+        let mut a = -(r + 1.2);
+        while a <= r + 1.2 {
+            for sgn in [-1.0f32, 1.0] {
+                put(Vec3::new(h.x, y, h.z) + dir * a + side * (sgn * (r + 1.2)), if band { bronze } else { dark });
+                put(Vec3::new(h.x, y, h.z) + side * a + dir * (sgn * (r + 1.2)), if band { bronze } else { dark });
+            }
+            a += V * 0.9;
+        }
+        y += V * 0.9;
+    }
+    (g.mesh(V, true), Vec3::new(mid.x, base, mid.z))
+}
+
+/// A lock's pad: a square stone trapdoor, flush with the floor, a bronze
+/// rim round it (the scene lights the rim while the lock is armed). Centred,
+/// y from 0.
+pub fn pad_mesh() -> VoxelMesh {
+    const V: f32 = 0.25;
+    let n = (crate::machine::PAD_HALF * 2.0 / V) as i32;
+    let mut g = Grid::new(n as usize, 2, n as usize);
+    for x in 0..n {
+        for z in 0..n {
+            let rim = x == 0 || z == 0 || x == n - 1 || z == n - 1;
+            let k = ((x * 7 + z * 13) as u32).wrapping_mul(2654435761) >> 29;
+            let stone = [0.46 + k as f32 * 0.01, 0.44 + k as f32 * 0.01, 0.40 + k as f32 * 0.008, 1.0];
+            g.set(x, 0, z, if rim { [0.62, 0.44, 0.20, 1.0] } else { stone });
+            if !rim && (x == n / 2 || z == n / 2) {
+                g.set(x, 0, z, [0.30, 0.28, 0.26, 1.0]);
+            }
+        }
+    }
+    g.mesh(V, true)
+}
+
+/// The hole under an open pad: a square of dark, darkest in the middle, laid
+/// just over the floor. Centred, y from 0.
+pub fn pit_mesh() -> VoxelMesh {
+    const V: f32 = 0.25;
+    let n = (crate::machine::PAD_HALF * 2.0 / V) as i32;
+    let mut g = Grid::new(n as usize, 1, n as usize);
+    for x in 0..n {
+        for z in 0..n {
+            let e = x.min(z).min(n - 1 - x).min(n - 1 - z) as f32 / (n as f32 * 0.5);
+            let v = 0.10 * (1.0 - e) + 0.01;
+            g.set(x, 0, z, [v, v * 0.9, v * 0.8, 1.0]);
+        }
+    }
+    g.mesh(V, true)
+}
+
 fn stub_mesh(a: Vec3, b: Vec3) -> VoxelMesh {
     const V: f32 = 0.4;
     let mid = (a + b) * 0.5;
@@ -523,6 +646,12 @@ mod tests {
             for it in &items {
                 let pts: Vec<Vec3> = match *it {
                     Item::Stub { a, b } => vec![a, b, (a + b) * 0.5],
+                    // up by a hopper, on the ground there, off the floor
+                    Item::Screw { at } => {
+                        assert!(crate::machine::pairs().iter().flatten().any(|t| Vec3::new(t.hopper().x, 0.0, t.hopper().z).distance(Vec3::new(at.x, 0.0, at.z)) < crate::machine::BOULDER_R + 3.0), "{it:?} by no hopper");
+                        assert!(f.sdf(at.x, at.z) > 1.0 && (at.y - mz::terrain_height(at.x, at.z)).abs() < 1e-3, "{it:?} not standing on the wall or the hills");
+                        vec![]
+                    }
                     _ => vec![item_at(it)],
                 };
                 for p in pts {

@@ -56,14 +56,17 @@ bring down; stones to break first.
   the elder dawn. Fifteen a side: for matters that concern every clan at
   once. The high path climbs a shelf around the western fang; the caves along
   the side paths are the dens of the vole-beasts that keep the camps.
-- **The Thornmaze**: the works of the **Geartooth clan**, the engineer-cats
+- **The Engineer's Quarry**: the works of the **Geartooth clan**, the engineer-cats
   of the old hills, who learned to cut wood and stone with their teeth and
   set the rivers to turn it. They built the labyrinth as a machine for
   moving the mountain: gear trains across the wall tops, stone gates that
   rise and sink in their slots, Archimedes screws that lift quarried stone
-  up from the cisterns, and tracks the stones roll down through the rooms.
-  The Geartooth are long gone; the machine is not. The thorns grew over it
-  after them, and wake where it is working. Five a side.
+  from the cisterns in the hills, chutes on trestles that bring it down,
+  and tracks it rolls along through the rooms. A room the stone passes
+  through is a LOCK while it runs: the machine seals its gates and opens the
+  trapdoors in its floor behind the stone, down to the old workings. The
+  Geartooth are long gone; the machine is not, and it does not know that
+  cats walk its locks now. The thorns grew over it after them. Five a side.
 
 ## The ancestors
 

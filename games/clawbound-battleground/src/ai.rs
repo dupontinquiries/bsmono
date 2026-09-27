@@ -357,7 +357,7 @@ pub fn think(game: &mut Game, gi: usize) {
         }
     }
 
-    // The Thornmaze: alone (or one of two) in ground that is waking, get
+    // The Engineer's Quarry: alone (or one of two) in ground that is waking, get
     // out of it -- to a friend close enough to reach, else to calm ground
     // (`maze::bot_goal`). Not mid-fight: the stance decides that.
     let mut escaping = false;
@@ -370,7 +370,7 @@ pub fn think(game: &mut Game, gi: usize) {
         }
     }
 
-    // A boulder coming (the Thornmaze's machine): step off its track, in
+    // A boulder coming (the Quarry's machine): step off its track, in
     // any state -- a duel is not worth being rolled over (`machine::dodge`)
     if let Some(p) = crate::machine::dodge(game, gi) {
         escaping = true;
@@ -503,7 +503,7 @@ pub fn think(game: &mut Game, gi: usize) {
             let reached = m.route_wp.is_some_and(|w| Vec3::new(w.x - pos.x, 0.0, w.z - pos.z).length() < 1.5);
             if !(now - m.route_t < crate::steer::ROUTE_EVERY) || reached {
                 let tgt = game.ai_move_target(gi);
-                // (not through a shut gate: the Thornmaze -- `route_open`)
+                // (not through a shut gate: the Quarry -- `route_open`)
                 let wp = f.next_waypoint_with(game.route_from(pos), tgt, 0.5, &|s| game.route_open(s));
                 let m = &mut game.steer_mem[gi];
                 m.route_wp = wp;

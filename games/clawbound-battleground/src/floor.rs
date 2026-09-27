@@ -219,7 +219,7 @@ impl FloorPlan {
     }
 
     /// As [`route`](Self::route), through only the shapes `open` allows (a
-    /// shut gate's passage is not a way: the Thornmaze).
+    /// shut gate's passage is not a way: the Quarry).
     pub fn route_with(&self, from: Vec3, to: Vec3, open: &dyn Fn(usize) -> bool) -> Vec<Vec3> {
         let (Some(s), Some(g)) = (self.shape_at(from.x, from.z), self.shape_at(to.x, to.z)) else { return vec![to] };
         if s == g {

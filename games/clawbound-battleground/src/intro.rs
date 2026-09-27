@@ -323,7 +323,7 @@ impl Intro {
                 let drowned = crate::map::active() == crate::map::MapId::Atlantis;
                 // (and the Drowned Halls are flown over their walls, through
                 // the glass: the halls are too narrow to fly down)
-                // (the Thornmaze too: its corridors wind too tightly to fly)
+                // (the Quarry too: its corridors wind too tightly to fly)
                 let maze = crate::map::active() == crate::map::MapId::Maze;
                 let over = if sky && lane == Lane::Mid {
                     crate::sky::UPPER_Y + 6.0
