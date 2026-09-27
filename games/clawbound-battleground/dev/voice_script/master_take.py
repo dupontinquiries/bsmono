@@ -99,51 +99,52 @@ CHAINS = {
                "aecho=0.8:0.35:24|47:0.06|0.035",
  # -- the stand-in voices (synth_session.py) --
  # a tiger in the reeds: low, close, dark; a small dead room
- 'duskstripe': "rubberband=pitch=0.89:formant=preserved,"
+ 'duskstripe': "rubberband=pitch=0.89:formant=preserved:pitchq=quality,"
                "equalizer=f=160:t=q:w=1:g=3,equalizer=f=3000:t=q:w=1.2:g=1.5,lowpass=f=9000,"
                "acompressor=threshold=-26dB:ratio=3:attack=8:release=150:makeup=2,"
                "aecho=0.8:0.4:18|31:0.10|0.06",
  # a leopard of the rivers: easy, a ripple of chorus, a wet open room
- 'rainspots':  "rubberband=pitch=0.97:formant=preserved,"
+ 'rainspots':  ""
                "equalizer=f=220:t=q:w=1:g=1.5,treble=g=2:f=7000,"
                "chorus=0.7:0.9:35|48:0.3|0.25:0.35|0.6:2.2|1.6,"
                "acompressor=threshold=-24dB:ratio=3:attack=8:release=120:makeup=2,"
                "aecho=0.8:0.5:60|110:0.18|0.10",
  # the moonless woods: hushed, dark, a long soft night-forest tail
- 'nightpelt':  "rubberband=pitch=0.92:formant=preserved,"
+ 'nightpelt':  "rubberband=pitch=0.92:formant=preserved:pitchq=quality,"
                "equalizer=f=250:t=q:w=1:g=2,lowpass=f=6500,"
                "acompressor=threshold=-28dB:ratio=3:attack=10:release=200:makeup=3,"
                "aecho=0.8:0.6:120|230|370:0.22|0.15|0.09",
  # a singer across the grasslands: bright, ringing, a big open hall
- 'faryowl':    "rubberband=pitch=1.0:formant=preserved,"
+ 'faryowl':    ""
                "equalizer=f=2500:t=q:w=1.2:g=3,treble=g=3:f=8000,"
                "acompressor=threshold=-22dB:ratio=2.5:attack=10:release=150:makeup=2,"
                "aecho=0.8:0.6:80|160|300:0.24|0.16|0.10",
  # radiant, ceremonial: warm and golden, a temple
- 'suneye':     "rubberband=pitch=0.95:formant=preserved,"
+ 'suneye':     "rubberband=pitch=0.95:formant=preserved:pitchq=quality,"
                "equalizer=f=300:t=q:w=1:g=2,equalizer=f=4000:t=q:w=1:g=2,"
                "acompressor=threshold=-24dB:ratio=3:attack=10:release=150:makeup=2,"
                "aecho=0.8:0.6:70|140|260:0.26|0.18|0.12",
  # a lynx in the snow: cold, clear, a crisp small plate
- 'snowhush':   "rubberband=pitch=1.0:formant=preserved,"
+ 'snowhush':   ""
                "highpass=f=130,equalizer=f=350:t=q:w=1:g=-2,equalizer=f=6000:t=q:w=1:g=3,"
                "acompressor=threshold=-24dB:ratio=3:attack=6:release=100:makeup=2,"
                "aecho=0.8:0.45:30|55:0.14|0.08",
  # a grey ghost of the crags: dry up close, and the mountain answering
- # a quarter-second later
- 'stonewhisper': "rubberband=pitch=0.94:formant=preserved,"
+ # a quarter-second later (quietly: louder, the recogniser heard the
+ # echoed last syllable as a word of its own -- "Crumble... things")
+ 'stonewhisper': "rubberband=pitch=0.94:formant=preserved:pitchq=quality,"
                "highpass=f=120,equalizer=f=2200:t=q:w=1:g=2,"
                "acompressor=threshold=-26dB:ratio=3:attack=8:release=120:makeup=2,"
-               "aecho=0.8:0.7:260|520:0.14|0.06",
+               "aecho=0.8:0.7:260|520:0.07|0.03",
  # a jaguar of the drowned forest: heavy, down with the formants, wet
  # and murky
- 'riptail':    "rubberband=pitch=0.9:formant=shifted,"
+ 'riptail':    "rubberband=pitch=0.9:formant=shifted:pitchq=quality,"
                "equalizer=f=120:t=q:w=1:g=3,lowpass=f=5000,"
                "flanger=delay=2:depth=3:regen=-20:width=60:speed=0.3,"
                "acompressor=threshold=-26dB:ratio=4:attack=12:release=200:makeup=2,"
                "aecho=0.8:0.5:45|90:0.18|0.10",
  # the storm-dragon's ninth son: serene and deep, a mountain valley
- 'stillsmoke': "rubberband=pitch=0.93:formant=preserved,"
+ 'stillsmoke': "rubberband=pitch=0.93:formant=preserved:pitchq=quality,"
                "equalizer=f=140:t=q:w=1:g=3,"
                "acompressor=threshold=-24dB:ratio=3:attack=10:release=180:makeup=2,"
                "aecho=0.8:0.6:110|240|420:0.24|0.16|0.10",
@@ -155,7 +156,7 @@ CHAINS = {
                "acompressor=threshold=-24dB:ratio=3:attack=5:release=90:makeup=2,"
                "aecho=0.8:0.35:28|52:0.10|0.06",
  # a young daredevil: bright and quick, a short slap
- 'cometail':   "rubberband=pitch=1.04:tempo=1.03:formant=preserved,"
+ 'cometail':   "rubberband=pitch=1.04:tempo=1.03:formant=preserved:pitchq=quality,"
                "highpass=f=120,treble=g=4:f=6000,"
                "aexciter=level_in=1:level_out=1:amount=1.2:drive=5:blend=0:freq=4500,"
                "acompressor=threshold=-24dB:ratio=3:attack=5:release=90:makeup=2,"
@@ -301,66 +302,66 @@ def _breath(c, lo, hi, level, seed):
 
 def duskstripe_layers(c, key):
     # a tiger: breath close to the ear, and a low chuffing growl under it
-    return c + _breath(c, 1500, 7000, -13, 21) + _growl(c, 58, 0.2, 0.4, 22, -9, base=0.4)
+    return c + _breath(c, 1500, 7000, -18, 21) + _growl(c, 58, 0.2, 0.4, 22, -14, base=0.3)
 
 
 def rainspots_layers(c, key):
     # a leopard: the sawing rasp leopards call with (a slow, very uneven
     # pulse) under the words, and a bright ripple -- water -- above
-    return c + _growl(c, 34, 0.35, 0.6, 23, -10, base=0.5, rise=0.6) + _breath(c, 3500, 9000, -17, 24)
+    return c + _growl(c, 34, 0.35, 0.6, 23, -15, base=0.4, rise=0.6) + _breath(c, 3500, 9000, -21, 24)
 
 
 def nightpelt_layers(c, key):
     # the dark: a whispered double (the voice on breath) nearly as loud as
     # the voice, and a shadow an octave under it
-    return c + _breath(c, 700, 8000, -8, 25) + B.at(-15, B.octave(c, 0.5), c)
+    return c + _breath(c, 700, 8000, -14, 25) + B.at(-19, B.octave(c, 0.5), c)
 
 
 def faryowl_layers(c, key):
     # a singer: a fifth and an octave above her, ringing -- and on the
     # shouts, a caterwaul (the octave-up double swells)
-    fifth = B.at(-13, B.octave(c, 1.5), c)
-    up = B.at(-16, B.octave(c, 2.0), c) * (0.5 + 1.2 * B.loud_gate(c, 10))
+    fifth = B.at(-18, B.octave(c, 1.5), c)
+    up = B.at(-21, B.octave(c, 2.0), c) * (0.5 + 1.2 * B.loud_gate(c, 10))
     return c + fifth + up
 
 
 def suneye_layers(c, key):
     # a priestess of the sun: a choir -- an octave under, a fifth over, an
     # octave over -- and a warm purr beneath
-    choir = B.at(-11, B.octave(c, 0.5), c) + B.at(-14, B.octave(c, 1.5), c) + B.at(-17, B.octave(c, 2.0), c)
+    choir = B.at(-16, B.octave(c, 0.5), c) + B.at(-20, B.octave(c, 1.5), c) + B.at(-23, B.octave(c, 2.0), c)
     return c + choir + B.at(-16, B.lowpass(B.cross(c, B.growl_carrier(len(c), f0=27, jitter=0.1, double=0.2, seed=26)), 500), c)
 
 
 def snowhush_layers(c, key):
     # a lynx: cold air on the words, a faint ice-bright octave above, and a
     # hiss rising on the loud ones
-    hiss = _breath(c, 3000, 10000, -12, 27) * (0.4 + 1.0 * B.loud_gate(c, 10))
+    hiss = _breath(c, 3000, 10000, -17, 27) * (0.4 + 1.0 * B.loud_gate(c, 10))
     return c + hiss + B.at(-18, B.octave(c, 2.0), c)
 
 
 def stonewhisper_layers(c, key):
     # a ghost of the crags: half whisper, half voice, and a stone-deep
     # shadow
-    return c + _breath(c, 900, 7000, -9, 28) + B.at(-14, B.octave(c, 0.5), c)
+    return c + _breath(c, 900, 7000, -20, 28) + B.at(-22, B.octave(c, 0.5), c)
 
 
 def riptail_layers(c, key):
     # a jaguar in the flood: an octave-down double, a wet low growl, and
     # a roar on the shouts
-    return c + B.at(-8, B.octave(c, 0.5), c) + _growl(c, 48, 0.25, 0.45, 29, -7, below=12, base=0.4, rise=1.3)
+    return c + B.at(-13, B.octave(c, 0.5), c) + _growl(c, 48, 0.25, 0.45, 29, -12, below=12, base=0.3, rise=1.3)
 
 
 def stillsmoke_layers(c, key):
     # a dragon's son: an octave-down double, and thunder under the loud
     # words (the voice on noise, kept below 300 Hz)
     thunder = B.lowpass(B.cross(c, B.noise(len(c), seed=30)), 300)
-    return c + B.at(-9, B.octave(c, 0.5), c) + B.at(-4, thunder, c) * B.loud_gate(c, 10) ** 2
+    return c + B.at(-14, B.octave(c, 0.5), c) + B.at(-8, thunder, c) * B.loud_gate(c, 10) ** 2
 
 
 def cometail_layers(c, key):
     # a comet: a sparkle a fifth up, and a streak (a falling whoosh) after
     # the casts and the select call
-    y = c + B.at(-15, B.octave(c, 1.5), c)
+    y = c + B.at(-20, B.octave(c, 1.5), c)
     if key.startswith('cast') or key == 'select':
         n = int(0.35 * SR)
         t = np.arange(n) / SR
