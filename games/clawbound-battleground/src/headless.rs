@@ -109,6 +109,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("spectate") {
         return run_spectate();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("sprout") {
+        return run_sprout_shots();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("sky") {
         return crate::skyshots::run();
     }
@@ -1574,6 +1577,90 @@ pub fn run_blast_shots() -> Result<(), String> {
         save_shot(&renderer.device, &renderer.queue, &target, name)?;
         println!("saved {name}");
     }
+    Ok(())
+}
+
+/// Sproutkit and his gifts: a close look at him, the litter running, three
+/// enemies giggling, and the dance party with its glitter-ball.
+/// `CLAWBOUND_SHOTS=sprout clawbound-battleground --screenshot`
+pub fn run_sprout_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("sprout"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let kit = crate::gods::ROSTER.iter().position(|d| matches!(d.pelt, crate::gods::PeltKind::Kit)).unwrap() as u32;
+    let mut game = Game::new_teams(&[kit], &[0, 6, 7]);
+    game.blockers = scene.blockers.clone();
+    game.next_wave_t = 1e9;
+    let at = Vec3::new(0.0, 0.0, -40.0);
+    game.gods[0].pos = at;
+    game.gods[0].yaw = std::f32::consts::FRAC_PI_2;
+    game.gods[0].mana = 9999.0;
+    let foes = [Vec3::new(-2.5, 0.0, 7.0), Vec3::new(2.5, 0.0, 8.0), Vec3::new(0.0, 0.0, 10.0)];
+    let place = |g: &mut Game| {
+        for (k, f) in foes.iter().enumerate() {
+            g.gods[k + 1].pos = at + *f;
+            g.gods[k + 1].yaw = -std::f32::consts::FRAC_PI_2;
+            g.gods[k + 1].ai = None;
+            g.gods[k + 1].hp = g.gods[k + 1].max_hp;
+        }
+        g.gods[0].ai = None;
+    };
+    place(&mut game);
+    let mut vfx = Vfx::default();
+    let step = |game: &mut Game, vfx: &mut Vfx, secs: f32| {
+        for _ in 0..(secs * 60.0) as usize {
+            game.tick(1.0 / 60.0);
+            let ev = std::mem::take(&mut game.events);
+            vfx.update(1.0 / 60.0, &ev, game);
+        }
+    };
+    let mut shoot = |renderer: &mut Renderer, game: &Game, vfx: &mut Vfx, name: &str, cam: Camera| -> Result<(), String> {
+        renderer.clear_queues();
+        scene.draw(renderer, game, vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+        Ok(())
+    };
+    step(&mut game, &mut vfx, 0.3);
+    shoot(&mut renderer, &game, &mut vfx, "sprout_close.png", Camera { eye: at + Vec3::new(2.4, 1.6, 3.0), target: at + Vec3::Y * 1.2, fov_y: 0.8 })?;
+    let wide = Camera { eye: at + Vec3::new(-9.0, 7.0, -6.0), target: at + Vec3::new(0.0, 1.0, 7.0), fov_y: 1.0 };
+    // the litter, running
+    for k in 1..4 {
+        game.gods[k].pos = at + foes[k - 1] * 1.4;
+    }
+    game.cast_queue.push((0, 0, at + Vec3::new(0.0, 0.0, 8.0)));
+    step(&mut game, &mut vfx, 0.4);
+    shoot(&mut renderer, &game, &mut vfx, "sprout_litter.png", wide)?;
+    step(&mut game, &mut vfx, 1.5);
+    // the giggles
+    place(&mut game);
+    for k in 1..4 {
+        game.gods[k].pos = at + foes[k - 1] * 0.7;
+    }
+    game.gods[0].cds = [0.0; 4];
+    game.cast_queue.push((0, 1, at + Vec3::Z * 4.0));
+    step(&mut game, &mut vfx, 0.55);
+    shoot(&mut renderer, &game, &mut vfx, "sprout_giggle.png", wide)?;
+    step(&mut game, &mut vfx, 2.0);
+    // the dance party
+    place(&mut game);
+    game.gods[0].cds = [0.0; 4];
+    game.cast_queue.push((0, 3, at + Vec3::new(0.0, 0.0, 8.5)));
+    step(&mut game, &mut vfx, 1.6);
+    shoot(&mut renderer, &game, &mut vfx, "sprout_party.png", Camera { eye: at + Vec3::new(-11.0, 9.0, -4.0), target: at + Vec3::new(0.0, 3.5, 8.5), fov_y: 1.0 })?;
     Ok(())
 }
 

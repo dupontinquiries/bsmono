@@ -79,6 +79,10 @@ pub enum Event {
     FissureOpen { a: Vec3, b: Vec3 },
     TornadoDebris { pos: Vec3 },
     BossDown { kind: crate::bosses::BossKind, pos: Vec3, team: Option<Team> },
+    /// One of Sproutkit's litter popped (a nip, or its time ran out).
+    KitlingPop { pos: Vec3 },
+    /// Sproutkit's laugh went round (`kit`).
+    GiggleFx { pos: Vec3, radius: f32 },
 }
 
 #[derive(Clone, Debug)]
@@ -229,6 +233,12 @@ pub struct GodUnit {
     pub sneak: bool,
     /// Seconds of ability-granted quiet left: full speed, low and silent.
     pub hush_t: f32,
+    /// Giggling (Sproutkit, `kit`): no attacks or casts, wandering paws.
+    pub giggle_t: f32,
+    /// Dancing under a glitter-ball (`kit`), and the slow (share, seconds)
+    /// it drags off with when the music stops.
+    pub dance_t: f32,
+    pub dance_after: (f32, f32),
     /// A cast winding up or channelling: fires when `t` reaches `dur`.
     pub casting: Option<Casting>,
     /// Seconds during which movement does not turn the cat: after a cast
@@ -292,6 +302,9 @@ pub struct Minion {
     /// ranks down the lane instead of threading onto one line of
     /// waypoints (thirty-two a side on the sky map became a single file).
     pub lane_off: f32,
+    /// Giggling / dancing (Sproutkit, `kit`): no attacks; a dancer shuffles.
+    pub giggle_t: f32,
+    pub dance_t: f32,
 }
 
 pub struct Tower {
@@ -372,6 +385,9 @@ pub struct Zone {
 pub enum ZoneKind {
     Storm { until: f32, dps: f32, strike_t: f32, owner: usize },
     Ring { trigger_t: f32, dmg: f32, owner: usize, done: bool },
+    /// Sproutkit's glitter-ball (`kit`): seconds left, and the slow its
+    /// dancers drag off with.
+    Dance { until: f32, slow: f32, slow_secs: f32, owner: usize },
 }
 
 // --- game ---------------------------------------------------------------------
@@ -384,6 +400,8 @@ pub struct Game {
     pub titans: [Titan; 2],
     pub projectiles: Vec<Projectile>,
     pub zones: Vec<Zone>,
+    /// Sproutkit's litters, running (`kit`).
+    pub kitlings: Vec<crate::kit::Kitling>,
     pub events: Vec<Event>,
     pub killfeed: Vec<KillEntry>,
     pub next_wave_t: f32,
@@ -535,6 +553,9 @@ impl Game {
                 whiff_t: -10.0,
                 sneak: false,
                 hush_t: 0.0,
+                giggle_t: 0.0,
+                dance_t: 0.0,
+                dance_after: (0.0, 0.0),
                 last_act_t: -99.0,
                 ai: if is_player { None } else { Some(AiBrain::new(lane, 0.45 + rng.f32() * 0.5)) },
                 prot,
@@ -583,6 +604,7 @@ impl Game {
             titans,
             projectiles: Vec::new(),
             zones: Vec::new(),
+            kitlings: Vec::new(),
             events: Vec::new(),
             killfeed: Vec::new(),
             next_wave_t: WAVE_FIRST,
@@ -869,7 +891,9 @@ impl Game {
             self.blockers.going_at(g.pos.x, g.pos.z, crate::going::Carriage { stalking })
         };
         let boon = crate::moonwell::move_mul(g.boon.map(|b| b.0));
-        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk * going * boon
+        // dancing under Sproutkit's glitter-ball: a shuffle
+        let dance = if g.dance_t > 0.0 { crate::kit::DANCE_MOVE } else { 1.0 };
+        dance * base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk * going * boon
     }
 
     pub fn auto_interval(&self, i: usize) -> f32 {

@@ -88,6 +88,10 @@ pub struct Scene {
     /// Its body's segments: [with a crest fin?][variant].
     pub wyrm_seg: [[u64; 2]; 2],
     pub star: u64,
+    /// Sproutkit's litter (his own body, drawn small), by team, and his
+    /// glitter-ball.
+    pub kitling: [u64; 2],
+    pub disco: u64,
     /// The sky map's drifting stone and cloud (`skydrift`), and their meshes
     /// by kind (anchor, fragment, puff) and variant.
     pub drift: Vec<crate::skydrift::Drift>,
@@ -373,6 +377,9 @@ impl Scene {
             }
         }
         let star = r.upload_mesh(&crate::skyprops::star_mote());
+        let kit_def = ROSTER.iter().find(|d| matches!(d.pelt, crate::gods::PeltKind::Kit)).expect("Sproutkit on the roster");
+        let kitling = [r.upload_mesh(&models::build_god(kit_def, Team::Blue)), r.upload_mesh(&models::build_god(kit_def, Team::Red))];
+        let disco = r.upload_mesh(&models::disco_ball());
         let sky = crate::map::active() == crate::map::MapId::Sky;
         let drift = if sky { crate::skydrift::placements() } else { Vec::new() };
         let mut drift_mesh = [[0u64; DRIFT_VARIANTS]; 3];
@@ -426,6 +433,8 @@ impl Scene {
             moonwyrm,
             wyrm_seg,
             star,
+            kitling,
+            disco,
             drift,
             drift_mesh,
             river_log,
@@ -811,8 +820,19 @@ impl Scene {
             // cos t), so facing (cos yaw, 0, sin yaw) needs t = pi/2 - yaw.
             // This read `yaw - pi/2`, which mirrors the facing in X: right
             // on the north-south lanes, backwards on any east-west run.
-            let base = Mat4::from_translation(g.pos + Vec3::Y * (pose.lift - sink))
-                * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - g.yaw);
+            // dancing (Sproutkit's party): a spin and a hop; giggling: a
+            // helpless wobble side to side (`kit`)
+            let (spin, hop, roll) = if g.dance_t > 0.0 {
+                let k = vfx.time * 6.0 + i as f32;
+                (k, (k * 1.5).sin().abs() * 0.35, 0.0)
+            } else if g.giggle_t > 0.0 {
+                (0.0, (vfx.time * 18.0).sin().abs() * 0.08, (vfx.time * 11.0 + i as f32).sin() * 0.18)
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+            let base = Mat4::from_translation(g.pos + Vec3::Y * (pose.lift - sink + hop))
+                * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - g.yaw + spin)
+                * Mat4::from_axis_angle(Vec3::Z, roll);
             // Planted paws (`footfall`): world soles into the rig frame. The
             // sim's floor is y = 0 through the river too and the drawn cat
             // is sunk, so the soles sink with it.
@@ -988,8 +1008,42 @@ impl Scene {
             let base = Mat4::from_translation(pos)
                 * Mat4::from_axis_angle(Vec3::Y, -m.yaw + std::f32::consts::FRAC_PI_2)
                 * Mat4::from_axis_angle(Vec3::Z, lean);
+            // dancing under the glitter-ball: a spin and a hop
+            let base = if m.dance_t > 0.0 {
+                let k = vfx.time * 7.0 + m.id as f32;
+                Mat4::from_translation(Vec3::Y * (k * 1.3).sin().abs() * 0.3) * Mat4::from_translation(pos) * Mat4::from_axis_angle(Vec3::Y, k) * Mat4::from_translation(-pos) * base
+            } else {
+                base
+            };
             let mesh = if m.caster { self.minion_caster[ti] } else { self.minion_melee[ti] };
             r.queue_draw(mesh, base, [1.0; 4], 0.0, 0.09, false);
+        }
+
+        // Sproutkit's litter: his own body, small, hopping as it runs
+        for k in &game.kitlings {
+            if !sphere_in_frustum(&vp, k.pos, ACTOR_CULL_R) {
+                continue;
+            }
+            let hop = ((k.age * 11.0).sin().abs()) * 0.35;
+            let yaw = k.dir.z.atan2(k.dir.x);
+            let m = Mat4::from_translation(k.pos + Vec3::Y * hop)
+                * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - yaw)
+                * Mat4::from_scale(Vec3::splat(crate::kit::KITLING_SCALE));
+            r.queue_draw(self.kitling[k.team as usize], m, [1.0; 4], 0.15, models::GOD_DRAW_VOXEL, false);
+        }
+        // and his glitter-ball, turning over the dance floor
+        for z in &game.zones {
+            if let crate::sim::ZoneKind::Dance { until, .. } = z.kind {
+                let _ = until;
+                let at = z.pos + Vec3::Y * (crate::kit::BALL_HEIGHT + (vfx.time * 1.3).sin() * 0.15);
+                let m = Mat4::from_translation(at) * Mat4::from_axis_angle(Vec3::Y, vfx.time * 1.4);
+                r.queue_draw(self.disco, m, [1.0; 4], 0.0, models::DISCO_VOX, false);
+                // the chain it hangs from, up into the sky
+                for s in 1..10 {
+                    let p = at + Vec3::Y * (1.3 + s as f32 * 0.6);
+                    r.queue_draw(self.orb, Mat4::from_translation(p), [0.8, 0.8, 0.85, 1.0], 0.2, 0.05, false);
+                }
+            }
         }
 
         // projectiles

@@ -147,6 +147,13 @@ CHAINS = {
                "equalizer=f=140:t=q:w=1:g=3,"
                "acompressor=threshold=-24dB:ratio=3:attack=10:release=180:makeup=2,"
                "aecho=0.8:0.6:110|240|420:0.24|0.16|0.10",
+ # a kitten god: up and small (the formants follow the pitch, so the
+ # throat shrinks with it), bright, bubbly, a sunny little room
+ 'sproutkit':  "rubberband=pitch=1.32:tempo=1.04:formant=shifted,"
+               "highpass=f=160,equalizer=f=3000:t=q:w=1:g=2,treble=g=3:f=7000,"
+               "chorus=0.7:0.9:18|29:0.25|0.2:0.6|0.9:1.5|1.8,"
+               "acompressor=threshold=-24dB:ratio=3:attack=5:release=90:makeup=2,"
+               "aecho=0.8:0.35:28|52:0.10|0.06",
  # a young daredevil: bright and quick, a short slap
  'cometail':   "rubberband=pitch=1.04:tempo=1.03:formant=preserved,"
                "highpass=f=120,treble=g=4:f=6000,"
@@ -314,7 +321,21 @@ def cometail_layers(c, key):
     return y.astype(np.float32)
 
 
-PRE = {'goldenmane': goldenmane_layers, 'oldroar': oldroar_layers, 'twofang': twofang_layers, 'windclaw': windclaw_layers,
+def sproutkit_layers(c, key):
+    # a kitten: a soft purr under every word, a mew before the select call
+    # and the litter, and a giggle after the kills and the giggle fit
+    purr = B.lowpass(B.cross(c, B.growl_carrier(len(c), f0=26, jitter=0.08, double=0.25, seed=32)), 700)
+    y = c + B.at(-15, purr, c)
+    peak = float(np.abs(c).max())
+    gap = np.zeros(int(0.04 * SR), np.float32)
+    if key in ('select', 'cast1'):
+        y = np.concatenate([B.chirp(0.2, 700, 1100, seed=5) * peak * 0.45, gap, y])
+    if key.startswith('kill') or key == 'cast2':
+        y = np.concatenate([y, gap, B.giggle(seed=6) * peak * 0.5])
+    return y.astype(np.float32)
+
+
+PRE = {'sproutkit': sproutkit_layers, 'goldenmane': goldenmane_layers, 'oldroar': oldroar_layers, 'twofang': twofang_layers, 'windclaw': windclaw_layers,
        'duskstripe': duskstripe_layers, 'rainspots': rainspots_layers, 'nightpelt': nightpelt_layers, 'faryowl': faryowl_layers,
        'suneye': suneye_layers, 'snowhush': snowhush_layers, 'stonewhisper': stonewhisper_layers, 'riptail': riptail_layers,
        'stillsmoke': stillsmoke_layers, 'cometail': cometail_layers}

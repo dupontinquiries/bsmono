@@ -568,6 +568,9 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } => f32::INFINITY,
             Archetype::Pull { radius, .. } => radius + 4.0,
             Archetype::Meteor { range, .. } => range,
+            Archetype::Litter { .. } => crate::kit::SEEK * 1.6,
+            Archetype::Giggle { radius, .. } => radius * 0.85,
+            Archetype::DanceParty { radius, .. } => crate::kit::PARTY_RANGE + radius * 0.5,
         };
         let pri = match ab.arch {
             Archetype::Nova { .. } => {
@@ -594,6 +597,17 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             // a falling star on a fight worth it: a dive on a god
             Archetype::Meteor { .. } => {
                 if engage && is_god_target && dist < range { 0.92 } else { 0.0 }
+            }
+            // the litter on anything in reach; the laugh on a cat close
+            // enough; the party on a fight with a cat in it
+            Archetype::Litter { .. } => {
+                if dist < range { 0.72 } else { 0.0 }
+            }
+            Archetype::Giggle { .. } => {
+                if is_god_target && dist < range { 0.85 } else { 0.0 }
+            }
+            Archetype::DanceParty { .. } => {
+                if is_god_target && dist < range { 0.95 } else { 0.0 }
             }
             Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } => {
                 let hurt = g.hp / g.max_hp;

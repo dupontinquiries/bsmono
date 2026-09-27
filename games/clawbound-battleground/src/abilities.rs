@@ -31,6 +31,11 @@ pub fn cast_timing(ab: &crate::gods::AbilityDef) -> (f32, f32) {
         Archetype::Storm { .. } => (0.55, 0.0),
         // the crouch before the vault
         Archetype::Meteor { .. } => (0.3, 0.3),
+        // the litter tumbles out at once; the laugh is a breath; the ball
+        // takes a moment to rise
+        Archetype::Litter { .. } => (0.12, 0.8),
+        Archetype::Giggle { .. } => (0.2, 0.6),
+        Archetype::DanceParty { .. } => (0.4, 0.0),
     };
     if ab.ult && w > 0.0 {
         ((w * 1.5).max(0.45), 0.0)
@@ -56,6 +61,10 @@ impl Game {
     /// when it FIRES, so an interrupted cast costs nothing.
     pub fn begin_cast(&mut self, gi: usize, slot: u32, aim: Vec3) {
         if self.over.is_some() || self.gods[gi].respawn_t > 0.0 || self.gods[gi].casting.is_some() || self.gods[gi].skyfall.is_some() {
+            return;
+        }
+        // giggling or dancing (`kit`): no casting
+        if !self.kit_free(gi) {
             return;
         }
         let ab = self.def(gi).abilities[slot as usize];
@@ -308,6 +317,22 @@ impl Game {
                 self.events.push(Event::NovaFx { pos: from, radius: 2.5, color: ab.color });
                 self.events.push(Event::RingTelegraph { pos: dest, radius, delay: vault, color: ab.color });
                 self.gods[gi].dash = Some(DashState { from, to: dest, t: 0.0, dur: vault, dmg: 0.0, arc: 16.0, blast: Some((radius, d)) });
+            }
+            Archetype::Litter { count, dmg, speed, life } => {
+                let d = dmg_scale(dmg, ab.power_scale);
+                self.events.push(Event::NovaFx { pos: from, radius: 1.8, color: ab.color });
+                self.litter(gi, dir, count, d, speed, life);
+            }
+            Archetype::Giggle { radius, dmg, secs } => {
+                let d = if dmg > 0.0 { dmg_scale(dmg, ab.power_scale) } else { 0.0 };
+                self.events.push(Event::GiggleFx { pos: from, radius });
+                self.giggle(gi, radius, d, secs);
+            }
+            Archetype::DanceParty { radius, duration, slow, slow_secs } => {
+                let at = Vec3::new(from.x, 0.0, from.z) + dir * dist.min(crate::kit::PARTY_RANGE);
+                let at = Vec3::new(at.x, crate::map::ground_y(at.x, at.z), at.z);
+                self.events.push(Event::StormFx { pos: at, radius, color: ab.color, dur: duration });
+                self.dance_party(gi, at, radius, duration, slow, slow_secs, ab.color);
             }
             Archetype::Blink { dist: dd, dmg } => {
                 let d = if dmg > 0.0 { dmg_scale(dmg, ab.power_scale) } else { 0.0 };

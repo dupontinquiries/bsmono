@@ -50,6 +50,9 @@ CAST = {
     'stillsmoke': ('bm_george', 0.9),
     # a young daredevil: bright, quick
     'cometail': ('am_puck', 1.08),
+    # a kitten god: a young voice, pitched up with its formants in
+    # master_take (sproutkit's chain) until it is small
+    'sproutkit': ('am_liam', 1.1),
 }
 
 

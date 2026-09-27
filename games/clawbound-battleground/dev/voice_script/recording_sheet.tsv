@@ -125,6 +125,15 @@ voice/cometail/kill.1.opus	cometail	Never saw me coming. Nobody does.	light, tea
 voice/cometail/kill.2.opus	cometail	Burned out.	quiet, almost gentle	2	takes down an enemy ancestor
 voice/cometail/death.1.opus	cometail	Just... a shooting star...	fading, wistful	2	falls
 voice/cometail/death.2.opus	cometail	Back... to the sky...	a last breath, looking up	1	falls
+voice/sproutkit/select.opus	sproutkit	Let's play!	bouncing, delighted	4	locked in on the select screen
+voice/sproutkit/cast1.opus	sproutkit	Everybody, go!	calling the litter out, a bounce on 'go'	4	winds up Litter
+voice/sproutkit/cast2.opus	sproutkit	Hee hee hee!	a giggle fit that won't stop	3	winds up Giggle Fit
+voice/sproutkit/cast3.opus	sproutkit	Grow, grow!	soft, sing-song	3	winds up First Spring
+voice/sproutkit/cast4.opus	sproutkit	DANCE PARTY!	a squeal of pure joy	5	winds up Dance Party
+voice/sproutkit/kill.1.opus	sproutkit	Tag, you're out!	teasing	3	takes down an enemy ancestor
+voice/sproutkit/kill.2.opus	sproutkit	Nap time!	a yawn in it	2	takes down an enemy ancestor
+voice/sproutkit/death.1.opus	sproutkit	Not... fair...	a pout	2	falls
+voice/sproutkit/death.2.opus	sproutkit	I'll grow... back...	sleepy, sure of it	1	falls
 narrator/prologue1.opus	narrator	Before any word was written, the world belonged to the clans.	hushed, as if starting an old story	2	the prologue opens, line 1 of 8 (first match of a session)
 narrator/prologue2.opus	narrator	No hand raised a wall. No fire burned but the lightning's.	slow, each sentence its own image	2	the prologue, line 2 of 8
 narrator/prologue3.opus	narrator	From the frozen long-ago to the endless dunes, the great cats kept it.	growing, sweeping	3	the prologue, line 3 of 8

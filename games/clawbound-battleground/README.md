@@ -1,6 +1,6 @@
 # Clawbound — Battleground · Rust + wgpu Microvoxel Edition
 
-A three-map arena for the **fourteen legendary ancestors of Clawbound**,
+A three-map arena for the **fifteen legendary ancestors of Clawbound**,
 built as a native Linux game in Rust + wgpu. No engine, no assets — every
 ancestor, minion, tower, Elder, projectile and ability effect is procedurally
 generated microvoxels: tens of thousands of instanced cubes with baked ambient
@@ -65,13 +65,19 @@ what else is known-but-unresolved.
   it keeps falling, the wind drifts it from the blown stretches into the lee,
   cats bound through drifts ploughing a trench and leave separate prints on
   powder, and blasts throw craters, fire melts it, frost lays more.
-- **14 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
+- **15 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
   Windclaw, Faryowl, Oldroar, Twofang, Suneye, Snowhush, Riptail, Stillsmoke,
   Stonewhisper, Cometail (the star-fallen caracal: Starshot, Meteor Pounce,
-  Flare, and the Falling Star ultimate) — across 5 roles (Warrior / Guardian / Mage / Hunter / Assassin).
+  Flare, and the Falling Star ultimate) and Sproutkit (the ever-young kitten,
+  god of life and youth: **Litter** sends kitten doubles scampering at the
+  nearest enemies to nip them into giggles; **Giggle Fit** sets everyone near
+  laughing -- no attacks, no casts, and their paws wander; **First Spring**
+  heals; the **Dance Party** ultimate hangs a glitter-ball over a fight, and
+  every enemy under it dances -- no attacks or casts, a shuffle -- then drags
+  its paws for 6 s after the music stops; `src/kit.rs`) — across 5 roles (Warrior / Guardian / Mage / Hunter / Assassin).
   Each is a quadruped feline voxel body with a pelt signature (mane, stripes,
   rosettes, saber fangs, antlers, sun disc, ear tufts…) and its crest colour,
-  plus **4 mechanical abilities** (52 total) built from 13 archetype systems.
+  plus **4 mechanical abilities** (60 total) built from 17 archetype systems.
   Clawbound kits are a passive + two techniques + an ultimate; here the passive
   is reforged as a third short-cooldown technique (see `src/gods.rs`).
 - **Dynamic weather** (`src/weather.rs`) — Clear / Overcast / Rain / Storm /
@@ -357,6 +363,7 @@ src/
 ├── map_events.rs  event scheduler + effects; `speed_mul` / `gold_mul` hooks
 ├── wild.rs        heal trees, prey (hare / stag / glowfish), the hunt, Riverblessing
 ├── lift.rs        Starwell's updrafts: pads, rides up to the Aerie and down
+├── kit.rs         Sproutkit's litter (kitten doubles), giggles and dance party
 ├── bosses.rs      the Elder Boar + Storm Drake: pits, AI, rewards, TargetRef::Boss
 ├── disasters.rs   wildfire / tempest / earthquake / flood / tornado + map scars
 ├── audio.rs       acoustics_at(pos) → howl/reverb voicing; WindSynth DSP; cpal shell
