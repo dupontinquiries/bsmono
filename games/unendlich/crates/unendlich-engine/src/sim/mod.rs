@@ -98,6 +98,7 @@ pub mod game_speed;
 pub mod voice_spatial; // r434: pure spatial-voice params (block occlusion + reverb estimate)
 pub mod server_config; // r440: headless server CLI config (pure, tested)
 pub mod current_force; // r442: flow→drift force + erosion potential (pure, tested)
+pub mod cave_air; // breath stages and the torch canary in bad air (cave_biomes.docx)
 pub mod water_sim_core; // r443: pure settle core extracted for testing (water-vs-water, cave-fill, r441 regression)
 pub mod water_react;
 pub mod water_tint; // r459: water surface albedo from temperature/salinity/erosion/depth (pure, tested)
