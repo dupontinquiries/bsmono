@@ -207,11 +207,20 @@ impl PropKind {
         use PropKind::*;
         match self {
             // Trunks — block the post, not the leaves.
-            Pine => Footprint::solid(0.75, 3.0),
-            Oak => Footprint::solid(0.85, 3.0),
-            JungleTree => Footprint::solid(0.90, 4.0),
-            Palm => Footprint::solid(0.55, 4.0),
-            StranglerFig => Footprint::solid(1.10, 4.0),
+            //
+            // Radii are the trunk AS DRAWN, measured off the meshes
+            // (`props::trunk_fit`, held there by
+            // `trunk_collision_is_the_trunk_that_is_drawn`). They were
+            // 0.55-0.9 against drawn trunks of 0.7-1.8, and every mesh sat
+            // half a voxel off its placement: a cat's shoulder went a third
+            // of a metre into the bark on one side and walked round air on
+            // the other. Tops are the trunk's height, not a hip-high 3-4 u:
+            // a leap now stops at a tree instead of sailing through it.
+            Pine => Footprint::solid(1.20, 6.0),
+            Oak => Footprint::solid(1.20, 7.0),
+            JungleTree => Footprint::solid(1.75, 8.4),
+            Palm => Footprint::solid(0.70, 6.0),
+            StranglerFig => Footprint::solid(1.50, 9.6),
             // A stand of stems, not a trunk: you shoulder through it. Hides
             // well, costs a lot of speed (`going`), stops nobody.
             Bamboo => Footprint::cover(0.75, 1.5),
@@ -480,20 +489,29 @@ impl Blockers {
         true
     }
 
-    /// The outer buttress roots of a jungle tree at `(x, z)`.
+    /// The buttress roots of a jungle tree at `(x, z)`.
     ///
     /// Mirrors `props::jungle_tree`: four roots at `variant * 0.9 + 0.4 +
-    /// k * 90°`, boxes three voxels wide at 0.6 u/voxel. Only the outer two
-    /// boxes of each root are low enough (1.8 u) to scramble; the inner three
-    /// are 2.4 u and up and are still ghost geometry — see TODO.md. A
-    /// placement's quarter-turn maps the four directions onto themselves, so
-    /// it does not need to be known here.
+    /// k * 90°`, boxes three voxels wide at 0.6 u/voxel. The outer two
+    /// boxes of each root are low enough (1.8 u) to scramble over, and are
+    /// steps. The inner three stand 2.4-4.8 u, and are walls a cat goes round
+    /// or bounds over (their `top` is the lowest of them, 2.4 u, so a leap
+    /// clears the run); they used to be ghost geometry a cat walked through.
+    /// A placement's quarter-turn maps the four directions onto themselves,
+    /// so it does not need to be known here. Returns the steps added.
     pub fn push_jungle_roots(&mut self, x: f32, z: f32, base_y: f32, variant: i32) -> usize {
         const VOX: f32 = 0.6;
         let mut n = 0;
         for k in 0..4 {
             let a = variant as f32 * 0.9 + k as f32 * std::f32::consts::FRAC_PI_2 + 0.4;
             let (dx, dz) = (a.cos(), a.sin());
+            // boxes i = 0..2: from the trunk's edge out to the third box
+            let (w0, w1) = (2.6 * VOX, 4.9 * VOX);
+            self.push(Blocker {
+                shape: Shape::Segment { x0: x + dx * w0, z0: z + dz * w0, x1: x + dx * w1, z1: z + dz * w1, r: 1.35 * VOX },
+                top: base_y + 4.0 * VOX,
+                cover: Cover::NONE,
+            });
             // boxes i = 3, 4 of the mesh: centres at 6.65 and 8.0 voxels.
             let (r0, r1) = (6.65 * VOX, 8.0 * VOX);
             let shape = Shape::Segment { x0: x + dx * r0, z0: z + dz * r0, x1: x + dx * r1, z1: z + dz * r1, r: 1.5 * VOX };
@@ -502,6 +520,42 @@ impl Blockers {
             self.going.push(crate::going::Rough { shape, mul: 0.82, edge: 0.4, ground: crate::going::Ground::Roots });
         }
         n
+    }
+
+    /// The aerial roots of a strangler fig at `(x, z)`, where they reach
+    /// the ground: six posts round the host trunk, from `props::strangler_fig`
+    /// (root k at `k * 60° + variant * 0.55`, `2.6 + (1 - t) * 5.6 * s`
+    /// voxels out at height fraction t, two voxels wide in x). Between them
+    /// there is room for a cat and not much more: the cage is somewhere to
+    /// worm into, not a wall and not air. `quarter` is the placement's turn
+    /// (six roots do not map onto themselves under 90°). Returns the posts.
+    pub fn push_fig_roots(&mut self, x: f32, z: f32, base_y: f32, variant: i32, s: f32, quarter: u8) -> usize {
+        const VOX: f32 = 0.6;
+        // the posts at cat height: the root between y = 0 and 3 voxels
+        let r = (2.6 + (1.0 - 1.5 / 17.0) * 5.6 * s) * VOX;
+        for k in 0..6 {
+            let a = k as f32 / 6.0 * std::f32::consts::TAU + variant as f32 * 0.55;
+            let (mut px, mut pz) = (a.cos() * r + 0.5 * VOX, a.sin() * r);
+            for _ in 0..(quarter % 4) {
+                (px, pz) = (pz, -px);
+            }
+            self.push(Blocker { shape: Shape::Circle { x: x + px, z: z + pz, r: 0.75 }, top: base_y + 9.6, cover: Cover::NONE });
+        }
+        6
+    }
+
+    /// The two bark poles a vine curtain hangs from (`props::vine_curtain`:
+    /// two voxels square at x = +-4.4 u, 0.55 u/voxel, 13 u tall). The
+    /// curtain between them is cover you slip through; the poles are wood.
+    pub fn push_curtain_poles(&mut self, x: f32, z: f32, base_y: f32, quarter: u8) -> usize {
+        for side in [-1.0f32, 1.0] {
+            let (mut px, mut pz) = (side * 4.4, 0.0f32);
+            for _ in 0..(quarter % 4) {
+                (px, pz) = (pz, -px);
+            }
+            self.push(Blocker { shape: Shape::Circle { x: x + px, z: z + pz, r: 0.62 }, top: base_y + 13.0, cover: Cover::NONE });
+        }
+        2
     }
 
     /// World Y of the highest hump under `(x, z)`, if any. Rounded off
@@ -1043,13 +1097,20 @@ mod tests {
         assert_eq!(b.landing_under(20.0, 0.0, 1.0), None, "not if it is already below the top");
     }
 
-    /// Roots lift paws and move nobody. Both halves matter: the first is
-    /// the feature, the second is the promise that bots path as before.
+    /// The outer roots lift paws and move nobody; the inner, tall ones are
+    /// walls. The first half is the feature, the second the promise that a
+    /// cat on the low root is not shoved off it by the tall one beside it.
     #[test]
-    fn roots_are_climbed_over_and_never_push() {
+    fn low_roots_are_climbed_over_and_tall_ones_are_walls() {
         let mut b = Blockers::new(100.0, 6.0);
         assert_eq!(b.push_jungle_roots(10.0, 10.0, 0.0, 0), 4);
-        assert!(b.is_empty(), "a root is not a blocker");
+        assert_eq!(b.len(), 4, "one wall per root: its tall inner run");
+        // the inner run of root 0, halfway along: a wall at cat height,
+        // and one a leap clears
+        let (ix, iz) = (10.0 + 0.4f32.cos() * 2.3, 10.0 + 0.4f32.sin() * 2.3);
+        assert!(b.blocked(ix, iz, 0.6), "the tall root is solid");
+        assert!(!b.blocked(10.0 + 0.4f32.cos() * 2.3 - 0.4f32.sin() * 1.6, 10.0 + 0.4f32.sin() * 2.3 + 0.4f32.cos() * 1.6, 0.6), "beside it is open");
+        assert!(b.all().iter().all(|r| (2.3..=2.41).contains(&r.top)), "above a scramble, and a bound clears it");
         // variant 0, k 0: direction 0.4 rad, crest between 3.99 and 4.8 u out.
         let (dx, dz) = (0.4f32.cos(), 0.4f32.sin());
         let on = (10.0 + dx * 4.4, 10.0 + dz * 4.4);
@@ -1063,6 +1124,47 @@ mod tests {
         assert_eq!(b.resolve(p, 0.6), p, "standing on a root moves nobody");
         assert!(!b.blocked(on.0, on.1, 0.6));
         assert!(!b.push_step(Shape::Circle { x: 0.0, z: 0.0, r: 1.0 }, 0.0, SCRAMBLE_MAX + 0.1), "too tall to scramble");
+    }
+
+    /// A fig's aerial roots are posts with a cat's width between them, and
+    /// they turn with the tree; a curtain's poles are wood either side of
+    /// the vines.
+    #[test]
+    fn fig_roots_are_a_cage_to_worm_into_and_curtain_poles_are_wood() {
+        use std::f32::consts::TAU;
+        for q in 0..4u8 {
+            let mut b = Blockers::new(100.0, 6.0);
+            assert_eq!(b.push_fig_roots(0.0, 0.0, 0.0, 0, 1.0, q), 6);
+            let posts: Vec<(f32, f32)> = b.all().iter().map(|p| match p.shape { Shape::Circle { x, z, .. } => (x, z), _ => panic!("a post") }).collect();
+            for &(x, z) in &posts {
+                let d = x.hypot(z);
+                assert!((4.3..5.2).contains(&d), "q{q}: a post {d:.2} u out (the mesh's roots reach the ground ~4.6-4.9 u out)");
+                assert!(b.blocked(x, z, 0.6));
+            }
+            // between two neighbouring posts, at the posts' ring: room for a cat
+            let a = posts[0].1.atan2(posts[0].0) + TAU / 12.0;
+            let r = posts[0].0.hypot(posts[0].1);
+            assert!(!b.blocked(a.cos() * r, a.sin() * r, 0.55), "q{q}: no gap to worm through");
+            // inside the cage, beside the trunk: open (the trunk is its own blocker)
+            assert!(!b.blocked(a.cos() * 2.9, a.sin() * 2.9, 0.55), "q{q}: the cage is not solid");
+        }
+        // the posts turn with the tree: quarter 1 is quarter 0 turned (x, z) -> (z, -x)
+        let mut b0 = Blockers::new(100.0, 6.0);
+        let mut b1 = Blockers::new(100.0, 6.0);
+        b0.push_fig_roots(0.0, 0.0, 0.0, 3, 1.1, 0);
+        b1.push_fig_roots(0.0, 0.0, 0.0, 3, 1.1, 1);
+        for (p0, p1) in b0.all().iter().zip(b1.all()) {
+            if let (Shape::Circle { x: x0, z: z0, .. }, Shape::Circle { x: x1, z: z1, .. }) = (p0.shape, p1.shape) {
+                assert!((x1 - z0).abs() < 1e-4 && (z1 + x0).abs() < 1e-4);
+            }
+        }
+        let mut c = Blockers::new(100.0, 6.0);
+        assert_eq!(c.push_curtain_poles(0.0, 0.0, 0.0, 0), 2);
+        assert!(c.blocked(4.4, 0.0, 0.5) && c.blocked(-4.4, 0.0, 0.5), "the poles");
+        assert!(!c.blocked(0.0, 0.0, 0.5), "the vines between them are not");
+        let mut c1 = Blockers::new(100.0, 6.0);
+        c1.push_curtain_poles(0.0, 0.0, 0.0, 1);
+        assert!(c1.blocked(0.0, -4.4, 0.5) && !c1.blocked(4.4, 0.0, 0.5), "turned with the curtain");
     }
 
     /// An arch is a doorway; walling its centre defeats the prop.

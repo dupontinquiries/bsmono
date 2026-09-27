@@ -420,17 +420,27 @@ impl Game {
                     g.leap_cd = crate::leap::LEAP_COOLDOWN * if now - g.last_dmg_t < crate::brawl::WINDED_SECS { crate::brawl::WINDED_COOLDOWN } else { 1.0 };
                 }
             } else if let Some(d) = &mut g.dash {
+                let a0 = (d.t / d.dur).min(1.0);
                 d.t += dt;
                 let a = (d.t / d.dur).min(1.0);
+                // Step along the line from where the cat IS, not set to where
+                // the line says it should be: the resolve below shoves it off
+                // a trunk it dashes into, and setting the position from the
+                // line every tick threw that shove away -- the dash went
+                // straight through the tree. Moved by the step, a dash into
+                // bark slides round it.
+                let step = d.to - d.from;
+                let (x, z) = (g.pos.x + step.x * (a - a0), g.pos.z + step.z * (a - a0));
                 // over the ground the whole way: a straight line up a ramp
                 // went INTO the slope, then snapped up at the end
-                let p = d.from.lerp(d.to, a);
-                let gy = crate::map::ground_y(p.x, p.z);
-                g.pos = Vec3::new(p.x, p.y.max(gy), p.z) + Vec3::Y * (a * (1.0 - a) * 4.0 * d.arc);
+                let line_y = d.from.y + step.y * a;
+                let gy = crate::map::ground_y(x, z);
+                g.pos = Vec3::new(x, line_y.max(gy), z) + Vec3::Y * (a * (1.0 - a) * 4.0 * d.arc);
                 if a >= 1.0 {
-                    let gy = crate::map::ground_y(d.to.x, d.to.z);
-                    g.pos = Vec3::new(d.to.x, d.to.y.max(gy), d.to.z);
-                    dash_ends.push((i, g.team, d.from, d.to, d.dmg, d.blast));
+                    let gy = crate::map::ground_y(x, z);
+                    g.pos = Vec3::new(x, (d.from.y + step.y).max(gy), z);
+                    // the strike runs to where the dash really ended
+                    dash_ends.push((i, g.team, d.from, g.pos, d.dmg, d.blast));
                     g.dash = None;
                 }
                 g.walk_anim += dt * 12.0;
@@ -583,6 +593,7 @@ impl Game {
             self.dash_strikes(gi, team, from, to, dmg, blast);
         }
         // separation
+        let mut shoved = vec![false; self.gods.len()];
         for a in 0..self.gods.len() {
             for b in (a + 1)..self.gods.len() {
                 let (pa, pb) = (self.gods[a].pos, self.gods[b].pos);
@@ -592,7 +603,18 @@ impl Game {
                     let push = d.normalize() * (1.1 - dist) * 0.5;
                     self.gods[a].pos -= push;
                     self.gods[b].pos += push;
+                    shoved[a] = true;
+                    shoved[b] = true;
                 }
+            }
+        }
+        // ...and back out of anything the shove put them into: two cats
+        // meeting beside a trunk pushed one into the bark, where it stayed
+        // until its next step (on the ground only -- a cat in the air is
+        // resolved at its feet above)
+        for (gi, g) in self.gods.iter_mut().enumerate() {
+            if shoved[gi] && g.leap.is_none() && g.dash.is_none() && g.perch.is_none() && g.fall.is_none() {
+                g.pos = self.blockers.resolve(g.pos, GOD_RADIUS);
             }
         }
     }

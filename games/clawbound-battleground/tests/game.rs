@@ -213,6 +213,40 @@ fn xp_curve_monotonic() {
 }
 
 
+/// A dash into a tree trunk goes round it, not through it: the dash used to
+/// set the cat's position from its line every tick, throwing away the
+/// shove the trunk gave it, so a cat dashed straight through the bark.
+#[test]
+fn a_dash_into_a_trunk_goes_round_it() {
+    use clawbound::blockers::{Blockers, PropKind};
+    use clawbound::sim::DashState;
+    use glam::Vec3;
+    let from = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]).gods[0].pos;
+    let to = from + Vec3::new(9.0, 0.0, 0.0);
+    let r = PropKind::JungleTree.footprint().radius + clawbound::consts::GOD_RADIUS;
+    // head on (0.3 u off the trunk's centre line): stopped at the bark;
+    // a glancing line (1.6 u off): shouldered round it and on past
+    for (off, past) in [(0.3f32, false), (1.6, true)] {
+        let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        let tree = from + Vec3::new(4.0, 0.0, off);
+        let mut b = Blockers::new(200.0, 6.0);
+        b.push_prop(PropKind::JungleTree, tree.x, tree.z, 0.0, 1.0);
+        game.blockers = std::sync::Arc::new(b);
+        game.gods[0].pos = from;
+        game.gods[0].dash = Some(DashState { from, to, t: 0.0, dur: 0.4, dmg: 0.0, arc: 0.35, blast: None });
+        let mut closest = f32::MAX;
+        for _ in 0..40 {
+            game.tick(1.0 / 60.0);
+            let p = game.gods[0].pos;
+            closest = closest.min(Vec3::new(p.x - tree.x, 0.0, p.z - tree.z).length());
+        }
+        assert!(game.gods[0].dash.is_none(), "off {off}: the dash ended");
+        assert!(closest >= r - 0.05, "off {off}: the dash went {closest:.2} u from the trunk's centre; the bark is at {r:.2}");
+        let end = game.gods[0].pos.x;
+        assert_eq!(end > tree.x, past, "off {off}: ended at x {end:.2}, the tree at {:.2}", tree.x);
+    }
+}
+
 /// The leap, through the real sim loop: press toward a rock, end up standing
 /// on it; press again toward the next, and the chain skips the cooldown;
 /// walk off, and come back down.

@@ -90,6 +90,13 @@ pub fn cues_for(ev: &Event, game: &Game) -> Vec<Cue> {
         }
         Event::TowerDown { pos, .. } => vec![Cue { keys: vec!["sfx/tower_down".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 6 }],
         Event::LevelUp { pos } => vec![Cue { keys: vec!["sfx/levelup".into()], bus: Bus::Sfx, gain: 0.7, pos: Some(*pos), speaker: None, priority: 3 }],
+        // the big beasts (dev/voice_script/beast_sfx.py, grown from a real
+        // snore): a boss wakes growling where it rises, groans where it
+        // falls, and a titan whose guard is down snorts -- heard map-wide,
+        // like the announcer's line it comes with
+        Event::BossSpawn { pos, .. } => vec![Cue { keys: vec!["sfx/beast/wake".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 6 }],
+        Event::BossDown { pos, .. } => vec![Cue { keys: vec!["sfx/beast/fall".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 6 }],
+        Event::TitanVulnerable { .. } => vec![Cue { keys: vec!["sfx/beast/snort".into()], bus: Bus::Sfx, gain: 0.8, pos: None, speaker: None, priority: 5 }],
         _ => Vec::new(),
     }
 }
@@ -230,6 +237,30 @@ mod tests {
 
     /// Left is left: a sound to the listener's right pans right; far away is
     /// quieter; a far voice line is not spoken; the announcer is everywhere.
+    #[test]
+    fn the_big_beasts_are_heard_waking_falling_and_snorting() {
+        use crate::bosses::BossKind;
+        let g = game();
+        let p = Vec3::new(3.0, 0.0, -4.0);
+        let kind = BossKind::Boar;
+        let one = |ev: Event| {
+            let c = cues_for(&ev, &g);
+            assert_eq!(c.len(), 1, "{ev:?}");
+            c.into_iter().next().unwrap()
+        };
+        let w = one(Event::BossSpawn { kind, pos: p });
+        assert_eq!((w.keys[0].as_str(), w.pos), ("sfx/beast/wake", Some(p)));
+        let f = one(Event::BossDown { kind, pos: p, team: None });
+        assert_eq!((f.keys[0].as_str(), f.pos), ("sfx/beast/fall", Some(p)));
+        let s = one(Event::TitanVulnerable { team: g.gods[0].team });
+        assert_eq!((s.keys[0].as_str(), s.pos), ("sfx/beast/snort", None));
+        // and the files are there to be played
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/audio");
+        for k in [&w, &f, &s] {
+            assert!(dir.join(format!("{}.opus", k.keys[0])).is_file(), "{}", k.keys[0]);
+        }
+    }
+
     #[test]
     fn placement_pans_fades_and_limits_voices() {
         let cue = Cue { keys: vec![], bus: Bus::Sfx, gain: 1.0, pos: Some(Vec3::new(10.0, 0.0, 0.0)), speaker: None, priority: 1 };

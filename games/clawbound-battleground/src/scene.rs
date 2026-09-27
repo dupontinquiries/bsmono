@@ -1116,6 +1116,16 @@ fn jungle_spot(rng: &mut Rng, min_clear: f32) -> Option<(f32, f32)> {
     None
 }
 
+/// The middle band: between the side lanes, either side of the river line
+/// through the pits (`glades`' module doc has the picture).
+pub(crate) const MID_BAND: f32 = 44.0;
+/// Of the scatter that lands in the middle band, the share dropped.
+pub(crate) const MID_THIN: f32 = 0.5;
+
+pub(crate) fn in_mid_band(x: f32, z: f32) -> bool {
+    z.abs() < MID_BAND && x.abs() < 78.0 && x.hypot(z) >= crate::midjungle::HOLLOW_RADIUS
+}
+
 /// May scatter put something at `(x, z)`? Off the lanes, out of the river,
 /// out of the pits, off the authored centre and out of the tower clearings.
 fn jungle_ok(x: f32, z: f32, min_clear: f32) -> bool {
@@ -1126,6 +1136,7 @@ fn jungle_ok(x: f32, z: f32, min_clear: f32) -> bool {
         && consts::river_dist(x, z) > 9.5
         && !crate::bosses::in_pit(x, z)
         && !crate::midjungle::reserved(x, z)
+        && !crate::glades::reserved(x, z)
         && !consts::in_tower_clearing(x, z)
 }
 
@@ -1314,13 +1325,32 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
                 plant!(JungleTree; props::jungle_tree(a.scale, vi), x, z, 0.0, q, V_MED, 1.0);
                 blockers.push_jungle_roots(x, z, 0.0, vi);
             }
-            PropKind::StranglerFig => plant!(StranglerFig; props::strangler_fig(a.scale, vi), x, z, 0.0, q, V_MED, 0.8),
+            PropKind::StranglerFig => {
+                plant!(StranglerFig; props::strangler_fig(a.scale, vi), x, z, 0.0, q, V_MED, 0.8);
+                blockers.push_fig_roots(x, z, 0.0, vi, a.scale, q);
+            }
             PropKind::Palm => plant!(Palm; props::palm(a.scale, vi), x, z, 0.0, q, V_MED, 1.6),
             PropKind::Fern => plant!(Fern; props::fern(vi), x, z, 0.0, 0, V_SM, 2.6),
             PropKind::Bush => plant!(Bush; props::bush(vi), x, z, 0.0, 0, V_SM, 1.8),
             // A kind the layout uses and this match does not build would be
             // a prop that collides and cannot be seen.
             other => panic!("midjungle::layout places {other:?}, which build_world has no mesh arm for"),
+        }
+    }
+
+    // --- the glades: the Rings and the Steps, somewhere for a jungle fight
+    // to happen (`glades`). Before the groves and the scatter, which keep
+    // off them.
+    for (i, a) in crate::glades::layout().into_iter().enumerate() {
+        let (x, z, q, vi) = (a.x, a.z, a.quarter, 700 + i as i32);
+        match a.kind {
+            PropKind::Rock => put!(Rock; props::rock(a.scale), x, z, 0.0, q, V_MED),
+            PropKind::BoulderCluster => put!(BoulderCluster; props::boulder_cluster(a.scale, vi), x, z, 0.0, q, V_MED),
+            PropKind::RuinPillar => put!(RuinPillar; props::ruin_pillar(a.scale, vi), x, z, 0.0, q, V_MED),
+            PropKind::RuinWall => put!(RuinWall; props::ruin_wall(a.scale, vi), x, z, 0.0, q, V_MED),
+            PropKind::Fern => plant!(Fern; props::fern(vi), x, z, 0.0, 0, V_SM, 2.6),
+            PropKind::Bush => plant!(Bush; props::bush(vi), x, z, 0.0, 0, V_MED, 1.8),
+            other => panic!("glades::layout places {other:?}, which build_world has no mesh arm for"),
         }
     }
 
@@ -1347,7 +1377,10 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
                     plant!(JungleTree; props::jungle_tree(sc, v), x, z, 0.0, q, V_MED, 1.0);
                     blockers.push_jungle_roots(x, z, 0.0, v);
                 }
-                PropKind::StranglerFig => plant!(StranglerFig; props::strangler_fig(sc, v), x, z, 0.0, q, V_MED, 0.8),
+                PropKind::StranglerFig => {
+                    plant!(StranglerFig; props::strangler_fig(sc, v), x, z, 0.0, q, V_MED, 0.8);
+                    blockers.push_fig_roots(x, z, 0.0, v, sc, q);
+                }
                 PropKind::Bamboo => plant!(Bamboo; props::bamboo(sc, v), x, z, 0.0, q, V_MED, 2.2),
                 PropKind::Bush => plant!(Bush; props::bush(v), x, z, 0.0, 0, V_MED, 1.8),
                 PropKind::Fern => plant!(Fern; props::fern(v), x, z, 0.0, 0, V_SM, 2.6),
@@ -1359,10 +1392,20 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
 
     // Every scatter pass below goes through this: `jungle_spot`, minus the
     // grove beds.
+    //
+    // ...and thinned in the middle band. A plot of the blockers showed the
+    // band either side of mid (|z| < MID_BAND) as an even speckle of
+    // trunks, rocks and beds: everywhere a little in the way, nowhere a
+    // shape to fight round -- reported as clutter. Half of what lands there
+    // is dropped (not moved: moved, it would crowd the deep jungle instead),
+    // and the fights get authored shapes instead (`glades`).
     let jungle_spot = |rng: &mut Rng, min_clear: f32| -> Option<(f32, f32)> {
         for _ in 0..8 {
             let (x, z) = jungle_spot(rng, min_clear)?;
             if !rooms.iter().any(|&(gx, gz, r)| (x - gx).hypot(z - gz) < r) {
+                if in_mid_band(x, z) && rng.f32() < MID_THIN {
+                    return None;
+                }
                 return Some((x, z));
             }
         }
@@ -1385,7 +1428,9 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
     }
     for _ in 0..16 {
         if let Some((x, z)) = jungle_spot(&mut rng, 9.0) {
-            plant!(StranglerFig; props::strangler_fig(0.9 + rng.f32() * 0.25, v), x, z, 0.0, (v % 4) as u8, V_MED, 0.8);
+            let sc = 0.9 + rng.f32() * 0.25;
+            plant!(StranglerFig; props::strangler_fig(sc, v), x, z, 0.0, (v % 4) as u8, V_MED, 0.8);
+            blockers.push_fig_roots(x, z, 0.0, v, sc, (v % 4) as u8);
         }
         v += 1;
     }
@@ -1460,6 +1505,7 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
     for _ in 0..54 {
         if let Some((x, z)) = jungle_spot(&mut rng, 6.5) {
             plant!(VineCurtain; props::vine_curtain(v), x, z, 0.0, (v % 4) as u8, V_MED, 2.4);
+            blockers.push_curtain_poles(x, z, 0.0, (v % 4) as u8);
         }
         v += 1;
     }
@@ -1503,6 +1549,15 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
         let r = 30.0 + rng.f32() * (ARENA_RADIUS - 50.0);
         let (x, z) = (a.cos() * r, a.sin() * r);
         if consts::lane_clearance(x, z) < 17.0 || consts::river_dist(x, z) < 14.0 {
+            continue;
+        }
+        // a camp is ~9 u across: nowhere near the authored ground, a
+        // tower's, or a pit (none of which it was checked against)
+        let near = |f: &dyn Fn(f32, f32) -> bool| (0..8).any(|k| {
+            let a = k as f32 / 8.0 * TAU;
+            f(x + a.cos() * 9.0, z + a.sin() * 9.0)
+        }) || f(x, z);
+        if near(&|x, z| crate::midjungle::reserved(x, z) || crate::glades::reserved(x, z) || consts::in_tower_clearing(x, z) || crate::bosses::in_pit(x, z)) {
             continue;
         }
         if camps.iter().any(|(cx, cz)| ((cx - x).powi(2) + (cz - z).powi(2)).sqrt() < 34.0) {
@@ -1766,6 +1821,57 @@ mod plan_tests {
         assert!(b.steps().len() > 224, "the screen's jungle trees brought their roots: {}", b.steps().len());
     }
 
+    /// The glades are what stands on their ground: every round prop inside
+    /// a Ring's clearing or along the Steps is one of theirs (the scatter
+    /// and the groves were kept off), and the middle band holds less
+    /// scatter than the same area of deep jungle (`MID_THIN`).
+    #[test]
+    fn scatter_leaves_the_glades_alone_and_thins_the_middle() {
+        use crate::blockers::Shape;
+        let (_, _, b) = build_world();
+        let glade = crate::glades::layout();
+        let mut inside = 0;
+        for bl in b.all() {
+            if let Shape::Circle { x, z, .. } = bl.shape {
+                // (the pit's own ring of boulders is where the Steps lead)
+                let pit_ring = crate::bosses::pit_positions().iter().any(|p| (p.x - x).hypot(p.z - z) < crate::bosses::PIT_RADIUS + 3.0);
+                if crate::glades::reserved(x, z) && !pit_ring {
+                    inside += 1;
+                    assert!(glade.iter().any(|p| (p.x - x).hypot(p.z - z) < 0.3), "a scattered prop at ({x:.1}, {z:.1}) on a glade's ground");
+                }
+            }
+        }
+        assert!(inside >= 20, "the glades' own props were found on their ground: {inside}");
+        // props per 1000 u^2, middle band against the jungle band beyond it
+        // (40..75 u from the centre line on each side, off the band), both
+        // outside anything authored
+        let density = |f: &dyn Fn(f32, f32) -> bool| {
+            let (mut n, mut area) = (0usize, 0usize);
+            let mut z = -160.0f32;
+            while z < 160.0 {
+                let mut x = -160.0f32;
+                while x < 160.0 {
+                    if f(x, z) && jungle_ok(x, z, 5.0) {
+                        area += 1;
+                    }
+                    x += 2.0;
+                }
+                z += 2.0;
+            }
+            for bl in b.all() {
+                if let Shape::Circle { x, z, .. } = bl.shape {
+                    if f(x, z) && jungle_ok(x, z, 5.0) {
+                        n += 1;
+                    }
+                }
+            }
+            n as f32 / (area as f32 * 4.0) * 1000.0
+        };
+        let mid = density(&|x, z| in_mid_band(x, z));
+        let deep = density(&|x, z| !in_mid_band(x, z) && x.hypot(z) < ARENA_RADIUS - 10.0 && x.hypot(z) > 60.0);
+        assert!(mid > 0.0 && mid < deep * 0.8, "middle {mid:.2} props / 1000 u^2 against {deep:.2} in the deep jungle");
+    }
+
     /// The performance claim, measured on the REAL world rather than argued:
     /// how many instances the static world uploads. Floors on both sides --
     /// a big drop, and not so big that visible surface went with it.
@@ -1935,3 +2041,4 @@ pub fn switch_world(r: &mut Renderer, old: Option<Scene>, m: crate::map::MapId) 
     }
     Scene::new(r)
 }
+

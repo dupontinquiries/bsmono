@@ -13,23 +13,26 @@ fn mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 
 pub fn pine(s: f32) -> VoxelMesh {
     let mut g = Grid::new(12, 26, 12);
-    let c = 6;
-    g.cyl_y(c as f32, c as f32, 1.6, 0, 5, solid([0.36, 0.26, 0.16]));
+    // cell 6's centre is half a voxel off the mesh origin (`Grid::mesh`
+    // centres on the grid's edge, nx / 2): a trunk at 5.5 is drawn round
+    // the point its collision is placed at
+    let c = 5.5;
+    g.cyl_y(c, c, 1.6, 0, 5, solid([0.36, 0.26, 0.16]));
     let leaf = [0.14, 0.38, 0.20];
     let leaf2 = [0.10, 0.30, 0.16];
-    g.cone_y(c as f32, c as f32, 5.0 * s, 1.2, 4, 11, solid(leaf));
-    g.cone_y(c as f32, c as f32, 4.2 * s, 1.0, 10, 17, solid(leaf2));
-    g.cone_y(c as f32, c as f32, 3.2 * s, 0.6, 16, 23, solid(leaf));
+    g.cone_y(c, c, 5.0 * s, 1.2, 4, 11, solid(leaf));
+    g.cone_y(c, c, 4.2 * s, 1.0, 10, 17, solid(leaf2));
+    g.cone_y(c, c, 3.2 * s, 0.6, 16, 23, solid(leaf));
     g.mesh(0.6, true)
 }
 
 pub fn oak(s: f32) -> VoxelMesh {
     let mut g = Grid::new(16, 22, 16);
-    let c = 8;
-    g.cyl_y(c as f32, c as f32, 1.8, 0, 8, solid([0.4, 0.29, 0.18]));
-    g.ellipsoid(c as f32, 13.0, c as f32, 6.5 * s, 4.6 * s, 6.5 * s, solid([0.22, 0.45, 0.18]));
-    g.ellipsoid((c - 3) as f32, 11.0, (c + 2) as f32, 4.0 * s, 3.0 * s, 4.0 * s, solid([0.16, 0.38, 0.14]));
-    g.ellipsoid((c + 3) as f32, 12.0, (c - 2) as f32, 3.6 * s, 2.8 * s, 3.6 * s, solid([0.26, 0.50, 0.20]));
+    let c = 7.5; // centred on the mesh origin: see `pine`
+    g.cyl_y(c, c, 1.8, 0, 8, solid([0.4, 0.29, 0.18]));
+    g.ellipsoid(c, 13.0, c, 6.5 * s, 4.6 * s, 6.5 * s, solid([0.22, 0.45, 0.18]));
+    g.ellipsoid(c - 3.0, 11.0, c + 2.0, 4.0 * s, 3.0 * s, 4.0 * s, solid([0.16, 0.38, 0.14]));
+    g.ellipsoid(c + 3.0, 12.0, c - 2.0, 3.6 * s, 2.8 * s, 3.6 * s, solid([0.26, 0.50, 0.20]));
     g.mesh(0.6, true)
 }
 
@@ -191,7 +194,7 @@ const STONE_D: [f32; 3] = [0.28, 0.275, 0.26];
 /// variant picks canopy shape/vine layout deterministically.
 pub fn jungle_tree(s: f32, variant: i32) -> VoxelMesh {
     let mut g = Grid::new(22, 26, 22);
-    let c = 11.0;
+    let c = 10.5; // centred on the mesh origin: see `pine`
     let bark = [0.30, 0.215, 0.125];
     let bark_d = [0.24, 0.17, 0.10];
     // trunk
@@ -205,8 +208,8 @@ pub fn jungle_tree(s: f32, variant: i32) -> VoxelMesh {
         for i in 0..5 {
             let r = 2.6 + i as f32 * 1.35;
             let h = (7 - i * 2).max(2);
-            let x = (c + dx * r) as i32;
-            let z = (c + dz * r) as i32;
+            let x = (c + dx * r).round() as i32;
+            let z = (c + dz * r).round() as i32;
             g.filled_box(x - 1, 0, z - 1, x + 1, h, z + 1, solid(bark_d));
         }
         // moss collar at the root base
@@ -247,7 +250,8 @@ pub fn palm(s: f32, variant: i32) -> VoxelMesh {
     for y in 0..19 {
         let t = y as f32 / 19.0;
         let x = c + bend * t * t * 3.2;
-        g.filled_box(x as i32 - 1, y, c as i32 - 1, x as i32, y + 1, c as i32, solid([0.42, 0.31, 0.18]));
+        let xi = x.round() as i32; // rounded, not truncated: a palm leaning -x started half a voxel off
+        g.filled_box(xi - 1, y, c as i32 - 1, xi, y + 1, c as i32, solid([0.42, 0.31, 0.18]));
     }
     let top_x = c + bend * 3.2;
     let top_y = 19;
@@ -274,7 +278,7 @@ pub fn palm(s: f32, variant: i32) -> VoxelMesh {
 /// Strangler fig: host trunk wrapped in aerial roots under a wide flat canopy.
 pub fn strangler_fig(s: f32, variant: i32) -> VoxelMesh {
     let mut g = Grid::new(26, 28, 26);
-    let c = 13.0;
+    let c = 12.5; // centred on the mesh origin: see `pine`
     let bark = [0.27, 0.20, 0.13];
     // host trunk
     g.cyl_y(c, c, 2.4, 0, 16, solid(bark));
@@ -284,8 +288,8 @@ pub fn strangler_fig(s: f32, variant: i32) -> VoxelMesh {
         for y in 0..17 {
             let t = y as f32 / 17.0;
             let r = 2.6 + (1.0 - t) * 5.6 * s;
-            let x = (c + a.cos() * r) as i32;
-            let z = (c + a.sin() * r) as i32;
+            let x = (c + a.cos() * r).round() as i32;
+            let z = (c + a.sin() * r).round() as i32;
             g.set(x, y, z, solid(bark));
             g.set(x + 1, y, z, solid([0.23, 0.17, 0.11]));
         }
@@ -1235,4 +1239,61 @@ pub fn diorama(kind: u8, variant: i32) -> VoxelMesh {
         }
     }
     m
+}
+
+/// Where a trunk is drawn, measured off its mesh: the voxels whose centres
+/// lie between `lo` and `hi` above the feet and within `within` of the
+/// placement origin (so neither roots nor canopy count). Returns the
+/// centre of that band and its radius to the voxels' outer faces. The
+/// collision a trunk gets (`blockers::PropKind::footprint`) is held to
+/// this by `tests::trunk_collision_is_the_trunk_that_is_drawn`.
+#[cfg(test)]
+pub(crate) fn trunk_fit(m: &VoxelMesh, lo: f32, hi: f32, within: f32) -> (f32, f32, f32) {
+    let pts: Vec<(f32, f32)> = m
+        .inst
+        .iter()
+        .map(|v| v.off_ao)
+        .filter(|o| o[1] >= lo && o[1] <= hi && o[0].hypot(o[2]) < within)
+        .map(|o| (o[0], o[2]))
+        .collect();
+    assert!(pts.len() >= 8, "trunk band {lo}..{hi} caught only {} voxels", pts.len());
+    let n = pts.len() as f32;
+    let (cx, cz) = pts.iter().fold((0.0, 0.0), |a, p| (a.0 + p.0 / n, a.1 + p.1 / n));
+    // the outer face of a voxel is half a voxel (0.3 u) past its centre
+    let r = pts.iter().map(|p| (p.0 - cx).hypot(p.1 - cz)).fold(0.0f32, f32::max) + 0.3;
+    (cx, cz, r)
+}
+
+#[cfg(test)]
+mod trunk_tests {
+    use super::*;
+
+    /// Each tree's collision is the trunk it draws: centred on it (every
+    /// mesh sat half a voxel, 0.42 u, off its blocker) and within 10% of
+    /// its radius (they were 0.55-0.9 against 0.7-1.8 drawn), for every
+    /// variant and the scales the scene uses.
+    #[test]
+    fn trunk_collision_is_the_trunk_that_is_drawn() {
+        use crate::blockers::PropKind;
+        let mut checked = 0;
+        for v in 0..4 {
+            for sc in [0.85f32, 1.0, 1.2] {
+                for (kind, m, lo, hi, w) in [
+                    (PropKind::JungleTree, jungle_tree(sc, v), 4.9, 5.5, 2.4),
+                    (PropKind::StranglerFig, strangler_fig(sc, v), 5.0, 6.5, 1.9),
+                    (PropKind::Pine, pine(sc), 0.3, 2.2, 1.6),
+                    (PropKind::Oak, oak(sc), 0.3, 4.0, 1.8),
+                    (PropKind::Palm, palm(sc, v), 0.3, 1.5, 1.2),
+                ] {
+                    let (x, z, r) = trunk_fit(&m, lo, hi, w);
+                    let f = kind.footprint();
+                    assert!(x.hypot(z) < 0.1, "{kind:?} v{v} s{sc}: trunk drawn at ({x:.2}, {z:.2}), collision at the origin");
+                    assert!((0.9 * r..=1.02 * r).contains(&f.radius), "{kind:?} v{v} s{sc}: drawn r {r:.2}, collision r {}", f.radius);
+                    assert!(f.top >= 6.0, "{kind:?}: a trunk {} u tall is one a leap sails through", f.top);
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 60);
+    }
 }
