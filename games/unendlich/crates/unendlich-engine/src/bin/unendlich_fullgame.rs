@@ -2969,6 +2969,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     };
     let mut view_pin: Option<[f32; 5]> =
         std::env::var("UNENDLICH_VIEW").ok().and_then(|v| parse_view_pin(&v));
+    // UNENDLICH_PLACE=<path>: a file of `x,y,z,block` lines (block by its id name,
+    // e.g. `torch`, `lava`, `air`); whenever the file changes, its lines are applied
+    // with set_block. For soaks that need a torch in a cave or a hole in a wall.
+    let place_file: Option<String> = std::env::var("UNENDLICH_PLACE").ok();
+    let mut place_file_seen: Option<std::time::SystemTime> = None;
     // r534: third-person / cinematic camera-distance zoom (+/- keys). 1.0 = default
     // pull-back; clamped so the camera can't clip into the player or fly too far.
     let mut cam_zoom: f32 = 1.0;
@@ -3351,6 +3356,22 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let water_trace = std::env::var("UNENDLICH_WATER_TRACE").map_or(false, |v| v == "1");
     // Lava flows by default (UNENDLICH_LAVA_FLOW=0 freezes it as before), every third water tick.
     let lava_flow_enabled = std::env::var("UNENDLICH_LAVA_FLOW").map_or(true, |v| v != "0");
+    // Sky + block light (world::light_volume): caves go dark, torches, lava, glow
+    // crystal and glowshrooms light them. UNENDLICH_BLOCK_LIGHT=0 keeps the old
+    // everywhere-outdoor light; UNENDLICH_LIGHT_TRACE=1 logs the loop once a second.
+    let block_light_enabled = std::env::var("UNENDLICH_BLOCK_LIGHT").map_or(true, |v| v != "0");
+    let light_trace = std::env::var("UNENDLICH_LIGHT_TRACE").map_or(false, |v| v == "1");
+    // UNENDLICH_LIGHT_DEBUG=1 shows the light inputs (sky, normals), =2 the final colour
+    // (NaN, sky, brightness) instead of the scene.
+    let light_debug: u8 = std::env::var("UNENDLICH_LIGHT_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // UNENDLICH_LIGHT_AUDIT=<secs>: every <secs>, relight the whole window from the
+    // world as it is and log any chunk whose stored light is stale (a change the
+    // loop missed). Slow; a diagnostic.
+    let light_audit_secs: Option<f32> =
+        std::env::var("UNENDLICH_LIGHT_AUDIT").ok().and_then(|v| v.parse().ok());
+    let mut light_audit_last = std::time::Instant::now();
+    let mut light_sys = unendlich_engine::world::light_volume::LightVolumeSys::new();
+    let mut light_trace_last = std::time::Instant::now();
     let mut lava_tick: u32 = 0;
     // r637: DEFAULT ON. Water lateral spread (settle toward level) was gated off since
     // r539 for perf; the operator wants water to flow to the sides, so it's on by default now.
@@ -13159,6 +13180,30 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             if let Some(path) = view_pin_file.as_ref() {
                 view_pin = std::fs::read_to_string(path).ok().and_then(|v| parse_view_pin(&v));
             }
+            if let Some(path) = place_file.as_ref() {
+                let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+                if mtime.is_some() && mtime != place_file_seen {
+                    place_file_seen = mtime;
+                    let text = std::fs::read_to_string(path).unwrap_or_default();
+                    for line in text.lines() {
+                        let f: Vec<&str> = line.split(',').map(|x| x.trim()).collect();
+                        if f.len() != 4 {
+                            continue;
+                        }
+                        let (Ok(x), Ok(y), Ok(z)) = (f[0].parse::<i32>(), f[1].parse::<i32>(), f[2].parse::<i32>()) else {
+                            continue;
+                        };
+                        let b = if f[3] == "air" { Some(BlockId::Air) } else { BlockId::from_id_str(f[3]) };
+                        match b {
+                            Some(b) => {
+                                let ok = chunk_manager.set_block(x, y, z, b);
+                                log::info!("[place] {:?} at ({x},{y},{z}): {}", b, if ok { "set" } else { "chunk not loaded" });
+                            }
+                            None => log::warn!("[place] unknown block '{}'", f[3]),
+                        }
+                    }
+                }
+            }
             if let (Some(v), None) = (view_pin, body.as_ref()) {
                 local_player.view.position.x = v[0];
                 local_player.view.position.y = v[1];
@@ -16912,6 +16957,81 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 if submerged { 1.0 } else { 0.0 },
                 start.elapsed().as_secs_f32(),
             );
+        }
+        if block_light_enabled {
+            let e = local_player.view.position;
+            let cs = unendlich_engine::constants::CHUNK_SIZE;
+            let pc = [
+                (e.x.floor() as i32).div_euclid(cs),
+                (e.y.floor() as i32).div_euclid(cs),
+                (e.z.floor() as i32).div_euclid(cs),
+            ];
+            let ups = light_sys.tick(pc, &|c| chunk_manager.get_chunk(c));
+            if !ups.is_empty() {
+                renderer.queue_light_uploads(ups);
+            }
+            if let Some(w) = light_sys.window() {
+                renderer.set_light_debug(light_debug);
+                renderer.set_light_volume(w.origin_blocks(), true);
+            }
+            if let Some(secs) = light_audit_secs {
+                if light_audit_last.elapsed().as_secs_f32() >= secs && light_sys.stats.dirty == 0 && light_sys.stats.in_flight == 0 {
+                    light_audit_last = std::time::Instant::now();
+                    let bad = light_sys.audit(&|c| chunk_manager.get_chunk(c));
+                    log::info!("light audit: {} stale chunk(s) {:?}", bad.len(), bad);
+                }
+            }
+            if light_trace && light_trace_last.elapsed().as_secs_f32() >= 1.0 {
+                light_trace_last = std::time::Instant::now();
+                let (pending, uploaded) = renderer.light_upload_stats();
+                let st = light_sys.stats;
+                // What the view is pointed at, and the light in the cells around it.
+                let cf = local_player.forward();
+                let probe = chunk_manager
+                    .raycast_octree([e.x, e.y, e.z], [cf.x, cf.y, cf.z], 160.0, |b| b.is_solid())
+                    .map(|hit| {
+                        let (hx, hy, hz) = hit.world_cell;
+                        let around: Vec<String> = [[0, 1, 0], [0, -1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]]
+                            .iter()
+                            .map(|d| {
+                                let w = [hx + d[0], hy + d[1], hz + d[2]];
+                                format!("{:?}", light_sys.light_at(w))
+                            })
+                            .collect();
+                        let above = [hx, hy + 1, hz];
+                        let cs = unendlich_engine::constants::CHUNK_SIZE;
+                        let ac = [above[0].div_euclid(cs), above[1].div_euclid(cs), above[2].div_euclid(cs)];
+                        let tx = unendlich_engine::world::light_volume::chunk_texel_origin(ac);
+                        format!(
+                            "{:?} ({},{},{}) around[+y,-y,+x,-x,+z,-z] {} | box {:?} of chunk {:?} holds {:?} cpu {:?}",
+                            hit.block, hx, hy, hz, around.join(" "), tx, ac, renderer.light_box_owner(tx), light_sys.lit_hash(ac)
+                        )
+                    })
+                    .unwrap_or_else(|| "nothing".into());
+                // Does every box on the GPU hold what the CPU thinks it holds?
+                let mut stale: Vec<([i32; 3], Option<[i32; 3]>)> = Vec::new();
+                if let Some(w) = light_sys.window() {
+                    let unlit = unendlich_engine::world::light_volume::box_hash(
+                        &unendlich_engine::world::light_volume::unlit_box(),
+                    );
+                    for c in w.chunks() {
+                        let tx = unendlich_engine::world::light_volume::chunk_texel_origin(c);
+                        let want = light_sys.lit_hash(c).unwrap_or(unlit);
+                        match renderer.light_box_owner(tx) {
+                            Some((oc, h)) if oc == c && h == want => {}
+                            other => stale.push((c, other.map(|o| o.0))),
+                        }
+                    }
+                }
+                log::info!(
+                    "light: gpu boxes stale {}: {:?}",
+                    stale.len(), &stale[..stale.len().min(8)]
+                );
+                log::info!(
+                    "light: window {:?} dirty {} in_flight {} relit {} ignored {} moves {} uploads pending {} done {} | aim {}",
+                    light_sys.window().map(|w| w.min), st.dirty, st.in_flight, st.relit, st.ignored, st.window_moves, pending, uploaded, probe
+                );
+            }
         }
         // r598: ROAMER SANITY SWEEP — the wild-chunk producer hunt points at
         // an entity position going non-finite during the menu-phase ecosystem
