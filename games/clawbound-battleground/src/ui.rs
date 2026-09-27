@@ -738,6 +738,27 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
         });
     }
 
+    // the Quarry's tablets (`geartooth`): standing at one, the player's cat
+    // reads it -- the carving, the clans' reading, and what it shows of the
+    // tongue
+    if crate::map::active() == crate::map::MapId::Maze && g.respawn_t <= 0.0 {
+        static TABS: std::sync::OnceLock<Vec<(Vec3, usize)>> = std::sync::OnceLock::new();
+        let tabs = TABS.get_or_init(crate::mazeworld::tablets);
+        if let Some(k) = crate::mazeworld::tablet_near(tabs, g.pos) {
+            let tb = &crate::geartooth::TABLETS[k];
+            egui::Area::new(egui::Id::new("gt_tablet")).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -150.0]).show(ctx, |ui| {
+                let (r, _) = ui.allocate_exact_size(Vec2::new(460.0, 92.0), Sense::hover());
+                let p = ui.painter();
+                p.rect_filled(r, 6.0, Color32::from_rgba_premultiplied(26, 22, 18, 215));
+                p.rect_stroke(r, 6.0, Stroke::new(1.5_f32, Color32::from_rgb(170, 125, 60)));
+                p.text(r.center_top() + Vec2::new(0.0, 12.0), Align2::CENTER_CENTER, "A GEARTOOTH TABLET", FontId::proportional(11.0), Color32::from_rgb(170, 125, 60));
+                p.text(r.center_top() + Vec2::new(0.0, 34.0), Align2::CENTER_CENTER, tb.gt.to_uppercase(), FontId::proportional(20.0), Color32::from_rgb(235, 215, 170));
+                p.text(r.center_top() + Vec2::new(0.0, 58.0), Align2::CENTER_CENTER, tb.reading, FontId::proportional(14.0), Color32::from_rgb(220, 220, 215));
+                p.text(r.center_top() + Vec2::new(0.0, 78.0), Align2::CENTER_CENTER, tb.teaches, FontId::proportional(12.0), Color32::from_rgb(160, 160, 150));
+            });
+        }
+    }
+
     // sky + map-event chip (top centre)
     {
         let wk = game.weather.kind.name();

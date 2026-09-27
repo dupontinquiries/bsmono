@@ -412,7 +412,7 @@ fn pads_of(p: usize, laid: &[Pad]) -> Vec<Pad> {
     let f = mz::floor();
     let pair = &pairs()[p];
     let tr = &pair[0];
-    let items: Vec<Vec3> = crate::mazeworld::placements()
+    let items: Vec<Vec3> = crate::mazeworld::placements_without_tablets()
         .into_iter()
         .filter(|i| !matches!(i, crate::mazeworld::Item::Screw { .. }))
         .flat_map(|i| match i {
