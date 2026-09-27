@@ -1314,7 +1314,10 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
                 plant!(JungleTree; props::jungle_tree(a.scale, vi), x, z, 0.0, q, V_MED, 1.0);
                 blockers.push_jungle_roots(x, z, 0.0, vi);
             }
-            PropKind::StranglerFig => plant!(StranglerFig; props::strangler_fig(a.scale, vi), x, z, 0.0, q, V_MED, 0.8),
+            PropKind::StranglerFig => {
+                plant!(StranglerFig; props::strangler_fig(a.scale, vi), x, z, 0.0, q, V_MED, 0.8);
+                blockers.push_fig_roots(x, z, 0.0, vi, a.scale, q);
+            }
             PropKind::Palm => plant!(Palm; props::palm(a.scale, vi), x, z, 0.0, q, V_MED, 1.6),
             PropKind::Fern => plant!(Fern; props::fern(vi), x, z, 0.0, 0, V_SM, 2.6),
             PropKind::Bush => plant!(Bush; props::bush(vi), x, z, 0.0, 0, V_SM, 1.8),
@@ -1347,7 +1350,10 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
                     plant!(JungleTree; props::jungle_tree(sc, v), x, z, 0.0, q, V_MED, 1.0);
                     blockers.push_jungle_roots(x, z, 0.0, v);
                 }
-                PropKind::StranglerFig => plant!(StranglerFig; props::strangler_fig(sc, v), x, z, 0.0, q, V_MED, 0.8),
+                PropKind::StranglerFig => {
+                    plant!(StranglerFig; props::strangler_fig(sc, v), x, z, 0.0, q, V_MED, 0.8);
+                    blockers.push_fig_roots(x, z, 0.0, v, sc, q);
+                }
                 PropKind::Bamboo => plant!(Bamboo; props::bamboo(sc, v), x, z, 0.0, q, V_MED, 2.2),
                 PropKind::Bush => plant!(Bush; props::bush(v), x, z, 0.0, 0, V_MED, 1.8),
                 PropKind::Fern => plant!(Fern; props::fern(v), x, z, 0.0, 0, V_SM, 2.6),
@@ -1385,7 +1391,9 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
     }
     for _ in 0..16 {
         if let Some((x, z)) = jungle_spot(&mut rng, 9.0) {
-            plant!(StranglerFig; props::strangler_fig(0.9 + rng.f32() * 0.25, v), x, z, 0.0, (v % 4) as u8, V_MED, 0.8);
+            let sc = 0.9 + rng.f32() * 0.25;
+            plant!(StranglerFig; props::strangler_fig(sc, v), x, z, 0.0, (v % 4) as u8, V_MED, 0.8);
+            blockers.push_fig_roots(x, z, 0.0, v, sc, (v % 4) as u8);
         }
         v += 1;
     }
@@ -1460,6 +1468,7 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
     for _ in 0..54 {
         if let Some((x, z)) = jungle_spot(&mut rng, 6.5) {
             plant!(VineCurtain; props::vine_curtain(v), x, z, 0.0, (v % 4) as u8, V_MED, 2.4);
+            blockers.push_curtain_poles(x, z, 0.0, (v % 4) as u8);
         }
         v += 1;
     }
