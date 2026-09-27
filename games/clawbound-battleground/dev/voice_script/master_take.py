@@ -47,33 +47,56 @@ CLEAN = f"highpass=f=75,adeclick,arnndn=m={RNN}:mix=0.85,afftdn=nr=8:nf=-60"
 # smaller shifts and lets them follow for Oldroar's, so he sounds bigger,
 # not just lower.
 CHAINS = {
- # warm, commanding baritone: a touch lower, chest and presence, a hall
+ # warm, commanding baritone: a touch lower; a clean low-mid boom under it
+ # (thunder, not grit -- no saturation anywhere in this chain); a three-voice
+ # chorus for the pride behind him; presence; a hall
  'goldenmane': "rubberband=pitch=0.944:formant=preserved,"
-               "equalizer=f=180:t=q:w=0.9:g=3,equalizer=f=2800:t=q:w=1.2:g=2.5,equalizer=f=420:t=q:w=1.5:g=-2,"
-               "acompressor=threshold=-24dB:ratio=3:attack=8:release=120:makeup=2,"
+               "equalizer=f=110:t=q:w=0.8:g=4,equalizer=f=200:t=q:w=0.9:g=3.5,equalizer=f=450:t=q:w=1.4:g=-2.5,"
+               "equalizer=f=2800:t=q:w=1.2:g=2.5,"
+               "chorus=0.7:0.9:22|37|53:0.35|0.3|0.25:0.23|0.37|0.51:1.6|2.1|2.6,"
+               "acompressor=threshold=-24dB:ratio=3:attack=10:release=150:makeup=2,"
                "aecho=0.8:0.55:38|71:0.22|0.14",
- # vast, slow, gravelly: down a major third with the formants, slowed,
- # sub and grit, a cave
+ # vast, slow, gravelly: down a major third with the formants, slowed; a
+ # deep sub under the voice; the grit kept low in the spectrum and the top
+ # rolled off after it (the saturation's harmonics were the fizz up top)
  'oldroar':    "rubberband=pitch=0.84:tempo=0.94:formant=shifted,"
-               "asubboost=dry=1:wet=0.5:decay=0.5:feedback=0.4:cutoff=100,"
-               "equalizer=f=90:t=q:w=1:g=3.5,equalizer=f=2200:t=q:w=1.2:g=2,lowpass=f=8000,"
-               "asoftclip=type=tanh:threshold=0.75:output=1,"
+               "asubboost=dry=1:wet=0.9:decay=0.6:feedback=0.5:cutoff=90:slope=0.6,"
+               "equalizer=f=48:t=q:w=0.8:g=9,equalizer=f=90:t=q:w=1:g=4,equalizer=f=2200:t=q:w=1.2:g=1.5,"
+               "asoftclip=type=tanh:threshold=0.85:output=1,"
+               "lowpass=f=5200:p=2,lowpass=f=5200,equalizer=f=3800:t=q:w=1.5:g=-3,deesser=i=0.5:f=0.4,"
                "acompressor=threshold=-26dB:ratio=4:attack=15:release=250:makeup=2,"
                "aecho=0.85:0.5:90|170|260:0.20|0.13|0.08",
- # clipped, deadly: a little lower, dry and close, bitten mids, hard comp
+ # clipped, deadly: a little lower, dry and close, bitten mids, hard comp,
+ # and a viper's rattle: a fast tremolo with a flicker of vibrato;
+ # almost no room
  'twofang':    "rubberband=pitch=0.917:formant=preserved,"
                "highpass=f=110,equalizer=f=250:t=q:w=1:g=-3,equalizer=f=1800:t=q:w=1.0:g=4,equalizer=f=5500:t=q:w=1:g=2,"
                "asoftclip=type=atan:threshold=0.8,"
                "acompressor=threshold=-28dB:ratio=6:attack=3:release=60:makeup=3,"
-               "aecho=0.9:0.3:14:0.18",
- # bright, fast, a little wild: up, quicker, air, a breath of wind
+               "aecho=0.9:0.3:14:0.06",  # + viper() below
+ # bright, fast, a little wild: up, quicker, air, a breath of wind; a
+ # small room only
  'windclaw':   "rubberband=pitch=1.12:tempo=1.06:formant=preserved,"
                "highpass=f=140,equalizer=f=300:t=q:w=1:g=-2,treble=g=5:f=6000,"
                "aexciter=level_in=1:level_out=1:amount=1.5:drive=6:blend=0:freq=5000,"
                "chorus=0.8:0.9:28:0.35:0.4:1.8,"
                "acompressor=threshold=-24dB:ratio=3:attack=5:release=90:makeup=2,"
-               "aecho=0.8:0.35:24|47:0.16|0.1",
+               "aecho=0.8:0.35:24|47:0.06|0.035",
 }
+
+def viper(y):
+    """Twofang's rattle: a fast tremolo (13 Hz, 45% deep) and a flicker of
+    vibrato (6.5 Hz, +-0.35 ms of delay, about +-14 cents). Done here, not
+    with ffmpeg's tremolo/vibrato, whose start-up spike (-14 dBFS, 20 ms)
+    came out louder than the line and threw the trim."""
+    t = np.arange(len(y)) / SR
+    trem = 1.0 - 0.45 * (0.5 + 0.5 * np.sin(2 * np.pi * 13.0 * t))
+    d = 0.00035 * SR * (1.0 + np.sin(2 * np.pi * 6.5 * t))
+    idx = np.clip(np.arange(len(y)) - d, 0, len(y) - 1)
+    i0 = np.floor(idx).astype(int); i1 = np.minimum(i0 + 1, len(y) - 1); fr = idx - i0
+    return ((y[i0] * (1 - fr) + y[i1] * fr) * trem).astype(np.float32)
+
+POST = {'twofang': viper}
 sheet = {}
 for row in csv.DictReader(open(os.path.join(HERE, 'recording_sheet.tsv')), delimiter='\t'):
     sheet[row['file']] = row
@@ -95,6 +118,15 @@ def trim(x, pre=0.06, post=0.18, floor_db=-38, start_db=None):
         while k > 0 and db[k-1] > db.max()+start_db:
             k -= 1
         st = k
+        # and the end the same way, forward from the line's last loud frame
+        # through its decay (gaps of up to 30 ms bridged), not on to a breath
+        # or a noise after it
+        last = np.where(db > db.max()-20)[0][-1]
+        k, gap = last, 0
+        while k + 1 < len(db) and gap <= 3:
+            k += 1
+            gap = 0 if db[k] > db.max() + floor_db + 5 else gap + 1
+        on = np.array([k - gap])
     a = max(0, st*h - int(pre*SR)); b = min(len(x), (on[-1]+1)*h + int(post*SR))
     y = x[a:b].copy(); fi, fo = int(0.01*SR), int(0.06*SR)
     y[:fi] *= np.linspace(0,1,fi); y[-fo:] *= np.linspace(1,0,fo)
@@ -115,6 +147,8 @@ for who, key, s, e in TAKES:
     # the chain, then room for the tail to ring out
     ff('tmp_cut.wav', 'tmp_fx.wav', "apad=pad_dur=0.5," + CHAINS[who])
     y, _ = sf.read('tmp_fx.wav', dtype='float32')
+    if who in POST:
+        y = POST[who](y)
     y = trim(y, pre=0.09, post=0.25, floor_db=-45, start_db=-36)
     # level: -18 LUFS at energy 3, 1.5 LU a step up or down the sheet's scale
     target = -18.0 + 1.5*(energy-3)
