@@ -56,7 +56,7 @@ bring down; stones to break first.
   the elder dawn. Fifteen a side: for matters that concern every clan at
   once. The high path climbs a shelf around the western fang; the caves along
   the side paths are the dens of the vole-beasts that keep the camps.
-- **The Thornmaze**: the works of the **Geartooth clan**, the engineer-cats
+- **The Engineer's Quarry**: the works of the **Geartooth clan**, the engineer-cats
   of the old hills, who learned to cut wood and stone with their teeth and
   set the rivers to turn it. They built the labyrinth as a machine for
   moving the mountain: gear trains across the wall tops, stone gates that

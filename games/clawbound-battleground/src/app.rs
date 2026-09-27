@@ -1226,7 +1226,7 @@ fn render(s: &mut AppState) {
                 }
                 None => Camera {
                     // the boom comes in over the cat rather than sit in a
-                    // wall (`map::camera_boom`: the Thornmaze's corridors)
+                    // wall (`map::camera_boom`: the Quarry's corridors)
                     eye: target - dir * crate::map::camera_boom(target, dir, s.cam_dist) + jolt * 0.5,
                     target,
                     fov_y: 0.95,

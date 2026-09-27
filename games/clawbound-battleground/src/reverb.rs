@@ -191,7 +191,7 @@ pub fn space_at(pos: Vec3) -> Space {
     }
 }
 
-/// The Thornmaze: bare stone close on both sides, open to the sky. A
+/// The Engineer's Quarry: bare stone close on both sides, open to the sky. A
 /// short, bright slap off the near wall in the corridors; in a chamber
 /// (far from any wall) a bigger room and a later answer.
 fn maze_space(pos: Vec3) -> Space {

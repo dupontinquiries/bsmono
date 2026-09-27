@@ -1,4 +1,4 @@
-//! maze — the Thornmaze: 5 a side in a great walled labyrinth of SECTIONS
+//! maze — the Quarry: 5 a side in a great walled labyrinth of SECTIONS
 //! (rooms) joined by gates, where the labyrinth turns -- gates rise and
 //! sink -- and sections wake and turn on whoever walks them alone.
 //!
@@ -665,7 +665,7 @@ impl Game {
     }
 
     /// May the floor router go through floor shape `s` now? Not through a
-    /// shut gate's passage (on the Thornmaze; every shape elsewhere).
+    /// shut gate's passage (on the Quarry; every shape elsewhere).
     pub fn route_open(&self, s: usize) -> bool {
         if crate::map::active() != crate::map::MapId::Maze {
             return true;
@@ -690,7 +690,7 @@ impl Game {
         if p.p0.distance(pos) < p.p1.distance(pos) { p.p0 } else { p.p1 }
     }
 
-    /// Once a tick, on the Thornmaze only: the gates set from the clock, the
+    /// Once a tick, on the Quarry only: the gates set from the clock, the
     /// pack's ward, the thorns, and the announcements.
     pub fn maze_tick(&mut self, dt: f32) {
         if crate::map::active() != crate::map::MapId::Maze {
@@ -778,7 +778,7 @@ pub fn banner(game: &Game, i: usize) -> Option<(String, [u8; 3])> {
     }
 }
 
-/// Where a bot should go instead of its lane, on the Thornmaze (None: carry
+/// Where a bot should go instead of its lane, on the Quarry (None: carry
 /// on). A cat in a pack (two friends close) goes where it likes. Otherwise:
 ///
 /// * in a section that is waking or biting: out of it, to the nearest room

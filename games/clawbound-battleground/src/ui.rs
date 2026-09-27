@@ -728,7 +728,7 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
         });
     }
 
-    // the Thornmaze (`maze::banner`): what the ground under the player's
+    // the Quarry (`maze::banner`): what the ground under the player's
     // cat is doing, and what its pack means there
     if let Some((text, rgb)) = crate::maze::banner(game, player) {
         egui::Area::new(egui::Id::new("maze_banner")).anchor(egui::Align2::CENTER_CENTER, [0.0, -96.0]).show(ctx, |ui| {
@@ -750,7 +750,7 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
         if g.blessing_t > 0.0 {
             line = format!("{}   ·   RIVERBLESSED {:.0}s", line, g.blessing_t);
         }
-        // the Thornmaze: the pack you have (two friends close: a tenth less
+        // the Quarry: the pack you have (two friends close: a tenth less
         // from every blow, and the thorns let you be)
         if crate::map::active() == crate::map::MapId::Maze && g.respawn_t <= 0.0 {
             let pack = game.pack(player);

@@ -3245,12 +3245,12 @@ mod oremantle {
     }
 }
 
-mod thornmaze {
+mod quarry {
     use clawbound::map::{self, MapId};
     use clawbound::maze::{self as mz, Mood};
     use clawbound::sim::{Event, Game};
 
-    /// Eight minutes of bots on the Thornmaze, one seed: nobody in a wall,
+    /// Eight minutes of bots on the Quarry, one seed: nobody in a wall,
     /// every cat out of its base, the thorns biting, and no cat left alone
     /// in biting ground for long (the bots walk out of it: `maze::bot_goal`).
     pub fn play(seed: u64, secs: f32) -> (f32, usize, [usize; 2], u32, f32, u32, usize, usize) {
@@ -3317,11 +3317,11 @@ mod thornmaze {
     }
 
     #[test]
-    fn eight_minutes_in_the_thornmaze() {
+    fn eight_minutes_in_the_quarry() {
         let t0 = std::time::Instant::now();
         for seed in [5u64, 9] {
             let (worst, bites, towers, kills, alone, stuck, hits, falls) = play(seed, 8.0 * 60.0);
-            eprintln!("thornmaze seed {seed}: worst alone-in-thorns {worst:.1}s, total {alone:.1}s, {bites} bites, towers {towers:?}, {kills} kills, {stuck} stuck, {hits} boulder hits, {falls} fell through pads, in {:.1}s", t0.elapsed().as_secs_f32());
+            eprintln!("quarry seed {seed}: worst alone-in-thorns {worst:.1}s, total {alone:.1}s, {bites} bites, towers {towers:?}, {kills} kills, {stuck} stuck, {hits} boulder hits, {falls} fell through pads, in {:.1}s", t0.elapsed().as_secs_f32());
             assert!(bites > 0, "seed {seed}: the thorns never bit");
             assert_eq!(stuck, 0, "seed {seed}: a bot stood stuck (against a shut gate?)");
             // measured with the bots' rule: 9.1 s worst (seed 5); without

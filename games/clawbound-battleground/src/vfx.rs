@@ -104,7 +104,7 @@ pub struct Vfx {
     pub beams: Vec<Beam>,
     pub rings: Vec<Ring>,
     pub time: f32,
-    /// How far the Thornmaze's machinery has turned (radians of a unit
+    /// How far the Quarry's machinery has turned (radians of a unit
     /// wheel): its drive (`machine::drive`) integrated, so the gears spin
     /// up and settle rather than jump.
     pub machine_turn: f32,

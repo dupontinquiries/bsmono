@@ -24,7 +24,7 @@ what else is known-but-unresolved.
   waves of four (five every third: 3 melee + 1–2 casters) that hold targets,
   answer a hit on their cats, and chase within a leash; 12 towers, two Elders
   gated behind tower kills.
-- **The Thornmaze** (5v5, `--map thornmaze`; `src/maze.rs`): a great walled
+- **The Engineer's Quarry** (5v5, `--map quarry`; `src/maze.rs`): a great walled
   labyrinth of fifteen rooms -- courtyards, colonnades, the round Heart with
   its stone cat, the beasts' pits -- joined by short passages. Two lanes wind
   room to room down the west and east sides through passages that never
@@ -419,9 +419,9 @@ src/
 ├── stalker.rs     Hollowstep's other, the terror radius, the step and every shadow
 ├── lantern.rs     Brasshowl's lamp: the flight from it, the shown-up, no shadows in it
 ├── sentinel.rs    the Sentinel role: coats instead of casts, the four fields, the bot's choice
-├── maze.rs        the Thornmaze: rooms and gates, the labyrinth turning, the waking, the thorns, the pack
-├── mazeworld.rs   the Thornmaze's dressing, gate slabs (collision + mesh), thorn spots, gear trains, screws, chutes, pads, boulder
-├── machine.rs     the Thornmaze's machine: tracks from hopper to chute to floor, which pair runs each turn, the locks and their pads, the roll, the hit, the fall, the bots' dodge
+├── maze.rs        the Quarry: rooms and gates, the labyrinth turning, the waking, the thorns, the pack
+├── mazeworld.rs   the Quarry's dressing, gate slabs (collision + mesh), thorn spots, gear trains, screws, chutes, pads, boulder
+├── machine.rs     the Quarry's machine: tracks from hopper to chute to floor, which pair runs each turn, the locks and their pads, the roll, the hit, the fall, the bots' dodge
 ├── bosses.rs      the Elder Boar + Storm Drake: pits, AI, rewards, TargetRef::Boss
 ├── disasters.rs   wildfire / tempest / earthquake / flood / tornado + map scars
 ├── audio.rs       acoustics_at(pos) → howl/reverb voicing; WindSynth DSP; cpal shell

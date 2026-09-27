@@ -2340,7 +2340,7 @@ pub fn cavity_ao(h: f32, ring: f32) -> f32 {
 /// the Library; a medallion in each base), teal basalt walls laid in
 /// courses with a pale coping, and outside them the sea floor -- sand in
 /// dunes, dark rock.
-/// The Thornmaze: worn flagstones with moss in the joints and grass at the
+/// The Engineer's Quarry: worn flagstones with moss in the joints and grass at the
 /// wall's foot; the walls old grey stone; their crown a dark thorn hedge,
 /// berried; the Heart's floor a ring of pale stone; beyond the outer wall,
 /// the hills' rock and heather.

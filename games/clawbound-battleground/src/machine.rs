@@ -1,4 +1,4 @@
-//! machine — the Thornmaze's clockwork: the stones it moves, and when.
+//! machine — the Quarry's clockwork: the stones it moves, and when.
 //!
 //! The labyrinth is a machine, the works of the Geartooth clan of
 //! engineer-cats (gear trains on the wall tops, stone gates in their slots).
@@ -473,7 +473,7 @@ pub fn pad_phase(seed: u64, t: f32, p: usize, d: &Pad) -> PadPhase {
 }
 
 impl Game {
-    /// Once a tick, on the Thornmaze: the boulders roll over whatever cats
+    /// Once a tick, on the Quarry: the boulders roll over whatever cats
     /// are in their way, and the pads they pass drop whatever cats stand on
     /// them. (Their places are the clock's; this is only what they do.)
     pub fn machine_tick(&mut self, dt: f32) {

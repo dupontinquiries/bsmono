@@ -38,7 +38,7 @@ pub enum MapId {
     /// The Drowned Halls: 3 a side on the sea floor, one lane hall and one
     /// jungle rotunda, walled and domed (`atlantis`).
     Atlantis,
-    /// The Thornmaze: 5 a side in a great walled labyrinth, two winding
+    /// The Engineer's Quarry: 5 a side in a great walled labyrinth, two winding
     /// lanes, and sections that wake and turn on whoever walks them alone
     /// (`maze`).
     Maze,
@@ -53,7 +53,7 @@ impl MapId {
             MapId::Pass => "Twinfang Pass",
             MapId::Sky => "Starwell Glacier",
             MapId::Atlantis => "The Drowned Halls",
-            MapId::Maze => "The Thornmaze",
+            MapId::Maze => "The Engineer's Quarry",
         }
     }
     /// Command-line / config key.
@@ -63,10 +63,14 @@ impl MapId {
             MapId::Pass => "pass",
             MapId::Sky => "starwell",
             MapId::Atlantis => "atlantis",
-            MapId::Maze => "thornmaze",
+            MapId::Maze => "quarry",
         }
     }
     pub fn from_key(s: &str) -> Option<MapId> {
+        // (the Quarry was the Quarry first: its old key still works)
+        if s.trim().eq_ignore_ascii_case("thornmaze") {
+            return Some(MapId::Maze);
+        }
         MapId::ALL.into_iter().find(|m| m.key().eq_ignore_ascii_case(s.trim()))
     }
     /// Cats per team.
@@ -143,7 +147,7 @@ impl MapId {
         }
     }
     /// The play camera's pitch at the start of a match (radians down from
-    /// level). Steeper in the Thornmaze: at the usual 0.38 the camera sat
+    /// level). Steeper in the Quarry: at the usual 0.38 the camera sat
     /// in its walls whenever a cat backed toward one; from higher it looks
     /// down into the rooms and over the walls (`camera_boom` does the rest).
     pub fn cam_pitch(self) -> f32 {
@@ -324,6 +328,15 @@ pub fn team_picks(player: u32, rng: &mut crate::sim::Rng) -> (Vec<u32>, Vec<u32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Quarry answers to its new key and to the one it had as the
+    /// Thornmaze.
+    #[test]
+    fn the_quarry_answers_to_its_old_key() {
+        assert_eq!(MapId::from_key("quarry"), Some(MapId::Maze));
+        assert_eq!(MapId::from_key("Thornmaze"), Some(MapId::Maze));
+        assert_eq!(MapId::Maze.name(), "The Engineer's Quarry");
+    }
 
     #[test]
     fn keys_round_trip_and_the_default_is_the_jungle() {

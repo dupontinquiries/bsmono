@@ -1,4 +1,4 @@
-//! mazeworld — what stands in the Thornmaze's rooms, its gates, and where
+//! mazeworld — what stands in the Quarry's rooms, its gates, and where
 //! its thorns grow.
 //!
 //! `maze` is the ground; this is the dressing, for `scene` to draw and
@@ -57,7 +57,7 @@ fn flip(it: Item) -> Item {
     }
 }
 
-/// Everything placed in the Thornmaze. Computed AS that map whatever is
+/// Everything placed in the Quarry. Computed AS that map whatever is
 /// active.
 pub fn placements() -> Vec<Item> {
     crate::map::with(crate::map::MapId::Maze, placements_here)

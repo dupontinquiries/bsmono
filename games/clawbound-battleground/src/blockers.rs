@@ -363,7 +363,7 @@ pub struct Blockers {
     /// On a map carved out of rock (`floor`), the edge of the floor is a
     /// wall too: a cliff. `None` on the open jungle.
     floor: Option<&'static crate::floor::FloorPlan>,
-    /// Gates: blockers that come and go while a match runs (the Thornmaze's
+    /// Gates: blockers that come and go while a match runs (the Quarry's
     /// labyrinth turning). `gate_of[i]` is blocker `i`'s gate (u16::MAX:
     /// not a gate); an OPEN gate is skipped by every query, at `near`, the
     /// one door they all come through. The flags are shared by every clone

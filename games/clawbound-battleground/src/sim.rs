@@ -102,9 +102,9 @@ pub enum Event {
     CoatShift { god: usize, pos: Vec3, material: crate::gods::Material, radius: f32 },
     /// A Sentinel's footfall.
     Tread { pos: Vec3 },
-    /// The Thornmaze's thorns bit a cat (`maze`); `alone`: the heavy bite.
+    /// The Engineer's Quarry's thorns bit a cat (`maze`); `alone`: the heavy bite.
     ThornBite { pos: Vec3, alone: bool },
-    /// The Thornmaze's labyrinth turned: gates rise and sink (`maze`).
+    /// The Engineer's Quarry's labyrinth turned: gates rise and sink (`maze`).
     LabyrinthTurns,
     /// A boulder was let go (`machine`), and one rolled over a cat.
     BoulderRoll { pos: Vec3 },
@@ -293,7 +293,7 @@ pub struct GodUnit {
     /// Seconds toward her next magma burn.
     pub burn_t: f32,
     /// The share of each blow this cat takes, this tick: under 1 inside a
-    /// friend's granite (`sentinel`) or in a pack on the Thornmaze
+    /// friend's granite (`sentinel`) or in a pack on the Quarry
     /// (`maze`), 1 otherwise. Reset by `sentinel_tick`, which runs first.
     pub ward: f32,
     /// Seconds toward the next thorn bite (`maze`).
@@ -522,7 +522,7 @@ pub struct Game {
     /// A bot's dive on an enemy god, for its teammates to answer:
     /// (target god, when). Indexed by the diving team.
     pub calls: [Option<(usize, f32)>; 2],
-    /// The Thornmaze's waking order (`maze`); unused on other maps.
+    /// The Engineer's Quarry's waking order (`maze`); unused on other maps.
     pub wake: crate::maze::Wake,
 }
 

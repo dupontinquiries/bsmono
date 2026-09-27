@@ -8,7 +8,7 @@
 //! one: the first coat she has, from the moment she first stands up.
 //!
 //! The Sentinels are the Geartooth engineers' work (the clan that built the
-//! Thornmaze's machine, which knows them: `machine`). Oremantle, the first
+//! Quarry's machine, which knows them: `machine`). Oremantle, the first
 //! of them, was built in the likeness of Stonewhisper's grandmother:
 //!
 //! * **Granite** -- every friend in the field, and she, takes a share less

@@ -1,6 +1,6 @@
-//! mazeshots — the Thornmaze, looked at.
+//! mazeshots — the Quarry, looked at.
 //!
-//! `CLAWBOUND_SHOTS=maze clawbound-battleground --screenshot --map thornmaze`.
+//! `CLAWBOUND_SHOTS=maze clawbound-battleground --screenshot --map quarry`.
 //! `CLAWBOUND_SHEET=top,heart` limits which are taken. The whole labyrinth
 //! from above (and again after it has turned), a room at play height, the
 //! Heart, gates rising and warning, a section stirring and biting with a
@@ -21,7 +21,7 @@ const H: u32 = 720;
 
 pub fn run() -> Result<(), String> {
     if crate::map::active() != crate::map::MapId::Maze {
-        return Err("run with --map thornmaze (or CLAWBOUND_MAP=thornmaze)".into());
+        return Err("run with --map quarry (or CLAWBOUND_MAP=quarry)".into());
     }
     let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
     let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);

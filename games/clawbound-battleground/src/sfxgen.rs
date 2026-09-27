@@ -534,7 +534,7 @@ pub const GENERIC: [&str; 15] = [
     "sfx/stalker/heart", "sfx/stalker/step", "sfx/stalker/swap",
     // a Sentinel's footfall (`sentinel`): the ground takes her weight
     "sfx/sentinel/tread",
-    // the Thornmaze's thorns raking a cat (`maze`)
+    // the Quarry's thorns raking a cat (`maze`)
     "sfx/maze/thorns",
     // the labyrinth turning: stone grinding on stone, far off
     "sfx/maze/turn",

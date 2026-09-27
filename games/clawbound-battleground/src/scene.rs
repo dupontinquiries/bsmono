@@ -93,13 +93,13 @@ pub struct Scene {
     pub kitling: [u64; 2],
     /// Hollowstep's body, by team, for the others of him (`stalker`).
     pub hollow: [u64; 2],
-    /// The Thornmaze's thorns (three clumps), and where they rise, by the
+    /// The Engineer's Quarry's thorns (three clumps), and where they rise, by the
     /// class of section (`mazeworld::thorn_spots`); empty on other maps.
     pub thorns: [u64; 3],
     pub thorn_spots: Vec<(u8, Vec3, f32)>,
-    /// The Thornmaze's gate slab (one mesh, turned across each passage).
+    /// The Engineer's Quarry's gate slab (one mesh, turned across each passage).
     pub maze_gate: u64,
-    /// The Thornmaze's machine (`machine`): the gear trains on the walls
+    /// The Engineer's Quarry's machine (`machine`): the gear trains on the walls
     /// (each with its wheel's mesh, shared by radius), the screws at the
     /// tracks' heads, and the boulder; empty on other maps.
     pub gears: Vec<(crate::mazeworld::Gear, u64)>,
@@ -1118,7 +1118,7 @@ impl Scene {
                 r.queue_draw(mesh, m, [0.78, 0.78, 0.82, 1.0], 0.0, models::GOD_DRAW_VOXEL, false);
             }
         }
-        // The Thornmaze's gates: each slab at the height the clock gives it
+        // The Engineer's Quarry's gates: each slab at the height the clock gives it
         // (sunk into the floor when open), glowing red while it is about to
         // move (a lane's never shuts and is never drawn up)
         if crate::map::active() == crate::map::MapId::Maze {
@@ -1138,7 +1138,7 @@ impl Scene {
                 r.queue_draw(self.maze_gate, m, tint, glow, 0.5, false);
             }
         }
-        // The Thornmaze's machine (`machine`): the gear trains turning on
+        // The Engineer's Quarry's machine (`machine`): the gear trains turning on
         // the walls (a wheel turns at the train's pace over its own radius,
         // so neighbours read as meshed), the screws winding (fastest while a
         // ball comes up), and the boulders winding up out of the floor,
@@ -1203,7 +1203,7 @@ impl Scene {
                 }
             }
         }
-        // The Thornmaze (`maze`): thorns rise along the walls of a waking
+        // The Engineer's Quarry (`maze`): thorns rise along the walls of a waking
         // section -- small and pulsing red while it stirs (the warning),
         // full grown while it bites, sinking as it quiets
         if !self.thorn_spots.is_empty() {
