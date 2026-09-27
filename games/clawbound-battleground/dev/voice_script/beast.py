@@ -131,23 +131,6 @@ def at(level_db, layer, ref):
     return layer * (rms(ref) / rms(layer)) * 10 ** (level_db / 20)
 
 
-def giggle(n_hee=4, seed=7):
-    """A kitten's giggle: short bright "hee"s, each a little lower and
-    shaken fast, with breath in them."""
-    rng = np.random.default_rng(seed)
-    out = []
-    for k in range(n_hee):
-        d = 0.09
-        t = np.arange(int(SR * d)) / SR
-        f = 1100.0 * (0.93 ** k) * (1 + 0.05 * np.sin(2 * np.pi * 36 * t))
-        ph = 2 * np.pi * np.cumsum(f) / SR
-        tone = np.sin(ph) + 0.35 * np.sin(2 * ph) + 0.15 * rng.normal(0, 1, len(t))
-        env = np.sin(np.pi * t / d) ** 1.2
-        out += [tone * env, np.zeros(int(SR * 0.045))]
-    y = bandpass(np.concatenate(out).astype(np.float32), 600, 6000, 2)
-    return y / (np.abs(y).max() + 1e-9)
-
-
 def chirp(dur=0.16, f_from=520.0, f_to=980.0, seed=3):
     """A caracal's chirrup: a harmonic tone sweeping up with a quick trill
     in its amplitude, through a bright formant."""

@@ -174,7 +174,63 @@ def viper(y):
     i0 = np.floor(idx).astype(int); i1 = np.minimum(i0 + 1, len(y) - 1); fr = idx - i0
     return ((y[i0] * (1 - fr) + y[i1] * fr) * trem).astype(np.float32)
 
-POST = {'twofang': viper}
+def baby(name):
+    """A clip of the real baby (baby_clips.py), with the same small room as
+    Sproutkit's chain (28 and 52 ms echoes) so it sits beside his words."""
+    x, sr = sf.read(os.path.join(HERE, 'baby', name + '.opus'), dtype='float32')
+    assert sr == SR, (name, sr)
+    y = np.concatenate([x, np.zeros(int(0.06 * SR), np.float32)])
+    for ms, g in ((28, 0.10), (52, 0.06)):
+        d = int(ms * SR / 1000)
+        y[d:d + len(x)] += g * x
+    return y
+
+
+# Which baby goes with which line, and how: 'before' / 'after' the words
+# (a 60 ms gap; a negative gap overlaps), or 'under' them from `at` s in.
+# Levels are the clip's peak against the line's.
+SPROUT_BABY = {
+    'select': [('ah.5', 'before', 0.06, 0.8)],
+    'cast1':  [('ah.3', 'after', -0.08, 0.8)],
+    'cast2':  [('babble.1', 'under', 0.15, 0.7)],
+    'cast3':  [('coo.2', 'after', 0.06, 0.7)],
+    'cast4':  [('squeal.1', 'after', -0.05, 1.0)],
+    'kill.1': [('babble.2', 'after', 0.06, 0.75)],
+    'kill.2': [('coo.1', 'after', 0.08, 0.6)],
+    'death.1': [('fall.2', 'after', 0.08, 0.6)],
+    'death.2': [('fall.1', 'after', 0.10, 0.55)],
+}
+
+
+def sproutkit_post(y, key):
+    """The baby, mixed in AFTER the chain: the words are pitched up into a
+    kitten, the baby is already small and stays as it was recorded."""
+    peak = float(np.abs(y).max())
+    for name, how, t, level in SPROUT_BABY.get(key, []):
+        b = baby(name)
+        b *= peak * level / (np.abs(b).max() + 1e-9)
+        # the words' own extent (the chain's padded tail is silence)
+        e = B.envelope(y, 10)
+        on = np.where(e > e.max() * 0.03)[0]
+        st, en = (on[0], on[-1]) if len(on) else (0, len(y))
+        if how == 'before':
+            y = np.concatenate([b, np.zeros(int(t * SR), np.float32), y[st:]])
+        elif how == 'after':
+            at = en + int(t * SR)
+            out = np.zeros(max(len(y), at + len(b)), np.float32)
+            out[:len(y)] += y
+            out[at:at + len(b)] += b
+            y = out
+        else:
+            at = st + int(t * SR)
+            out = np.zeros(max(len(y), at + len(b)), np.float32)
+            out[:len(y)] += y
+            out[at:at + len(b)] += b
+            y = out
+    return y.astype(np.float32)
+
+
+POST = {'twofang': lambda y, key: viper(y), 'sproutkit': sproutkit_post}
 
 # The god and the beast under each voice, laid in BEFORE the chain so the
 # chain's pitch, EQ, compression and room glue them to the voice (beast.py).
@@ -322,17 +378,10 @@ def cometail_layers(c, key):
 
 
 def sproutkit_layers(c, key):
-    # a kitten: a soft purr under every word, a mew before the select call
-    # and the litter, and a giggle after the kills and the giggle fit
+    # a kitten: a soft purr under every word (the real baby's squeals, coos
+    # and babble go in after the chain: sproutkit_post)
     purr = B.lowpass(B.cross(c, B.growl_carrier(len(c), f0=26, jitter=0.08, double=0.25, seed=32)), 700)
-    y = c + B.at(-15, purr, c)
-    peak = float(np.abs(c).max())
-    gap = np.zeros(int(0.04 * SR), np.float32)
-    if key in ('select', 'cast1'):
-        y = np.concatenate([B.chirp(0.2, 700, 1100, seed=5) * peak * 0.45, gap, y])
-    if key.startswith('kill') or key == 'cast2':
-        y = np.concatenate([y, gap, B.giggle(seed=6) * peak * 0.5])
-    return y.astype(np.float32)
+    return (c + B.at(-15, purr, c)).astype(np.float32)
 
 
 PRE = {'sproutkit': sproutkit_layers, 'goldenmane': goldenmane_layers, 'oldroar': oldroar_layers, 'twofang': twofang_layers, 'windclaw': windclaw_layers,
@@ -393,7 +442,7 @@ for who, key, s, e in TAKES:
     ff('tmp_cut.wav', 'tmp_fx.wav', "apad=pad_dur=0.5," + CHAINS[who])
     y, _ = sf.read('tmp_fx.wav', dtype='float32')
     if who in POST:
-        y = POST[who](y)
+        y = POST[who](y, key)
     y = trim(y, pre=0.09, post=0.25, floor_db=-45, start_db=-36)
     # level: -18 LUFS at energy 3, 1.5 LU a step up or down the sheet's scale
     target = -18.0 + 1.5*(energy-3)
