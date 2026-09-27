@@ -102,6 +102,7 @@ pub mod cave_air; // breath stages and the torch canary in bad air (cave_biomes.
 pub mod notices; // short HUD messages to the player, one line per topic, timed out
 pub mod cave_sound; // cave RT60 per zone and the limestone drip (cave_biomes.docx)
 pub mod cave_fields; // bending field signatures per cave zone (cave_biomes.docx)
+pub mod crystal_edges; // laceration on a fast transit through dense crystal (cave_biomes.docx)
 pub mod water_sim_core; // r443: pure settle core extracted for testing (water-vs-water, cave-fill, r441 regression)
 pub mod water_react;
 pub mod water_tint; // r459: water surface albedo from temperature/salinity/erosion/depth (pure, tested)
