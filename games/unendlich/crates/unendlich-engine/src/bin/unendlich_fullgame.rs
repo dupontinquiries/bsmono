@@ -3416,6 +3416,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // How closed-in the player is (world::cave_climate::enclosure), from the
     // exposure block; drives the cave drips (sim::cave_sound).
     let mut enclosure_last = 0.0f32;
+    // Crystal blades cut on a fast transit (sim::crystal_edges).
+    let mut crystal_blades = unendlich_engine::sim::crystal_edges::Blades::default();
     let mut drip_clock = unendlich_engine::sim::cave_sound::DripClock::new(0xD21F);
     let mut cave_sound_clock = 0.0f32;
     // UNENDLICH_CAVE_DRIPS=0 turns the drips off; a number > 1 is a drips-
@@ -17232,6 +17234,31 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             #[cfg(feature = "audio")]
             if lifetime_frame % 6 == 0 {
                 fg_sfx.set_master_volume(fg_sfx_vol * (1.0 - air_hush));
+            }
+            // Crystal blades (sim::crystal_edges, cave_biomes.docx): sprinting
+            // through a dense crystal field cuts, once per transit.
+            if survival_mode && playing {
+                use unendlich_engine::sim::crystal_edges as ce;
+                let feet = (e.y - 1.5).floor() as i32;
+                let (cx, cz) = (e.x.floor() as i32, e.z.floor() as i32);
+                let mut blades = 0usize;
+                for dy in 0..2 {
+                    for dx in -1..=1 {
+                        for dz in -1..=1 {
+                            if ce::is_blade(chunk_manager.block_at(cx + dx, feet + dy, cz + dz)) {
+                                blades += 1;
+                            }
+                        }
+                    }
+                }
+                if let Some(cut) = crystal_blades.tick(blades, last_player_speed) {
+                    fg_app.vitality_mut().tick(1.0, cut * player_dmg_resist);
+                    log::info!(
+                        "[survival] crystal blades cut you ({} blade cells, {:.1} b/s) — vitality {:.0}%",
+                        blades, last_player_speed, fg_app.vitality().energy * 100.0
+                    );
+                    notices.push("crystal", "Crystal edges cut you: go carefully here");
+                }
             }
             // Cave drips (sim::cave_sound, cave_biomes.docx): in a closed-in
             // wet cave a drop falls now and then from the ceiling somewhere
