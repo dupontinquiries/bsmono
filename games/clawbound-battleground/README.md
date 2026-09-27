@@ -50,7 +50,11 @@ what else is known-but-unresolved.
   armed -- swing open as the stone passes, and a cat standing on an open
   pad falls to its death. Bots leave a lock the machine is working and step
   off a track when a ball is due within 1.5 s. The machine knows its own: a
-  Sentinel is hurt by a stone but not thrown, and braces across a pad.
+  Sentinel is hurt by a stone but not thrown, and braces across a pad. The
+  Quarry has LINE OF SIGHT: a cat sees 55 u down open floor, not through a
+  wall or a shut gate; an enemy nobody on your team sees (and no tower of
+  yours reaches) is not drawn, not on the minimap, and not targeted by
+  bots.
 - **The Drowned Halls** (3v3, `--map atlantis`): one colonnaded hall and a
   domed library on the sea floor.
 - **The first three maps** — the jungle valley (5v5, three lanes), Twinfang Pass (15v15

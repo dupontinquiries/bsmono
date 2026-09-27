@@ -890,8 +890,9 @@ impl Game {
     /// fighting by what it is tied to: intent that a fight interrupts, a
     /// window some abilities grant (the fast low run before a pounce, at
     /// full speed), and the way a badly hurt animal slinks.
-    /// Can `team` see cat `j`? Always, off the sky map, for its own cats,
-    /// and before the first cloud refresh (`vision_tick`).
+    /// Can `team` see cat `j`? Always for its own cats, on the open maps,
+    /// and before the first refresh (`vision_tick`); through the sky map's
+    /// clouds and the Quarry's walls, only as `vision_tick` found.
     pub fn sees(&self, team: Team, j: usize) -> bool {
         // shown up by Brasshowl's lamp (`lantern`): seen by everyone
         if self.gods.get(j).is_some_and(|g| g.revealed_t > 0.0) {
@@ -916,6 +917,15 @@ impl Game {
     /// Minions give no sight: with 32 a side in every lane, they would see
     /// everything and the cloud nothing.
     pub fn vision_tick(&mut self) {
+        // the Quarry: its walls and shut gates hide (`maze::sight`)
+        if crate::map::active() == crate::map::MapId::Maze {
+            if self.t < self.vision.next_t && self.vision.seen[0].len() == self.gods.len() {
+                return;
+            }
+            self.vision.next_t = self.t + 1.0 / crate::skycloud::VISION_HZ;
+            self.vision.seen = [Team::Blue, Team::Red].map(|team| crate::maze::seen_by(self, team));
+            return;
+        }
         if crate::map::active() != crate::map::MapId::Sky {
             if !self.vision.seen[0].is_empty() {
                 self.vision = Default::default();
