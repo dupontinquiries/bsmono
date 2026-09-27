@@ -41,7 +41,7 @@ fn stacking_items_declare_rules() {
 
 #[test]
 fn roster_is_14_ancestors_with_4_abilities_each() {
-    assert_eq!(ROSTER.len(), 14);
+    assert_eq!(ROSTER.len(), 15);
     let roles: std::collections::HashSet<_> = ROSTER.iter().map(|g| g.role).collect();
     assert!(roles.len() >= 4, "roster should span multiple roles");
     for g in &ROSTER {
@@ -711,6 +711,11 @@ fn firing_range_every_ability_goes_where_it_is_aimed_and_turns_the_cat() {
                         shots.push(Vec3::new(p.vel.x, 0.0, p.vel.z).normalize());
                     }
                 }
+                // a litter (Sproutkit): its kittens fan out round the aim
+                if !game.kitlings.is_empty() {
+                    let mean: Vec3 = game.kitlings.iter().map(|k| k.dir).sum();
+                    shots.push(Vec3::new(mean.x, 0.0, mean.z).normalize_or_zero());
+                }
                 for e in game.events.drain(..) {
                     fired |= matches!(e, Event::Cast { god: 0, .. });
                     events.push(e);
@@ -742,7 +747,7 @@ fn firing_range_every_ability_goes_where_it_is_aimed_and_turns_the_cat() {
             if matches!(ab.arch, Archetype::Blink { .. }) {
                 dirs.push(flat(game.gods[0].pos));
             }
-            let directional = !matches!(ab.arch, Archetype::Nova { .. } | Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. });
+            let directional = !matches!(ab.arch, Archetype::Nova { .. } | Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } | Archetype::Giggle { .. });
             if directional {
                 assert!(!dirs.is_empty(), "{} slot {slot} ({:?}): no directional effect found", def.name, ab.arch);
                 for d in &dirs {
@@ -2248,5 +2253,242 @@ mod lifts {
             assert!(g.gods[0].lift.is_none() && g.gods[0].pos.y < 1.0);
         });
         assert!(clawbound::lift::pads().is_empty());
+    }
+}
+
+/// Sproutkit (`kit`): the litter nips, the giggles disarm and confuse, the
+/// dance party makes dancers who cannot fight and drag their paws after.
+mod sproutkit {
+    use clawbound::gods::{Archetype, ROSTER};
+    use clawbound::sim::Game;
+    use glam::Vec3;
+
+    fn quiet(g: &mut Game) {
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+            c.move_dir = Vec3::ZERO;
+            c.attack_held = false;
+        }
+        g.minions.clear();
+        g.next_wave_t = 1e9;
+    }
+    fn run(g: &mut Game, secs: f32) {
+        for _ in 0..(secs * 60.0) as usize {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+        }
+    }
+    fn kit() -> u32 {
+        ROSTER.iter().position(|d| d.name == "Sproutkit").expect("Sproutkit is on the roster") as u32
+    }
+    fn slot(f: impl Fn(&Archetype) -> bool) -> u32 {
+        (0..4).find(|&s| f(&ROSTER[kit() as usize].abilities[s].arch)).unwrap() as u32
+    }
+    fn game(red: &[u32]) -> Game {
+        let mut g = Game::new_teams(&[kit()], red);
+        quiet(&mut g);
+        g.gods[0].pos = Vec3::ZERO;
+        g.gods[0].mana = 9999.0;
+        g
+    }
+
+    /// The litter: four kittens run at the nearest enemy, nip it (damage and
+    /// a giggle), and are gone; one sent at nobody pops when its time runs out.
+    #[test]
+    fn the_litter_runs_at_the_enemy_and_nips() {
+        let mut g = game(&[0]);
+        g.gods[1].pos = Vec3::new(0.0, 0.0, 7.0);
+        let h = g.gods[1].hp;
+        g.cast_queue.push((0, slot(|a| matches!(a, Archetype::Litter { .. })), Vec3::new(0.0, 0.0, 7.0)));
+        let (mut most, mut giggled, mut pops) = (0usize, false, 0);
+        for _ in 0..(2 * 60) {
+            g.tick(1.0 / 60.0);
+            most = most.max(g.kitlings.len());
+            giggled |= g.gods[1].giggle_t > 0.0;
+            pops += g.events.iter().filter(|e| matches!(e, clawbound::sim::Event::KitlingPop { .. })).count();
+            g.events.clear();
+        }
+        assert_eq!(most, 4, "a litter of four");
+        assert!(g.kitlings.is_empty() && pops == 4, "all popped: {} left, {pops} pops", g.kitlings.len());
+        assert!(g.gods[1].hp < h - 150.0, "four nips: {h} -> {}", g.gods[1].hp);
+        assert!(giggled, "nipped into giggles");
+        // at nobody: they run on and pop when their time is up
+        let mut g = game(&[0]);
+        g.gods[1].pos = Vec3::new(0.0, 0.0, -60.0);
+        g.cast_queue.push((0, slot(|a| matches!(a, Archetype::Litter { .. })), Vec3::new(0.0, 0.0, 7.0)));
+        run(&mut g, 1.0);
+        assert_eq!(g.kitlings.len(), 4, "still running");
+        let far = g.kitlings.iter().map(|k| k.pos.length()).fold(0.0f32, f32::max);
+        assert!(far > 8.0, "and running out along the fan: {far}");
+        run(&mut g, 3.5);
+        assert!(g.kitlings.is_empty(), "gone when their time is up");
+    }
+
+    /// A giggling cat cannot strike or cast, and its paws wander; when the
+    /// giggles pass it fights again.
+    #[test]
+    fn a_giggle_disarms_silences_and_confuses() {
+        let mut g = game(&[0]);
+        // in reach of its paw (Goldenmane is melee)
+        let near = Vec3::new(0.0, 0.0, ROSTER[0].auto_range * 0.8);
+        g.gods[1].pos = near;
+        g.gods[1].mana = 9999.0;
+        g.cast_queue.push((0, slot(|a| matches!(a, Archetype::Giggle { .. })), Vec3::ZERO));
+        run(&mut g, 0.3);
+        assert!(g.gods[1].giggle_t > 1.0, "giggling: {}", g.gods[1].giggle_t);
+        // it tries to fight: swings, and a cast
+        let hp0 = g.gods[0].hp;
+        g.gods[1].attack_held = true;
+        g.cast_queue.push((1, 0, Vec3::ZERO));
+        for _ in 0..60 {
+            g.gods[1].pos = near;
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+        }
+        assert_eq!(g.gods[0].hp, hp0, "no blow landed while it giggled");
+        assert!(g.gods[1].cds.iter().all(|c| *c <= 0.0), "no cast went off");
+        // it tries to walk straight: it wanders
+        let from = g.gods[1].pos;
+        g.gods[1].attack_held = false;
+        g.gods[1].move_dir = Vec3::X;
+        let mut off = 0.0f32;
+        for _ in 0..30 {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+            off = off.max((g.gods[1].pos.z - from.z).abs());
+        }
+        assert!(off > 0.4, "its paws wander off the line: {off}");
+        // sober again: it fights
+        g.gods[1].move_dir = Vec3::ZERO;
+        run(&mut g, 1.2);
+        assert!(g.gods[1].giggle_t <= 0.0);
+        g.gods[1].pos = near;
+        g.gods[1].attack_held = true;
+        run(&mut g, 1.5);
+        assert!(g.gods[0].hp < hp0, "fights again when the giggles pass");
+    }
+
+    /// Under the glitter-ball an enemy dances -- no blows, a shuffle -- and
+    /// after the party it drags its paws for a long while; a friend under it
+    /// and an enemy outside it are untouched.
+    #[test]
+    fn the_dance_party_stops_the_fight_and_the_slow_lingers() {
+        let mut g = game(&[0, 1]);
+        g.gods[0].pos = Vec3::new(0.0, 0.0, -6.0);
+        let floor = Vec3::new(0.0, 0.0, 6.0);
+        g.gods[1].pos = floor;
+        g.gods[2].pos = floor + Vec3::new(30.0, 0.0, 0.0);
+        let s = slot(|a| matches!(a, Archetype::DanceParty { .. }));
+        let Archetype::DanceParty { duration, slow, slow_secs, .. } = ROSTER[kit() as usize].abilities[s as usize].arch else { unreachable!() };
+        g.cast_queue.push((0, s, floor));
+        run(&mut g, 1.0);
+        assert!(g.gods[1].dance_t > 0.0, "the one under the ball dances");
+        assert!(g.gods[2].dance_t <= 0.0 && g.gods[0].dance_t <= 0.0, "the one outside, and the caster, do not");
+        // a dancer cannot hit Sproutkit even standing next to him
+        let hp0 = g.gods[0].hp;
+        g.gods[0].pos = floor + Vec3::X * 2.0;
+        g.gods[1].attack_held = true;
+        for _ in 0..60 {
+            g.gods[1].pos = floor;
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+        }
+        assert_eq!(g.gods[0].hp, hp0, "no blows from the dance floor");
+        g.gods[0].pos = Vec3::new(0.0, 0.0, -6.0);
+        g.gods[1].attack_held = false;
+        // a shuffle: much slower than the one walking outside
+        let (a, b) = (g.gods[1].pos, g.gods[2].pos);
+        g.gods[1].move_dir = Vec3::Z;
+        g.gods[2].move_dir = Vec3::Z;
+        run(&mut g, 0.5);
+        let (da, db) = ((g.gods[1].pos - a).length(), (g.gods[2].pos - b).length());
+        assert!(da < db * 0.45, "dancers shuffle: {da} vs {db}");
+        g.gods[1].move_dir = Vec3::ZERO;
+        g.gods[2].move_dir = Vec3::ZERO;
+        g.gods[1].pos = floor;
+        // the party ends; the moment the music stops the dancer starts to
+        // drag its paws, for slow_secs
+        let mut waited = 0.0;
+        while g.gods[1].dance_t > 0.0 {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+            waited += 1.0 / 60.0;
+            assert!(waited < duration + 0.5, "the music never stopped");
+        }
+        assert!(g.gods[1].slow >= slow - 1e-3 && (g.gods[1].slow_t - slow_secs).abs() < 0.1, "the long drag: {} for {}", g.gods[1].slow, g.gods[1].slow_t);
+        run(&mut g, 0.2);
+        assert!(g.zones.is_empty(), "the ball is gone");
+        run(&mut g, slow_secs + 0.5);
+        assert!(g.gods[1].slow <= 0.0, "and then it wears off");
+    }
+
+    /// A minion under the ball, or giggling, does not attack.
+    #[test]
+    fn minions_dance_too() {
+        let mut g = Game::new_teams(&[kit()], &[0]);
+        quiet(&mut g);
+        g.gods[1].pos = Vec3::new(80.0, 0.0, 80.0);
+        g.next_wave_t = 0.0;
+        g.tick(1.0 / 60.0);
+        assert!(!g.minions.is_empty());
+        // one red minion, out in the open with Sproutkit (no towers near)
+        let red = g.minions.iter().position(|m| m.team == clawbound::consts::Team::Red).unwrap();
+        let one = g.minions.swap_remove(red);
+        g.minions.clear();
+        g.minions.push(one);
+        g.next_wave_t = 1e9;
+        let at = Vec3::ZERO;
+        g.minions[0].pos = at;
+        g.gods[0].pos = at + Vec3::X * 1.2;
+        g.gods[0].mana = 9999.0;
+        g.cast_queue.push((0, slot(|a| matches!(a, Archetype::DanceParty { .. })), at));
+        // (it may land a blow during the wind-up; from the first beat, none)
+        while g.minions[0].dance_t <= 0.0 {
+            g.minions[0].pos = at;
+            g.gods[0].pos = at + Vec3::X * 1.2;
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+            assert!(g.t < 3.0, "never danced");
+        }
+        let hp0 = g.gods[0].hp;
+        let mut danced = false;
+        for _ in 0..(3 * 60) {
+            g.minions[0].pos = at;
+            g.gods[0].pos = at + Vec3::X * 1.2;
+            danced |= g.minions[0].dance_t > 0.0;
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+        }
+        assert!(danced && g.minions[0].dance_t > 0.0, "the minion dances");
+        assert_eq!(g.gods[0].hp, hp0, "no minion blow on Sproutkit while it danced");
+        // after the party it fights again
+        run(&mut g, 5.0);
+        let hp1 = g.gods[0].hp;
+        for _ in 0..(3 * 60) {
+            g.minions[0].pos = at;
+            g.gods[0].pos = at + Vec3::X * 1.2;
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+        }
+        assert!(g.gods[0].hp < hp1, "and bites again after");
+    }
+
+    /// A bot Sproutkit uses its whole kit in a real fight.
+    #[test]
+    fn a_bot_sproutkit_uses_his_kit() {
+        let mut g = Game::new_teams(&[0, kit()], &[1, 2]);
+        for c in g.gods.iter_mut() {
+            c.ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+        }
+        let mut used = [false; 4];
+        for _ in 0..(240 * 30) {
+            g.tick(1.0 / 30.0);
+            for e in g.events.drain(..) {
+                if let clawbound::sim::Event::Cast { god: 1, slot, .. } = e {
+                    used[slot as usize] = true;
+                }
+            }
+        }
+        assert!(used[0] && used[1] && used[3], "litter, giggles and the party in four minutes: {used:?}");
     }
 }

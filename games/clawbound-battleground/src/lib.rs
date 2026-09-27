@@ -70,6 +70,7 @@ pub mod skycloud;
 pub mod clancamp;
 /// The starlight lifts between the sky map's islands and the Aerie.
 pub mod lift;
+pub mod kit;
 /// The generated preparation documents in dev/ (cue cards, recording sheet, cue sheet).
 pub mod devdocs;
 /// Character voxels as smooth surfaces with fur lengths, for the ultra preview.

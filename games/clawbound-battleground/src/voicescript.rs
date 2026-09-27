@@ -255,6 +255,21 @@ pub const PARTS: &[Part] = &[
         ],
     },
     Part {
+        who: "sproutkit",
+        voice: "A kitten's voice: bright, high, fearless and giggly -- a baby god who thinks the whole war is a game. Laughter bubbles up between the words. Never menacing, even on a kill.",
+        lines: &[
+            l("select", "Let's play!", "bouncing, delighted", 4, SELECT),
+            l("cast1", "Everybody, go!", "calling the litter out, a bounce on 'go'", 4, "winds up Litter"),
+            l("cast2", "Hee hee hee!", "a giggle fit that won't stop", 3, "winds up Giggle Fit"),
+            l("cast3", "Grow, grow!", "soft, sing-song", 3, "winds up First Spring"),
+            l("cast4", "DANCE PARTY!", "a squeal of pure joy", 5, "winds up Dance Party"),
+            l("kill.1", "Tag, you're out!", "teasing", 3, KILL),
+            l("kill.2", "Nap time!", "a yawn in it", 2, KILL),
+            l("death.1", "Not... fair...", "a pout", 2, DEATH),
+            l("death.2", "I'll grow... back...", "sleepy, sure of it", 1, DEATH),
+        ],
+    },
+    Part {
         who: "narrator",
         voice: "The storyteller of the clans, over the first match's prologue: unhurried, weighty, a little in awe. Let each line breathe; the music leaves room between them. Record each as its own file.",
         lines: &[
