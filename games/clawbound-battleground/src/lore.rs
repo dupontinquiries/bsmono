@@ -146,8 +146,8 @@ pub const ANCESTORS: [Ancestor; 15] = [
         species: "jaguar",
         age: "the green ages",
         land: "the drowned forest",
-        gender: Gender::Male,
-        story: "A jaguar of the flooded dark, who hunted under the water as easily as over it. The river does not chase, he says; it gathers, and so does he.",
+        gender: Gender::Female,
+        story: "A jaguar of the flooded dark, who hunted under the water as easily as over it. The river does not chase, she says; it gathers, and so does she.",
         instruments: "rainstick, panpipes, water percussion, slit drum; rain, rushing floodwater",
     },
     Ancestor {
@@ -237,6 +237,26 @@ mod tests {
             }
         }
         assert_eq!(of("Stillsmoke").unwrap().gender, Gender::Male, "canon: the ninth son");
+    }
+
+    /// Each story speaks of its ancestor as the lore's gender does. (When
+    /// Riptail was recast as she, nothing here would have noticed a story
+    /// still saying "he says" -- the check above reads the game's text,
+    /// not the stories.)
+    #[test]
+    fn the_stories_agree() {
+        let male = ["he", "him", "his", "himself"];
+        let female = ["she", "her", "hers", "herself"];
+        let mut checked = 0;
+        for a in ANCESTORS.iter() {
+            let words: Vec<String> = a.story.split(|c: char| !c.is_alphabetic() && c != '\'').map(|w| w.to_ascii_lowercase()).collect();
+            let (right, wrong): (&[&str], &[&str]) = if a.gender == Gender::Male { (&male, &female) } else { (&female, &male) };
+            for w in &words {
+                assert!(!wrong.contains(&w.as_str()), "{}: the story says '{w}', the lore says {}", a.name, a.gender.pronouns());
+            }
+            checked += words.iter().any(|w| right.contains(&w.as_str())) as usize;
+        }
+        assert!(checked >= 10, "only {checked} stories use a pronoun at all");
     }
 
     /// The voice notes the performer reads do not contradict the gender

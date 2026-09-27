@@ -77,7 +77,7 @@ voice note contradicts its ancestor. Seven are female, six male.
 | Twofang | sabre-tooth (smilodon) | the elder dawn | the tar-pit plains of the far west | he |
 | Suneye | sand cat | the golden ages | the endless dunes and the sun temples | she |
 | Snowhush | lynx | the long winters | the white silence of the northern taiga | she |
-| Riptail | jaguar | the green ages | the drowned forest | he |
+| Riptail | jaguar | the green ages | the drowned forest | she |
 | Stillsmoke | dragon-cat, son of the storm-dragon | the age of storms | the far-east thunder mountains | he |
 | Stonewhisper | snow leopard | the long winters | the high crags | she |
 | Cometail | caracal | the elder dawn | the glacier-sky above the cloud sea | he |
@@ -124,8 +124,8 @@ chose. She picked the ground, let the snow fall, and waited; her clan keeps
 the silence still.
 
 **Riptail.** A jaguar of the flooded dark, who hunted under the water as
-easily as over it. The river does not chase, he says; it gathers, and so
-does he.
+easily as over it. The river does not chase, she says; it gathers, and so
+does she.
 
 **Stillsmoke.** Ninth son of the storm-dragon: antlered, scaled,
 sabre-fanged, and happiest sitting still in incense smoke. He sits so long

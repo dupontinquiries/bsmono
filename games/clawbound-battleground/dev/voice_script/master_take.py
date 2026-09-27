@@ -142,9 +142,10 @@ CHAINS = {
                "highpass=f=120,equalizer=f=2200:t=q:w=1:g=2,"
                "acompressor=threshold=-26dB:ratio=3:attack=8:release=120:makeup=2,"
                "aecho=0.8:0.7:260|520:0.07|0.03",
- # a jaguar of the drowned forest: heavy, down with the formants, wet
- # and murky
- 'riptail':    "rubberband=pitch=0.9:formant=shifted:pitchq=quality,"
+ # a jaguar of the drowned forest -- she: heavy, a little lower with her
+ # formants kept (shifted with them, as when the part was a he, a woman's
+ # reading came out a man's), wet and murky
+ 'riptail':    "rubberband=pitch=0.94:formant=preserved:pitchq=quality,"
                "equalizer=f=120:t=q:w=1:g=3,lowpass=f=5000,"
                "flanger=delay=2:depth=3:regen=-20:width=60:speed=0.3,"
                "acompressor=threshold=-26dB:ratio=4:attack=12:release=200:makeup=2,"
