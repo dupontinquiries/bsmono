@@ -78,6 +78,7 @@ pub mod lantern;
 pub mod sentinel;
 pub mod maze;
 pub mod machine;
+pub mod hours;
 pub mod mazeworld;
 /// The Curio shelf's passives, worked (items::Passive).
 pub mod curios;

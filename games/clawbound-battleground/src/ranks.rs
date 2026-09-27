@@ -93,6 +93,10 @@ pub fn mastery_text(arch: &Archetype) -> &'static str {
         Archetype::Echoes { .. } => "Mastery: the echoes linger 30% longer",
         Archetype::Lantern { .. } => "Mastery: the light reaches 25% further",
         Archetype::Field { .. } => "Mastery: the field reaches 20% further",
+        Archetype::Rewind { .. } => "Mastery: turned back a breath further",
+        Archetype::SendBack { .. } => "Mastery: reaches 20% further",
+        Archetype::WindForward { .. } => "Mastery: winds a second further on",
+        Archetype::LongLook { .. } => "Mastery: the look lingers 2 s longer",
     }
 }
 
@@ -122,6 +126,11 @@ pub fn mastery(arch: Archetype) -> Archetype {
         Echoes { each, life, dmg } => Echoes { each, life: life * 1.3, dmg },
         Lantern { radius, dmg, flee, reveal } => Lantern { radius: radius * 1.25, dmg, flee, reveal },
         Field { material, radius, amount, secs } => Field { material, radius: radius * 1.2, amount, secs },
+        // (a trail is `hours::TRAIL_SECS` long: 4 s back is the most there is)
+        Rewind { secs } => Rewind { secs: (secs + 1.0).min(crate::hours::TRAIL_SECS) },
+        SendBack { range, dmg, secs } => SendBack { range: range * 1.2, dmg, secs },
+        WindForward { radius, secs } => WindForward { radius, secs: secs + 1.0 },
+        LongLook { range, flight, reveal, exposed } => LongLook { range, flight, reveal: reveal + 2.0, exposed },
     }
 }
 
@@ -156,6 +165,12 @@ fn scale_amounts(arch: Archetype, m: f32) -> Archetype {
         // a field's strength grows with its rank (the sentinel caps what
         // granite and rime may reach)
         Field { material, radius, amount, secs } => Field { material, radius, amount: amount * m, secs },
+        // turning her own hour back has no amount (it is the health she
+        // had); winding on and looking back last a little longer instead
+        Rewind { secs } => Rewind { secs },
+        SendBack { range, dmg, secs } => SendBack { range, dmg: dmg * m, secs },
+        WindForward { radius, secs } => WindForward { radius, secs: secs * (1.0 + (m - 1.0) * 0.5) },
+        LongLook { range, flight, reveal, exposed } => LongLook { range, flight, reveal: reveal * (1.0 + (m - 1.0) * 0.5), exposed },
     }
 }
 

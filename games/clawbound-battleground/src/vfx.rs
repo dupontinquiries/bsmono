@@ -1322,6 +1322,36 @@ impl Vfx {
                         self.particles.push(Particle { pos: p, vel: v, life: 1.0, max_life: 1.0, size, color: col, alpha: 1.0, gravity: grav, drag: 1.0 });
                     }
                 }
+                // Hourwatch (`hours`): a line of pale gold motes from where a
+                // cat was sent to where it is now, fading back along it;
+                // her friends' hours wound on, a clock's ring; up into the
+                // stars and down again
+                Event::TimeTurned { from, to, back, .. } => {
+                    let col = if *back { [1.6, 1.35, 0.7] } else { [1.1, 0.95, 1.7] };
+                    for k in 0..40 {
+                        let u = k as f32 / 39.0;
+                        let p = *from + (*to - *from) * u + Vec3::Y * (0.6 + (k % 5) as f32 * 0.3);
+                        self.particles.push(Particle { pos: p, vel: Vec3::Y * 0.4, life: 0.4 + 0.8 * u, max_life: 1.2, size: 0.14, color: col, alpha: 0.9, gravity: -0.2, drag: 1.0 });
+                    }
+                    self.rings.push(Ring { pos: *to + Vec3::Y * 0.05, r0: 2.4, r1: 0.4, until: 0.5, dur: 0.5, color: [col[0] * 0.6, col[1] * 0.6, col[2] * 0.6], thick: 0.2 });
+                }
+                Event::WindFx { pos, radius } => {
+                    self.rings.push(Ring { pos: *pos + Vec3::Y * 0.05, r0: 0.8, r1: *radius, until: 0.6, dur: 0.6, color: [1.4, 1.2, 0.55], thick: 0.3 });
+                    for k in 0..12 {
+                        let a = k as f32 * std::f32::consts::TAU / 12.0;
+                        let d = Vec3::new(a.cos(), 0.0, a.sin());
+                        self.particles.push(Particle { pos: *pos + d * (*radius * 0.9) + Vec3::Y * 0.3, vel: Vec3::Y * 1.5, life: 0.7, max_life: 0.7, size: 0.2, color: [1.6, 1.3, 0.6], alpha: 1.0, gravity: 0.0, drag: 1.0 });
+                    }
+                }
+                Event::LookUp { pos, .. } => {
+                    for k in 0..48 {
+                        let a = k as f32 * 2.399;
+                        self.particles.push(Particle { pos: *pos + Vec3::new(a.cos() * 0.8, 0.5, a.sin() * 0.8), vel: Vec3::new(a.cos() * 1.5, 10.0 + (k % 6) as f32 * 2.5, a.sin() * 1.5), life: 1.4, max_life: 1.4, size: 0.12, color: [1.3, 1.4, 2.0], alpha: 1.0, gravity: 0.0, drag: 0.3 });
+                    }
+                }
+                Event::LookLand { pos, .. } => {
+                    self.rings.push(Ring { pos: *pos + Vec3::Y * 0.05, r0: 0.5, r1: 7.0, until: 0.7, dur: 0.7, color: [0.9, 1.0, 1.6], thick: 0.3 });
+                }
                 Event::BoulderLand { pos } | Event::CatFell { pos } => {
                     // a ring of dust off the flags
                     for k in 0..32 {

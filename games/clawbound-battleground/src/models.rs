@@ -243,6 +243,8 @@ fn god_grid(def: &GodDef, team: Team) -> Grid {
         PeltKind::Hollow => (5, 1, false),
         // a sand cat's ears: broad and low, set wide
         PeltKind::Lamp => (3, 2, false),
+        // a Pallas's cat's: small, round, set low and wide on a flat head
+        PeltKind::Hours => (2, 2, false),
         _ => (3, 1, false),
     };
     for sx in [-1i32, 1] {
@@ -334,6 +336,47 @@ fn god_grid(def: &GodDef, team: Team) -> Grid {
             g.set(cx, 24, lz + 1, brass);
             g.set(cx, 25, lz + 1, brass);
             paint_shell(&mut g, |_x, y, _z| (6..=12).contains(&y) && y % 3 == 0, solid(mix(pelt, dark, 0.35)));
+        }
+        PeltKind::Hours => {
+            // a Pallas's cat: frosted tips all over the long smoky coat;
+            // thin dark bars on the brow and down the cheeks; dark rings
+            // round the tail; and on her back a small brass hourglass, its
+            // sand pale and bright
+            paint_shell(&mut g, |x, y, z| {
+                if y < 14 {
+                    return false;
+                }
+                let h = ((x * 13 + z * 29 + y * 5) as u32).wrapping_mul(2654435761) >> 24;
+                h > 200
+            }, solid(mix(pelt, [1.0, 1.0, 1.0], 0.45)));
+            paint_shell(&mut g, |_x, y, z| z < cz - 17 && y > 20 && (z + 40).rem_euclid(3) == 0, solid(dark));
+            for dx in [-2i32, 0, 2] {
+                g.set(cx + dx, hy as i32 + 3, hz as i32 + 3, solid(dark));
+            }
+            for sx in [-1i32, 1] {
+                for k in 0..2 {
+                    g.set(cx + sx * 4, hy as i32 - k, hz as i32 + 3 - k, solid(dark));
+                }
+            }
+            let brass = solid([0.72, 0.52, 0.20]);
+            let sand = solid([1.0, 0.90, 0.62]);
+            let mut top = 0;
+            for y in (0..H).rev() {
+                if g.get(cx, y, cz + 2).is_some() {
+                    top = y;
+                    break;
+                }
+            }
+            let (y0, z0) = (top + 1, cz + 2);
+            g.filled_box(cx - 2, y0, z0 - 2, cx + 2, y0, z0 + 2, brass);
+            g.filled_box(cx - 2, y0 + 6, z0 - 2, cx + 2, y0 + 6, z0 + 2, brass);
+            for (px, pz) in [(-2i32, -2i32), (2, -2), (-2, 2), (2, 2)] {
+                g.filled_box(cx + px, y0 + 1, z0 + pz, cx + px, y0 + 5, z0 + pz, brass);
+            }
+            g.filled_box(cx - 1, y0 + 1, z0 - 1, cx + 1, y0 + 2, z0 + 1, sand);
+            g.set(cx, y0 + 3, z0, sand);
+            g.set(cx, y0 + 4, z0, sand);
+            g.filled_box(cx - 1, y0 + 5, z0 - 1, cx + 1, y0 + 5, z0 + 1, sand);
         }
         PeltKind::Mantle => {
             // the old snow leopard: open rosette rings over the whole
@@ -477,7 +520,7 @@ mod rig_tests {
     /// a hole that only shows in one pose.
     #[test]
     fn every_ancestor_cuts_into_ten_nonempty_parts_and_loses_nothing() {
-        assert_eq!(ROSTER.len(), 18);
+        assert_eq!(ROSTER.len(), 19);
         for def in ROSTER.iter() {
             let grid = god_grid(def, Team::Blue);
             let plan = feline_cut_plan(role_bulk(def.role), matches!(def.pelt, PeltKind::Antlers));

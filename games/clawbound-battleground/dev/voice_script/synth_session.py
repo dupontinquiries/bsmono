@@ -64,6 +64,9 @@ CAST = {
     # slowed to the floor this cast allows, and taken down in pitch with
     # her formants kept in master_take (oremantle's chain)
     'oremantle': ('af_bella', 0.9),
+    # the Watcher: dry, amused, a little too calm -- the C+ voice with
+    # the most even delivery, at her own pace
+    'hourwatch': ('af_aoede', 0.95),
 }
 
 

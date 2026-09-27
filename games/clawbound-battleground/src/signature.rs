@@ -78,12 +78,16 @@ pub enum Motif {
     /// ground in rings, one band inside another, hanging there and settling
     /// back: heavy, low, and in no hurry.
     Strata,
+    /// Hourwatch -- the hours: pale gold motes set round a clock face at
+    /// waist height, turning slowly round it, and a few blue starpoints
+    /// hanging above: still, measured, gone all at once.
+    Hours,
 }
 
-pub const MOTIFS: [Motif; 18] = [
+pub const MOTIFS: [Motif; 19] = [
     Motif::Sunroar, Motif::Rake, Motif::Rainfall, Motif::Umbra, Motif::Gyre, Motif::Yowl, Motif::Rime,
     Motif::Fangs, Motif::Halo, Motif::Hush, Motif::Lash, Motif::Thunderhead, Motif::Scree, Motif::Starfall,
-    Motif::Bloom, Motif::Fog, Motif::Lamplight, Motif::Strata,
+    Motif::Bloom, Motif::Fog, Motif::Lamplight, Motif::Strata, Motif::Hours,
 ];
 
 impl Motif {
@@ -113,6 +117,7 @@ impl Motif {
             Motif::Fog => [[0.46, 0.48, 0.53], [0.30, 0.32, 0.36], [0.15, 0.16, 0.19]],
             Motif::Lamplight => [[1.0, 0.92, 0.65], [1.0, 0.65, 0.22], [0.75, 0.30, 0.08]],
             Motif::Strata => [[0.90, 0.84, 0.70], [0.62, 0.54, 0.42], [0.42, 0.36, 0.30]],
+            Motif::Hours => [[1.0, 0.96, 0.80], [0.95, 0.78, 0.38], [0.55, 0.62, 1.0]],
         }
     }
 }
@@ -134,10 +139,10 @@ impl Gesture {
     pub fn of(arch: &Archetype) -> Gesture {
         use Archetype as A;
         match arch {
-            A::Nova { .. } | A::Storm { .. } | A::Pull { .. } | A::Giggle { .. } | A::Echoes { .. } | A::Lantern { .. } => Gesture::Burst,
+            A::Nova { .. } | A::Storm { .. } | A::Pull { .. } | A::Giggle { .. } | A::Echoes { .. } | A::Lantern { .. } | A::WindForward { .. } => Gesture::Burst,
             A::Bolt { .. } | A::Volley { .. } | A::Beam { .. } | A::Dash { .. } | A::Litter { .. } | A::Send { .. } => Gesture::Line,
-            A::Lob { .. } | A::Ring { .. } | A::Blink { .. } | A::Meteor { .. } | A::DanceParty { .. } | A::Swap { .. } => Gesture::Mark,
-            A::Shield { .. } | A::Buff { .. } | A::Heal { .. } | A::Field { .. } => Gesture::Mantle,
+            A::Lob { .. } | A::Ring { .. } | A::Blink { .. } | A::Meteor { .. } | A::DanceParty { .. } | A::Swap { .. } | A::SendBack { .. } | A::LongLook { .. } => Gesture::Mark,
+            A::Shield { .. } | A::Buff { .. } | A::Heal { .. } | A::Field { .. } | A::Rewind { .. } => Gesture::Mantle,
         }
     }
 }
@@ -319,6 +324,23 @@ pub fn emit(motif: Motif, gesture: Gesture, origin: Vec3, aim: Vec3, ult: bool, 
                 let base = if gesture == Gesture::Line { origin + dir * (u * span) + side * (band - 1.0) * 0.9 } else { centre + ring * (0.8 + band * 1.3) * (span / 4.5) };
                 push(Vec3::new(base.x, 0.05, base.z), Vec3::new(0.0, 1.3 + 0.4 * band, 0.0), 2.4, 0.26 + 0.08 * rng.f(), (i % 3).min(2), 1.0, 0.9, 1.6);
             }
+            Motif::Hours => {
+                // Twelve in thirteen set round a clock face at waist height
+                // (along the aim for a line: a row of them), turning slowly
+                // round it and hanging; the thirteenth a blue starpoint
+                // above, still.
+                if i % 13 == 12 {
+                    push(centre + Vec3::new(rng.s() * 1.5, 3.0 + 1.5 * rng.f(), rng.s() * 1.5), Vec3::ZERO, 1.6, 0.12, 2, 1.0, 0.0, 0.0);
+                } else {
+                    let (base, turn) = if gesture == Gesture::Line {
+                        (origin + dir * (u * span) + Vec3::Y * 1.0, side * 0.6)
+                    } else {
+                        let face = ring * (span * 0.35).max(1.4);
+                        (centre + face + Vec3::Y * 1.0, Vec3::new(-ring.z, 0.0, ring.x) * 2.2)
+                    };
+                    push(base, turn, 1.3, 0.1 + 0.05 * rng.f(), (i % 2) as usize, 1.0, 0.0, 0.2);
+                }
+            }
             Motif::Fog => {
                 // Low and flat, creeping OUT slowly along the ground, and
                 // slow to go: height is what it does not have.
@@ -413,7 +435,8 @@ mod tests {
                 }
             }
         }
-        assert_eq!(pairs, 2 * 18 * 17 / 2);
+        let n = MOTIFS.len();
+        assert_eq!(pairs, 2 * n * (n - 1) / 2);
         eprintln!("closest pair: {closest:?}");
     }
 
@@ -452,7 +475,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(total, 18 * 4 * 2);
+        assert_eq!(total, MOTIFS.len() * 4 * 2);
         // Aim on top of the caster, and garbage: no panic, no NaN.
         assert!(emit(Motif::Yowl, Gesture::Line, o, o, false, &mut Rng(1)).iter().all(|p| p.pos.is_finite()));
         assert!(emit(Motif::Rake, Gesture::Line, Vec3::splat(f32::NAN), o, false, &mut Rng(1)).is_empty());
@@ -474,6 +497,6 @@ mod tests {
             multi += (seen.len() >= 2) as usize;
         }
         assert_eq!(crate::gods::ROSTER.len(), MOTIFS.len(), "one motif per ancestor, exactly");
-        assert!(multi >= 12, "only {multi}/14 kits use two or more gestures");
+        assert!(multi >= 12, "only {multi}/{} kits use two or more gestures", crate::gods::ROSTER.len());
     }
 }

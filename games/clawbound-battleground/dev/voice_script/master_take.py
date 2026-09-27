@@ -185,6 +185,12 @@ CHAINS = {
                "highpass=f=70,lowshelf=f=160:g=3,equalizer=f=2400:t=q:w=1:g=1,"
                "acompressor=threshold=-24dB:ratio=3:attack=10:release=200:makeup=2,"
                "aecho=0.8:0.5:150|300:0.06|0.03",
+ # the Watcher of the high steppe: dry and close, clear consonants, and far
+ # behind her the steppe at night answering late and faint (a long, thin
+ # echo): the only room she is in is the whole sky
+ 'hourwatch':  "highpass=f=90,equalizer=f=220:t=q:w=1:g=1,equalizer=f=3600:t=q:w=1.2:g=2,"
+               "acompressor=threshold=-24dB:ratio=3:attack=8:release=150:makeup=2,"
+               "aecho=0.8:0.45:340|680:0.09|0.04",
  # a young daredevil: bright and quick, a short slap
  'cometail':   "rubberband=pitch=1.04:tempo=1.03:formant=preserved:pitchq=quality,"
                "highpass=f=120,treble=g=4:f=6000,"

@@ -901,7 +901,10 @@ pub fn bot_goal(game: &Game, gi: usize) -> Option<Vec3> {
                 continue;
             }
             let n = if p.a == rm { p.b } else { p.a };
-            if !towered(n) && seen.insert(n) {
+            // (nor a passage an enemy tower covers: the same standoff, one
+            // room on -- Twofang, seed 9, 15 s)
+            let covered = game.towers.iter().any(|tw| tw.team != me.team && tw.hp > 0.0 && [p.p0, p.mid(), p.p1].iter().any(|q| tw.pos.distance(*q) < crate::consts::TOWER_RANGE + 2.0));
+            if !towered(n) && !covered && seen.insert(n) {
                 q.push_back(n);
             }
         }

@@ -443,6 +443,58 @@ pub fn ability(def: &GodDef, slot: usize) -> Vec<f32> {
             let warm = tones(1.2, &[b * 2.0, b * 2.5, b * 3.0], 0.12, 0.7, 0.1, 0.2);
             mix_at(&mut x, &warm, 0.1, 0.6);
         }
+        // Hourwatch (`hours`): the clock
+        Archetype::Rewind { .. } => {
+            // her own hour turned back: a bell played backwards (swelling
+            // up out of nothing and stopping dead), ticks running backward
+            // under it, faster and faster
+            let mut bell = tones(0.8, &[b * 6.0, b * 6.0 * 2.4, b * 6.0 * 4.1], 0.002, 0.5, 0.0, 0.0);
+            bell.reverse();
+            mix_at(&mut x, &bell, 0.0, 0.7);
+            let mut at = 0.0;
+            let mut gap = 0.12;
+            // (the gaps shrink toward 0.6 s in all: stop at the last one
+            // longer than 20 ms, not at a time the ticks never reach)
+            while gap > 0.02 {
+                let tick = thud(0.03, 2600.0, 1800.0, 0.2, &mut n);
+                mix_at(&mut x, &tick, at, 0.35);
+                at += gap;
+                gap *= 0.8;
+            }
+        }
+        Archetype::SendBack { .. } => {
+            // someone else's hour: one hard tick, and a whoosh drawn
+            // backward (it swells toward the tick, then silence)
+            let mut w = whoosh(0.45, 600.0, 3800.0, 1.4, &mut n);
+            w.reverse();
+            mix_at(&mut x, &w, 0.0, 0.8);
+            let tick = thud(0.06, 1900.0, 1100.0, 0.3, &mut n);
+            mix_at(&mut x, &tick, 0.44, 0.9);
+            let low = tones(0.5, &[b * 2.0], 0.005, 0.3, 0.3, 0.0);
+            mix_at(&mut x, &low, 0.44, 0.5);
+        }
+        Archetype::WindForward { .. } => {
+            // a mainspring wound: a ratchet climbing in pitch, and a bright
+            // chord as it lets go
+            let mut at = 0.0;
+            let mut k = 0;
+            while at < 0.5 {
+                let tick = thud(0.025, 1400.0 + k as f32 * 180.0, 1000.0 + k as f32 * 150.0, 0.3, &mut n);
+                mix_at(&mut x, &tick, at, 0.45);
+                at += 0.05;
+                k += 1;
+            }
+            let chord = tones(0.7, &[b * 4.0, b * 5.04, b * 6.0], 0.01, 0.45, 0.05, 0.0);
+            mix_at(&mut x, &chord, 0.5, 0.6);
+        }
+        Archetype::LongLook { .. } => {
+            // up into the stars: a long rising shimmer, a high glassy bell
+            // at the top, and the sky's hush
+            let w = whoosh(0.9, 300.0, 7000.0, 2.0, &mut n);
+            mix_at(&mut x, &w, 0.0, 0.7);
+            let bell = tones(0.8, &[b * 12.0, b * 12.0 * 1.5, b * 12.0 * 2.01], 0.01, 0.6, 0.0, 0.3);
+            mix_at(&mut x, &bell, 0.35, 0.45);
+        }
         Archetype::Field { material, .. } => {
             use crate::gods::Material;
             match material {

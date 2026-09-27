@@ -315,6 +315,21 @@ pub const PARTS: &[Part] = &[
         ],
     },
     Part {
+        who: "hourwatch",
+        voice: "A night-watcher who has seen every ending already: dry, amused, unhurried, a little too calm. She talks as if she remembers what you are about to do. Mid voice, clipped consonants; the ultimate is the only line with wonder in it.",
+        lines: &[
+            l("select", "I have seen how this goes.", "dry, faintly amused", 2, SELECT),
+            l("cast1", "Again.", "calm, a correction", 2, "winds up Turn Back"),
+            l("cast2", "Not yet, you don't.", "tart, pointing", 3, "winds up Send Back"),
+            l("cast3", "Sooner.", "brisk, winding a spring", 3, "winds up Wind Forward"),
+            l("cast4", "Look back... I see ALL of you!", "hushed wonder, rising on 'all'", 5, "winds up The Long Look"),
+            l("kill.1", "I saw that coming.", "unsurprised", 2, KILL),
+            l("kill.2", "Right on time.", "satisfied, checking a clock", 2, KILL),
+            l("death.1", "I didn't see... this one...", "genuinely surprised", 1, DEATH),
+            l("death.2", "Out of... time...", "a last dry joke", 1, DEATH),
+        ],
+    },
+    Part {
         who: "narrator",
         voice: "The storyteller of the clans, over the first match's prologue: unhurried, weighty, a little in awe. Let each line breathe; the music leaves room between them. Record each as its own file.",
         lines: &[

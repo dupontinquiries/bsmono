@@ -95,7 +95,7 @@ fn trophies_grow_the_stat_they_name_up_to_their_most() {
 
 #[test]
 fn roster_is_14_ancestors_with_4_abilities_each() {
-    assert_eq!(ROSTER.len(), 18);
+    assert_eq!(ROSTER.len(), 19);
     let roles: std::collections::HashSet<_> = ROSTER.iter().map(|g| g.role).collect();
     assert!(roles.len() >= 4, "roster should span multiple roles");
     for g in &ROSTER {
@@ -858,7 +858,9 @@ fn firing_range_every_ability_goes_where_it_is_aimed_and_turns_the_cat() {
             }
             // the step goes to wherever his other is, and the echoes rise
             // round him: neither goes along the aim
-            let directional = !matches!(ab.arch, Archetype::Nova { .. } | Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } | Archetype::Giggle { .. } | Archetype::Swap { .. } | Archetype::Echoes { .. } | Archetype::Lantern { .. } | Archetype::Field { .. });
+            // (Hourwatch's hours go where the cat WAS, or to friends round
+            // her, or -- sent back -- to an enemy, and this range is empty)
+            let directional = !matches!(ab.arch, Archetype::Nova { .. } | Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } | Archetype::Giggle { .. } | Archetype::Swap { .. } | Archetype::Echoes { .. } | Archetype::Lantern { .. } | Archetype::Field { .. } | Archetype::Rewind { .. } | Archetype::WindForward { .. } | Archetype::SendBack { .. });
             if directional {
                 assert!(!dirs.is_empty(), "{} slot {slot} ({:?}): no directional effect found", def.name, ab.arch);
                 for d in &dirs {
@@ -3118,6 +3120,76 @@ mod brasshowl {
             }
         }
         assert!(used[0] > 0 && used[1] > 0 && used[3] > 0, "oil, bark and the lamp in four minutes: {used:?}");
+    }
+}
+
+mod hourwatch {
+    use clawbound::gods::ROSTER;
+    use clawbound::map::{self, MapId};
+    use clawbound::sim::{Event, Game};
+    use glam::Vec3;
+
+    fn id() -> u32 {
+        ROSTER.iter().position(|d| d.name == "Hourwatch").unwrap() as u32
+    }
+
+    /// A bot Hourwatch in a real match uses her kit: sends back, winds
+    /// forward, and looks long, in four minutes.
+    #[test]
+    fn a_bot_hourwatch_keeps_the_hours() {
+        let mut g = Game::new_teams(&[0, id(), 3], &[1, 2, 4]);
+        for c in g.gods.iter_mut() {
+            c.ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+        }
+        for i in 0..g.gods.len() {
+            g.set_level(i, 6);
+        }
+        let mut used = [0u32; 4];
+        for _ in 0..(240 * 30) {
+            g.tick(1.0 / 30.0);
+            for e in g.events.drain(..) {
+                if let Event::Cast { god: 1, slot, .. } = e {
+                    used[slot as usize] += 1;
+                }
+            }
+        }
+        assert!(used[1] > 0 && used[2] > 0 && used[3] > 0, "send back, wind forward and the long look in four minutes: {used:?}");
+    }
+
+    /// On the Quarry, where walls hide: an enemy behind a wall is not seen
+    /// by her team -- until she looks long from in front of it.
+    #[test]
+    fn the_long_look_sees_through_the_quarry_walls() {
+        map::with(MapId::Maze, || {
+            let mut g = Game::new_teams(&[id()], &[1]);
+            g.blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+            for c in g.gods.iter_mut() {
+                c.ai = None;
+            }
+            g.minions.clear();
+            g.next_wave_t = 1e9;
+            let blue = g.gods[0].team;
+            let fwd = clawbound::hours::forward(blue);
+            // her in the Heart; the enemy two rooms back toward her base
+            // (behind her), in the middle column's back room
+            g.gods[0].pos = Vec3::new(0.0, 0.0, 0.0);
+            g.gods[1].pos = clawbound::maze::room_pos((1, if fwd.z > 0.0 { -2 } else { 2 })) + Vec3::new(8.0, 0.0, 0.0);
+            g.gods[0].mana = 9999.0;
+            g.set_level(0, 6);
+            for _ in 0..30 {
+                g.tick(1.0 / 60.0);
+            }
+            assert!(!g.sees(blue, 1), "seen through the walls before the look");
+            let slot = 3;
+            let aim = g.gods[0].pos + fwd * 20.0;
+            g.cast_queue.push((0, slot, aim));
+            let mut seen = false;
+            for _ in 0..60 {
+                g.tick(1.0 / 60.0);
+                seen |= g.sees(blue, 1);
+            }
+            assert!(seen, "the long look did not show the one behind her");
+        });
     }
 }
 

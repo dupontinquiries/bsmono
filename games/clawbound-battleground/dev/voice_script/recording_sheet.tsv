@@ -161,6 +161,15 @@ voice/oremantle/kill.1.opus	oremantle	Rest now.	grandmotherly, almost kind	2	tak
 voice/oremantle/kill.2.opus	oremantle	Stone outlasts.	flat, certain	2	takes down an enemy ancestor
 voice/oremantle/death.1.opus	oremantle	Even mountains... fall...	surprised, slow	1	falls
 voice/oremantle/death.2.opus	oremantle	Back... to the rock...	content, going home	1	falls
+voice/hourwatch/select.opus	hourwatch	I have seen how this goes.	dry, faintly amused	2	locked in on the select screen
+voice/hourwatch/cast1.opus	hourwatch	Again.	calm, a correction	2	winds up Turn Back
+voice/hourwatch/cast2.opus	hourwatch	Not yet, you don't.	tart, pointing	3	winds up Send Back
+voice/hourwatch/cast3.opus	hourwatch	Sooner.	brisk, winding a spring	3	winds up Wind Forward
+voice/hourwatch/cast4.opus	hourwatch	Look back... I see ALL of you!	hushed wonder, rising on 'all'	5	winds up The Long Look
+voice/hourwatch/kill.1.opus	hourwatch	I saw that coming.	unsurprised	2	takes down an enemy ancestor
+voice/hourwatch/kill.2.opus	hourwatch	Right on time.	satisfied, checking a clock	2	takes down an enemy ancestor
+voice/hourwatch/death.1.opus	hourwatch	I didn't see... this one...	genuinely surprised	1	falls
+voice/hourwatch/death.2.opus	hourwatch	Out of... time...	a last dry joke	1	falls
 narrator/prologue1.opus	narrator	Before any word was written, the world belonged to the clans.	hushed, as if starting an old story	2	the prologue opens, line 1 of 8 (first match of a session)
 narrator/prologue2.opus	narrator	No hand raised a wall. No fire burned but the lightning's.	slow, each sentence its own image	2	the prologue, line 2 of 8
 narrator/prologue3.opus	narrator	From the frozen long-ago to the endless dunes, the great cats kept it.	growing, sweeping	3	the prologue, line 3 of 8
