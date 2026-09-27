@@ -61,7 +61,7 @@ CHAINS = {
  # rolled off after it (the saturation's harmonics were the fizz up top)
  'oldroar':    "rubberband=pitch=0.84:tempo=0.94:formant=shifted,"
                "asubboost=dry=1:wet=0.9:decay=0.6:feedback=0.5:cutoff=90:slope=0.6,"
-               "equalizer=f=48:t=q:w=0.8:g=9,equalizer=f=90:t=q:w=1:g=4,equalizer=f=2200:t=q:w=1.2:g=1.5,"
+               "equalizer=f=48:t=q:w=0.8:g=5,equalizer=f=90:t=q:w=1:g=4,equalizer=f=2200:t=q:w=1.2:g=1.5,"
                "asoftclip=type=tanh:threshold=0.85:output=1,"
                "lowpass=f=5200:p=2,lowpass=f=5200,equalizer=f=3800:t=q:w=1.5:g=-3,deesser=i=0.5:f=0.4,"
                "acompressor=threshold=-26dB:ratio=4:attack=15:release=250:makeup=2,"
@@ -97,6 +97,66 @@ def viper(y):
     return ((y[i0] * (1 - fr) + y[i1] * fr) * trem).astype(np.float32)
 
 POST = {'twofang': viper}
+
+# The god and the beast under each voice, laid in BEFORE the chain so the
+# chain's pitch, EQ, compression and room glue them to the voice (beast.py).
+sys.path.insert(0, HERE)
+import beast as B
+
+
+def goldenmane_layers(c, key):
+    # a second, octave-down self speaking with him (the god), and a lion's
+    # growl in his throat -- a thread of it always, swelling on the shouts
+    low = B.at(-9, B.octave(c, 0.5), c)
+    g = B.cross(c, B.growl_carrier(len(c), f0=62, jitter=0.15, double=0.3, seed=11))
+    gate = B.loud_gate(c, 14) ** 1.5
+    return c + low + B.at(-9, g, c) * (0.3 + 1.2 * gate)
+
+
+def oldroar_layers(c, key):
+    # older and deeper: the octave-down self louder, and a slow cave-lion
+    # rumble (a 38 Hz growl, very irregular) under every word
+    low = B.at(-5, B.octave(c, 0.5), c)
+    g = B.cross(c, B.growl_carrier(len(c), f0=38, jitter=0.28, double=0.5, seed=12))
+    gate = B.loud_gate(c, 18)
+    return c + low + B.at(-6, B.lowpass(g, 900), c) * (0.5 + 0.8 * gate)
+
+
+def twofang_layers(c, key):
+    # the sabertooth hisses through its words (the voice's envelope on
+    # noise, only the top), snarls on its loud ones, and the lines it has
+    # time for trail off in a hiss
+    hiss = B.bandpass(B.cross(c, B.noise(len(c), seed=13)), 2800, 9000)
+    g = B.cross(c, B.growl_carrier(len(c), f0=92, jitter=0.3, double=0.45, seed=14))
+    gate = B.loud_gate(c, 10) ** 2
+    y = c + B.at(-12, hiss, c) + B.at(-6, g, c) * gate
+    if not key.startswith('cast'):
+        n = int(0.45 * SR)
+        tail = B.bandpass(B.noise(n, seed=15), 2500, 8000)
+        tail *= np.exp(-np.arange(n) / (0.12 * SR)) * np.minimum(1, np.arange(n) / (0.02 * SR))
+        y = np.concatenate([y, B.at(-8, tail, c) * 1.6])
+    return y
+
+
+def windclaw_layers(c, key):
+    # a caracal of the sky: a breath of wind through the words, a faint
+    # fifth-up spirit voice, and its chirrup -- before the select call,
+    # after a kill (the laugh in it), and on "Up, up!"
+    wind = B.bandpass(B.cross(c, B.noise(len(c), seed=16)), 500, 3000)
+    hi = B.octave(c, 1.5)
+    y = c + B.at(-16, wind, c) + B.at(-17, hi, c)
+    ch = B.chirp()
+    ch = ch * (np.abs(c).max() * 0.55)
+    gap = np.zeros(int(0.05 * SR), np.float32)
+    if key == 'select':
+        y = np.concatenate([ch, gap, y])
+    elif key.startswith('kill') or key == 'cast3':
+        up = B.chirp(0.13, 620, 1250, seed=4) * (np.abs(c).max() * 0.5)
+        y = np.concatenate([y, gap, up])
+    return y.astype(np.float32)
+
+
+PRE = {'goldenmane': goldenmane_layers, 'oldroar': oldroar_layers, 'twofang': twofang_layers, 'windclaw': windclaw_layers}
 sheet = {}
 for row in csv.DictReader(open(os.path.join(HERE, 'recording_sheet.tsv')), delimiter='\t'):
     sheet[row['file']] = row
@@ -143,6 +203,9 @@ for who, key, s, e in TAKES:
     c, _ = sf.read('tmp_clean.wav', dtype='float32')
     c = c[int(0.5*SR):len(c)-int(0.5*SR)]
     c = trim(c)
+    if who in PRE:
+        c = PRE[who](c, key).astype(np.float32)
+        c /= max(1.0, float(np.abs(c).max()) / 0.9)
     sf.write('tmp_cut.wav', c, SR)
     # the chain, then room for the tail to ring out
     ff('tmp_cut.wav', 'tmp_fx.wav', "apad=pad_dur=0.5," + CHAINS[who])

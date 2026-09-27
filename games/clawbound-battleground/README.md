@@ -133,7 +133,14 @@ what else is known-but-unresolved.
   and a hall; Oldroar down a major third with the formants, slowed, a deep
   sub, grit with the top rolled off, a cave; Twofang dry, bitten,
   hard-compressed, with a viper's tremolo rattle; Windclaw up, quicker,
-  bright and airy, in a small room).
+  bright and airy, in a small room). Under each, layers synthesised from
+  the line itself (`dev/voice_script/beast.py`: a vocoder putting the words
+  on a growl or on breath): Goldenmane an octave-down double and a lion's
+  growl that swells on his shouts; Oldroar a louder octave-down double and
+  a 38 Hz cave rumble; Twofang a hiss through his words, a snarl on the loud
+  ones and a hiss trailing his kill, death and select lines; Windclaw wind,
+  a faint fifth-up spirit voice and a caracal chirrup before his select
+  call, after his kills and on "Up, up!".
   `dev/voice_script/master_take.py` cuts, cleans and masters a session;
   `tests/voice_assets.rs` checks every recorded ancestor is complete,
   trimmed and levelled. The other ancestors are still unvoiced.
