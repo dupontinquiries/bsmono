@@ -3403,6 +3403,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // O2 at the head last frame (the bending fields read it before the air
     // block runs), how muffled the world sounds, and when the earth last spoke.
     let mut o2_head_last = unendlich_engine::world::cave_gas::O2_AIR;
+    // HUD notices (sim::notices): short messages under the status lines.
+    let mut notices = unendlich_engine::sim::notices::Notices::new();
+    let mut notices_shown_rev = 0u64;
     let mut air_hush = 0.0f32;
     // Cave air temperature (world::cave_climate). UNENDLICH_CAVE_CLIMATE=0
     // keeps the surface climate everywhere, as before.
@@ -8506,6 +8509,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 log::info!(
                     "[survival] YOU DIED at ({:.0},{:.0},{:.0}) — {} item(s) dropped there; respawned",
                     here[0], here[1], here[2], dropped
+                );
+                notices.push(
+                    "death",
+                    format!("You died. {} item(s) lie where you fell", dropped),
                 );
             }
             // r130: PLAYER BENDING (B) — stance from movement, element from
@@ -15737,7 +15744,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
             // Periodic readout of the flock's sustained state (so alarm holding
             // while you linger — and decaying as you leave — is visible).
-            if lifetime_frame % 30 == 0 {
+            // Also redraw at once when a notice appears or expires (sim::notices).
+            let notice_due = notices.revision() != notices_shown_rev
+                || notices.next_expiry().map_or(false, |t| start.elapsed().as_secs_f32() >= t);
+            if lifetime_frame % 30 == 0 || notice_due {
                 // r126: on-screen HUD (egui card top-left) — same data as the
                 // [HUD] log line, visible without a terminal.
                 // r545: survival meters for the on-screen bars (hunger + thermal now;
@@ -15904,6 +15914,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         ));
                     }
                 }
+                // HUD notices (sim::notices), newest first.
+                for t in notices.active(start.elapsed().as_secs_f32()) {
+                    renderer.hud_status_lines.push(format!("\u{25b6} {t}"));
+                }
+                notices_shown_rev = notices.revision();
                 // r509: show the held weapon's durability when one is equipped.
                 if let Some((_, cur, max)) = equipped_weapon_dura {
                     renderer.hud_status_lines.push(format!(
@@ -17132,6 +17147,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             let nb = ca::breath_for(o2_head);
             if nb != breath {
                 log::info!("[air] O2 {:.1}% at the head: {:?} -> {:?}", o2_head * 100.0, breath, nb);
+                // Breath is a survival matter: creative has no lungs to warn.
+                if survival_mode {
+                    match ca::breath_notice(breath, nb) {
+                        Some(t) => notices.push("breath", t),
+                        None => notices.clear("breath"),
+                    }
+                }
                 breath = nb;
             }
             air_fx = ca::effects(if survival_mode { breath } else { ca::Breath::Normal });
@@ -17146,6 +17168,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 let nh = ca::heat_for(ambient_c_last);
                 if nh != heat {
                     log::info!("[heat] air {:.0}°C: {:?} -> {:?}", ambient_c_last, heat, nh);
+                    if survival_mode {
+                        match ca::heat_notice(nh) {
+                            Some(t) => notices.push("heat", t),
+                            None => notices.clear("heat"),
+                        }
+                    }
                     heat = nh;
                 }
             }
@@ -17185,6 +17213,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             "[bending] the stone tells of dead air {:.0} blocks off, below y={} (earth sense)",
                             s.distance, s.basin.surface_y + 1
                         );
+                        notices.push(
+                            "earth",
+                            if s.distance < 1.0 {
+                                "The stone tells you: you stand in dead air".to_string()
+                            } else {
+                                format!("The stone tells of dead air {:.0} blocks off, below y {}", s.distance, s.basin.surface_y + 1)
+                            },
+                        );
                     }
                     gas_sensed = key;
                 }
@@ -17207,10 +17243,22 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     let mut k = 1.0;
                     if b == unendlich_engine::world::blocks::BlockId::Torch {
                         match held_flame.tick(o2_at(lp), dt) {
-                            ca::FlameEvent::StartedSputtering => log::info!("[air] your torch sputters"),
-                            ca::FlameEvent::Died => log::info!("[air] your torch goes out"),
-                            ca::FlameEvent::Recovered => log::info!("[air] your torch steadies"),
-                            ca::FlameEvent::Rekindled => log::info!("[air] your torch rekindles"),
+                            ca::FlameEvent::StartedSputtering => {
+                                log::info!("[air] your torch sputters");
+                                notices.push("flame", "Your torch sputters");
+                            }
+                            ca::FlameEvent::Died => {
+                                log::info!("[air] your torch goes out");
+                                notices.push("flame", "Your torch goes out");
+                            }
+                            ca::FlameEvent::Recovered => {
+                                log::info!("[air] your torch steadies");
+                                notices.push("flame", "Your torch steadies");
+                            }
+                            ca::FlameEvent::Rekindled => {
+                                log::info!("[air] your torch rekindles");
+                                notices.push("flame", "Your torch rekindles");
+                            }
                             ca::FlameEvent::None => {}
                         }
                         k = held_flame.intensity(now_s);
