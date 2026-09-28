@@ -3604,3 +3604,138 @@ mod god_limit {
         });
     }
 }
+
+/// Claypaw's mudslide kittens think for themselves (`clay::kit_foe`,
+/// `clay::kit_idle_goal`): they hunt cats past a lane minion's notice and
+/// past its leash, go for the one their potter is fighting, keep to him
+/// with nothing to bite, and march a lane when he is gone.
+mod mud_kittens {
+    use clawbound::map::{self, MapId};
+    use clawbound::sim::Game;
+    use glam::Vec3;
+
+    fn claypaw() -> u32 {
+        clawbound::gods::ROSTER.iter().find(|d| d.name == "Claypaw").unwrap().id
+    }
+
+    /// Claypaw (0) against two cats (1, 2), nobody driven, no towers to
+    /// distract, the enemies parked far off unless a test places them.
+    fn quiet() -> Game {
+        let mut g = Game::new_teams(&[claypaw()], &[0, 1]);
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+        }
+        for t in g.towers.iter_mut() {
+            t.hp = 0.0;
+        }
+        g.gods[1].pos = Vec3::new(400.0, 0.0, 400.0);
+        g.gods[2].pos = Vec3::new(-400.0, 0.0, 400.0);
+        g
+    }
+
+    fn run(g: &mut Game, secs: f32, mut each: impl FnMut(&mut Game)) {
+        for _ in 0..(secs * 30.0) as usize {
+            each(g);
+            g.tick(1.0 / 30.0);
+            g.events.clear();
+            // only the kittens: no lane waves wander in
+            g.minions.retain(|m| m.clay.is_some());
+        }
+    }
+
+    fn kits(g: &Game) -> Vec<Vec3> {
+        g.minions.iter().filter(|m| m.clay.is_some()).map(|m| m.pos).collect()
+    }
+
+    /// A cat 12 u BEHIND the mud (a lane minion notices at 7), walking
+    /// away: the kittens turn, catch it and bite, and follow it well past
+    /// a lane minion's 9 u leash.
+    #[test]
+    fn they_hunt_a_cat_behind_them_and_past_the_leash() {
+        let mut g = quiet();
+        let at = Vec3::new(10.0, 0.0, -20.0);
+        g.gods[0].pos = at + Vec3::new(0.0, 0.0, -40.0); // the potter out of it
+        g.gods[1].pos = at - Vec3::X * 12.0;
+        let hp0 = g.gods[1].hp;
+        g.slide_kittens(0, at, 6, Vec3::X);
+        run(&mut g, 4.0, |g| g.gods[1].pos -= Vec3::X * (2.5 / 30.0));
+        assert!(g.gods[1].hp < hp0 - 50.0, "the kittens never bit: {} of {hp0}", g.gods[1].hp);
+        let far = kits(&g).iter().map(|k| (*k - at).length()).fold(0.0f32, f32::max);
+        assert!(far > 15.0, "no kitten followed past the leash: furthest {far:.1} u");
+    }
+
+    /// Two cats, the nearer one untouched, the other just hit by the
+    /// potter: the kittens go for his.
+    #[test]
+    fn they_go_for_the_cat_their_potter_is_fighting() {
+        let mut g = quiet();
+        let at = Vec3::new(10.0, 0.0, -20.0);
+        g.gods[0].pos = at + Vec3::new(-6.0, 0.0, 0.0);
+        g.gods[1].pos = at + Vec3::new(0.0, 0.0, 7.0);
+        g.gods[2].pos = at + Vec3::new(0.0, 0.0, -10.0);
+        g.slide_kittens(0, at, 6, Vec3::X);
+        run(&mut g, 1.2, |g| {
+            let t = g.t;
+            g.gods[2].recent_damagers = vec![(0, t)];
+        });
+        let (a, b) = (g.gods[1].pos, g.gods[2].pos);
+        let to_b = kits(&g).iter().filter(|k| (**k - b).length() < (**k - a).length()).count();
+        assert!(to_b >= 5, "only {to_b} of 6 went for the potter's cat");
+    }
+
+    /// Nothing to bite: they keep round the potter as he walks, not off
+    /// the way the mud threw them.
+    #[test]
+    fn with_nothing_to_bite_they_keep_to_their_potter() {
+        let mut g = quiet();
+        let at = Vec3::new(10.0, 0.0, -20.0);
+        g.gods[0].pos = at;
+        g.slide_kittens(0, at + Vec3::X * 2.0, 6, Vec3::X);
+        run(&mut g, 6.0, |g| g.gods[0].pos += Vec3::Z * (5.0 / 30.0));
+        let o = g.gods[0].pos;
+        let far = kits(&g).iter().map(|k| (*k - o).length()).fold(0.0f32, f32::max);
+        assert!(!kits(&g).is_empty() && far < 6.0, "a kitten strayed {far:.1} u from its potter");
+    }
+
+    /// The potter dead: they march the nearest lane, not on into the wild.
+    #[test]
+    fn without_their_potter_they_take_a_lane() {
+        let mut g = quiet();
+        g.gods[0].respawn_t = 100.0;
+        let lanes: Vec<Vec3> = map::lanes().iter().flat_map(|&l| clawbound::consts::lane_path(l, g.gods[0].team).to_vec()).collect();
+        let off = |p: Vec3| lanes.iter().map(|w| Vec3::new(w.x - p.x, 0.0, w.z - p.z).length()).fold(f32::MAX, f32::min);
+        // a spot well off any lane, thrown further off
+        let at = (0..400).map(|k| Vec3::new(-90.0 + (k % 20) as f32 * 9.0, 0.0, -90.0 + (k / 20) as f32 * 9.0)).find(|p| (18.0..30.0).contains(&off(*p))).expect("an off-lane spot");
+        let away = lanes.iter().min_by(|a, b| (**a - at).length().total_cmp(&(**b - at).length())).map(|w| Vec3::new(at.x - w.x, 0.0, at.z - w.z).normalize()).unwrap();
+        g.slide_kittens(0, at, 4, away);
+        let start = off(at);
+        run(&mut g, 6.0, |_| {});
+        let worst = kits(&g).iter().map(|k| off(*k)).fold(0.0f32, f32::max);
+        assert!(worst < 5.0, "a kitten is still {worst:.1} u off the lanes (started {start:.1})");
+    }
+
+    /// On the Pass, thrown at a cliff with the scene's own collision:
+    /// no kitten ever stands in the rock.
+    #[test]
+    fn on_the_pass_they_stay_out_of_the_rock() {
+        map::with(MapId::Pass, || {
+            let mut g = quiet();
+            g.blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+            g.gods[0].respawn_t = 100.0;
+            let f = map::floor().unwrap();
+            let path = clawbound::consts::lane_path(map::lanes()[0], g.gods[0].team);
+            // a lane point with rock close beside it, and the way to it
+            let (at, dir) = path
+                .iter()
+                .flat_map(|p| (0..16).map(move |k| (*p, Vec3::new((k as f32 * 0.3927).cos(), 0.0, (k as f32 * 0.3927).sin()))))
+                .find(|(p, d)| f.sdf(p.x, p.z) < -2.0 && f.sdf(p.x + d.x * 9.0, p.z + d.z * 9.0) > 1.0)
+                .expect("rock beside a lane");
+            g.slide_kittens(0, at, 6, dir);
+            run(&mut g, 8.0, |g| {
+                for m in &g.minions {
+                    assert!(f.sdf(m.pos.x, m.pos.z) <= 0.3, "a kitten in the rock at {} (sdf {:.2})", m.pos, f.sdf(m.pos.x, m.pos.z));
+                }
+            });
+        });
+    }
+}
