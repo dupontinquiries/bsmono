@@ -66,6 +66,10 @@ pub struct Floater {
 pub struct UiState {
     /// The map the next match is played on (the select screen's picker).
     pub map_choice: crate::map::MapId,
+    /// The god limit for the next match (`picks`), and under no limit
+    /// whether the bots all play the player's ancestor.
+    pub god_limit: crate::picks::GodLimit,
+    pub mirror: bool,
     /// the player's display name from the game centre, if launched from it
     pub player_label: Option<String>,
     pub shop_open: bool,
@@ -429,6 +433,8 @@ pub fn draw_select(ctx: &egui::Context, ui_state: &mut UiState, locked: &mut boo
         }
         ui.add_space(12.0);
         map_picker(ui, &mut ui_state.map_choice);
+        ui.add_space(6.0);
+        god_limit_picker(ui, &mut ui_state.god_limit, &mut ui_state.mirror, ui_state.map_choice.team_size());
         ui.add_space(10.0);
         let lock = ui.add_sized([300.0, 48.0], egui::Button::new(egui::RichText::new("LOCK IN").size(22.0).color(Color32::BLACK).strong()).fill(GOLD));
         glow_hover(ui, &lock, GOLD, 8.0);
@@ -1455,6 +1461,36 @@ pub fn map_blurb(m: crate::map::MapId) -> &'static str {
 }
 
 /// The map picker on the select screen: a card per map, the chosen one lit.
+/// The god limit (`picks::GodLimit`): three buttons, the chosen one's
+/// line under them, and under no limit the mirror toggle.
+pub fn god_limit_picker(ui: &mut egui::Ui, limit: &mut crate::picks::GodLimit, mirror: &mut bool, size: usize) {
+    use crate::picks::GodLimit;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("ANCESTORS").size(13.0).color(GOLD));
+        ui.add_space(6.0);
+        for l in GodLimit::ALL {
+            let sel = *limit == l;
+            let b = egui::Button::new(egui::RichText::new(l.name()).size(13.0).color(if sel { Color32::BLACK } else { Color32::from_rgb(220, 216, 205) }))
+                .fill(if sel { GOLD } else { Color32::from_rgb(34, 33, 40) })
+                .min_size(Vec2::new(0.0, 26.0));
+            if ui.add(b).clicked() {
+                *limit = l;
+            }
+        }
+        // on the same row, so the choice costs the panel no height
+        if *limit == GodLimit::Open {
+            ui.add_space(6.0);
+            ui.checkbox(mirror, egui::RichText::new("Every cat plays yours").size(12.0));
+        }
+    });
+    let line = if *limit == GodLimit::Open && *mirror {
+        format!("Every cat plays your ancestor: {size} of it a side.")
+    } else {
+        limit.blurb(size, crate::gods::ROSTER_LEN)
+    };
+    ui.label(egui::RichText::new(line).size(11.0).color(Color32::from_rgb(160, 156, 146)));
+}
+
 pub fn map_picker(ui: &mut egui::Ui, choice: &mut crate::map::MapId) {
     ui.label(egui::RichText::new("BATTLEGROUND").size(16.0).color(GOLD));
     // as many cards as there are maps, sharing the panel's width (three at

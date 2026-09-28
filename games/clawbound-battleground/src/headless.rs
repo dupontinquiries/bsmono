@@ -1374,6 +1374,10 @@ pub fn run_select_shot() -> Result<(), String> {
     let mut st = UiState::new();
     st.map_choice = crate::map::MapId::Sky;
     st.selected = crate::gods::ROSTER_LEN - 1; // the newest ancestor
+    // the god limit as a launch would set it (CLAWBOUND_GODS / _MIRROR)
+    let o = crate::launch::LaunchOptions::from_process();
+    st.god_limit = o.gods.unwrap_or_default();
+    st.mirror = o.mirror;
     clear(&renderer.device, &renderer.queue, &view);
     let mut textures = egui::TexturesDelta::default();
     let mut out = None;

@@ -148,6 +148,10 @@ pub fn run(opts: crate::launch::LaunchOptions) {
                             Ok(mut s) => {
                                 eprintln!("RESUMED: init ok — surface configured");
                                 s.launch = opts.clone();
+                                if let Some(g) = opts.gods {
+                                    s.ui.god_limit = g;
+                                }
+                                s.ui.mirror = opts.mirror;
                                 if let Some(role) = &opts.handoff {
                                     let id = opts.player_id.clone().unwrap_or_else(|| format!("cat-{:x}", std::process::id()));
                                     let name = opts.player_name.clone().unwrap_or_else(|| "Cat".into());
@@ -876,25 +880,25 @@ fn start_game(s: &mut AppState) {
         .map(|d| d.as_secs())
         .unwrap_or(42);
     let mut rng = crate::sim::Rng::new(0xBEEF ^ seed);
+    // The god limit (`picks`) -- the default in a LAN match, for the same
+    // reason as the map: the select screen is not synced between peers.
+    let (limit, fill) = if s.lan.is_some() {
+        (crate::picks::GodLimit::default(), crate::picks::Fill::Random)
+    } else {
+        (s.ui.god_limit, if s.ui.mirror { crate::picks::Fill::Mirror } else { crate::picks::Fill::Random })
+    };
+    let (blue, red) = crate::map::team_picks_under(limit, fill, s.ui.selected as u32, &mut rng);
     if crate::map::active() != crate::map::MapId::Jungle {
-        let (blue, red) = crate::map::team_picks(s.ui.selected as u32, &mut rng);
         let mut game = Game::new_teams(&blue, &red);
         open_playbook(s, &mut game, &mut rng);
         s.game = Some(game);
         finish_start(s);
         return;
     }
-    let mut pool: Vec<u32> = (0..crate::gods::ROSTER_LEN as u32).filter(|&i| i != s.ui.selected as u32).collect();
-    let mut allies = [0u32; 4];
-    let mut enemies = [0u32; 5];
-    for a in allies.iter_mut() {
-        let k = (rng.next_u() % pool.len() as u64) as usize;
-        *a = pool.remove(k);
-    }
-    for e in enemies.iter_mut() {
-        let k = (rng.next_u() % pool.len() as u64) as usize;
-        *e = pool.remove(k.min(pool.len() - 1));
-    }
+    // (the jungle's constructor takes fixed arrays; the deal is the same
+    // draw the jungle made here by hand before the god limit)
+    let allies: [u32; 4] = blue[1..5].try_into().expect("the jungle is 5 a side");
+    let enemies: [u32; 5] = red[..5].try_into().expect("the jungle is 5 a side");
     let mut game = Game::new(s.ui.selected as u32, allies, enemies);
     open_playbook(s, &mut game, &mut rng);
     s.game = Some(game);

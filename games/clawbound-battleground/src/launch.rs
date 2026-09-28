@@ -39,6 +39,12 @@ pub struct LaunchOptions {
     /// `--map <jungle|pass|starwell|atlantis>` (or `CLAWBOUND_MAP`): which map to play. Chosen
     /// at launch because the terrain mesh is built with the renderer.
     pub map: crate::map::MapId,
+    /// `--gods <lobby|team|open>` (or `CLAWBOUND_GODS`): the god limit
+    /// (`picks`); the select screen's choice otherwise.
+    pub gods: Option<crate::picks::GodLimit>,
+    /// `--mirror` (or `CLAWBOUND_MIRROR=1`): under no limit, every bot
+    /// plays the player's ancestor. Implies `--gods open`.
+    pub mirror: bool,
 }
 
 impl LaunchOptions {
@@ -58,6 +64,8 @@ impl LaunchOptions {
                     o.ancestor = it.next();
                     o.quick_match = true;
                 }
+                "--gods" => o.gods = it.next().as_deref().and_then(crate::picks::GodLimit::from_key),
+                "--mirror" => o.mirror = true,
                 "--map" => {
                     if let Some(m) = it.next().as_deref().and_then(crate::map::MapId::from_key) {
                         o.map = m;
@@ -81,6 +89,13 @@ impl LaunchOptions {
         o.peer_id = env("BSGAMES_HANDOFF_PEER");
         if let Some(m) = env("CLAWBOUND_MAP").as_deref().and_then(crate::map::MapId::from_key) {
             o.map = m;
+        }
+        if let Some(g) = env("CLAWBOUND_GODS").as_deref().and_then(crate::picks::GodLimit::from_key) {
+            o.gods = Some(g);
+        }
+        o.mirror |= env("CLAWBOUND_MIRROR").as_deref() == Some("1");
+        if o.mirror {
+            o.gods = Some(crate::picks::GodLimit::Open);
         }
         // a handoff means "we were sent here to play": don't sit at the menu
         if o.handoff.is_some() {
@@ -110,6 +125,17 @@ mod tests {
 
     fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+    }
+
+    #[test]
+    fn the_god_limit_comes_from_the_flag_or_the_env() {
+        let o = LaunchOptions::parse(vec!["--gods".to_string(), "team".to_string()], &env_of(&[]));
+        assert_eq!((o.gods, o.mirror), (Some(crate::picks::GodLimit::Team), false));
+        let o = LaunchOptions::parse(vec!["--mirror".to_string()], &env_of(&[]));
+        assert_eq!((o.gods, o.mirror), (Some(crate::picks::GodLimit::Open), true), "the mirror is a no-limit fill");
+        let o = LaunchOptions::parse(Vec::<String>::new(), &env_of(&[("CLAWBOUND_GODS", "open")]));
+        assert_eq!(o.gods, Some(crate::picks::GodLimit::Open));
+        assert_eq!(LaunchOptions::parse(Vec::<String>::new(), &env_of(&[])).gods, None);
     }
 
     #[test]
