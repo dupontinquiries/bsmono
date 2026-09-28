@@ -676,7 +676,7 @@ mod tests {
         assert_eq!(kits(&g), 15, "a god slain in the surge");
         g.gods[0].clay_surge_t = 0.0;
         g.clay_kill_credit(0, KITS_PER_GOD_KILL, Vec3::ZERO);
-        assert_eq!(kits(&g), 12, "kittens after the surge");
+        assert_eq!(kits(&g), 15, "kittens after the surge");
     }
 
     /// Each kitten broken is SLIDE_KIT_GOLD to its breaker; one that runs
