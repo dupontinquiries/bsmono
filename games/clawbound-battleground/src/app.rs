@@ -26,6 +26,8 @@ use crate::vfx::Vfx;
 enum Screen {
     Menu,
     Select,
+    /// The custom-game rules, before choosing an ancestor.
+    Custom,
     Playing,
     /// Browsing or hosting on the local network.
     Lan,
@@ -148,6 +150,10 @@ pub fn run(opts: crate::launch::LaunchOptions) {
                             Ok(mut s) => {
                                 eprintln!("RESUMED: init ok — surface configured");
                                 s.launch = opts.clone();
+                                s.ui.rules = opts.rules;
+                                if let Some(e) = &opts.rules_error {
+                                    eprintln!("[clawbound] --rules: {e}");
+                                }
                                 if let Some(role) = &opts.handoff {
                                     let id = opts.player_id.clone().unwrap_or_else(|| format!("cat-{:x}", std::process::id()));
                                     let name = opts.player_name.clone().unwrap_or_else(|| "Cat".into());
@@ -876,26 +882,25 @@ fn start_game(s: &mut AppState) {
         .map(|d| d.as_secs())
         .unwrap_or(42);
     let mut rng = crate::sim::Rng::new(0xBEEF ^ seed);
+    // The match rules (`rules`, the god limit among them) -- a normal
+    // match's in a LAN match, for the same reason as the map: nothing
+    // carries the setup between peers yet.
+    let rules = if s.lan.is_some() { crate::rules::MatchRules::default() } else { s.ui.rules };
+    let (blue, red) = crate::map::team_picks_under(rules.gods, rules.fill(), s.ui.selected as u32, &mut rng);
     if crate::map::active() != crate::map::MapId::Jungle {
-        let (blue, red) = crate::map::team_picks(s.ui.selected as u32, &mut rng);
         let mut game = Game::new_teams(&blue, &red);
+        game.apply_rules(rules);
         open_playbook(s, &mut game, &mut rng);
         s.game = Some(game);
         finish_start(s);
         return;
     }
-    let mut pool: Vec<u32> = (0..crate::gods::ROSTER_LEN as u32).filter(|&i| i != s.ui.selected as u32).collect();
-    let mut allies = [0u32; 4];
-    let mut enemies = [0u32; 5];
-    for a in allies.iter_mut() {
-        let k = (rng.next_u() % pool.len() as u64) as usize;
-        *a = pool.remove(k);
-    }
-    for e in enemies.iter_mut() {
-        let k = (rng.next_u() % pool.len() as u64) as usize;
-        *e = pool.remove(k.min(pool.len() - 1));
-    }
+    // (the jungle's constructor takes fixed arrays; the deal is the same
+    // draw the jungle made here by hand before the god limit)
+    let allies: [u32; 4] = blue[1..5].try_into().expect("the jungle is 5 a side");
+    let enemies: [u32; 5] = red[..5].try_into().expect("the jungle is 5 a side");
     let mut game = Game::new(s.ui.selected as u32, allies, enemies);
+    game.apply_rules(rules);
     open_playbook(s, &mut game, &mut rng);
     s.game = Some(game);
     finish_start(s);
@@ -1191,7 +1196,7 @@ fn render(s: &mut AppState) {
 
     // camera
     let cam = match s.screen {
-        Screen::Menu | Screen::Select | Screen::Lan => {
+        Screen::Menu | Screen::Select | Screen::Custom | Screen::Lan => {
             let t = s.last_frame.elapsed().as_secs_f32() * 0.05;
             let r = 55.0;
             Camera {
@@ -1437,6 +1442,7 @@ fn render(s: &mut AppState) {
     // egui frame
     let raw_input = s.egui_winit.take_egui_input(s.window);
     let mut play = false;
+    let (mut custom, mut custom_next, mut custom_back) = (false, false, false);
     let mut quit = false;
     let mut open_lan = false;
     let mut spectate = false;
@@ -1455,10 +1461,11 @@ fn render(s: &mut AppState) {
         }
         match s.screen {
             Screen::Menu => {
-                ui::draw_menu(ctx, &mut play, &mut quit, &mut open_lan, &mut spectate);
+                ui::draw_menu(ctx, &mut play, &mut custom, &mut quit, &mut open_lan, &mut spectate);
                 ui::draw_controls_button(ctx, &mut open_controls);
             }
             Screen::Select => ui::draw_select(ctx, &mut s.ui, &mut locked_in),
+            Screen::Custom => ui::draw_custom(ctx, &mut s.ui, &mut custom_next, &mut custom_back),
             Screen::Lan => {
                 if let Some(l) = s.lan.as_mut() {
                     l.tick(Instant::now());
@@ -1593,7 +1600,22 @@ fn render(s: &mut AppState) {
         start_spectate(s);
     }
     if play {
+        // PLAY is a normal match (the launch flags' rules, if any, stand)
+        if s.ui.custom {
+            s.ui.rules = s.launch.rules;
+            s.ui.custom = false;
+        }
         s.screen = Screen::Select;
+    }
+    if custom {
+        s.ui.custom = true;
+        s.screen = Screen::Custom;
+    }
+    if custom_next {
+        s.screen = Screen::Select;
+    }
+    if custom_back {
+        s.screen = Screen::Menu;
     }
     if quit {
         s.exiting = true;

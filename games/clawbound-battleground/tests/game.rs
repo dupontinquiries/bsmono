@@ -3531,3 +3531,76 @@ mod quarry {
         let _ = mz::CYCLE;
     }
 }
+
+/// The god limit (`picks`) at its loosest: no limit, every bot playing the
+/// player's ancestor. Nothing in the sim may assume one cat per line.
+mod god_limit {
+    use clawbound::consts::Lane;
+    use clawbound::map::{self, MapId};
+    use clawbound::picks::{Fill, GodLimit};
+    use clawbound::sim::{AiBrain, Event, Game, Rng};
+
+    /// Every ancestor, ten of it in one 5v5 on the jungle, for 90 s of
+    /// bots: nothing panics, every cat stays finite, and the mirrored kits
+    /// are used (casts from both sides).
+    #[test]
+    fn every_ancestor_can_mirror_itself() {
+        map::with(MapId::Jungle, || {
+            let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+            for id in 0..clawbound::gods::ROSTER_LEN as u32 {
+                let (b, r) = map::team_picks_under(GodLimit::Open, Fill::Mirror, id, &mut Rng::new(7));
+                assert!(b.iter().chain(&r).all(|&x| x == id) && b.len() == 5 && r.len() == 5);
+                let mut g = Game::new_teams(&b, &r);
+                g.blockers = blockers.clone();
+                g.gods[0].ai = Some(AiBrain::new(Lane::Mid, 0.9));
+                let mut casts = [0u32; 2];
+                for _ in 0..(90 * 30) {
+                    g.tick(1.0 / 30.0);
+                    for e in &g.events {
+                        if let Event::Cast { god, .. } = *e {
+                            casts[(god >= 5) as usize] += 1;
+                        }
+                    }
+                    g.events.clear();
+                }
+                for (i, c) in g.gods.iter().enumerate() {
+                    assert!(c.pos.is_finite() && c.hp.is_finite(), "{}: cat {i} went non-finite", clawbound::gods::god(id).name);
+                }
+                eprintln!("{:>14}: casts {casts:?}, deaths {}", clawbound::gods::god(id).name, g.gods.iter().map(|c| c.deaths).sum::<u32>());
+                assert!(casts[0] > 0 && casts[1] > 0, "{}: a side never cast in 90 s: {casts:?}", clawbound::gods::god(id).name);
+            }
+        });
+    }
+
+    /// Fifteen Claypaws a side on the Pass for two minutes: no cat in the
+    /// rock, the potters shape, and the clay kittens on the field at once
+    /// stay bounded.
+    #[test]
+    fn fifteen_claypaws_a_side_on_the_pass() {
+        map::with(MapId::Pass, || {
+            let claypaw = clawbound::gods::ROSTER.iter().find(|d| d.name == "Claypaw").unwrap().id;
+            let (b, r) = map::team_picks_under(GodLimit::Open, Fill::Mirror, claypaw, &mut Rng::new(3));
+            let mut g = Game::new_teams(&b, &r);
+            assert_eq!(g.gods.len(), 30);
+            g.blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+            g.gods[0].ai = Some(AiBrain::new(Lane::Mid, 0.9));
+            let f = map::floor().unwrap();
+            let (mut most_kits, mut shaped) = (0usize, 0u32);
+            for _ in 0..(120 * 30) {
+                g.tick(1.0 / 30.0);
+                shaped += g.events.iter().filter(|e| matches!(e, Event::ClayShaped { .. })).count() as u32;
+                g.events.clear();
+                for (i, c) in g.gods.iter().enumerate() {
+                    if c.respawn_t <= 0.0 {
+                        assert!(f.sdf(c.pos.x, c.pos.z) <= 0.05, "cat {i} in the rock at {}", c.pos);
+                    }
+                }
+                most_kits = most_kits.max(g.minions.iter().filter(|m| m.clay.is_some()).count());
+            }
+            eprintln!("kittens at most {most_kits}, shaped {shaped}");
+            assert!(shaped > 30, "the potters barely shaped: {shaped}");
+            // (measured 99 at most: none would mean the kittens never came)
+            assert!((1..=400).contains(&most_kits), "{most_kits} kittens at once");
+        });
+    }
+}

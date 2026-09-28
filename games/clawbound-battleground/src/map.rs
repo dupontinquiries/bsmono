@@ -263,66 +263,18 @@ pub fn onto_floor(p: Vec3, radius: f32) -> Vec3 {
     }
 }
 
-/// Rosters for a match on the active map. The player's ancestor is
-/// `blue[0]`. On the jungle every cat is a different ancestor; on the pass,
-/// 30 cats from 13 lines, each line spread as evenly as the numbers allow
-/// (two or three of each), and no side fields three of one line while the
-/// other fields one.
+/// Rosters for a match on the active map under the default god limit (one
+/// per match: `picks::GodLimit::Lobby`). The player's ancestor is
+/// `blue[0]`. On the 5-a-side maps every cat is a different ancestor; on
+/// the 15-a-side maps (30 seats, 20 lines) every line fields before any
+/// fields twice, and none twice on a side.
 pub fn team_picks(player: u32, rng: &mut crate::sim::Rng) -> (Vec<u32>, Vec<u32>) {
-    let n = crate::gods::ROSTER_LEN as u32;
-    let size = active().team_size();
-    if size <= 5 {
-        let mut pool: Vec<u32> = (0..n).filter(|&i| i != player).collect();
-        let mut draw = |rng: &mut crate::sim::Rng| pool.remove((rng.next_u() % pool.len() as u64) as usize);
-        let mut blue = vec![player];
-        for _ in 1..size {
-            blue.push(draw(rng));
-        }
-        let red = (0..size).map(|_| draw(rng)).collect();
-        return (blue, red);
-    }
-    // Every line once per side, then the remainder (30 - 2 * 13 = 4 extra
-    // cats) from distinct lines split evenly between the sides. A line is
-    // then within one cat of even across the two sides BY CONSTRUCTION;
-    // dealing alternately off a shuffled deck, the first version, fielded a
-    // line three to nil.
-    let shuffle = |v: &mut Vec<u32>, rng: &mut crate::sim::Rng| {
-        for i in (1..v.len()).rev() {
-            let j = (rng.next_u() % (i as u64 + 1)) as usize;
-            v.swap(i, j);
-        }
-    };
-    let per_side_once = (size as u32).min(n);
-    let mut lines: Vec<u32> = (0..n).collect();
-    shuffle(&mut lines, rng);
-    let mut blue_rest: Vec<u32> = lines.iter().copied().take(per_side_once as usize).filter(|&l| l != player).collect();
-    let mut red: Vec<u32> = lines.iter().copied().take(per_side_once as usize).collect();
-    if !lines[..per_side_once as usize].contains(&player) {
-        // the player's line was not in the once-each set: it replaces one
-        blue_rest.pop();
-    }
-    // extras from lines not yet doubled, alternating sides
-    let mut extra: Vec<u32> = (0..n).collect();
-    shuffle(&mut extra, rng);
-    let mut to_blue = true;
-    for l in extra {
-        if blue_rest.len() + 1 >= size && red.len() >= size {
-            break;
-        }
-        if to_blue && blue_rest.len() + 1 < size {
-            blue_rest.push(l);
-        } else if red.len() < size {
-            red.push(l);
-        } else {
-            blue_rest.push(l);
-        }
-        to_blue = !to_blue;
-    }
-    shuffle(&mut blue_rest, rng);
-    shuffle(&mut red, rng);
-    let mut blue = vec![player];
-    blue.extend(blue_rest);
-    (blue, red)
+    team_picks_under(crate::picks::GodLimit::Lobby, crate::picks::Fill::Random, player, rng)
+}
+
+/// [`team_picks`] under any god limit (`picks`).
+pub fn team_picks_under(limit: crate::picks::GodLimit, fill: crate::picks::Fill, player: u32, rng: &mut crate::sim::Rng) -> (Vec<u32>, Vec<u32>) {
+    crate::picks::deal(limit, fill, player, active().team_size(), crate::gods::ROSTER_LEN, rng)
 }
 
 #[cfg(test)]
@@ -414,21 +366,16 @@ mod tests {
             let (b, r) = team_picks((seed % 13) as u32, &mut rng);
             assert_eq!((b.len(), r.len()), (15, 15));
             assert_eq!(b[0], (seed % 13) as u32);
+            // 30 seats from 20 lines: every line fields, none twice on a
+            // side (so no line is lopsided by more than one). Until the god
+            // limit (`picks`) the deal was the same 15 lines on each side,
+            // five sitting out; now every line plays.
             let n = crate::gods::ROSTER_LEN as u32;
-            // with more lines than a side has cats (16 to 15), a line sits
-            // the match out -- and when it is the player's own line that
-            // was left out of the once-each deal, the player's cat takes a
-            // blue seat and one more line is on red alone
-            let (mut absent, mut one_sided) = (0, 0);
             for line in 0..n {
-                let cb = b.iter().filter(|&&x| x == line).count() as i32;
-                let cr = r.iter().filter(|&&x| x == line).count() as i32;
-                assert!(cb + cr <= 4, "line {line}: {cb}+{cr}");
-                absent += (cb + cr == 0) as u32;
-                one_sided += (cb + cr == 1) as u32;
-                assert!((cb - cr).abs() <= 1, "seed {seed}: line {line} lopsided: {cb} v {cr}");
+                let cb = b.iter().filter(|&&x| x == line).count();
+                let cr = r.iter().filter(|&&x| x == line).count();
+                assert!(cb <= 1 && cr <= 1 && cb + cr >= 1, "seed {seed}: line {line}: {cb}+{cr}");
             }
-            assert!(absent <= n.saturating_sub(15) && one_sided <= 2, "seed {seed}: {absent} lines sat out, {one_sided} on one side");
             }
         });
     }

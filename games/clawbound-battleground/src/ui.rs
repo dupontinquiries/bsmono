@@ -66,6 +66,10 @@ pub struct Floater {
 pub struct UiState {
     /// The map the next match is played on (the select screen's picker).
     pub map_choice: crate::map::MapId,
+    /// The next match's rules (`rules`): a normal match unless it came
+    /// through the custom-game screen (`custom`) or the launch flags.
+    pub rules: crate::rules::MatchRules,
+    pub custom: bool,
     /// the player's display name from the game centre, if launched from it
     pub player_label: Option<String>,
     pub shop_open: bool,
@@ -240,7 +244,7 @@ pub fn draw_lan(ctx: &egui::Context, lobby: &mut crate::lanlobby::LanLobby) -> c
     action
 }
 
-pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool, lan: &mut bool, spectate: &mut bool) {
+pub fn draw_menu(ctx: &egui::Context, play: &mut bool, custom: &mut bool, quit: &mut bool, lan: &mut bool, spectate: &mut bool) {
     setup_style(ctx);
     egui::Area::new(egui::Id::new("menu")).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
         ui.vertical_centered(|ui| {
@@ -257,6 +261,12 @@ pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool, lan: &mu
             }
             if play_btn.clicked() {
                 *play = true;
+            }
+            ui.add_space(8.0);
+            let custom_btn = ui.add_sized([260.0, 42.0], egui::Button::new(egui::RichText::new("CUSTOM GAME").size(18.0)));
+            glow_hover(ui, &custom_btn, GOLD, 5.0);
+            if custom_btn.clicked() {
+                *custom = true;
             }
             ui.add_space(8.0);
             let lan_btn = ui.add_sized([260.0, 42.0], egui::Button::new(egui::RichText::new("LOCAL NETWORK").size(18.0)));
@@ -429,6 +439,10 @@ pub fn draw_select(ctx: &egui::Context, ui_state: &mut UiState, locked: &mut boo
         }
         ui.add_space(12.0);
         map_picker(ui, &mut ui_state.map_choice);
+        if ui_state.custom || !ui_state.rules.is_default() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(format!("CUSTOM · {}", ui_state.rules.summary())).size(11.5).color(GOLD));
+        }
         ui.add_space(10.0);
         let lock = ui.add_sized([300.0, 48.0], egui::Button::new(egui::RichText::new("LOCK IN").size(22.0).color(Color32::BLACK).strong()).fill(GOLD));
         glow_hover(ui, &lock, GOLD, 8.0);
@@ -1455,6 +1469,96 @@ pub fn map_blurb(m: crate::map::MapId) -> &'static str {
 }
 
 /// The map picker on the select screen: a card per map, the chosen one lit.
+/// The custom-game screen: the map, who may play whom, and every numeric
+/// rule (`rules::KNOBS`) as a slider, with the rules' text form shown
+/// under them. `next` goes on to choosing an ancestor; `back` to the menu.
+pub fn draw_custom(ctx: &egui::Context, ui_state: &mut UiState, next: &mut bool, back: &mut bool) {
+    setup_style(ctx);
+    egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::from_rgb(22, 24, 24)).inner_margin(16.0)).show(ctx, |ui| {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.set_max_width(ui.available_width().min(760.0));
+            ui.label(egui::RichText::new("CUSTOM GAME").size(30.0).color(GOLD));
+            ui.label(egui::RichText::new("Against bots. Every rule here applies to every cat on both sides.").size(12.0).color(Color32::from_rgb(160, 156, 146)));
+            ui.add_space(10.0);
+            map_picker(ui, &mut ui_state.map_choice);
+            ui.add_space(6.0);
+            let r = &mut ui_state.rules;
+            god_limit_picker(ui, &mut r.gods, &mut r.mirror, ui_state.map_choice.team_size());
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("RULES").size(16.0).color(GOLD));
+            // long enough to set a step precisely with a thumb
+            ui.spacing_mut().slider_width = (ui.available_width() - 230.0).clamp(140.0, 360.0);
+            egui::Grid::new("custom_rules").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+                for k in crate::rules::KNOBS {
+                    let mut v = (k.get)(r);
+                    let normal = (k.get)(&crate::rules::MatchRules::default());
+                    ui.label(egui::RichText::new(k.label).size(14.0));
+                    let changed = ui.add(egui::Slider::new(&mut v, k.min..=k.max).step_by(k.step as f64).show_value(false)).changed();
+                    let txt = if (v - normal).abs() > 1e-4 { egui::RichText::new(k.show(v)).size(14.0).color(GOLD) } else { egui::RichText::new(k.show(v)).size(14.0) };
+                    ui.label(txt);
+                    if changed {
+                        (k.set)(r, k.fit(v));
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.add_space(4.0);
+            // what the waves come to on this map
+            let (m, c) = ui_state.map_choice.wave(0);
+            let (wm, wc) = r.wave((m, c));
+            ui.label(egui::RichText::new(format!("A wave: {} minions a lane (normally {}).", wm + wc, m + c)).size(11.0).color(Color32::from_rgb(160, 156, 146)));
+            ui.add_space(8.0);
+            // the rules' own text: what `--rules` takes, visible as it changes
+            let text = r.encode();
+            ui.label(egui::RichText::new(if text.is_empty() { "--rules \"\"  (a normal match)".to_string() } else { format!("--rules \"{text}\"") }).monospace().size(11.0).color(Color32::from_rgb(140, 138, 130)));
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let go = ui.add_sized([240.0, 44.0], egui::Button::new(egui::RichText::new("CHOOSE ANCESTOR").size(18.0).color(Color32::BLACK).strong()).fill(GOLD));
+                glow_hover(ui, &go, GOLD, 6.0);
+                if go.clicked() {
+                    *next = true;
+                }
+                if ui.add_sized([110.0, 44.0], egui::Button::new(egui::RichText::new("Reset").size(15.0))).clicked() {
+                    ui_state.rules = crate::rules::MatchRules::default();
+                }
+                if ui.add_sized([110.0, 44.0], egui::Button::new(egui::RichText::new("Back").size(15.0))).clicked() {
+                    *back = true;
+                }
+            });
+        });
+    });
+}
+
+/// The god limit (`picks::GodLimit`): three buttons, the chosen one's
+/// line under them, and under no limit the mirror toggle.
+pub fn god_limit_picker(ui: &mut egui::Ui, limit: &mut crate::picks::GodLimit, mirror: &mut bool, size: usize) {
+    use crate::picks::GodLimit;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("ANCESTORS").size(13.0).color(GOLD));
+        ui.add_space(6.0);
+        for l in GodLimit::ALL {
+            let sel = *limit == l;
+            let b = egui::Button::new(egui::RichText::new(l.name()).size(13.0).color(if sel { Color32::BLACK } else { Color32::from_rgb(220, 216, 205) }))
+                .fill(if sel { GOLD } else { Color32::from_rgb(34, 33, 40) })
+                .min_size(Vec2::new(0.0, 26.0));
+            if ui.add(b).clicked() {
+                *limit = l;
+            }
+        }
+        // on the same row, so the choice costs the panel no height
+        if *limit == GodLimit::Open {
+            ui.add_space(6.0);
+            ui.checkbox(mirror, egui::RichText::new("Every cat plays yours").size(12.0));
+        }
+    });
+    let line = if *limit == GodLimit::Open && *mirror {
+        format!("Every cat plays your ancestor: {size} of it a side.")
+    } else {
+        limit.blurb(size, crate::gods::ROSTER_LEN)
+    };
+    ui.label(egui::RichText::new(line).size(11.0).color(Color32::from_rgb(160, 156, 146)));
+}
+
 pub fn map_picker(ui: &mut egui::Ui, choice: &mut crate::map::MapId) {
     ui.label(egui::RichText::new("BATTLEGROUND").size(16.0).color(GOLD));
     // as many cards as there are maps, sharing the panel's width (three at

@@ -93,7 +93,7 @@ impl Game {
         let scale = 1.0 + (self.t / 60.0).min(15.0) * 0.07;
         let hp = MINION_HP * scale * self.lane_surge(team, lane);
         // melee in ranks (four abreast, eight for a big wave), casters behind
-        let (melee, casters) = crate::map::active().wave(self.waves);
+        let (melee, casters) = self.rules.wave(crate::map::active().wave(self.waves));
         let rank = |k: usize, n: usize, back: f32| -> [f32; 2] {
             // eight abreast for a big wave (the sky's 32 u lanes), else four
             let per = if n > 8 { 8 } else { n.min(4).max(1) };
