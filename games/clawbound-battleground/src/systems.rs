@@ -640,9 +640,12 @@ impl Game {
         // ...and back out of anything the shove put them into: two cats
         // meeting beside a trunk pushed one into the bark, where it stayed
         // until its next step (on the ground only -- a cat in the air is
-        // resolved at its feet above)
+        // resolved at its feet above). A dash is on the ground: shoved
+        // mid-dash into a trunk, a cat was left 0.14 u inside the bark (it
+        // showed when bots began to move a reaction late, `reaction`, and
+        // one was still standing in the dash's way)
         for (gi, g) in self.gods.iter_mut().enumerate() {
-            if shoved[gi] && g.leap.is_none() && g.dash.is_none() && g.perch.is_none() && g.fall.is_none() {
+            if shoved[gi] && g.leap.is_none() && g.perch.is_none() && g.fall.is_none() {
                 g.pos = self.blockers.resolve(g.pos, GOD_RADIUS);
             }
         }

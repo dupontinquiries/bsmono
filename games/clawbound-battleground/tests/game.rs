@@ -216,35 +216,81 @@ fn xp_curve_monotonic() {
 /// A dash into a tree trunk goes round it, not through it: the dash used to
 /// set the cat's position from its line every tick, throwing away the
 /// shove the trunk gave it, so a cat dashed straight through the bark.
+///
+/// The dash alone (every other cat parked far off): head on (0.3 u off the
+/// trunk's centre line) and glancing (1.6 u off), it never enters the bark
+/// and slides round the trunk and on. (This test used to claim the head-on
+/// dash STOPPED at the bark. That held only because a teammate standing at
+/// the base was in the dash's way; when bots began to move a reaction late
+/// (`reaction`) that teammate moved differently and the claim fell. Alone,
+/// a head-on dash slides round, as a glancing one does.)
 #[test]
 fn a_dash_into_a_trunk_goes_round_it() {
+    for off in [0.3f32, 1.6] {
+        let (closest, r, end, tree) = dash_at_trunk(off, None);
+        assert!(closest >= r - 0.05, "off {off}: the dash went {closest:.2} u from the trunk's centre; the bark is at {r:.2}");
+        assert!(end > tree + r * 0.5, "off {off}: ended at x {end:.2}, short of round the tree at {tree:.2}");
+    }
+}
+
+/// A dash shoved by the cats around it still never ends up in the bark:
+/// the push-out after cats shove each other skipped a dashing cat, and at
+/// the base with the whole team about (bots moving at a normal match's
+/// reaction, `reaction`) one was left 0.14 u inside a trunk.
+#[test]
+fn a_dash_shoved_by_a_cat_does_not_go_into_the_bark() {
+    let mut worst = (f32::MAX, 0.0, 0.0, 0.0);
+    let mut tried = 0;
+    for off in [-0.8f32, -0.3, 0.3, 0.8, 1.6] {
+        for sx in 0..9 {
+            for sz in 0..9 {
+                let stand = glam::Vec3::new(1.0 + sx as f32 * 0.5, 0.0, off - 2.0 + sz as f32 * 0.5);
+                let (closest, r, _, _) = dash_at_trunk(off, Some(stand));
+                tried += 1;
+                if closest - r < worst.0 {
+                    worst = (closest - r, off, stand.x, stand.z);
+                }
+            }
+        }
+    }
+    eprintln!("SWEEP {tried} scenes, worst: {:.3} u into the bark (off {}, a cat at {:.1},{:.1})", -worst.0, worst.1, worst.2, worst.3);
+    assert!(worst.0 >= -0.05, "off {}, a cat standing at ({:.1}, {:.1}): the dash went {:.2} u into the bark", worst.1, worst.2, worst.3, -worst.0);
+}
+
+/// Dash cat 0 9 u along +x past a trunk `off` from its line, 4 u out, with
+/// every other cat parked far off -- or, `crowd`, left where the match put
+/// them, the bots thinking. Returns (closest approach to the trunk's
+/// centre, the bark's radius for a cat, where the dash ended in x, the
+/// tree's x).
+fn dash_at_trunk(off: f32, stand: Option<glam::Vec3>) -> (f32, f32, f32, f32) {
     use clawbound::blockers::{Blockers, PropKind};
     use clawbound::sim::DashState;
     use glam::Vec3;
-    let from = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]).gods[0].pos;
+    let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    let from = game.gods[0].pos;
     let to = from + Vec3::new(9.0, 0.0, 0.0);
     let r = PropKind::JungleTree.footprint().radius + clawbound::consts::GOD_RADIUS;
-    // head on (0.3 u off the trunk's centre line): stopped at the bark;
-    // a glancing line (1.6 u off): shouldered round it and on past
-    for (off, past) in [(0.3f32, false), (1.6, true)] {
-        let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
-        let tree = from + Vec3::new(4.0, 0.0, off);
-        let mut b = Blockers::new(200.0, 6.0);
-        b.push_prop(PropKind::JungleTree, tree.x, tree.z, 0.0, 1.0);
-        game.blockers = std::sync::Arc::new(b);
-        game.gods[0].pos = from;
-        game.gods[0].dash = Some(DashState { from, to, t: 0.0, dur: 0.4, dmg: 0.0, arc: 0.35, blast: None });
-        let mut closest = f32::MAX;
-        for _ in 0..40 {
-            game.tick(1.0 / 60.0);
-            let p = game.gods[0].pos;
-            closest = closest.min(Vec3::new(p.x - tree.x, 0.0, p.z - tree.z).length());
-        }
-        assert!(game.gods[0].dash.is_none(), "off {off}: the dash ended");
-        assert!(closest >= r - 0.05, "off {off}: the dash went {closest:.2} u from the trunk's centre; the bark is at {r:.2}");
-        let end = game.gods[0].pos.x;
-        assert_eq!(end > tree.x, past, "off {off}: ended at x {end:.2}, the tree at {:.2}", tree.x);
+    let tree = from + Vec3::new(4.0, 0.0, off);
+    let mut b = Blockers::new(200.0, 6.0);
+    b.push_prop(PropKind::JungleTree, tree.x, tree.z, 0.0, 1.0);
+    game.blockers = std::sync::Arc::new(b);
+    for k in 1..game.gods.len() {
+        game.gods[k].ai = None;
+        game.gods[k].pos = Vec3::new(300.0 + k as f32 * 5.0, 0.0, 300.0);
     }
+    if let Some(s) = stand {
+        game.gods[1].pos = from + s;
+    }
+    game.gods[0].pos = from;
+    game.gods[0].dash = Some(DashState { from, to, t: 0.0, dur: 0.4, dmg: 0.0, arc: 0.35, blast: None });
+    let mut closest = f32::MAX;
+    for _ in 0..40 {
+        game.tick(1.0 / 60.0);
+        let p = game.gods[0].pos;
+        closest = closest.min(Vec3::new(p.x - tree.x, 0.0, p.z - tree.z).length());
+    }
+    assert!(game.gods[0].dash.is_none(), "off {off}: the dash ended");
+    (closest, r, game.gods[0].pos.x, tree.x)
 }
 
 /// The leap, through the real sim loop: press toward a rock, end up standing
