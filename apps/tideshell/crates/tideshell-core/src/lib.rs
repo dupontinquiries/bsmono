@@ -131,3 +131,28 @@ pub enum Action {
     /// Switch the apps' theme to light (true) for sunlight, or restore.
     AppsLightTheme(bool),
 }
+
+/// Windows that exist for plumbing and must not be treated as apps.
+///
+/// xwaylandvideobridge (KDE) keeps a tiny, invisible X11 window mapped so the
+/// screencast portal can offer X11 apps for sharing. KWin hides it with window
+/// rules; COSMIC and tideshell have none, so it turned up as a blank "app" in
+/// the switcher and carousel (and, under a phone window policy, would be
+/// maximized over everything). Matched by app id, case-insensitively, with
+/// and without the reverse-DNS prefix.
+pub fn is_helper_window(app_id: &str) -> bool {
+    const HELPERS: [&str; 2] = ["org.kde.xwaylandvideobridge", "xwaylandvideobridge"];
+    let id = app_id.trim().to_ascii_lowercase();
+    HELPERS.iter().any(|h| id == *h)
+}
+
+#[cfg(test)]
+mod helper_window_tests {
+    #[test]
+    fn the_video_bridge_is_a_helper_and_real_apps_are_not() {
+        assert!(super::is_helper_window("org.kde.xwaylandvideobridge"));
+        assert!(super::is_helper_window("XWaylandVideoBridge"));
+        assert!(!super::is_helper_window("org.kde.kdenlive"));
+        assert!(!super::is_helper_window("com.system76.CosmicSettings"));
+    }
+}

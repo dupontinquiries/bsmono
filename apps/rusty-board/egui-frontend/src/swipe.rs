@@ -167,16 +167,21 @@ impl SwipeState {
         adaptive: &Adaptive,
         half: crate::halfboard::Side,
     ) -> Option<Vec<WordCandidate>> {
-        let (down, pos, time) = ui.input(|i| {
+        let (down, pos, time, origin) = ui.input(|i| {
             (
                 i.pointer.primary_down(),
                 i.pointer.interact_pos(),
                 i.time * 1000.0,
+                i.pointer.press_origin(),
             )
         });
 
         if down {
-            if let Some(p) = pos.filter(|p| board.contains(*p)) {
+            // Only a press that STARTED on the board is a word: a rail swipe
+            // (Ctrl/Tab/Alt, modlatch.rs) travels onto the keys and must not
+            // also swipe-type the letters it crosses.
+            let started_here = origin.is_none_or(|o| board.contains(o));
+            if let Some(p) = pos.filter(|p| board.contains(*p) && started_here) {
                 if !self.active {
                     self.active = true;
                     self.path.clear();

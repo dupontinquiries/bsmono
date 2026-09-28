@@ -14,6 +14,10 @@
 //! The same datagram shape as tideshell's own `tideshell.ctl`, so one tool
 //! (`socat - UNIX-SENDTO:$XDG_RUNTIME_DIR/rusty-board.ctl`) drives both.
 //! Unknown commands are ignored and counted, never fatal.
+//!
+//! `reload-settings` / `reload-layouts` come from the companion app
+//! (`rusty-board-settings`) after it writes `settings.conf` or a layout file,
+//! so a running keyboard picks the change up without a restart.
 
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
@@ -25,6 +29,8 @@ pub enum Cmd {
     VoiceCancel,
     VoiceToggle,
     Cold(bool),
+    ReloadSettings,
+    ReloadLayouts,
 }
 
 pub fn parse(s: &str) -> Option<Cmd> {
@@ -35,12 +41,23 @@ pub fn parse(s: &str) -> Option<Cmd> {
         "voice-toggle" => Some(Cmd::VoiceToggle),
         "cold on" => Some(Cmd::Cold(true)),
         "cold off" => Some(Cmd::Cold(false)),
+        "reload-settings" => Some(Cmd::ReloadSettings),
+        "reload-layouts" => Some(Cmd::ReloadLayouts),
         _ => None,
     }
 }
 
 pub fn socket_path() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("rusty-board.ctl"))
+}
+
+/// Send one command to a running keyboard. `Err` when none is listening
+/// (no socket, or nobody bound to it), which a caller can show as
+/// "applies next time the keyboard starts" rather than as a failure.
+pub fn send(cmd: &str) -> Result<(), String> {
+    let path = socket_path().ok_or("no XDG_RUNTIME_DIR")?;
+    let tx = UnixDatagram::unbound().map_err(|e| e.to_string())?;
+    tx.send_to(cmd.as_bytes(), &path).map(|_| ()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 pub struct Ctl {
@@ -122,5 +139,7 @@ mod tests {
         assert_eq!(parse(" voice-toggle\n"), Some(Cmd::VoiceToggle));
         assert_eq!(parse("cold off"), Some(Cmd::Cold(false)));
         assert_eq!(parse("cold"), None);
+        assert_eq!(parse("reload-layouts"), Some(Cmd::ReloadLayouts));
+        assert_eq!(parse("reload-settings\n"), Some(Cmd::ReloadSettings));
     }
 }

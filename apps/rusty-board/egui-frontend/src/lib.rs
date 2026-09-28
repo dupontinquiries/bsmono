@@ -30,6 +30,12 @@ pub mod keyboard_service;
 pub mod sink;
 pub mod ctl;
 pub mod focus_policy;
+pub mod companion;
+pub mod modlatch;
+pub mod key_hold;
+pub mod user_font;
+pub mod layout_edit;
+pub mod settings_store;
 pub mod adaptive;
 pub mod nudge;
 pub mod real_layout;
@@ -536,6 +542,9 @@ impl Layout {
     }
 }
 
+/// Render-layout names of user layouts start with this.
+pub const USER_PREFIX: &str = "user:";
+
 /// A keyboard with multiple layouts you swipe between (qwerty ↔ symbols), using the shared
 /// gesture layer — mirroring rusty-board's swipe layout-switching.
 pub struct Board {
@@ -626,6 +635,41 @@ impl Board {
         self.layouts.iter().map(|l| l.name.as_str()).collect()
     }
     pub fn layout_index(&self) -> usize { self.idx }
+
+    /// Replace the user layouts (the JSON files from
+    /// `board_layouts::io::user_layouts_dir()`, made in rusty-board-settings)
+    /// with `files`. They go after the built-in boards and are marked by name
+    /// (`user:<slug>`) so a reload replaces exactly them. If the board showing
+    /// was a user layout that still exists, it stays showing; if it was
+    /// deleted, the letters board comes back.
+    pub fn set_user_layouts(&mut self, files: &[board_layouts::Layout]) {
+        let showing = self.layouts.get(self.idx).map(|l| l.name.clone());
+        self.layouts.retain(|l| !l.name.starts_with(USER_PREFIX));
+        for f in files {
+            let mut l = real_layout::to_render(f, real_layout::Shift::Off);
+            // The FILE slug (`save_user_layout` names the file after `name`), so
+            // `layout.user` names the same thing the directory listing shows.
+            l.name = format!("{USER_PREFIX}{}", board_layouts::io::slugify(&f.name));
+            self.layouts.push(l);
+        }
+        self.before_symbols = None;
+        self.idx = showing.and_then(|n| self.layouts.iter().position(|l| l.name == n)).unwrap_or(0);
+    }
+
+    /// Show the user layout with this slug. Returns false (and changes
+    /// nothing) when there is none by that name.
+    pub fn select_user_layout(&mut self, slug: &str) -> bool {
+        let want = format!("{USER_PREFIX}{slug}");
+        match self.layouts.iter().position(|l| l.name == want) {
+            Some(i) => {
+                self.idx = i;
+                self.shift = real_layout::Shift::Off;
+                self.before_symbols = None;
+                true
+            }
+            None => false,
+        }
+    }
 
     /// The shift state, for the caller that needs to draw it.
     pub fn shift(&self) -> real_layout::Shift { self.shift }
@@ -784,11 +828,13 @@ pub struct Style {
     /// board's width. `None` keeps the width-based default — a hand that has never been
     /// measured is better served by an estimate than by nothing.
     pub calibrated_reach: Option<f32>,
+    /// Key label size multiplier (`look.font_size`).
+    pub label_scale: f32,
 }
 
 impl Default for Style {
     fn default() -> Self {
-        Style { calibrated_reach: None, key_radius: None, opacity: 1.0, magnifier: true, half: crate::halfboard::Side::Off, arc: true }
+        Style { calibrated_reach: None, key_radius: None, opacity: 1.0, magnifier: true, half: crate::halfboard::Side::Off, arc: true, label_scale: 1.0 }
     }
 }
 
@@ -810,6 +856,7 @@ impl Style {
             half: crate::halfboard::Side::Off,
             arc: true,
             calibrated_reach: None,
+            label_scale: 1.0,
         }
     }
 
@@ -822,6 +869,12 @@ impl Style {
     /// Unknown keys and unknown values are ignored rather than reset to a default: a config
     /// written by a newer build must not silently undo a setting this build does understand.
     pub fn with_settings(mut self, values: &std::collections::HashMap<String, String>) -> Style {
+        self.label_scale = match values.get("look.font_size").map(String::as_str) {
+            Some("small") => 0.85,
+            Some("large") => 1.15,
+            Some("larger") => 1.3,
+            _ => 1.0,
+        };
         if let Some(h) = values.get("layout.hand") {
             self.half = match h.as_str() {
                 "left" => crate::halfboard::Side::Left,
@@ -1314,7 +1367,7 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, top_row: bool,
     // 0.42 (19.3pt on a 46pt key), which is most of why the port's caps looked heavier
     // than GTK's side by side.
     let font = FontId::proportional(uikit_egui::crisp::snap_font_pt(
-        (size.y * 0.35).clamp(11.0, 26.0),
+        (size.y * 0.35 * style.label_scale).clamp(11.0, 32.0),
         ppp,
     ));
     // And the cap itself: a 1px border at x = 40.3 covers 70% of one column and 30% of the

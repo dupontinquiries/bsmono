@@ -109,6 +109,19 @@ pub struct Feel {
     ctl: Option<crate::ctl::Ctl>,
     /// tideshell's cold mode: a keyboard shown while cold starts voice typing.
     cold: bool,
+    /// Ctrl/Alt latches, set by swipes on the layout rail (modlatch.rs).
+    mods: crate::modlatch::Mods,
+    /// Where a press that began on the rail started, until it is released.
+    rail_press: Option<egui::Pos2>,
+    /// The key being held (repeat / spacebar caret), key_hold.rs.
+    hold: Option<crate::key_hold::Hold>,
+    repeat_cfg: crate::key_hold::RepeatCfg,
+    /// config.toml's repeat values, before the `typing.repeat_*` settings.
+    repeat_base: crate::key_hold::RepeatCfg,
+    /// The `look.font` value last installed (None: nothing installed yet).
+    font_spec: Option<String>,
+    /// The rect the keys were last laid into (for hit-testing a hold, and tests).
+    keys_full: egui::Rect,
     /// A ctl command changed state while no frame was running; the shell
     /// should run one (the layer loop asks via `take_needs_frame`).
     needs_frame: bool,
@@ -199,16 +212,32 @@ impl Feel {
     }
 
     fn emit_text(&mut self, text: &str) {
-        if let Err(e) = self.sink.commit_text(text) {
-            self.sink_error = Some(e);
+        // A latched Ctrl/Alt turns a character into a chord; text cannot
+        // carry a modifier. See modlatch::apply_text.
+        match crate::modlatch::apply_text(&mut self.mods, text) {
+            crate::modlatch::Out::Text(t) => {
+                if let Err(e) = self.sink.commit_text(&t) {
+                    self.sink_error = Some(e);
+                }
+                self.typed.push_str(&t);
+            }
+            crate::modlatch::Out::Keysym(k) => {
+                if let Err(e) = self.sink.press_keysym(&k) {
+                    self.sink_error = Some(e);
+                }
+            }
         }
-        self.typed.push_str(text);
     }
 
     /// Send a non-character key by keysym name, and mirror its effect.
     fn emit_key(&mut self, keysym: &str) {
-        if let Err(e) = self.sink.press_keysym(keysym) {
+        let chord = crate::modlatch::apply_keysym(&mut self.mods, keysym);
+        if let Err(e) = self.sink.press_keysym(&chord) {
             self.sink_error = Some(e);
+        }
+        // A chord (Ctrl+BackSpace deletes a word) does not mirror as the bare key.
+        if chord != keysym {
+            return;
         }
         match keysym {
             "BackSpace" => {
@@ -370,6 +399,13 @@ impl Feel {
                 Cmd::VoiceCancel => self.cancel_dictation(),
                 Cmd::VoiceToggle => self.toggle_dictation(),
                 Cmd::Cold(on) => self.cold = on,
+                Cmd::ReloadSettings => self.reload_settings(),
+                Cmd::ReloadLayouts => {
+                    self.reload_user_layouts();
+                    // A reload keeps the showing board; the saved choice may
+                    // name a layout that only now exists.
+                    self.reload_settings();
+                }
                 _ => {}
             }
             self.needs_frame = true;
@@ -460,7 +496,7 @@ impl Feel {
             cfg.appearance.opacity,
             cfg.appearance.show_magnifier,
         );
-        Feel {
+        let mut f = Feel {
             // Open only when asked. See the field's note on the env var.
             thumb_cal: std::env::var("RUSTY_BOARD_CALIBRATE").is_ok()
                 .then(crate::thumbcal::Calibration::default),
@@ -513,6 +549,22 @@ impl Feel {
             // tests run on the device too.
             ctl: if cfg!(test) { None } else { crate::ctl::Ctl::bind() },
             cold: false,
+            mods: Default::default(),
+            rail_press: None,
+            hold: None,
+            keys_full: egui::Rect::NOTHING,
+            // The GTK keyboard's own repeat settings, same config file.
+            repeat_cfg: crate::key_hold::RepeatCfg {
+                enabled: cfg.behavior.key_repeat,
+                delay_ms: cfg.behavior.repeat_delay_ms as f64,
+                interval_ms: cfg.behavior.repeat_interval_ms.max(10) as f64,
+            },
+            repeat_base: crate::key_hold::RepeatCfg {
+                enabled: cfg.behavior.key_repeat,
+                delay_ms: cfg.behavior.repeat_delay_ms as f64,
+                interval_ms: cfg.behavior.repeat_interval_ms.max(10) as f64,
+            },
+            font_spec: None,
             needs_frame: false,
             #[cfg(feature = "voice")]
             voice: crate::config::Config::load_or_default()
@@ -537,6 +589,187 @@ impl Feel {
             setting_values: Default::default(),
             commit_flash: Default::default(),
             record_pulse: Default::default(),
+        };
+        // What the companion app (and the in-keyboard panel) saved. Not in
+        // tests: they must not depend on the device's config.
+        if !cfg!(test) {
+            f.reload_user_layouts();
+            f.reload_settings();
+        }
+        f
+    }
+
+    /// Re-read `settings.conf` and apply it: the same path as a tap in the
+    /// panel (mode on the board, the rest through `Style::with_settings`),
+    /// then the user layout if one is chosen. On start and on
+    /// `reload-settings` from the companion.
+    pub fn reload_settings(&mut self) {
+        let vals = crate::settings_store::valid_values(&crate::settings_store::load());
+        self.setting_values = vals.into_iter().collect();
+        let mode = self.setting_values.get("layout.experimental_mode").cloned().unwrap_or_default();
+        self.board.apply_mode(&mode);
+        let user = self.setting_values.get(crate::settings_store::USER_LAYOUT_KEY).cloned().unwrap_or_default();
+        if !user.is_empty() && !self.board.select_user_layout(&user) {
+            tracing::warn!("settings: layout.user = {user:?} is not in the user layouts directory");
+        }
+        self.style = self.base_style.with_settings(&self.setting_values);
+        self.apply_repeat();
+        self.needs_frame = true;
+    }
+
+    /// `typing.key_repeat` / `typing.repeat_speed` over config.toml's values.
+    fn apply_repeat(&mut self) {
+        let mut r = self.repeat_base;
+        match self.setting_values.get("typing.key_repeat").map(String::as_str) {
+            Some("off") => r.enabled = false,
+            Some("on") => r.enabled = true,
+            _ => {}
+        }
+        match self.setting_values.get("typing.repeat_speed").map(String::as_str) {
+            Some("slow") => (r.delay_ms, r.interval_ms) = (550.0, 80.0),
+            Some("fast") => (r.delay_ms, r.interval_ms) = (280.0, 33.0),
+            _ => {}
+        }
+        self.repeat_cfg = r;
+    }
+
+    /// Install `look.font` when it differs from what is installed. A face
+    /// that will not load is reported and the previous fonts stay.
+    fn sync_font(&mut self, ctx: &egui::Context) {
+        let want = self.setting_values.get(crate::user_font::KEY).cloned().unwrap_or_default();
+        if self.font_spec.as_deref() == Some(want.as_str()) {
+            return;
+        }
+        if let Err(e) = crate::user_font::apply(ctx, &want) {
+            tracing::warn!("look.font: {e}");
+            self.microterm.set_content(crate::microterm::Content::Status(format!("Key font not loaded: {e}")));
+            self.microterm.show();
+        }
+        self.font_spec = Some(want);
+    }
+
+    /// Re-read the user layouts directory into the board. A file that does
+    /// not import is logged and skipped, never fatal.
+    pub fn reload_user_layouts(&mut self) {
+        let mut files = Vec::new();
+        for e in board_layouts::io::list_user_layouts() {
+            match std::fs::read_to_string(&e.path).map_err(|e| e.to_string())
+                .and_then(|t| board_layouts::io::import_from_string(&t).map_err(|e| e.to_string()))
+            {
+                Ok(l) => files.push(l),
+                Err(err) => tracing::warn!("user layout {}: {err}", e.path.display()),
+            }
+        }
+        tracing::info!("user layouts: {} loaded", files.len());
+        self.board.set_user_layouts(&files);
+        self.needs_frame = true;
+    }
+}
+
+/// Start `rusty-board-settings`: next to this binary if it is there (a dev
+/// build, or both installed to the same prefix), else from PATH.
+fn open_companion() {
+    let beside = std::env::current_exe().ok()
+        .and_then(|p| p.parent().map(|d| d.join("rusty-board-settings")))
+        .filter(|p| p.is_file());
+    let prog = beside.unwrap_or_else(|| "rusty-board-settings".into());
+    // Not the keyboard's inherited WAYLAND_SOCKET (already consumed by the
+    // capture); the child connects by WAYLAND_DISPLAY like any app.
+    match std::process::Command::new(&prog).env_remove("WAYLAND_SOCKET").spawn() {
+        // Reaped on a thread, or it lingers as a zombie until the keyboard exits.
+        Ok(mut child) => { std::thread::spawn(move || { let _ = child.wait(); }); }
+        Err(e) => tracing::warn!("cannot start {}: {e}", prog.display()),
+    }
+}
+
+impl Feel {
+    /// Start, run and end a held key (key_hold.rs). Returns whether this
+    /// frame's release must be swallowed because the hold already acted.
+    fn hold_step(&mut self, ui: &egui::Ui, render: &crate::Layout, keys_full: egui::Rect, adaptive: &uikit_egui::Adaptive) -> bool {
+        let (down, pressed, origin, pos, now) = ui.input(|i| {
+            (i.pointer.primary_down(), i.pointer.primary_pressed(), i.pointer.press_origin(), i.pointer.interact_pos(), i.time * 1000.0)
+        });
+        if pressed {
+            self.hold = origin.and_then(|o| {
+                let rects = crate::key_rects(render, keys_full, adaptive, &self.style);
+                render.rows.iter().zip(&rects).find_map(|(row, rs)| {
+                    row.keys.iter().zip(rs).find(|(_, r)| r.contains(o)).map(|(k, _)| k.emit.clone())
+                })
+                .and_then(|emit| crate::key_hold::kind_for(&emit))
+                .map(|kind| crate::key_hold::Hold::new(kind, o, now))
+            });
+        }
+        if self.hold.is_none() {
+            return false;
+        }
+        if down {
+            let rep = self.repeat_cfg;
+            let sends = match (self.hold.as_mut(), pos) {
+                (Some(h), Some(p)) => h.tick(p, now, &rep, &crate::key_hold::CaretCfg::default()),
+                _ => Vec::new(),
+            };
+            for k in sends {
+                self.emit_key(k);
+            }
+            // The keyboard's loop is lazy; a hold needs the clock to advance.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+            return false;
+        }
+        let h = self.hold.take().expect("checked");
+        if h.consumed() && h.kind == crate::key_hold::Kind::Caret {
+            // A caret drag along the space row is not a word.
+            self.swipe.clear_candidates();
+        }
+        h.consumed()
+    }
+
+    /// Ctrl / Tab / Alt as swipes that start on the layout rail (modlatch.rs),
+    /// and the latch badges drawn over the rail's foot. Works on the collapsed
+    /// sliver too, so hiding the switcher does not hide the modifiers.
+    fn rail_gestures(&mut self, ui: &mut egui::Ui, rail: egui::Rect) {
+        // From the raw button events, in order: two quick swipes can land in
+        // one frame, and the aggregated pressed/released flags would then pair
+        // the second press with the first release.
+        let buttons: Vec<(egui::Pos2, bool)> = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, .. } => Some((*pos, *pressed)),
+                    _ => None,
+                })
+                .collect()
+        });
+        for (pos, pressed) in buttons {
+            if pressed {
+                self.rail_press = rail.contains(pos).then_some(pos);
+            } else if let Some(o) = self.rail_press.take() {
+                use crate::modlatch::RailSwipe;
+                match crate::modlatch::classify(pos - o) {
+                    Some(RailSwipe::Tab) => self.emit_key("Tab"),
+                    Some(s) => self.mods.apply_swipe(s),
+                    None => {}
+                }
+                ui.ctx().request_repaint();
+            }
+        }
+        // Badges: outlined for Once, filled for Locked, like Shift's cap.
+        let colors = uikit_egui::palette_colors(self.board.palette());
+        let mut y = rail.bottom() - 4.0;
+        for (name, latch) in [("Alt", self.mods.alt), ("Ctrl", self.mods.ctrl)] {
+            if !latch.on() {
+                continue;
+            }
+            let w = rail.width().max(30.0) - 4.0;
+            let r = egui::Rect::from_min_max(egui::pos2(rail.left() + 2.0, y - 18.0), egui::pos2(rail.left() + 2.0 + w, y));
+            let p = ui.painter();
+            if latch == crate::modlatch::Latch::Locked {
+                p.rect_filled(r, 5.0, colors.accent);
+            } else {
+                p.rect_filled(r, 5.0, colors.bg_raised);
+                p.rect_stroke(r, 5.0, egui::Stroke::new(1.5, colors.accent), egui::StrokeKind::Inside);
+            }
+            p.text(r.center(), egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(10.0), colors.text);
+            y -= 22.0;
         }
     }
 }
@@ -582,6 +815,7 @@ impl Feel {
     }
 
     pub fn frame(&mut self, ctx: &egui::Context) {
+        self.sync_font(ctx);
         apply_theme(ctx);
 
         // Drive whatever background event processing the active sink
@@ -1042,6 +1276,11 @@ impl Feel {
                             // cannot arrive with the wrong side effects.
                             let change = crate::settings_model::toggle(setting, &cur);
                             self.setting_values.insert(setting.key.to_string(), change.value.clone());
+                            if change.persist {
+                                if let Err(e) = crate::settings_store::set(setting.key, &change.value) {
+                                    tracing::warn!("settings: not saved: {e}");
+                                }
+                            }
                             // AND APPLY IT — through ONE path, not a growing list of
                             // special cases at the button. The board's mode is the one
                             // thing that is not a style, so it stays explicit; everything
@@ -1052,6 +1291,7 @@ impl Feel {
                                 self.board.apply_mode(&change.value);
                             }
                             self.style = self.base_style.with_settings(&self.setting_values);
+                            self.apply_repeat();
                             if change.broadcast { ctx.request_repaint(); }
                         }
                         // The help line is where the options are EXPLAINED —
@@ -1060,6 +1300,13 @@ impl Feel {
                         // meaningful, and two bare words leave the user guessing.
                         r.on_hover_text(setting.help);
                     }
+                }
+                ui.add_space(6.0);
+                // The panel has room for the choices; custom layouts and the
+                // text settings live in the companion app.
+                if ui.button("All settings and custom layouts…").clicked() {
+                    self.settings_open = false;
+                    open_companion();
                 }
                     });
             });
@@ -1150,7 +1397,7 @@ impl Feel {
             };
             ui.horizontal_top(|ui| {
                 let rail_w = crate::layout_rail::width(self.rail_collapsed);
-                ui.allocate_ui(egui::vec2(rail_w, board_h), |ui| {
+                let rail_rect = ui.allocate_ui(egui::vec2(rail_w, board_h), |ui| {
                     // demo layouts first, then the REAL layout files (shift/symbols live)
                     let mut entries: Vec<crate::layout_rail::Entry> = self
                         .board
@@ -1180,7 +1427,8 @@ impl Feel {
                             self.real.shift = crate::real_layout::Shift::Off;
                         }
                     }
-                });
+                }).response.rect;
+                self.rail_gestures(ui, rail_rect);
                 ui.vertical(|ui| {
                     // The reveal: content settles up from 12px low and fades in, inside the
                     // panel. `set_opacity` scopes to this Ui, so the sidebar and status strip
@@ -1189,6 +1437,18 @@ impl Feel {
                     ui.add_space(crate::platform::reveal_offset(t, 12.0));
                     ui.set_opacity(0.15 + 0.85 * crate::platform::reveal_progress(t));
                     let board_top = ui.cursor().min;
+                    // Held keys (repeat, spacebar caret) run BEFORE the keys draw: the
+                    // release that ends a hold arrives in the same frame the key would
+                    // fire, and a hold that sent anything swallows that release.
+                    let keys_full = ui.max_rect();
+                    self.keys_full = keys_full;
+                    let swallow = if self.real_active {
+                        let r = self.real.render_rc();
+                        self.hold_step(ui, &r, keys_full, &adaptive)
+                    } else {
+                        let r = self.board.rendered().into_owned();
+                        self.hold_step(ui, &r, keys_full, &adaptive)
+                    };
                     // Whether a KEY produced something this frame. A space zone must never
                     // fire on the same release as a key -- see the zone tap below.
                     let mut key_fired = false;
@@ -1196,7 +1456,7 @@ impl Feel {
                         // the real layout files: render via the projection, feed emissions through
                         // the board's state machine (shift/symbols absorbed), act on the rest
                         let render = self.real.render_rc();
-                        if let Some(e) = keyboard_ui_styled(ui, &render, &adaptive, self.board.palette(), self.style) {
+                        if let Some(e) = keyboard_ui_styled(ui, &render, &adaptive, self.board.palette(), self.style).filter(|_| !swallow) {
                             key_fired = true;
                             // THROUGH THE SINK, not straight into the
                             // preview string. These wrote to `self.typed`
@@ -1247,6 +1507,7 @@ impl Feel {
                         // would keep pulsing over a microphone that had already closed.
                         self.board.set_voice_active(self.dictation.is_active());
                         keyboard_ui_styled(ui, &self.board.rendered(), &adaptive, self.board.palette(), self.style)
+                            .filter(|_| !swallow)
                     } {
                         key_fired = true;
                         // Same decoder as the real layouts, so a mic key or an action token
@@ -1320,7 +1581,17 @@ impl Feel {
                         // the borrow ends keeps both without a clone of the layout.
                         top_edge = Some(crate::topedge::classify(press, release, len, ms, col, m));
                     }
-                    if self.swipe.update_half(ui, render, board_rect, &adaptive, self.style.half).is_some() {
+                    let swipe_done = self.swipe.update_half(ui, render, board_rect, &adaptive, self.style.half).is_some();
+                    if swipe_done && swallow {
+                        // The press was a HELD key (a spacebar caret drag, a repeating
+                        // backspace), not a word: nothing it traced may commit or offer
+                        // candidates, including the "ended outside the letters" space.
+                        self.swipe.clear_candidates();
+                        self.swipe.springboard_words.clear();
+                        self.swipe.trailing_space = false;
+                        self.swipe.delimiters.clear();
+                    }
+                    if swipe_done && !swallow {
                         // A completed swipe suppresses nothing: the candidates appear above and
                         // the user picks. Committing automatically would fight the tap that the
                         // same gesture's lift also produces on some touch stacks.
@@ -1644,3 +1915,77 @@ mod voice_session_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod hold_tests {
+    use super::*;
+    use egui::{pos2, vec2, Event, PointerButton, Pos2};
+
+    fn frame(f: &mut Feel, ctx: &egui::Context, t: f64, events: Vec<Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(432.0, 320.0))),
+            time: Some(t),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| f.frame(ctx));
+    }
+    fn btn(p: Pos2, pressed: bool) -> Event {
+        Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: Default::default() }
+    }
+    fn setup() -> (Feel, egui::Context) {
+        let mut f = Feel::new();
+        f.sink = Box::new(crate::sink::Preview::default());
+        let ctx = egui::Context::default();
+        frame(&mut f, &ctx, 0.0, vec![]);
+        frame(&mut f, &ctx, 0.016, vec![]);
+        (f, ctx)
+    }
+    /// Centre of the first key whose emit matches.
+    fn key(f: &Feel, want: impl Fn(&str) -> bool) -> Pos2 {
+        let l = f.board.rendered().into_owned();
+        let adaptive = crate::board_adaptive(&egui::Context::default());
+        let rects = crate::key_rects(&l, f.keys_full, &adaptive, &f.style);
+        l.rows.iter().zip(&rects)
+            .find_map(|(row, rs)| row.keys.iter().zip(rs).find(|(k, _)| want(&k.emit)).map(|(_, r)| r.center()))
+            .expect("key on the board")
+    }
+    fn hold_path(f: &mut Feel, ctx: &egui::Context, path: &[(Pos2, f64)]) {
+        let (p0, t0) = path[0];
+        frame(f, ctx, t0, vec![Event::PointerMoved(p0), btn(p0, true)]);
+        for &(p, t) in &path[1..] {
+            frame(f, ctx, t, vec![Event::PointerMoved(p)]);
+        }
+        let (pl, tl) = *path.last().unwrap();
+        frame(f, ctx, tl + 0.016, vec![btn(pl, false)]);
+    }
+
+    #[test]
+    fn holding_backspace_repeats_and_a_tap_deletes_one() {
+        let (mut f, ctx) = setup();
+        let bs = key(&f, |e| matches!(crate::key_hold::kind_for(e), Some(crate::key_hold::Kind::Repeat(ref k)) if k == "BackSpace"));
+        f.typed = "abcdefghijklmnopqrstuvwxyz".into();
+        hold_path(&mut f, &ctx, &[(bs, 1.0), (bs, 1.05)]);
+        assert_eq!(f.typed.len(), 25, "a tap is one: {:?}", f.typed);
+        let path: Vec<(Pos2, f64)> = (0..=60).map(|i| (bs, 2.0 + i as f64 * 0.016)).collect();
+        hold_path(&mut f, &ctx, &path);
+        let gone = 25 - f.typed.len();
+        // ~0.96s held: 400ms delay then 50ms steps => ~12, and the release adds none.
+        assert!((10..=14).contains(&gone), "held backspace removed {gone}");
+    }
+
+    #[test]
+    fn dragging_the_spacebar_moves_the_caret_and_types_no_space() {
+        let (mut f, ctx) = setup();
+        let sp = key(&f, |e| crate::key_hold::kind_for(e) == Some(crate::key_hold::Kind::Caret));
+        f.typed.clear();
+        hold_path(&mut f, &ctx, &[(sp, 1.0), (sp, 1.05)]);
+        assert_eq!(f.typed, " ", "a tap is a space");
+        f.typed.clear();
+        let path: Vec<(Pos2, f64)> = (0..=10).map(|i| (pos2(sp.x - 5.0 * i as f32, sp.y), 2.0 + i as f64 * 0.016)).collect();
+        hold_path(&mut f, &ctx, &path);
+        assert_eq!(f.typed, "", "a caret drag types nothing");
+        assert!(f.hold.is_none());
+    }
+}
+

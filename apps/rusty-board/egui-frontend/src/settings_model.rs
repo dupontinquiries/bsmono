@@ -41,7 +41,9 @@ impl Group {
         match self {
             Group::Layout => "Layout",
             Group::Typing => "Typing",
-            Group::Colors => "Colors",
+            // Fonts joined the colours; the key stays `Colors` so stored
+            // values and the CLI's group name keep working.
+            Group::Colors => "Look",
             Group::Llm => "LLM",
             Group::Experimental => "Experimental",
         }
@@ -85,6 +87,10 @@ pub enum Kind {
     /// colour that happens to equal the theme's are different states — one
     /// follows the theme when it changes and the other does not.
     Color,
+    /// A font: an installed family name (resolved with fontconfig) or a path
+    /// to a .ttf/.otf file. Empty is the built-in face. Its own kind because
+    /// the control is a picker over the installed fonts, not a text box.
+    Font,
 }
 
 /// One multiple-choice setting.
@@ -229,6 +235,37 @@ pub const SETTINGS: &[Setting] = &[
         group: Group::Typing,
         kind: Kind::Choice,
         options: &["On", "Off"], values: &["on", "off"],
+    },
+    // Key repeat: the GTK config's `key_repeat` / `repeat_delay_ms` /
+    // `repeat_interval_ms`, as two controls (key_hold.rs applies them).
+    Setting {
+        key: "typing.key_repeat", label: "Key repeat",
+        help: "Hold backspace or an arrow key to repeat it.",
+        group: Group::Typing,
+        kind: Kind::Choice,
+        options: &["On", "Off"], values: &["on", "off"],
+    },
+    Setting {
+        key: "typing.repeat_speed", label: "Repeat speed",
+        help: "How soon a held key starts repeating, and how fast.",
+        group: Group::Typing,
+        kind: Kind::Choice,
+        options: &["Normal", "Slow", "Fast"], values: &["normal", "slow", "fast"],
+    },
+    // ── Look: fonts ──────────────────────────────────────────────────────
+    Setting {
+        key: "look.font", label: "Key font",
+        help: "The face key labels are drawn in. Symbols it lacks still come from the built-in fallbacks.",
+        group: Group::Colors,
+        kind: Kind::Font,
+        options: &[""], values: &[""],
+    },
+    Setting {
+        key: "look.font_size", label: "Key label size",
+        help: "Label size relative to the key.",
+        group: Group::Colors,
+        kind: Kind::Choice,
+        options: &["Normal", "Small", "Large", "Larger"], values: &["normal", "small", "large", "larger"],
     },
     // ── Colors ───────────────────────────────────────────────────────────
     //

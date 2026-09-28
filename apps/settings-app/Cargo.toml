@@ -26,6 +26,12 @@ gui = ["dep:eframe"]
 egui = "0.34"
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
 uikit-egui = { path = "../../shared/uikit/crates/uikit-egui" }
+# The phone shell's screens (display scale / cold / screen sleep / 3D clock,
+# the speaker chain, COSMIC's own settings files), hosted as sections here so
+# the phone has ONE settings app. Library only: its standalone window is not
+# pulled in.
+tideshell-settings = { path = "../tideshell/settings", default-features = false }
+cosmic-levers = { path = "../../shared/cosmic-levers" }
 snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../shared/settings-kit" }
 bigsilicon-client = { path = "../../shared/bigsilicon-client" }

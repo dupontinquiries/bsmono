@@ -17,14 +17,28 @@ struct BSettings {
 impl BSettings {
     fn new() -> BSettings {
         let settings = bigsilicon_client::Settings::connect();
-        let (prefs, status) = match &settings {
-            Some(s) => (s.prefs().clone(), "connected to settingsd".to_string()),
-            None => (
-                settings_kit::Prefs::default(),
-                "offline — settingsd not reachable; edits won't persist".to_string(),
-            ),
+        // Offline, the file settingsd persists to is still the truth: start
+        // from it and write edits back to it (see `save_offline`), so a phone
+        // without settingsd running keeps what you set, and readers that
+        // watch the file (tideshell's sleeping hours) see it.
+        let file = bigsilicon_settings::settings_file_path();
+        let (prefs, status, note) = match &settings {
+            Some(s) => (s.prefs().clone(), "connected to settingsd".to_string(), "settingsd (live to every app; it persists them to the file below)".to_string()),
+            None => {
+                let text = file.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+                (
+                    bigsilicon_settings::prefs_from_settings_text(&text),
+                    "settingsd not running: editing its file directly (apps pick changes up when they re-read it)".to_string(),
+                    "the settings file directly (settingsd is not running)".to_string(),
+                )
+            }
         };
-        BSettings { editor: SettingsEditor::new(prefs), settings, status }
+        let mut editor = SettingsEditor::new(prefs);
+        editor.store_note = note;
+        if let Some(page) = std::env::args().nth(1).and_then(|a| bigsilicon_settings::Page::from_token(&a)) {
+            editor.page = page;
+        }
+        BSettings { editor, settings, status }
     }
 }
 
@@ -72,8 +86,11 @@ impl eframe::App for BSettings {
                             self.status = format!("published {} change(s) — every app updated live", changes.len());
                         }
                         None => {
+                            self.status = match save_offline(&changes) {
+                                Ok(p) => format!("saved {} change(s) to {}", changes.len(), p.display()),
+                                Err(e) => format!("not saved: {e}"),
+                            };
                             self.editor.mark_published();
-                            self.status = "offline — change applied locally, not persisted".to_string();
                         }
                     }
                 }
@@ -86,6 +103,17 @@ impl eframe::App for BSettings {
             ui.small(&self.status);
         });
     }
+}
+
+/// Merge changes into settingsd's file (settingsd not running).
+fn save_offline(changes: &[(String, String)]) -> Result<std::path::PathBuf, String> {
+    let path = bigsilicon_settings::settings_file_path().ok_or("no HOME or XDG_CONFIG_HOME")?;
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    std::fs::write(&path, bigsilicon_settings::merge_settings_text(&text, changes)).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
 }
 
 fn main() -> eframe::Result<()> {

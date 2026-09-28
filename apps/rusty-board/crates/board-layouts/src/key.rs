@@ -99,8 +99,18 @@ fn default_swipe_target() -> bool {
     true
 }
 
+/// JSON shape: `{"kind": "backspace"}` for plain actions and
+/// `{"kind": "literal", "value": "hi"}` for the ones that carry a string.
+///
+/// ADJACENTLY tagged (`content = "value"`). It was internally tagged, and
+/// serde cannot represent an internally tagged variant that wraps a bare
+/// string: `Literal`, `Keysym` and `Steno` could be neither saved nor loaded
+/// ("cannot serialize tagged newtype variant ... containing a string"), so
+/// any layout using them failed to export, and the layout editor could not
+/// have offered them. Plain actions serialize exactly as before, so every
+/// existing layout file still reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum KeyAction {
     /// Emit a character (the key's `label` or `shifted` value).
     Character,
@@ -423,5 +433,22 @@ mod tests {
     fn shift_key_emits_no_char() {
         let k = Key::modifier("⇧", KeyAction::Shift);
         assert!(k.emit_char(false).is_none());
+    }
+}
+
+#[cfg(test)]
+mod action_serde_tests {
+    use super::KeyAction;
+
+    #[test]
+    fn plain_actions_keep_their_old_json_and_string_actions_now_round_trip() {
+        assert_eq!(serde_json::to_string(&KeyAction::Backspace).unwrap(), r#"{"kind":"backspace"}"#);
+        let back: KeyAction = serde_json::from_str(r#"{ "kind": "symbols_toggle" }"#).unwrap();
+        assert_eq!(back, KeyAction::SymbolsToggle);
+        for a in [KeyAction::Literal("hi".into()), KeyAction::Keysym("Left".into()), KeyAction::Steno("L1".into())] {
+            let j = serde_json::to_string(&a).unwrap();
+            assert_eq!(serde_json::from_str::<KeyAction>(&j).unwrap(), a, "{j}");
+        }
+        assert_eq!(serde_json::to_string(&KeyAction::Literal("hi".into())).unwrap(), r#"{"kind":"literal","value":"hi"}"#);
     }
 }

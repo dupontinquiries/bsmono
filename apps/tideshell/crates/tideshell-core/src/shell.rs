@@ -264,6 +264,9 @@ impl Shell {
     }
 
     pub fn set_windows(&mut self, windows: Vec<WindowCard>) -> Vec<Action> {
+        // Helper windows that exist for plumbing, not for people (see
+        // `is_helper_window`): never a card, a carousel page or a palette entry.
+        let windows: Vec<WindowCard> = windows.into_iter().filter(|w| !crate::is_helper_window(&w.app_id)).collect();
         self.switcher.sync(&windows);
         let out = self.carousel.sync(&windows);
         self.windows = windows;
