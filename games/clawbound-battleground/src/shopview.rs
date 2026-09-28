@@ -408,7 +408,10 @@ pub enum Layout {
     Narrow,
 }
 
-pub const WIDE_MIN: f32 = 760.0;
+/// (700, not 760: a PinePhone held landscape is 720 x 360, and one
+/// column there left the hoard 117 pt under the tabs -- four of six slots
+/// cut off.)
+pub const WIDE_MIN: f32 = 700.0;
 pub const TALL_MIN: f32 = 560.0;
 
 pub fn layout_for(width: f32, height: f32) -> Layout {
@@ -517,6 +520,8 @@ mod tests {
     fn a_phone_gets_one_column_or_compact_chrome() {
         assert_eq!(layout_for(390.0, 844.0), Layout::Narrow, "portrait phone");
         assert_eq!(layout_for(844.0, 390.0), Layout::Short, "landscape phone");
+        assert_eq!(layout_for(720.0, 360.0), Layout::Short, "PinePhone landscape");
+        assert_eq!(layout_for(360.0, 720.0), Layout::Narrow, "PinePhone portrait");
         assert_eq!(layout_for(1280.0, 720.0), Layout::Wide);
         assert_eq!(layout_for(f32::NAN, 720.0), Layout::Narrow);
     }
