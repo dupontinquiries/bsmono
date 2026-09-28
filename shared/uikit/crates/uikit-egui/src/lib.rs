@@ -75,6 +75,7 @@ pub mod steps;
 pub mod chips;
 pub mod gesture_layer;
 pub mod touch;
+pub mod zoom;    // digital zoom: a pinch-driven window into a live picture, shared by the camera apps
 pub mod skin;
 pub mod livebg;
 pub mod nav;

@@ -120,6 +120,95 @@ impl History {
     }
 }
 
+/// Week navigation, from the GTK page: "◀  This Week  ▶", a Today button
+/// and "Export as CSV" beneath the chart.
+///
+/// `week_offset` counts weeks back from the current one; the host turns it
+/// into a query and fills `range` with the dates it actually covered, so the
+/// label says what the chart shows rather than what was asked for.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Nav {
+    pub week_offset: usize,
+    /// "Sep 21 – Sep 27", filled by the host from the query it ran.
+    pub range: String,
+    /// The last export's outcome, or a fetch error.
+    pub note: Option<String>,
+}
+
+/// What the navigation asks the host to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryAction {
+    PrevWeek,
+    NextWeek,
+    Today,
+    ExportCsv,
+}
+
+impl Nav {
+    /// "This week", "Last week", "3 weeks ago" — the GTK label.
+    pub fn title(&self) -> String {
+        match self.week_offset {
+            0 => "This week".into(),
+            1 => "Last week".into(),
+            n => format!("{n} weeks ago"),
+        }
+    }
+
+    /// Forward is only meaningful from the past; the GTK page greys the
+    /// arrow at the current week rather than letting it "go" nowhere.
+    pub fn can_go_forward(&self) -> bool { self.week_offset > 0 }
+
+    /// Apply a navigation action locally. Returns true when the week
+    /// changed and the host should re-query.
+    pub fn apply(&mut self, a: HistoryAction) -> bool {
+        let before = self.week_offset;
+        match a {
+            HistoryAction::PrevWeek => self.week_offset += 1,
+            HistoryAction::NextWeek => self.week_offset = self.week_offset.saturating_sub(1),
+            HistoryAction::Today => self.week_offset = 0,
+            HistoryAction::ExportCsv => {}
+        }
+        self.week_offset != before
+    }
+}
+
+/// The whole page: week navigation, the chart, the export row.
+pub fn history_page_ui(ui: &mut egui::Ui, h: &History, nav: &Nav,
+                       colors: &uikit_egui::PaletteColors) -> Option<HistoryAction> {
+    let mut out = None;
+    ui.horizontal(|ui| {
+        if ui.button("◀").clicked() { out = Some(HistoryAction::PrevWeek); }
+        ui.vertical(|ui| {
+            ui.colored_label(colors.text, egui::RichText::new(nav.title()).strong());
+            if !nav.range.is_empty() {
+                ui.colored_label(colors.text_weak, egui::RichText::new(&nav.range).small());
+            }
+        });
+        if ui.add_enabled(nav.can_go_forward(), egui::Button::new("▶")).clicked() {
+            out = Some(HistoryAction::NextWeek);
+        }
+        if ui.add_enabled(nav.can_go_forward(), egui::Button::new("Today")).clicked() {
+            out = Some(HistoryAction::Today);
+        }
+    });
+    history_ui(ui, h, colors);
+    // What the numbers are: the GTK chart plots the daily mean of the first
+    // thermal sensor as recorded, not the ambient prediction, and a 40°
+    // "history" on a page about room temperature needs that said.
+    ui.colored_label(colors.text_weak, egui::RichText::new(
+        "Daily mean of the primary thermal sensor, from the recorded readings.").small());
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui.add_enabled(!h.is_empty(), egui::Button::new("Export as CSV")).clicked() {
+            out = Some(HistoryAction::ExportCsv);
+        }
+        if let Some(n) = &nav.note {
+            ui.colored_label(colors.text_weak, egui::RichText::new(n).small());
+        }
+    });
+    out
+}
+
 /// Draw the history chart and its statistics.
 pub fn history_ui(ui: &mut egui::Ui, h: &History, colors: &uikit_egui::PaletteColors) {
     ui.heading("History");
@@ -279,5 +368,20 @@ mod tests {
         // Matching the sensor's honest precision: two decimals would claim
         // resolution a BME280 does not have.
         assert_eq!(h(&[21.44, 21.46]).stats()[0], "21.4°");
+    }
+
+    #[test]
+    fn the_week_label_reads_like_the_gtk_one() {
+        let mut n = Nav::default();
+        assert_eq!(n.title(), "This week");
+        assert!(!n.can_go_forward(), "nothing after the current week");
+        assert!(n.apply(HistoryAction::PrevWeek));
+        assert_eq!(n.title(), "Last week");
+        n.apply(HistoryAction::PrevWeek);
+        assert_eq!(n.title(), "2 weeks ago");
+        assert!(n.apply(HistoryAction::Today));
+        assert_eq!(n.week_offset, 0);
+        assert!(!n.apply(HistoryAction::NextWeek), "cannot go past today");
+        assert!(!n.apply(HistoryAction::ExportCsv), "an export does not move the week");
     }
 }

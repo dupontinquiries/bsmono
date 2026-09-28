@@ -1,0 +1,26 @@
+[Desktop Entry]
+Type=Application
+Name=PhotoSync
+GenericName=Photo Library
+Comment=Browse, view, deduplicate, tag and share your photos
+Exec=photosync-egui %f
+Icon=org.vidkit.PhotoSync
+Terminal=false
+Categories=Graphics;Photography;Viewer;
+Keywords=photos;pictures;gallery;library;duplicates;
+StartupNotify=true
+StartupWMClass=org.vidkit.PhotoSync
+MimeType=inode/directory;
+[Desktop Entry]
+Type=Application
+Name=PhotoSync
+GenericName=Photo Library
+Comment=Browse, view, deduplicate, tag and share your photos
+Exec=photosync-egui %f
+Icon=org.vidkit.PhotoSync
+Terminal=false
+Categories=Graphics;Photography;Viewer;
+Keywords=photos;pictures;gallery;library;duplicates;
+StartupNotify=true
+StartupWMClass=org.vidkit.PhotoSync
+MimeType=inode/directory;

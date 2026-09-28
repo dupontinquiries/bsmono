@@ -12,7 +12,9 @@ required-features = ["app"]
 [features]
 # Default-on so `cargo build --release` produces the deployable binary, the
 # convention the rest of the fleet uses. The LIBRARY is feature-free, so
-# `--no-default-features` gives a headless core that tests without a display.
+# `--no-default-features` gives a headless core that tests without a display:
+# the roll, the sharing rules, the store, the camera rig (capture-kit is
+# std-only), the handoffs — everything but the window.
 default = ["app"]
 app = ["dep:eframe", "dep:egui", "dep:uikit-egui"]
 
@@ -33,3 +35,19 @@ egui = { version = "0.34", optional = true }
 # reason it is worth the edge on an app this small — the IME request that lets
 # an on-screen keyboard reach a text field at all. See shared/uikit's `ime`.
 uikit-egui = { path = "../../shared/uikit/crates/uikit-egui", optional = true }
+# THE CAMERA. capture-kit runs gst-launch-1.0 as a subprocess and reads raw
+# RGBA frames off its stdout; device-kit (through it) decides which camera
+# and which pipeline. std-only, so the rig is in the headless library and
+# tested there with the kit's test pattern.
+capture-kit = { path = "../../shared/capture-kit" }
+# JPEG for the roll (encode only — the decoder is for re-reading thumbnails
+# after a restart).
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# XDG paths, the roll file, snapclone's contact book and photosync's root.
+config-kit = { path = "../../shared/config-kit" }
+# The file-based handoff to snapclone: the request goes in its outbox, the
+# outcome comes back beside it.
+snap-handoff = { path = "../../shared/snap-handoff" }
+
+[dev-dependencies]
+tempfile = "3.8"

@@ -143,6 +143,15 @@ impl Inbox {
 /// Draw the list. Returns the entry clicked, if any.
 pub fn inbox_ui(ui: &mut egui::Ui, inbox: &mut Inbox,
                 colors: &uikit_egui::PaletteColors) -> Option<u64> {
+    inbox_ui_with(ui, inbox, colors, true)
+}
+
+/// The list with or without its own filter row. The shell draws the
+/// filter as the ribbon's segments and sets `inbox.filter` from them, so
+/// it passes `false` — drawing both put All/Unread/Sent on the page twice,
+/// one row above the other, each keeping its own selection.
+pub fn inbox_ui_with(ui: &mut egui::Ui, inbox: &mut Inbox,
+                     colors: &uikit_egui::PaletteColors, show_filter: bool) -> Option<u64> {
     let mut clicked = None;
     if let Some(b) = inbox.banner.clone() {
         ui.horizontal(|ui| {
@@ -151,14 +160,16 @@ pub fn inbox_ui(ui: &mut egui::Ui, inbox: &mut Inbox,
         });
         ui.separator();
     }
-    ui.horizontal(|ui| {
-        for f in Filter::ALL {
-            let n = if f == Filter::Unread { inbox.unread_count() } else { 0 };
-            let label = if n > 0 { format!("{} ({n})", f.label()) } else { f.label().to_string() };
-            if ui.selectable_label(inbox.filter == f, label).clicked() { inbox.filter = f; }
-        }
-    });
-    ui.separator();
+    if show_filter {
+        ui.horizontal(|ui| {
+            for f in Filter::ALL {
+                let n = if f == Filter::Unread { inbox.unread_count() } else { 0 };
+                let label = if n > 0 { format!("{} ({n})", f.label()) } else { f.label().to_string() };
+                if ui.selectable_label(inbox.filter == f, label).clicked() { inbox.filter = f; }
+            }
+        });
+        ui.separator();
+    }
     let rows = inbox.visible().into_iter().cloned().collect::<Vec<_>>();
     if rows.is_empty() {
         // An empty state is a STATE: saying nothing looks like a broken list.

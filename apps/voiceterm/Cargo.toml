@@ -64,6 +64,7 @@ bcrypt = { version = "0.15", optional = true }
 # messaging — NaCl crypto_box (X25519 + XSalsa20-Poly1305). Encrypts a
 # message to a recipient's public key, authenticated by the sender's.
 crypto_box = { version = "0.9", optional = true, default-features = false, features = ["std", "salsa20", "getrandom"] }
+proton-srp = { version = "0.8", optional = true, features = ["pgpinternal"] }
 # v0.1.462 (llama.cpp backend arc): in-process GGUF inference,
 # GPU-accelerated via Vulkan (the universal target — Apple
 # Silicon via Honeykrisp, Qualcomm Adreno via Mesa Turnip, AMD
@@ -112,6 +113,11 @@ claude = []
 # inert providers (sealing/SRP/PGP return CryptoUnavailable, accounts session-only).
 # ON → NaCl-secretbox sealing (policy-gated + machine-bound) + bcrypt session gate.
 mail-crypto = ["crypto_secretbox", "bcrypt", "crypto_box"]
+# The Proton SRP handshake itself, through ProtonMail's own pure-Rust
+# crate (TODO_mail_srp_login.md). Separate from `mail-crypto` so the
+# heavier dependency stays opt-in; `pgpinternal` verifies the signed
+# modulus from /auth/info with rPGP, so no modulus key is pinned by hand.
+mail-proton-srp = ["mail-crypto", "dep:proton-srp"]
 # v0.1.462: in-process llama.cpp backend with Vulkan offload.
 # Single feature that pulls the Vulkan sub-feature (the
 # Vulkan-everywhere plan — one build target across M-series,

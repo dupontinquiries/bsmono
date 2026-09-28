@@ -185,6 +185,71 @@ impl Queue {
         if self.entries.is_empty() { return None; }
         Some(self.entries.remove(0))
     }
+
+    /// Take one ENTRY out by its queue id, leaving the rest in order —
+    /// what shuffle does, since it plays from the middle.
+    pub fn take(&mut self, queue_id: u64) -> Option<QueueEntry> {
+        let i = self.entries.iter().position(|e| e.queue_id == queue_id)?;
+        Some(self.entries.remove(i))
+    }
+
+    /// Put a track at the HEAD — "previous" returns what was playing to
+    /// the front so the next skip lands where you were.
+    pub fn push_front(&mut self, track_id: i64, title: &str, artist: &str) {
+        self.next_id += 1;
+        self.entries.insert(0, QueueEntry {
+            queue_id: self.next_id, track_id,
+            title: title.to_string(), artist: artist.to_string(),
+        });
+    }
+
+    /// Swap an entry with the one before it. False at the head or for an
+    /// unknown id, so a stray tap does nothing rather than something.
+    pub fn move_up(&mut self, queue_id: u64) -> bool {
+        match self.entries.iter().position(|e| e.queue_id == queue_id) {
+            Some(i) if i > 0 => { self.entries.swap(i, i - 1); true }
+            _ => false,
+        }
+    }
+
+    /// Swap an entry with the one after it.
+    pub fn move_down(&mut self, queue_id: u64) -> bool {
+        match self.entries.iter().position(|e| e.queue_id == queue_id) {
+            Some(i) if i + 1 < self.entries.len() => { self.entries.swap(i, i + 1); true }
+            _ => false,
+        }
+    }
+
+    /// The queue as `track_id\ttitle\tartist` lines, for persisting.
+    /// Tabs because titles contain every other separator; a title with a
+    /// tab in it is the one file this cannot round-trip, and that is a
+    /// tag nobody has written.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        for e in &self.entries {
+            out.push_str(&format!("{}\t{}\t{}\n", e.track_id,
+                e.title.replace(['\t', '\n'], " "), e.artist.replace(['\t', '\n'], " ")));
+        }
+        out
+    }
+
+    /// The inverse of `render`. Malformed lines are skipped, not fatal:
+    /// a queue file half-written by a killed process should cost the
+    /// bad line, not the whole queue.
+    pub fn restore(&mut self, text: &str) -> usize {
+        let mut n = 0;
+        for line in text.lines() {
+            let mut it = line.splitn(3, '\t');
+            let Some(id) = it.next().and_then(|s| s.trim().parse::<i64>().ok()) else { continue };
+            let title = it.next().unwrap_or("");
+            let artist = it.next().unwrap_or("");
+            self.next_id += 1;
+            self.entries.push(QueueEntry { queue_id: self.next_id, track_id: id,
+                title: title.to_string(), artist: artist.to_string() });
+            n += 1;
+        }
+        n
+    }
 }
 
 /// What the now-playing strip shows.
@@ -233,6 +298,8 @@ pub enum QueueAction {
     Remove(u64),
     Clear,
     SetMode(EnqueueMode),
+    MoveUp(u64),
+    MoveDown(u64),
 }
 
 /// Draw the queue page.
@@ -259,7 +326,11 @@ pub fn queue_ui(ui: &mut egui::Ui, q: &Queue,
         ui.colored_label(c.text_weak, "Nothing queued.");
         return act;
     }
-    egui::ScrollArea::vertical().id_salt("queue").show(ui, |ui| {
+    // Bounded: this list lives in the transport panel, which sizes to its
+    // content — an unbounded scroll area in a bottom panel takes the whole
+    // window and the page disappears under it.
+    egui::ScrollArea::vertical().id_salt("queue").max_height(150.0)
+        .auto_shrink([false, true]).show(ui, |ui| {
         for (i, e) in q.entries().iter().enumerate() {
             ui.horizontal(|ui| {
                 // The head is a commitment; the rest is a list.
@@ -274,12 +345,39 @@ pub fn queue_ui(ui: &mut egui::Ui, q: &Queue,
                     act = Some(QueueAction::PlayNow(e.queue_id));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("×").clicked() { act = Some(QueueAction::Remove(e.queue_id)); }
+                    if ui.small_button("×").on_hover_text("Remove").clicked() {
+                        act = Some(QueueAction::Remove(e.queue_id));
+                    }
+                    // Reorder by a tap rather than a drag: a drag in a
+                    // scroll list fights the scroll on a phone.
+                    if i + 1 < q.len() && ui.small_button("▾").on_hover_text("Later").clicked() {
+                        act = Some(QueueAction::MoveDown(e.queue_id));
+                    }
+                    if i > 0 && ui.small_button("▴").on_hover_text("Sooner").clicked() {
+                        act = Some(QueueAction::MoveUp(e.queue_id));
+                    }
                 });
             });
         }
     });
     act
+}
+
+/// The three breathing bars alone — the sign of life beside a transport
+/// that already names the track. `now_playing_ui` repeats the name, which
+/// is right for a source with no track and wrong beside the bar.
+pub fn equalizer_ui(ui: &mut egui::Ui, n: &NowPlaying,
+                    breath: &uikit_egui::motion::Breath,
+                    c: &uikit_egui::PaletteColors) {
+    if !n.show_equalizer() { return; }
+    ui.horizontal(|ui| {
+        for h in n.equalizer_bars(breath) {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+            let mut bar = rect;
+            bar.set_top(rect.bottom() - rect.height() * h);
+            ui.painter().rect_filled(bar, 1.0, c.accent);
+        }
+    });
 }
 
 /// Draw the now-playing strip.
@@ -518,9 +616,63 @@ mod tests {
     /// exactly "somebody added a variant and forgot the other half" — which a
     /// text search catches.
     #[test]
+    fn taking_from_the_middle_leaves_the_rest_in_order() {
+        let mut q = queued();
+        let ids: Vec<u64> = q.entries().iter().map(|e| e.queue_id).collect();
+        let mid = q.take(ids[1]).expect("the middle entry");
+        assert_eq!(mid.queue_id, ids[1]);
+        let left: Vec<u64> = q.entries().iter().map(|e| e.queue_id).collect();
+        assert_eq!(left, vec![ids[0], ids[2]]);
+        assert_eq!(q.take(999), None, "an unknown id takes nothing");
+    }
+
+    #[test]
+    fn push_front_is_what_previous_plays_next() {
+        let mut q = queued();
+        q.push_front(77, "Back", "Ada");
+        assert_eq!(q.up_next().unwrap().track_id, 77);
+        assert_eq!(q.len(), 4);
+        // and it got a fresh queue id, distinct from every existing one
+        let ids: Vec<u64> = q.entries().iter().map(|e| e.queue_id).collect();
+        let mut dedup = ids.clone(); dedup.sort(); dedup.dedup();
+        assert_eq!(ids.len(), dedup.len());
+    }
+
+    #[test]
+    fn moving_rows_swaps_neighbours_and_stops_at_the_ends() {
+        let mut q = queued();
+        let ids: Vec<u64> = q.entries().iter().map(|e| e.queue_id).collect();
+        assert!(!q.move_up(ids[0]), "the head cannot go sooner");
+        assert!(!q.move_down(ids[2]), "the tail cannot go later");
+        assert!(q.move_up(ids[2]));
+        let now: Vec<u64> = q.entries().iter().map(|e| e.queue_id).collect();
+        assert_eq!(now, vec![ids[0], ids[2], ids[1]]);
+        assert!(q.move_down(ids[0]));
+        let now: Vec<u64> = q.entries().iter().map(|e| e.queue_id).collect();
+        assert_eq!(now, vec![ids[2], ids[0], ids[1]]);
+        assert!(!q.move_up(999));
+    }
+
+    #[test]
+    fn the_queue_round_trips_through_its_text_form() {
+        let mut q = Queue::default();
+        q.add(5, "Don't Stop\tNow", "Ada");
+        q.add(6, "", "");
+        let text = q.render();
+        let mut back = Queue::default();
+        assert_eq!(back.restore(&text), 2);
+        assert_eq!(back.entries()[0].track_id, 5);
+        assert_eq!(back.entries()[0].title, "Don't Stop Now", "a tab in a title is flattened, not split");
+        assert_eq!(back.entries()[1].track_id, 6);
+        assert_eq!(back.entries()[1].title, "");
+        // a torn line costs itself, not the file
+        assert_eq!(Queue::default().restore("garbage\n7\tT\tA\n"), 1);
+    }
+
+    #[test]
     fn every_queue_action_is_handled_by_the_controller() {
         let lib = include_str!("lib.rs");
-        for variant in ["PlayNow", "Remove", "Clear", "SetMode"] {
+        for variant in ["PlayNow", "Remove", "Clear", "SetMode", "MoveUp", "MoveDown"] {
             assert!(
                 lib.contains(&format!("QueueAction::{variant}")),
                 "QueueAction::{variant} has no arm in lib.rs — clicking it does nothing"

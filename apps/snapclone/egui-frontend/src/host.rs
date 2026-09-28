@@ -169,8 +169,15 @@ pub enum HostEvent {
     /// Punch addresses older than the window should go.
     ExpirePunchAddrs { now_ms: u64 },
 
+    /// A vCard file was read (or could not be). The app imports it.
+    VCardLoaded(Result<String, String>),
     /// The voice transport came up or went down.
     VoiceLink(bool),
+    /// Voice frames are arriving from a contact while this side is not in
+    /// a call: someone is calling. Fired by the host once per burst; the
+    /// app decides whether to ring (it will not ring twice, and never for
+    /// a stranger).
+    CallRinging { from: String },
     /// A voice payload arrived from a peer.
     VoiceReceived { sender: String, payload: Vec<u8> },
     /// The mic produced a frame interval; ask the sender whether anything may
@@ -265,8 +272,13 @@ pub enum HostEvent {
 /// test double.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostCommand {
-    /// Capture a frame — the shutter was pressed.
-    CaptureSnap,
+    /// Capture a frame — the shutter was pressed. `crop` is the zoom
+    /// window (`[u0, v0, u1, v1]`, frame fractions) the viewfinder was
+    /// showing, `None` at 1×: the host crops the frame to it before
+    /// encoding, so the photo is what was on screen. It travels with the
+    /// command for the same reason the export folder does — the host does
+    /// not read the viewfinder's state behind the app's back.
+    CaptureSnap { crop: Option<[f32; 4]> },
     /// Run the export the user asked for, into `dest_dir` (Settings >
     /// Storage > export folder; empty means the host's default, the home
     /// directory). The destination travels with the command so the host does
@@ -453,7 +465,12 @@ impl Snapclone {
                 // And the ambient palette is told: it decides itself whether
                 // this arrival is worth a derivation.
                 let _ = self.ambient_snap_arrived(self.now_secs.max(0) as u64 * 1000);
-                let row = frame.to_feed_entry(&from);
+                let mut row = frame.to_feed_entry(&from);
+                // The LOCAL name for a contact beats what the sender calls
+                // itself: the tile read "sc-8fd30abd" for a friend the
+                // book knows as Ada, and a nickname the sender picks is
+                // not a fact this side has to accept.
+                if let Some(name) = self.contact_book.display_name(&from) { row.sender_name = name; }
                 // The finished set is consulted for a SINGLE arrival too,
                 // not only at a bulk feed load. A peer that re-sends a snap
                 // you already viewed must not put it back — and re-sending
@@ -542,7 +559,22 @@ impl Snapclone {
                 self.heard.purge_stale(now_ms, 24 * 60 * 60 * 1000);
             }
 
+            HostEvent::VCardLoaded(r) => match r {
+                Ok(text) => self.import_vcard_text(&text),
+                Err(e) => self.import_report = Some(format!("vCard: {e}")),
+            },
             HostEvent::VoiceLink(on) => self.voice_bridge.set_connected(on),
+            HostEvent::CallRinging { from } => {
+                // One sheet. Voice frames arrive fifty times a second and
+                // each is "a call" from the socket's point of view; a
+                // sheet re-presented per frame could never be answered.
+                // And only someone in the book can ring: a stranger's
+                // datagram at the voice port is a punch or a probe.
+                if self.incoming_call.is_none() && !self.group_voice.joined
+                    && self.contact_book.get(&from).is_some() {
+                    self.ring(&from);
+                }
+            }
             HostEvent::VoiceReceived { sender, payload } => {
                 // The return carries the routed packet; the app has already
                 // applied any floor change to the coordinator by the time it
@@ -719,7 +751,10 @@ impl Snapclone {
     /// runs, or the new snap misses the archive it was clearly meant to be in.
     pub fn drain_commands(&mut self) -> Vec<HostCommand> {
         let mut out = Vec::new();
-        if std::mem::take(&mut self.shutter_pressed) { out.push(HostCommand::CaptureSnap); }
+        if std::mem::take(&mut self.shutter_pressed) {
+            let z = &self.viewfinder.zoom;
+            out.push(HostCommand::CaptureSnap { crop: z.is_zoomed().then(|| z.window()) });
+        }
         for id in std::mem::take(&mut self.snaps_saved) { out.push(HostCommand::KeepSnap(id)); }
         if let Some(svg) = self.code_svg_requested.take() { out.push(HostCommand::SaveCodeSvg(svg)); }
         for id in std::mem::take(&mut self.snaps_viewed) { out.push(HostCommand::MarkViewed(id)); }
@@ -880,7 +915,7 @@ mod tests {
         s.export_requested = true;
         s.snaps_saved.push("snap-1".into());
         let out = s.apply(HostEvent::Tick { now_secs: 1 });
-        assert!(out.contains(&HostCommand::CaptureSnap));
+        assert!(out.iter().any(|c| matches!(c, HostCommand::CaptureSnap { .. })));
         assert!(out.iter().any(|c| matches!(c, HostCommand::ExportSnaps { .. })));
         assert!(out.contains(&HostCommand::KeepSnap("snap-1".into())));
     }
@@ -905,7 +940,7 @@ mod tests {
         s.shutter_pressed = true;
         s.export_requested = true;
         let out = s.drain_commands();
-        let cap = out.iter().position(|c| *c == HostCommand::CaptureSnap).unwrap();
+        let cap = out.iter().position(|c| matches!(c, HostCommand::CaptureSnap { .. })).unwrap();
         let exp = out.iter().position(|c| matches!(c, HostCommand::ExportSnaps { .. })).unwrap();
         assert!(cap < exp, "{out:?}");
     }
@@ -1018,6 +1053,55 @@ mod tests {
         }
         assert_eq!(s.feed.count(), 1, "a re-delivered snap appeared twice");
         assert_eq!(s.feed.entries()[0].sender_name, "kit");
+    }
+
+    #[test]
+    fn a_vcard_with_snapclone_ids_lands_in_the_book_and_the_rest_are_counted() {
+        let mut s = app();
+        let text = "BEGIN:VCARD\nVERSION:4.0\nFN:Ada\nX-SNAPCLONE-ID:sc-aabbccdd\nEND:VCARD\n\
+                    BEGIN:VCARD\nVERSION:4.0\nFN:No Id\nEND:VCARD\n\
+                    BEGIN:VCARD\nVERSION:4.0\nEND:VCARD\n";
+        let out = s.apply(HostEvent::VCardLoaded(Ok(text.into())));
+        assert_eq!(s.contact_book.len(), 1);
+        assert_eq!(s.contact_book.display_name("sc-aabbccdd").as_deref(), Some("Ada"));
+        assert!(s.peers.iter().any(|p| p.name == "sc-aabbccdd"), "a row for the import");
+        assert!(out.iter().any(|c| matches!(c, HostCommand::SaveContacts(_))), "and it is saved: {out:?}");
+        let r = s.import_report.clone().unwrap_or_default();
+        assert!(r.contains("1 added") && r.contains("1 without"), "{r}");
+        // a read failure is reported, not swallowed
+        s.apply(HostEvent::VCardLoaded(Err("no such file".into())));
+        assert!(s.import_report.as_deref().unwrap_or("").contains("no such file"));
+    }
+
+    #[test]
+    fn frames_from_a_contact_while_idle_ring_once_and_answering_joins_the_call() {
+        // `ring()` had no caller outside its tests, and an idle socket was
+        // polled with an empty peer table, so a caller's first frames were
+        // dropped as a stranger's and nothing rang.
+        let mut s = app();
+        let mut book = crate::contact_book::ContactBook::default();
+        book.upsert("sc-aabbccdd", 41234, 1);
+        book.rename("sc-aabbccdd", "Ada");
+        s.apply(HostEvent::ContactsLoaded(Box::new(book)));
+        // A stranger cannot ring.
+        s.apply(HostEvent::CallRinging { from: "sc-00000000".into() });
+        assert!(s.incoming_call.is_none(), "a stranger rang");
+        // A contact can, once: the sheet shows the nickname.
+        s.apply(HostEvent::CallRinging { from: "sc-aabbccdd".into() });
+        s.apply(HostEvent::CallRinging { from: "sc-aabbccdd".into() });
+        let call = s.incoming_call.as_ref().expect("ringing");
+        assert_eq!(call.caller_name, "Ada");
+        assert!(s.modal.topmost(crate::modal::Layer::Confirm).is_some_and(|p| p.id == "call:sc-aabbccdd"));
+        // Answering joins with the caller as a participant, through
+        // set_in_call, so play-out starts and the peer table admits them.
+        s.answer_call(crate::ring::Answer::Accepted);
+        assert!(s.incoming_call.is_none());
+        assert!(s.group_voice.joined);
+        assert!(s.group_voice.participants.iter().any(|p| p.id == "sc-aabbccdd" && !p.is_self));
+        assert!(s.modal.topmost(crate::modal::Layer::Confirm).is_none(), "the sheet is gone");
+        // In a call, a ring is ignored rather than stacked.
+        s.apply(HostEvent::CallRinging { from: "sc-aabbccdd".into() });
+        assert!(s.incoming_call.is_none());
     }
 
     #[test]
@@ -1685,7 +1769,7 @@ mod addr_health_host_tests {
         let mut s = app();
         assert_eq!(s.send_flow.step(), Step::Capture);
         s.shutter_pressed = true;
-        assert!(s.drain_commands().contains(&HostCommand::CaptureSnap));
+        assert!(s.drain_commands().iter().any(|c| matches!(c, HostCommand::CaptureSnap { .. })));
         s.apply(HostEvent::Tick { now_secs: 1_000 });
         s.apply(HostEvent::SnapSaved(Ok("/x/snaps/snap-7.jpg".into())));
         assert_eq!(s.send_flow.step(), Step::Compose, "a saved frame is what moves the flow on");

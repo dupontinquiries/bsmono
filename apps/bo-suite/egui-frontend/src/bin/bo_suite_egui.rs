@@ -40,7 +40,32 @@ struct App {
     /// restarts it and an unchanged one does not — respawning a process
     /// every frame is the shape of bug that empties a battery.
     voice_cmd: String,
+    /// Where mpv serves its IPC socket for this process. Per-pid so two
+    /// instances do not steer each other's player.
+    ipc_path: String,
+    /// The URL the player was last started with and the sink, so a
+    /// resume can tell "same track, still alive" from "start again".
+    playing_url: String,
+    /// When the session file was last written; it is written on change
+    /// but no more than once a second — the position moves every frame.
+    session_saved: std::time::Instant,
+    session_text: String,
+    /// A restored session names a track to load paused; resolved once
+    /// the catalogue answers.
+    restore_track: Option<(i64, f64)>,
+    /// The track whose play is recorded once the player says it started.
+    record_on_start: Option<i64>,
+    /// When to re-read the Home lists after a play was recorded.
+    home_refresh_at: Option<std::time::Instant>,
 }
+
+/// The session file: queue, modes, what was loaded. Under the same app
+/// name as the room and the voice prefs.
+const SESSION_APP: &str = "bo-suite";
+const SESSION_FILE: &str = "session.conf";
+
+/// The device name a local play is recorded under in the history table.
+const LOCAL_DEVICE: &str = "local";
 
 /// Fill `track_paths` for every row currently loaded into the all-tracks
 /// page or the browse grids — the set of ids `request_play` can actually
@@ -50,20 +75,19 @@ fn sync_track_paths(controller: &mut bo_suite_egui::Controller, catalog: &bo_sui
     let ids: Vec<i64> = controller.all_tracks.tracks().iter().map(|t| t.id)
         .chain(controller.browse_tracks.iter().map(|t| t.id))
         .collect();
-    let paths: Vec<(i64, String)> = ids.into_iter()
-        .filter_map(|id| catalog.path_of(id).map(|p| (id, p)))
-        .collect();
-    if !paths.is_empty() {
-        let mut merged = controller.track_paths.clone();
-        for (id, path) in paths {
-            if let Some(slot) = merged.iter_mut().find(|(k, _)| *k == id) {
-                slot.1 = path;
-            } else {
-                merged.push((id, path));
-            }
-        }
-        controller.set_track_paths(merged);
-    }
+    // One query for the set — this ran a statement per row and an O(n²)
+    // merge on every page load.
+    let paths = catalog.paths_for(&ids);
+    controller.merge_track_paths(paths);
+}
+
+/// Paths for one freshly fetched list, merged in.
+fn paths_for_rows(controller: &mut bo_suite_egui::Controller,
+                  catalog: &bo_suite_egui::real_catalog::RealCatalog,
+                  rows: &[bo_suite_egui::browse::BrowseTrack]) {
+    let ids: Vec<i64> = rows.iter().map(|t| t.id).collect();
+    let paths = catalog.paths_for(&ids);
+    controller.merge_track_paths(paths);
 }
 
 impl App {
@@ -90,6 +114,22 @@ impl App {
         let (media_cmd_tx, media_cmd_rx) = std::sync::mpsc::channel();
         let (media_res_tx, media_res_rx) = std::sync::mpsc::channel();
         eprintln!("bo-suite: media db at {}, roots: {:?}", db_path.display(), music_roots);
+        // FIRST LAUNCH. Nothing created the data directory, so on a fresh
+        // machine the worker's `catalog::open` failed, the worker exited,
+        // and every scan request went to a dropped channel — the library
+        // could never be built from this app. And the two opens raced:
+        // both connections read user_version 0 and both ran CREATE TABLE,
+        // so even with the directory the second one failed with "table
+        // tracks already exists". The directory is made here and the
+        // read handle is opened BEFORE the worker starts, so the schema
+        // exists by the time the worker looks; `catalog::migrate` is now
+        // also atomic, for the day the Qt app and this one start at once.
+        if let Some(dir) = db_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                eprintln!("bo-suite: could not create {}: {e}", dir.display());
+            }
+        }
+        let catalog_first = bo_suite_egui::real_catalog::RealCatalog::open(&db_path, media_cmd_tx.clone());
         {
             let db_path = db_path.clone();
             std::thread::spawn(move || {
@@ -115,7 +155,7 @@ impl App {
         std::thread::spawn(move || {
             bo_suite_egui::cast::run_discovery_worker(discovery_tx, std::time::Duration::from_secs(20));
         });
-        let catalog = match bo_suite_egui::real_catalog::RealCatalog::open(&db_path, media_cmd_tx) {
+        let catalog = match catalog_first {
             Ok(c) => c,
             Err(e) => {
                 // The worker thread above still runs and will create the
@@ -138,8 +178,22 @@ impl App {
         if catalog.total() == 0 {
             eprintln!("bo-suite: no music cataloged yet — rescan from Settings to scan \
                        $BO_MUSIC_DIR or ~/Music");
+            // An empty catalogue on a machine with a music folder: scan it
+            // without being asked, once. The alternative is an app that
+            // opens on "no music" until the user finds the button.
+            if bo_suite_egui::real_catalog::music_roots().iter().any(|r| r.is_dir()) {
+                eprintln!("bo-suite: scanning the music folder(s) for the first time");
+                controller.settings.scan = bo_suite_egui::settings_page::Scan::Running {
+                    seen: 0, total: None, path: String::new() };
+                catalog.rescan();
+            }
         } else {
             eprintln!("bo-suite: {} track(s) in the catalog", catalog.total());
+            // The browse aggregates from SQL, with real play counts, BEFORE
+            // the page answer — `answer_tracks_from` fills them from the
+            // page source when they are empty, and that source has no
+            // counts.
+            controller.supply_browse_tracks(catalog.browse_tracks());
             // The first page, so the list is not empty before anyone
             // scrolls. `answer_tracks_from` needs a pending request; asking
             // for offset 0 is that request.
@@ -151,6 +205,28 @@ impl App {
         // Whatever playlists already exist, so the page isn't empty until
         // the user creates one to see it work.
         controller.playlists_page.set(catalog.playlists());
+        // The last session: queue, modes, and the track that was loaded —
+        // paused where it was, not started.
+        let mut restore_track = None;
+        if let Some(text) = config_kit::load(SESSION_APP, SESSION_FILE) {
+            restore_track = controller.restore_session(&text).map(|id| (id, controller.transport.position()));
+            if let Some((id, at)) = restore_track {
+                if let Some(t) = controller.browse_tracks.iter().find(|t| t.id == id).cloned() {
+                    if let Some(path) = catalog.path_of(id) {
+                        controller.load_paused(id, &t.title, &t.primary_artist, &path, at);
+                        controller.merge_track_paths(vec![(id, path)]);
+                        // Its length, for the bar: no player is running
+                        // to report one.
+                        catalog.resolve_for_play(id);
+                        restore_track = None;
+                    }
+                }
+            }
+        }
+        let ipc_path = std::env::var("XDG_RUNTIME_DIR").ok()
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| std::env::temp_dir().display().to_string());
+        let ipc_path = format!("{ipc_path}/bo-suite-mpv-{}.sock", std::process::id());
         Self {
             backdrop: uikit_egui::Backdrop::for_app("bo-suite"),
             controller,
@@ -163,6 +239,76 @@ impl App {
             discovery_rx,
             voice: bo_suite_egui::voice_source::VoiceSource::new(),
             voice_cmd: String::new(),
+            ipc_path,
+            playing_url: String::new(),
+            session_saved: std::time::Instant::now(),
+            session_text: String::new(),
+            restore_track,
+            record_on_start: None,
+            home_refresh_at: None,
+        }
+    }
+
+    /// Write the session file when it changed, at most once a second.
+    fn save_session(&mut self) {
+        if self.session_saved.elapsed() < std::time::Duration::from_secs(1) { return; }
+        self.session_saved = std::time::Instant::now();
+        let text = self.controller.render_session();
+        if text == self.session_text { return; }
+        match config_kit::save(SESSION_APP, SESSION_FILE, &text) {
+            Ok(()) => self.session_text = text,
+            Err(e) => eprintln!("bo-suite: could not save session: {e}"),
+        }
+    }
+
+    /// Answer the library's outstanding questions: the browse
+    /// aggregates, a search, the Home lists, the open playlist's rows.
+    fn pump_library(&mut self) {
+        if self.controller.browse_stale && self.catalog.total() > 0 {
+            let rows = self.catalog.browse_tracks();
+            paths_for_rows(&mut self.controller, &self.catalog, &rows);
+            self.controller.supply_browse_tracks(rows);
+            // A restored session could not resolve its track before the
+            // library was read; it can now.
+            if let Some((id, at)) = self.restore_track.take() {
+                if let Some(t) = self.controller.browse_tracks.iter().find(|t| t.id == id).cloned() {
+                    if let Some(path) = self.catalog.path_of(id) {
+                        self.controller.load_paused(id, &t.title, &t.primary_artist, &path, at);
+                        self.controller.merge_track_paths(vec![(id, path)]);
+                        self.catalog.resolve_for_play(id);
+                    }
+                }
+            }
+        }
+        if let Some(q) = self.controller.pending_search.take() {
+            let rows = self.catalog.search(&q, 200);
+            paths_for_rows(&mut self.controller, &self.catalog, &rows);
+            self.controller.supply_search(&q, rows);
+        }
+        if self.home_refresh_at.is_some_and(|t| std::time::Instant::now() >= t) {
+            self.home_refresh_at = None;
+            self.controller.pending_home = true;
+        }
+        if self.controller.pending_home {
+            let home = self.catalog.home(bo_suite_egui::HOME_ROWS);
+            for list in [&home.recently_played, &home.recently_added, &home.most_played, &home.never_played] {
+                paths_for_rows(&mut self.controller, &self.catalog, list);
+            }
+            self.controller.supply_home(home);
+        }
+        if let Some(id) = self.controller.pending_playlist_open.take() {
+            let tracks = self.catalog.playlist_tracks(id);
+            paths_for_rows(&mut self.controller, &self.catalog, &tracks);
+            self.controller.playlist_tracks = tracks;
+        }
+        if let Some((pid, tid)) = self.controller.pending_playlist_remove.take() {
+            if self.catalog.remove_from_playlist(pid, tid) {
+                let tracks = self.catalog.playlist_tracks(pid);
+                self.controller.playlist_tracks = tracks;
+                self.controller.playlists_page.set(self.catalog.playlists());
+            } else {
+                self.controller.toast.show("could not remove that track");
+            }
         }
     }
 }
@@ -208,7 +354,7 @@ impl App {
     /// Carry out whatever the view asked for, and report back what the
     /// player did.
     fn pump_playback(&mut self) {
-        use bo_suite_egui::playback::{plan, Request, State};
+        use bo_suite_egui::playback::{Request, State};
         if self.controller.pending_rescan {
             self.controller.pending_rescan = false;
             self.catalog.rescan();
@@ -253,11 +399,6 @@ impl App {
                 None => self.last_note = format!("could not create playlist '{name}'"),
             }
         }
-        if let Some(id) = self.controller.pending_playlist_open.take() {
-            let tracks = self.catalog.playlist_tracks(id);
-            self.controller.browse_tracks = tracks;
-            sync_track_paths(&mut self.controller, &self.catalog);
-        }
         if let Some(id) = self.controller.pending_playlist_delete.take() {
             if self.catalog.delete_playlist(id) {
                 self.controller.playlists_page.set(self.catalog.playlists());
@@ -285,10 +426,12 @@ impl App {
             // real_catalog.rs), so reload whatever's currently showing
             // this track rather than waiting for the next scan.
             if let Some(pid) = self.controller.open_playlist {
-                self.controller.browse_tracks = self.catalog.playlist_tracks(pid);
+                self.controller.playlist_tracks = self.catalog.playlist_tracks(pid);
             }
             self.controller.pending_tracks =
                 Some(bo_suite_egui::all_tracks::TracksAction::Load { offset: 0 });
+            self.controller.browse_stale = true;
+            self.controller.pending_home = true;
         }
         if self.controller.pending_scan_picker_open {
             self.controller.pending_scan_picker_open = false;
@@ -328,39 +471,45 @@ impl App {
             }
         }
         if let Some(id) = self.controller.last_played_track.take() {
-            // Persisted through the worker (play count + history), not
-            // written on this connection — see real_catalog.rs.
-            self.catalog.record_play(id);
+            // Not recorded yet: a play is counted when the player reports
+            // it STARTED, not when it was asked for — a track that failed
+            // to open was showing up as "2 plays" in Most played.
+            self.record_on_start = Some(id);
+            // The tag reader's duration, for players that report none.
+            self.catalog.resolve_for_play(id);
+        }
+        if let Some(v) = self.controller.pending_volume.take() {
+            self.controller.volume = v.clamp(0.0, 100.0);
+            self.controller.dial.set_external(self.controller.volume);
+            let sink = self.controller.audio_sink.clone();
+            if !self.player.set_volume_with(&sink, v, "sh") {
+                self.last_note = "volume: pactl is not available on this machine".into();
+            }
         }
         if let Some(req) = self.controller.pending_playback.take() {
+            use bo_suite_egui::playback::Control;
             match req {
-                Request::Play { url, sink } => {
-                    if url.trim().is_empty() {
-                        // NOT attempted. Handing an empty path to a player
-                        // gets "no such file", which reads as a broken
-                        // player rather than as the missing catalogue it
-                        // actually is.
-                        self.last_note =
-                            "no track resolved — the library has titles, not files yet".into();
-                        self.controller.transport.pause();
-                    } else {
-                        // Whatever is installed, not whatever I assumed.
-                        // mpv was hardcoded and is not always present.
-                        let Some(player) = bo_suite_egui::playback::discover_player()
-                        else {
-                            self.last_note = "no player found — install mpv, ffplay \
-                                              or paplay".into();
-                            self.controller.transport.pause();
-                            return;
-                        };
-                        let p = plan(player, &url, &sink);
-                        for c in &p.setup { eprintln!("bo-suite: {c}"); }
-                        eprintln!("bo-suite: {}", p.play);
-                        self.player.start(&p);
+                Request::Play { url, sink, start_secs } => self.start_player(&url, &sink, start_secs),
+                Request::Pause => {
+                    // In place when the player can; a kill otherwise. The
+                    // transport remembered the position either way.
+                    if !self.player.control(Control::Pause) { self.player.stop_now(); }
+                }
+                Request::Resume { url, sink, at } => {
+                    let same = self.playing_url == url && self.player.is_running();
+                    if !(same && self.player.control(Control::Resume)) {
+                        self.start_player(&url, &sink, at);
                     }
                 }
-                Request::Stop => self.player.stop_now(),
-                Request::ReleaseRoute => self.player.release_route("sh"),
+                Request::Seek { url, sink, at } => {
+                    let same = self.playing_url == url && self.player.is_running();
+                    if !(same && self.player.control(Control::Seek(at))) {
+                        self.start_player(&url, &sink, at);
+                    }
+                }
+                Request::Stop => { self.player.stop_now(); self.playing_url.clear(); }
+                Request::ReleaseRoute => { self.player.release_route("sh"); self.playing_url.clear(); }
+                Request::Volume(v) => { self.controller.pending_volume = Some(v); }
             }
         }
         // THE PLAYER'S CLOCK INTO THE BAR. `Transport::report` is the sync
@@ -375,12 +524,29 @@ impl App {
             self.controller.transport.report(pos);
         }
         if let Some(state) = self.player.shared.take_state() {
+            if let State::Playing { .. } = &state {
+                if let Some(id) = self.record_on_start.take() {
+                    // Persisted through the worker (play count + history),
+                    // not written on this connection — see real_catalog.rs.
+                    // Both tables: `RecordPlay` bumps the count, and only
+                    // the history row makes "recently played" true.
+                    self.catalog.record_play(id);
+                    self.catalog.record_history(id, LOCAL_DEVICE, None);
+                    // Home's "recently played" is stale the moment this
+                    // plays. Asked for a moment later, so the worker has
+                    // written the row by the time the read runs.
+                    self.home_refresh_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(400));
+                }
+            }
             if let State::Failed(why) = state {
+                self.record_on_start = None;
                 // The player's own words. "Playback failed" tells nobody
                 // anything; "Failed to open audio device" tells them
                 // everything.
-                self.last_note = why;
+                self.last_note = format!("player: {why}");
                 self.controller.transport.pause();
+                self.controller.now_playing.playing = false;
+                self.playing_url.clear();
             }
         }
         if self.player.shared.take_ended() {
@@ -392,8 +558,38 @@ impl App {
             self.controller.on_track_ended();
         }
         if !self.last_note.is_empty() {
-            eprintln!("bo-suite: {}", std::mem::take(&mut self.last_note));
+            // Logged AND shown: a failure only on stderr is invisible on
+            // a phone, where there is no terminal behind the window.
+            let note = std::mem::take(&mut self.last_note);
+            eprintln!("bo-suite: {note}");
+            self.controller.toast.show(&note);
         }
+    }
+
+    /// Spawn the player for a track at an offset.
+    fn start_player(&mut self, url: &str, sink: &bo_suite_egui::playback::Sink, start_secs: f64) {
+        use bo_suite_egui::playback::{plan_with, PlayOpts};
+        if url.trim().is_empty() {
+            // NOT attempted. Handing an empty path to a player gets "no
+            // such file", which reads as a broken player rather than as
+            // the missing catalogue it actually is.
+            self.last_note = "no track resolved — the library has titles, not files yet".into();
+            self.controller.transport.pause();
+            return;
+        }
+        // Whatever is installed, not whatever I assumed. mpv was
+        // hardcoded and is not always present.
+        let Some(player) = bo_suite_egui::playback::discover_player() else {
+            self.last_note = "no player found — install mpv, ffplay or paplay".into();
+            self.controller.transport.pause();
+            return;
+        };
+        let opts = PlayOpts { start_secs, ipc: Some(self.ipc_path.clone()) };
+        let p = plan_with(player, url, sink, &opts);
+        for c in &p.setup { eprintln!("bo-suite: {c}"); }
+        eprintln!("bo-suite: {}", p.play);
+        self.player.start(&p);
+        self.playing_url = url.to_string();
     }
 
     /// Drain whatever the media worker has sent back since last frame.
@@ -431,7 +627,17 @@ impl App {
                         // the library.
                         self.controller.pending_tracks =
                             Some(bo_suite_egui::all_tracks::TracksAction::Load { offset: 0 });
-                        self.controller.browse_tracks.clear();
+                        self.controller.browse_stale = true;
+                        self.controller.pending_home = true;
+                        self.controller.toast.show(&format!("library: {} tracks", self.catalog.total()));
+                    }
+                }
+                MediaResult::TrackForPlay { track_id, duration_secs, .. } => {
+                    // The tag reader's length, for the bar when the player
+                    // reports none (ffplay, paplay). Only for the track
+                    // still loaded: the answer can arrive after a skip.
+                    if self.controller.now_playing_id == Some(track_id) {
+                        self.controller.set_duration_hint(duration_secs as f64);
                     }
                 }
                 MediaResult::Error(e) => self.last_note = format!("library: {e}"),
@@ -475,9 +681,11 @@ impl eframe::App for App {
             self.controller.answer_tracks_from(&self.catalog);
             sync_track_paths(&mut self.controller, &self.catalog);
         }
+        self.pump_library();
         self.pump_voice();
         self.pump_playback();
         self.pump_media_results();
+        self.save_session();
     }
 }
 

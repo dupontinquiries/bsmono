@@ -19,6 +19,34 @@ camera, a microphone, a second device, or a network — so the honest status is
 - Both previously-unreferenced modules (`video_backend`, `av1_encode`) now have
   callers; nothing else in the crate is unreferenced.
 
+## Walked 2026-09-27, two instances on one host (Xvfb, xdotool, no camera)
+
+A test pattern stands in for the camera (`SNAPCLONE_TEST_PATTERN_CODE`), so
+everything downstream of the sensor was exercised for real: two processes,
+two identities, one loopback network.
+
+- [x] Add a friend by QR: B shows A's code, A scans it (decode → request →
+      accept). Both rosters agree, keyed by sc-id — a friend added twice
+      under two names no longer appears twice.
+- [x] Add a friend by vCard import (a file, through the Friends page).
+- [x] A photo snap: capture → send → arrives → persists in the inbox on disk
+      → survives a restart → opens with its picture → expires.
+- [x] A video clip: record (frames spilled) → ffmpeg libsvtav1 encode → send
+      → arrives → opens. The second clip used to fail ("Error opening output
+      file": every clip was `0.mkv`); the output is named after its spill now.
+- [x] Incoming-call ringing is unit-tested and the false ring from a NAT
+      punch volley is fixed (punch-magic packets go to NAT even from a known
+      contact). AUDIO BOTH WAYS IS NOT VERIFIED — no microphone here.
+- [x] The gst-launch path: `camera.device = "gst:videotestsrc pattern=smpte"`
+      runs the REAL `gst-launch-1.0` (installed in the sandbox this time)
+      through the same fdsink framing a camera uses — SMPTE bars in the
+      viewfinder, shutter, snap saved. The capture engine now lives in
+      `shared/capture-kit` (snapshot-cam runs the same one).
+- [ ] Camera preview from a real SENSOR (v4l2src / pipewiresrc): needs
+      hardware; the plan strings for both are pinned by device-kit's tests.
+- [ ] The snap transport is still plaintext TCP; the send summary claims
+      encryption. Known, not fixed here.
+
 ## The walk, in dependency order so a failure isolates
 
 - [ ] Camera preview renders at all (blank preview fails everything below it).
@@ -50,3 +78,21 @@ camera, a microphone, a second device, or a network — so the honest status is
 `qr_shown_at` is cleared on OPEN rather than on close (v0.1.6xx) because three
 close paths existed and only one cleared it. If the scanner shows a stale code,
 that is the place to look first.
+
+## Digital zoom (2026-09-27)
+
+Pinch on the camera page (two fingers / trackpad / ctrl+wheel) zooms the
+viewfinder about the fingers; the chip at the top-right says the factor and a
+tap on it returns to 1×. `Viewfinder.zoom` (`uikit_egui::zoom::Zoom`) composes
+with the mirror and the quarter turns; `CaptureSnap { crop }` carries the
+window and the host crops the frame to it at native pixels before the JPEG
+encode (no upscaling). A one-finger drag pans while zoomed; two fingers no
+longer swipe the page (`tick_page_swipe` two-finger gate).
+
+Fixed alongside: tap-to-focus and double-tap flip never fired from a real
+pointer (`tick_feedback` discarded the press machine's `Tap` at the top of the
+frame); the reticle is drawn through `to_screen` so it sits under the finger
+on a mirrored, turned or zoomed preview.
+
+Verified under Xvfb with `gst:videotestsrc` (shots snap-zoom-1/2/3-focus);
+NOT RUN with a real two-finger touch.

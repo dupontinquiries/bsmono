@@ -66,6 +66,11 @@ pub struct LocationsPage {
     /// The add form's text, empty when closed.
     pub new_name: String,
     pub adding: bool,
+    /// Set by `open_add`, consumed by the view: the entry takes keyboard
+    /// focus on the frame it appears. Without it the form opened with
+    /// nothing focused, and on a phone that is a form with no keyboard —
+    /// the first screenshot that typed into it typed into nothing.
+    pub focus_pending: bool,
 }
 
 pub const EMPTY_TEXT: &str = "No saved locations.\nTap + to add one.";
@@ -90,6 +95,7 @@ impl LocationsPage {
 
     pub fn open_add(&mut self) {
         self.adding = true;
+        self.focus_pending = true;
         // Cleared on OPEN rather than on close, so a cancelled entry is not
         // silently resurrected the next time the form appears.
         self.new_name.clear();
@@ -203,6 +209,7 @@ pub fn locations_ui(ui: &mut egui::Ui, p: &mut LocationsPage,
         ui.label("What do you call this place?");
         let resp = ui.add(egui::TextEdit::singleline(&mut p.new_name).id_salt("locations-p_new_name")
             .hint_text("e.g. Office"));
+        if std::mem::take(&mut p.focus_pending) { resp.request_focus(); }
         // Enter accepts, as the QML's onAccepted does — a form you can only
         // submit by aiming at a button is a form you fight on a phone.
         let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));

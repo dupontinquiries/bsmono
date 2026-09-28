@@ -120,8 +120,8 @@ pub fn empty_reason() -> Option<String> {
     }
     let list: Vec<String> = looked.iter().map(|p| p.display().to_string()).collect();
     Some(format!(
-        "No local mail store. Looked in: {}.\nSet $MAIL to a maildir or mbox to read it here. \
-         Signing in to a remote account is a separate thing this build does not do.",
+        "No local mail store. Looked in: {}.\nSet $MAIL to a maildir or mbox to read it here, \
+         or sign in to Proton above.",
         list.join(", ")
     ))
 }
@@ -304,8 +304,9 @@ mod tests {
         assert!(why.contains("Looked in"), "{why}");
         assert!(why.contains(&dir.join("Maildir").display().to_string()), "{why}");
         // The remote case is named, because "no mail" reads as "your mail is missing" to
-        // someone who has an account somewhere and no local store at all.
-        assert!(why.contains("remote"), "{why}");
+        // someone who has an account somewhere and no local store at all — and it is
+        // named as the thing to DO, since the pane can sign in to Proton now.
+        assert!(why.contains("Proton"), "{why}");
         assert!(why.contains("$MAIL"), "the way out should be in the message: {why}");
 
         unsafe {

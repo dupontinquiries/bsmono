@@ -19,9 +19,19 @@
 //!   since a front camera that is not mirrored looks wrong to everyone who has
 //!   ever used a mirror.
 //!
+//! * **Digital zoom** — not in the Qt widget; added here. `zoom` is a
+//!   window into the frame (`uikit_egui::zoom::Zoom`, pinched about the
+//!   point between the fingers); the preview draws the window and the
+//!   shutter crops the frame to it, so the photo is what the viewfinder
+//!   showed at the sensor's native pixels. It composes with the mirror and
+//!   the quarter turns in the one order that is right: window first, then
+//!   mirror, then turn — a mirrored preview zoomed on its left shows the
+//!   frame's right, which is what a mirror does.
+//!
 //! The geometry is pure and tested; the drawing is a thin pass over it.
 
 use egui::{Color32, Pos2, Rect, Sense, Ui, Vec2};
+use uikit_egui::zoom::Zoom;
 
 /// Which way the camera points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -72,6 +82,9 @@ pub struct Viewfinder {
     /// Seconds since the tap, for the reticle fade.
     pub focus_age: f32,
     pub recipient: Option<String>,
+    /// Digital zoom: the window of the frame the preview shows and the
+    /// shutter saves. 1× is the whole frame.
+    pub zoom: Zoom,
 }
 
 impl Default for Viewfinder {
@@ -79,7 +92,7 @@ impl Default for Viewfinder {
         Viewfinder {
             facing: Facing::Back, full_bleed: true, scan_mode: false,
             sensor_aspect: 4.0 / 3.0, quarter_turns: 0, focus: None, focus_age: 0.0,
-            reticle: Default::default(), recipient: None,
+            reticle: Default::default(), recipient: None, zoom: Zoom::default(),
         }
     }
 }
@@ -132,11 +145,14 @@ impl Viewfinder {
     /// mirrored or upside down rather than obviously broken, and by eye those
     /// are hard to tell from a sensor that really is mounted that way.
     pub fn corner_uvs(&self) -> [Pos2; 4] {
+        // The zoom window's corners, not the texture's: at 1× they are the
+        // same four points.
+        let w = self.zoom.window();
         let mut c = [
-            Pos2::new(0.0, 0.0),
-            Pos2::new(1.0, 0.0),
-            Pos2::new(1.0, 1.0),
-            Pos2::new(0.0, 1.0),
+            Pos2::new(w[0], w[1]),
+            Pos2::new(w[2], w[1]),
+            Pos2::new(w[2], w[3]),
+            Pos2::new(w[0], w[3]),
         ];
         // Mirror FIRST, then rotate. The other order gives the mirror image of
         // the rotation, which for odd turns is not the same picture.
@@ -148,30 +164,51 @@ impl Viewfinder {
         c
     }
 
-    pub fn to_sensor(&self, p: Pos2, into: Rect) -> Option<[f32; 2]> {
+    /// A screen point as a fraction of the PICTURE drawn in `into` — the
+    /// turn undone and the mirror applied, unbounded (a point off the
+    /// picture maps outside 0..1). The zoom window maps this on to the
+    /// frame; it is the mapping `Zoom::apply` asks for.
+    pub fn picture_frac(&self, p: Pos2, into: Rect) -> [f32; 2] {
         let r = self.image_rect(into);
-        if r.width() <= 0.0 || r.height() <= 0.0 { return None; }
-        let mut x = (p.x - r.min.x) / r.width();
-        let y = (p.y - r.min.y) / r.height();
-        if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) { return None; }
+        let mut x = (p.x - r.min.x) / r.width().max(0.01);
+        let mut y = (p.y - r.min.y) / r.height().max(0.01);
         // UNDO the rotation, so a tap lands on the part of the SENSOR the user
         // pointed at. A focus point stored in screen terms would move the
         // moment the preview was turned.
-        let (mut x, mut y) = (x, y);
         for _ in 0..(self.quarter_turns % 4) {
             let (nx, ny) = (y, 1.0 - x);
             x = nx;
             y = ny;
         }
         if self.facing.mirrored() { x = 1.0 - x; }
-        Some([x, y])
+        [x, y]
     }
 
-    /// The inverse, for drawing the reticle where the user tapped.
+    pub fn to_sensor(&self, p: Pos2, into: Rect) -> Option<[f32; 2]> {
+        let r = self.image_rect(into);
+        if r.width() <= 0.0 || r.height() <= 0.0 { return None; }
+        let x = (p.x - r.min.x) / r.width();
+        let y = (p.y - r.min.y) / r.height();
+        if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) { return None; }
+        // Through the zoom window last: the picture is the window, and a
+        // tap on the picture's centre is the centre of the WINDOW, not of
+        // the sensor.
+        Some(self.zoom.frac_to_frame(self.picture_frac(p, into)))
+    }
+
+    /// The inverse, for drawing the reticle where the user tapped: the
+    /// zoom window, then the mirror, then the turn — `picture_frac` run
+    /// backwards, so the two round-trip.
     pub fn to_screen(&self, s: [f32; 2], into: Rect) -> Pos2 {
         let r = self.image_rect(into);
-        let x = if self.facing.mirrored() { 1.0 - s[0] } else { s[0] };
-        Pos2::new(r.min.x + x * r.width(), r.min.y + s[1] * r.height())
+        let f = self.zoom.frame_to_frac(s);
+        let (mut x, mut y) = (if self.facing.mirrored() { 1.0 - f[0] } else { f[0] }, f[1]);
+        for _ in 0..(self.quarter_turns % 4) {
+            let (nx, ny) = (1.0 - y, x);
+            x = nx;
+            y = ny;
+        }
+        Pos2::new(r.min.x + x * r.width(), r.min.y + y * r.height())
     }
 
     pub fn tap(&mut self, p: Pos2, into: Rect) -> bool {
@@ -241,8 +278,26 @@ impl Viewfinder {
     pub fn flip(&mut self) {
         self.facing = self.facing.flipped();
         // A focus point belongs to the sensor that set it; keeping it across a
-        // flip focuses somewhere the user never tapped.
+        // flip focuses somewhere the user never tapped. So does a zoom window.
         self.focus = None;
+        self.zoom.reset();
+    }
+
+    /// Fold a frame's gestures into the zoom: a pinch over the picture
+    /// zooms about the fingers, a one-finger drag pans while zoomed.
+    /// `into` is the rect the viewfinder was drawn in. Returns whether the
+    /// window changed.
+    pub fn zoom_gestures(&mut self, gestures: &[uikit_egui::touch::Gesture], into: Rect) -> bool {
+        let picture = self.image_rect(into).intersect(into);
+        let me = self.clone_geometry();
+        self.zoom.apply(gestures, picture, |p| me.picture_frac(p, into))
+    }
+
+    /// The geometry alone, for a mapping closure that must not borrow
+    /// `self` while the zoom is mutated.
+    fn clone_geometry(&self) -> Viewfinder {
+        Viewfinder { facing: self.facing, full_bleed: self.full_bleed, sensor_aspect: self.sensor_aspect,
+                     quarter_turns: self.quarter_turns, zoom: self.zoom, ..Default::default() }
     }
 }
 
@@ -361,7 +416,15 @@ pub fn viewfinder(ui: &mut Ui, vf: &mut Viewfinder, frame: Option<&egui::Texture
     // whatever the camera did, so it cannot tell "focused" from "gave up";
     // reticle::Reticle carries Searching / Locked / Failed and lingers on a
     // RESULT, which is the whole reason it was written.
-    crate::reticle::reticle_ui(ui, &vf.reticle, rect, colors);
+    //
+    // Drawn where the tap WAS: the reticle stores the sensor point, and
+    // the sensor point is on screen wherever the mirror, the turn and the
+    // zoom window put it. Mapping it as a fraction of the view (what
+    // `reticle_ui` does on its own) was right only for an unmirrored,
+    // unturned, unzoomed full-bleed preview.
+    if let Some((nx, ny)) = vf.reticle.at() {
+        crate::reticle::reticle_ui_at(ui, &vf.reticle, vf.to_screen([nx, ny], rect), colors);
+    }
     if let Some(name) = &vf.recipient {
         p.text(Pos2::new(rect.min.x + 10.0, rect.min.y + 8.0), egui::Align2::LEFT_TOP,
                format!("to {name}"), egui::FontId::proportional(13.0), colors.text);
@@ -444,6 +507,82 @@ mod tests {
         let flat = Viewfinder { full_bleed: false, sensor_aspect: 1.0, ..Default::default() };
         let s0 = flat.to_sensor(Pos2::new(10.0, 10.0), into).unwrap();
         assert!(s0[0] < 0.2 && s0[1] < 0.2, "got {s0:?}");
+    }
+
+    #[test]
+    fn the_zoom_window_is_what_the_mesh_draws_mirror_and_turn_included() {
+        // 2× on the frame's right half. Unmirrored, unturned: the mesh's
+        // top-left corner reads texture (0.5, 0.25).
+        let mut vf = Viewfinder { facing: Facing::Back, ..Default::default() };
+        vf.zoom.pinch(2.0, [1.0, 0.5]);
+        let uvs = vf.corner_uvs();
+        assert_eq!(uvs[0], Pos2::new(0.5, 0.25));
+        assert_eq!(uvs[2], Pos2::new(1.0, 0.75));
+        // Mirrored: the same window, drawn right to left.
+        let front = Viewfinder { facing: Facing::Front, ..vf.clone() };
+        let uvs = front.corner_uvs();
+        assert_eq!(uvs[0], Pos2::new(1.0, 0.25));
+        assert_eq!(uvs[1], Pos2::new(0.5, 0.25));
+        // Turned once: still the window's four corners, permuted.
+        let turned = Viewfinder { quarter_turns: 1, ..vf.clone() };
+        let mut got = turned.corner_uvs();
+        got.sort_by(|a, b| (a.x, a.y).partial_cmp(&(b.x, b.y)).unwrap());
+        assert_eq!(got, [Pos2::new(0.5, 0.25), Pos2::new(0.5, 0.75), Pos2::new(1.0, 0.25), Pos2::new(1.0, 0.75)]);
+        // At 1× the corners are the texture's, as before zoom existed.
+        assert_eq!(Viewfinder::default().corner_uvs(), [Pos2::new(0.0, 0.0), Pos2::new(1.0, 0.0), Pos2::new(1.0, 1.0), Pos2::new(0.0, 1.0)]);
+    }
+
+    #[test]
+    fn a_tap_while_zoomed_focuses_on_the_part_of_the_sensor_shown() {
+        // The picture is the window: its centre is the WINDOW's centre.
+        let mut vf = Viewfinder { full_bleed: false, sensor_aspect: 1.0, ..Default::default() };
+        let r = wide();
+        vf.zoom.pinch(2.0, [1.0, 0.0]);   // the frame's top-right quarter
+        let s = vf.to_sensor(vf.image_rect(r).center(), r).unwrap();
+        assert!((s[0] - 0.75).abs() < 0.01 && (s[1] - 0.25).abs() < 0.01, "{s:?}");
+        // And the reticle is drawn back where the tap was.
+        let back = vf.to_screen(s, r);
+        assert!((back.x - vf.image_rect(r).center().x).abs() < 1.0 && (back.y - vf.image_rect(r).center().y).abs() < 1.0);
+        // Mirrored: the same tap is the window's centre still, and the
+        // window itself is where the mirror put it.
+        let mut front = Viewfinder { facing: Facing::Front, full_bleed: false, sensor_aspect: 1.0, ..Default::default() };
+        let img = front.image_rect(r);
+        // Pinch with the fingers on the screen's LEFT edge: the frame's right.
+        let g = [uikit_egui::touch::Gesture::Pinch { scale: 2.0, rel: 2.0,
+            center: touchkit::Vec2::new(img.left() + 1.0, img.center().y) }];
+        assert!(front.zoom_gestures(&g, r));
+        assert!(front.zoom.window()[2] > 0.99, "{:?}", front.zoom.window());
+    }
+
+    #[test]
+    fn a_tap_and_its_reticle_round_trip_through_mirror_turn_and_zoom() {
+        // The reticle is drawn from the stored SENSOR point; it must land
+        // back under the finger whatever the preview is doing.
+        let into = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(360.0, 640.0));
+        for facing in [Facing::Back, Facing::Front] {
+            for turns in 0..4u8 {
+                for zoom in [1.0, 2.3] {
+                    let mut vf = Viewfinder { facing, quarter_turns: turns, sensor_aspect: 4.0 / 3.0, ..Default::default() };
+                    vf.zoom.pinch(zoom, [0.7, 0.3]);
+                    let img = vf.image_rect(into);
+                    let p = Pos2::new(img.min.x + img.width() * 0.3, img.min.y + img.height() * 0.8);
+                    let s = vf.to_sensor(p, into).expect("on the picture");
+                    let back = vf.to_screen(s, into);
+                    assert!((back.x - p.x).abs() < 0.5 && (back.y - p.y).abs() < 0.5,
+                            "{facing:?} turns={turns} zoom={zoom}: {p:?} -> {s:?} -> {back:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flipping_resets_the_zoom_and_turning_keeps_it() {
+        let mut vf = Viewfinder::default();
+        vf.zoom.set_factor(2.0);
+        vf.rotate_cw();
+        assert!(vf.zoom.is_zoomed(), "the same sensor, the same window");
+        vf.flip();
+        assert!(!vf.zoom.is_zoomed(), "a window into one sensor means nothing on the other");
     }
 
     #[test]

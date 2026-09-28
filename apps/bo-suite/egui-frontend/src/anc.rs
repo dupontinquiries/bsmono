@@ -337,8 +337,7 @@ pub fn anc_chip(ui: &mut egui::Ui, a: &mut Anc, scene: &mut uikit_egui::A11yScen
         let glyph = if a.mode != Mode::Off && !a.has_engine_report() { "\u{25cb}" } else { "\u{25cf}" };
         ui.colored_label(dot, glyph);
         let label = format!("ANC {}", a.mode.label());
-        let resp = ui.selectable_label(a.mode != Mode::Off, &label)
-            .on_hover_text("Off · Auto · On");
+        let resp = ui.selectable_label(a.mode != Mode::Off, &label);
         // REGISTERED FOR VOICE. The kit's a11y module says it is "shared
         // across every uikit-egui app" and one app used it; this control is
         // the case it was written for — a cycling button whose meaning is not
@@ -356,8 +355,14 @@ pub fn anc_chip(ui: &mut egui::Ui, a: &mut Anc, scene: &mut uikit_egui::A11yScen
             changed = Some(a.cycle());
         }
         // The reason, always — a silent canceller with no explanation is the
-        // thing that makes an operator stop trusting the control.
-        ui.colored_label(c.text_weak, egui::RichText::new(a.readout()).small());
+        // thing that makes an operator stop trusting the control. On a
+        // narrow bar it is on the chip's hover/long-press rather than
+        // beside it, where it overran the queue button at phone width.
+        if ui.available_width() > 320.0 {
+            ui.colored_label(c.text_weak, egui::RichText::new(a.readout()).small());
+        } else {
+            resp.on_hover_text(a.readout());
+        }
     });
     changed
 }

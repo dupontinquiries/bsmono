@@ -44,6 +44,12 @@ pub mod router;
 /// section — the caller the ten ported pages never had.
 pub mod shell;
 
+/// The GTK Live page's calibrate entry and button.
+pub mod calibrate;
+
+/// The GTK Live page's forecast box.
+pub mod forecast_card;
+
 use uikit_egui::motion;
 use weather_share::{WeatherRecord, WeatherShare};
 

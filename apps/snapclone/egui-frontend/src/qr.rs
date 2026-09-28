@@ -199,7 +199,29 @@ impl QrScan {
 /// Draw the scanner sheet. Returns a contact once one is confirmed.
 pub fn qr_ui(ui: &mut egui::Ui, s: &mut QrScan,
              c: &uikit_egui::PaletteColors) -> Option<ScannedContact> {
-    qr_ui_diag(ui, s, c, crate::qr_scan_status::Status::Idle)
+    qr_ui_diag(ui, s, c, crate::qr_scan_status::Status::Idle, None)
+}
+
+/// The scanner well's side, in points: as wide as the dialog allows up to
+/// a size a code fills comfortably at arm's length.
+pub const WELL_MAX: f32 = 260.0;
+pub const WELL_MIN: f32 = 160.0;
+
+/// The centre square of a `w × h` frame, as texture coordinates. The
+/// scanner shows the middle of the picture because that is where a code
+/// held up to the lens is, and a letterboxed 16:9 frame in a square well
+/// would make the code a third smaller than it needs to be.
+pub fn centre_square_uv(w: usize, h: usize) -> egui::Rect {
+    if w == 0 || h == 0 { return egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)); }
+    if w > h {
+        let f = h as f32 / w as f32;
+        let x0 = (1.0 - f) / 2.0;
+        egui::Rect::from_min_max(egui::pos2(x0, 0.0), egui::pos2(x0 + f, 1.0))
+    } else {
+        let f = w as f32 / h as f32;
+        let y0 = (1.0 - f) / 2.0;
+        egui::Rect::from_min_max(egui::pos2(0.0, y0), egui::pos2(1.0, y0 + f))
+    }
 }
 
 /// [`qr_ui`] with the scanner's own diagnosis of why it has not found anything.
@@ -207,9 +229,17 @@ pub fn qr_ui(ui: &mut egui::Ui, s: &mut QrScan,
 /// Separate so every existing call site draws what it drew. The diagnosis needs counters the
 /// camera loop keeps, and threading them through the one signature would have made the
 /// scanner's UI depend on state it has no business owning.
+///
+/// `frame` is the live camera texture, when the camera is running: the
+/// well shows it, centre-cropped, with corner marks — a popup ABOVE the
+/// camera page's controls, so the code being aimed at is the biggest thing
+/// on screen rather than a picture under a shutter, a dropdown and a step
+/// strip. Without a frame the well is the empty hole it always was, and
+/// the diagnosis line says why.
 pub fn qr_ui_diag(ui: &mut egui::Ui, s: &mut QrScan,
                   c: &uikit_egui::PaletteColors,
-                  diag: crate::qr_scan_status::Status) -> Option<ScannedContact> {
+                  diag: crate::qr_scan_status::Status,
+                  frame: Option<&egui::TextureHandle>) -> Option<ScannedContact> {
     let dt = ui.input(|i| i.stable_dt) * 1000.0;
     let mut out = s.tick(dt);
 
@@ -225,9 +255,10 @@ pub fn qr_ui_diag(ui: &mut egui::Ui, s: &mut QrScan,
         ui.spacing_mut().item_spacing.y = gap;
         ui.colored_label(c.text_weak, "SCAN A CODE");
         if s.is_scanning() || matches!(s.phase, Phase::Found { .. }) {
-            // The viewfinder: a frame that flashes on a hit. Nothing decodes
-            // here — frames arrive from the camera source.
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(200.0, 200.0), egui::Sense::hover());
+            // The viewfinder: the live picture, flashing on a hit. Nothing
+            // decodes here — frames arrive from the camera source.
+            let side = (ui.available_width() - 2.0 * pad).clamp(WELL_MIN, WELL_MAX);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
             let lit = s.flash();
             let border = if lit > 0.0 {
                 let g = c.success;
@@ -237,6 +268,20 @@ pub fn qr_ui_diag(ui: &mut egui::Ui, s: &mut QrScan,
             // a hole to look through rather than an outline floating on the
             // page — and so the status line under it has an edge to sit off.
             ui.painter().rect_filled(rect, 8.0, c.bg_base);
+            if let Some(t) = frame {
+                let [w, h] = t.size();
+                ui.painter().image(t.id(), rect.shrink(2.0), centre_square_uv(w, h), egui::Color32::WHITE);
+                // Corner marks: where to put the code. Four short L's rather
+                // than a full frame, so the picture underneath stays visible.
+                let (l, m) = (side * 0.12, 2.0);
+                let col = if lit > 0.0 { c.success } else { c.accent };
+                let r = rect.shrink(10.0);
+                for (cx, cy, sx, sy) in [(r.left(), r.top(), 1.0, 1.0), (r.right(), r.top(), -1.0, 1.0),
+                                          (r.left(), r.bottom(), 1.0, -1.0), (r.right(), r.bottom(), -1.0, -1.0)] {
+                    ui.painter().line_segment([egui::pos2(cx, cy), egui::pos2(cx + sx * l, cy)], egui::Stroke::new(m, col));
+                    ui.painter().line_segment([egui::pos2(cx, cy), egui::pos2(cx, cy + sy * l)], egui::Stroke::new(m, col));
+                }
+            }
             ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(2.0_f32, border),
                                      egui::StrokeKind::Inside);
             // WHY IT HAS NOT FOUND ANYTHING. A scanner that is looking and one that is broken
@@ -283,6 +328,20 @@ mod tests {
     use super::*;
 
     fn p(s: &str) -> Option<ScannedContact> { parse_payload(s) }
+
+    #[test]
+    fn the_scanner_well_shows_the_centre_square_of_the_frame() {
+        // A 16:9 frame in a square well: the middle 9/16 of the width, the
+        // whole height. A code held up to the lens is in the middle.
+        let uv = centre_square_uv(1280, 720);
+        assert!((uv.width() - 0.5625).abs() < 1e-4, "{uv:?}");
+        assert!((uv.min.x - 0.21875).abs() < 1e-4);
+        assert_eq!((uv.min.y, uv.max.y), (0.0, 1.0));
+        let tall = centre_square_uv(720, 1280);
+        assert_eq!((tall.min.x, tall.max.x), (0.0, 1.0));
+        assert!((tall.height() - 0.5625).abs() < 1e-4);
+        assert_eq!(centre_square_uv(0, 0).max, egui::pos2(1.0, 1.0), "degenerate: the whole frame");
+    }
 
     #[test]
     fn all_four_documented_payload_forms_parse() {
@@ -560,9 +619,14 @@ pub fn my_code_ui(ui: &mut egui::Ui, id: &str, c: &uikit_egui::PaletteColors, re
         let r = uikit_egui::qr::qr_ui_tilted(ui, &layout_for(id), side, c, revealed_at, tilt).on_hover_text("tap to enlarge");
         if r.clicked() { tapped = true; }
         ui.colored_label(c.text_weak, egui::RichText::new(id).monospace().small());
-        // The honest caption. See the module docs above.
+        // The honest caption. Not a standard QR (see the kit's module docs:
+        // no Reed-Solomon, no format bits), so a phone's stock reader will
+        // not decode it — but another snapclone's camera does, through the
+        // kit's own decoder, which is how the scan in the friends flow
+        // works. The old caption said "not scannable", which was true of
+        // strangers' readers and false of this app's.
         ui.colored_label(c.text_weak,
-            egui::RichText::new("a visual id, not a scannable QR — read the code aloud")
+            egui::RichText::new("another snapclone's camera can scan this — or read the code aloud")
                 .small());
     });
     tapped

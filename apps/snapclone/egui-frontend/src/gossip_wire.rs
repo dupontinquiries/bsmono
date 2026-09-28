@@ -508,14 +508,21 @@ impl GossipSocket {
     /// can receive unicast replies on, so a failed join is reported rather than
     /// fatal.
     ///
-    /// **Two instances on one host cannot both bind this port.** std's
-    /// UdpSocket exposes no SO_REUSEADDR/SO_REUSEPORT, so testing two copies on
-    /// one machine needs different ports (the Network tab has the field) or the
-    /// socket2 crate, which is not a dependency. Multicast loopback is left ON
-    /// for exactly that reason: with different ports, two local instances do
-    /// find each other.
+    /// **Two instances on one host share the port.** SO_REUSEADDR and (on
+    /// Linux) SO_REUSEPORT are set before the bind, so a second copy on the
+    /// same machine binds too and, with multicast loopback left on, both
+    /// hear each other's announces. That is the whole end-to-end walk —
+    /// scan, add, send, open — on one desk without two phones. std's
+    /// UdpSocket cannot set either option, hence socket2.
     pub fn bind(port: u16) -> std::io::Result<GossipSocket> {
-        let sock = std::net::UdpSocket::bind(("0.0.0.0", port))?;
+        use socket2::{Domain, Protocol, Socket, Type};
+        let raw = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        raw.set_reuse_address(true)?;
+        #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
+        raw.set_reuse_port(true)?;
+        let addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
+        raw.bind(&addr.into())?;
+        let sock: std::net::UdpSocket = raw.into();
         sock.set_nonblocking(true)?;
         sock.set_broadcast(true)?;
         let joined = crate::gossip::MULTICAST_GROUP.parse::<std::net::Ipv4Addr>().ok()
@@ -626,6 +633,36 @@ mod tests {
     #[test]
     fn an_announcement_round_trips() {
         assert_eq!(decode(&encode(&announce()).unwrap()).unwrap(), announce());
+    }
+
+    #[test]
+    fn two_instances_on_one_machine_can_both_bind_the_port_and_hear_each_other() {
+        // The one-desk walk. Before SO_REUSEADDR the second bind failed
+        // with "address in use", so a send could only ever be tried
+        // against a second machine. A high port that nothing else uses
+        // here, and unicast to loopback so the test does not depend on
+        // multicast routing in the sandbox.
+        let port = 49_877;
+        let a = GossipSocket::bind(port).expect("first bind");
+        let b = GossipSocket::bind(port).expect("second bind on the same port");
+        let mut b = b;
+        let to: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        a.send_to(&announce(), to).unwrap();
+        let mut got = Vec::new();
+        for _ in 0..100 {
+            got = b.poll(8);
+            if !got.is_empty() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // With both sockets on the port the kernel delivers a unicast
+        // datagram to one of them; either way the bind succeeded, which
+        // is the claim. Multicast (the real discovery path) fans out to
+        // both, and loopback stays on for that.
+        let a_heard = { let mut a = a; !a.poll(8).is_empty() };
+        assert!(!got.is_empty() || a_heard, "the datagram reached neither socket");
+        if let Some((_, r)) = got.first() {
+            assert_eq!(r.as_ref().ok().map(|x| x.id.clone()), Some("sc-32a51661".to_string()));
+        }
     }
 
     #[test]

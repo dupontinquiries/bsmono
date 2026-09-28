@@ -239,6 +239,10 @@ struct App {
     /// send. Held by the HOST and not by the app: the controller has no
     /// business carrying a photo in memory purely to hand it back.
     last_snap: Option<Vec<u8>>,
+    /// The last encoded clip, read back from the encoder's output file.
+    last_video: Option<Vec<u8>>,
+    /// Which of the two was captured most recently — what a send ships.
+    last_media: snapclone_egui::snaps::Media,
     /// The composition of the last send, for Retry.
     last_composition: Option<snapclone_egui::composer::Snap>,
     /// The frame most recently handed to the pump — what the viewfinder is
@@ -256,6 +260,18 @@ struct App {
     sending: Vec<std::thread::JoinHandle<()>>,
     /// Results from those threads.
     send_results: Arc<Mutex<Vec<(String, Result<(), String>)>>>,
+    /// Results of outbox sends, keyed by request id rather than peer, so
+    /// they never touch the app's own send rows.
+    outbox_results: Arc<Mutex<Vec<(String, Result<(), String>)>>>,
+    /// Outbox requests dispatched and not yet answered.
+    outbox_inflight: Vec<String>,
+    /// Requests waiting for their peer to be heard, so the wait is logged once.
+    outbox_waiting: Vec<String>,
+    /// When each peer was first heard this session, for the one-tick wait.
+    outbox_first_heard: std::collections::HashMap<String, u64>,
+    outbox_polled: std::time::Instant,
+    /// Wall clock at startup, for "heard this session".
+    started_ms: u64,
     /// An export running on its own thread, and where it reports. Archiving a
     /// month of photos takes seconds; the UI thread must not wait for zip.
     export_result: Arc<Mutex<Option<snapclone_egui::snap_export::Outcome>>>,
@@ -267,6 +283,8 @@ struct App {
     plan_logged: bool,
     /// Last reported focus, so the change is sent once rather than every frame.
     focused: bool,
+    /// Where unopened received snaps are kept between runs — see inbox_store.
+    inbox_dir: std::path::PathBuf,
     /// When stored snaps were last swept against retention.
     last_sweep: Option<i64>,
     /// The discovery socket, or None when the port was unavailable. Absent
@@ -325,6 +343,23 @@ impl App {
         let cmds = snap.apply(HostEvent::SnapStateLoaded(Box::new(st)));
         Self::report(cmds);
 
+        // THE INBOX, off disk. Received snaps lived only in memory, so a
+        // restart emptied the feed of everything unopened — or worse, left
+        // the tiles and lost the bytes behind them. `SnapsForFeed` existed
+        // for this and was never sent.
+        let inbox_dir = snapclone_egui::inbox_store::default_dir();
+        let kept = snapclone_egui::inbox_store::load_all(&inbox_dir);
+        if !kept.is_empty() {
+            eprintln!("snapclone: {} unopened snap(s) in the inbox", kept.len());
+            let entries: Vec<snapclone_egui::snaps::FeedEntry> = kept.iter().map(|s|
+                snapclone_egui::snaps::FeedEntry {
+                    id: s.id.clone(), sender_name: s.sender_name.clone(), sent_at: s.sent_at,
+                    media: s.media, thumb_path: String::new() }).collect();
+            for s in kept { snap.keep_received(s); }
+            let cmds = snap.apply(HostEvent::SnapsForFeed(entries));
+            Self::report(cmds);
+        }
+
         // Settings off disk, through the seam rather than by assignment: the
         // event sets `current` AND the saved baseline, so a freshly loaded
         // config does not come up reporting unsaved changes with the Save
@@ -352,7 +387,25 @@ impl App {
                 capture_group: None,
             }]
         } else {
-            snapclone_egui::camera_enumerate::enumerate()
+            let mut found = snapclone_egui::camera_enumerate::enumerate();
+            // A `gst:<source>` in Settings > camera.device is a source with
+            // no device behind it — `videotestsrc` on a machine with no
+            // camera, a `filesrc ! decodebin` of a clip. Listed as a camera
+            // so the choice machinery (which only starts the rig for a
+            // chosen camera) has one to choose; the plan builder turns the
+            // id into the pipeline. This is how the REAL gst-launch path
+            // is exercised without hardware.
+            let ov = snap.settings.current.camera.device.trim().to_string();
+            if ov.starts_with("gst:") && !found.iter().any(|d| d.id == ov) {
+                eprintln!("snapclone: camera.device is a GStreamer source override: {ov}");
+                found.push(snapclone_egui::camera_select::Device {
+                    id: ov.clone(),
+                    label: format!("GStreamer source ({})", ov.trim_start_matches("gst:").split_whitespace().next().unwrap_or("")),
+                    facing: snapclone_egui::camera_select::Facing::Rear,
+                    capture_group: None,
+                });
+            }
+            found
         };
         snap.apply(HostEvent::CamerasFound(cameras));
         // SNAPCLONE_BG=aurora|waves|starfield|gradient|bokeh: pick the live
@@ -393,13 +446,20 @@ impl App {
         };
 
         Self { snap, ime_repair: Default::default(), last_sweep: None, snaps_in, accel: None, glove_probed: false,
-               last_snap: None, last_composition: None, last_live: None, scan_frames: 0, sending: Vec::new(),
+               last_snap: None, last_video: None, last_media: snapclone_egui::snaps::Media::Image,
+               last_composition: None, last_live: None, scan_frames: 0, sending: Vec::new(),
                send_results: Arc::new(Mutex::new(Vec::new())),
+               outbox_results: Arc::new(Mutex::new(Vec::new())),
+               outbox_inflight: Vec::new(),
+               outbox_waiting: Vec::new(),
+               outbox_first_heard: Default::default(),
+               outbox_polled: std::time::Instant::now(),
+               started_ms: wall_ms(),
                export_result: Arc::new(Mutex::new(None)), exporting: None,
                voice: VoiceRig::idle(), rig: CaptureRig::idle(),
                nat: snapclone_egui::nat_traversal::Traversal::new(""), nat_id: String::new(),
                last_stun_ms: None, stun_resolve: None,
-               plan_logged: false, focused: true,
+               plan_logged: false, focused: true, inbox_dir,
                gossip, last_announce: 0, warned_unsigned: false, identity: keys }
     }
 
@@ -606,7 +666,29 @@ impl App {
             use snapclone_egui::video_encode_run::Done;
             self.snap.shutter_note = match done {
                 Done::Ok { out, bytes } => {
-                    format!("encoded {} \u{2014} {:.1}MB", out.display(), bytes as f64 / 1e6)
+                    // THE CLIP BECOMES THE THING TO SEND. The encode
+                    // finished into a file nobody read back, and the send
+                    // path only ever carried the last still. Read here,
+                    // once, and it is what SendSnap ships as Media::Video
+                    // until the next photo replaces it.
+                    match std::fs::read(&out) {
+                        Ok(data) => {
+                            self.last_video = Some(data);
+                            self.last_media = snapclone_egui::snaps::Media::Video;
+                            // AND THE FLOW MOVES ON, as it does for a photo:
+                            // step 1 is done, the composer (timer, recipients)
+                            // is next. A clip used to end at a note under the
+                            // shutter with no way to send it.
+                            let cmds = self.snap.apply(HostEvent::SnapSaved(Ok(out.display().to_string())));
+                            self.handle(cmds);
+                            // The receipt's size line, as the photo path
+                            // reports it — "Sending 0 B" was the clip's.
+                            let cmds = self.snap.apply(HostEvent::SnapEncoded { bytes });
+                            self.handle(cmds);
+                        }
+                        Err(e) => eprintln!("snapclone: encoded clip could not be read back: {e}"),
+                    }
+                    format!("encoded {} \u{2014} {:.1}MB \u{2014} ready to send", out.display(), bytes as f64 / 1e6)
                 }
                 // The reason, not just "failed". `run_blocking` already trimmed ffmpeg's
                 // stderr to its tail so the complaint is not buried under a build dump.
@@ -822,13 +904,43 @@ impl App {
         self.pump_nat();
         if !self.voice.live() {
             // Not in a call, but the socket is up and STUN replies and
-            // punches still arrive on it. Drain them.
-            let empty = snapclone_egui::voice_wire::Peers::new();
-            let refused = match self.voice.sock.as_mut() {
-                Some(s) => s.poll(&empty, 16).1,
-                None => Vec::new(),
+            // punches still arrive on it — and so do the first frames of
+            // a call someone is placing to us. The peer table for an idle
+            // socket is EVERY CONTACT with a known address, so a frame
+            // from a friend is recognised as theirs rather than refused
+            // as a stranger's: with an empty table here an incoming call
+            // was dropped into the NAT feed and nothing ever rang.
+            let mut idle = snapclone_egui::voice_wire::Peers::new();
+            let known: Vec<(String, snapclone_egui::punch_addrs::PeerAddr)> =
+                self.snap.contact_book.iter()
+                    .filter_map(|c| self.snap.punch.get(&c.sc_id).map(|a| (c.sc_id.clone(), a)))
+                    .collect();
+            idle.set(known);
+            let (ok, refused) = match self.voice.sock.as_mut() {
+                Some(s) => s.poll(&idle, 16),
+                None => (Vec::new(), Vec::new()),
             };
             self.feed_nat(refused);
+            // A known sender's datagram is a call only if it is NOT the
+            // NAT volley that precedes every snap send: those carry the
+            // punch magic and go to the traversal machine, whatever
+            // address they came from. Before this check the first photo
+            // sent between two desks rang the receiver as "incoming voice".
+            let mut caller = None;
+            for (from, bytes) in ok {
+                if snapclone_egui::nat_traversal::Traversal::parse_punch(&bytes).is_some() {
+                    if let Some(a) = self.snap.punch.get(&from) {
+                        let addr = std::net::SocketAddr::from((a.ip, a.port));
+                        if let Some(ev) = self.nat.on_datagram(addr, &bytes) { self.on_nat_event(ev); }
+                    }
+                    continue;
+                }
+                if caller.is_none() { caller = Some(from); }
+            }
+            if let Some(from) = caller {
+                let cmds = self.snap.apply(HostEvent::CallRinging { from });
+                self.handle(cmds);
+            }
             return;
         }
 
@@ -1019,6 +1131,14 @@ impl App {
             match snapclone_egui::snap_transport::resolve_sender(a.from, &known) {
                 Sender::Known(id) => {
                     if !senders.contains(&id) { senders.push(id.clone()); }
+                    // ON DISK before the app hears of it, so a crash between
+                    // arrival and viewing does not lose the snap while the
+                    // sender's side says delivered. The inbox file is what
+                    // `open_received` finds after a restart.
+                    let snap = a.frame.to_snap(&id);
+                    if let Err(e) = snapclone_egui::inbox_store::save(&self.inbox_dir, &snap) {
+                        eprintln!("snapclone: could not keep a snap from {id}: {e}");
+                    }
                     let cmds = self.snap.apply(HostEvent::SnapArrived {
                         from: id, frame: Box::new(a.frame) });
                     self.handle(cmds);
@@ -1041,6 +1161,122 @@ impl App {
             let cmds = self.snap.apply(HostEvent::SnapsArrived {
                 from: senders, focused: self.focused });
             self.handle(cmds);
+        }
+    }
+
+    /// One snap to one peer, on a worker thread. `tag` is what the result
+    /// is reported under: the peer id for the app's own sends, the outbox
+    /// request id for a handoff from another app.
+    ///
+    /// Extracted from the `SendSnap` arm so the outbox path (below) sends
+    /// through exactly the same address health, punch table, sequence ids
+    /// and transport — a second send path would be a second set of bugs.
+    fn dispatch_snap(&mut self, who: &str, media: snapclone_egui::snaps::Media, duration_secs: u16,
+                     bytes: Vec<u8>, tag: String,
+                     results: Arc<Mutex<Vec<(String, Result<(), String>)>>>) {
+        let me = self.snap.local_id.clone();
+        let name = self.snap.settings.current.general.display_name.clone();
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64).unwrap_or(0);
+        // AN ADDRESS KNOWN WRONG IS NOT TRIED. Five failures or an hour
+        // stale and the cached one is skipped, so the person waits for a
+        // refusal instead of a timeout — and the peer falls to whatever
+        // finds it next, gossip or the DHT.
+        if !self.snap.addr_health.usable(who, now_s * 1000) {
+            if let Ok(mut r) = results.lock() { r.push((tag, Err("last known address keeps failing".into()))); }
+            return;
+        }
+        let Some(addr) = self.snap.punch.get(who) else {
+            if let Ok(mut r) = results.lock() { r.push((tag, Err("no known address".into()))); }
+            return;
+        };
+        // REAL sequence and ack, from this peer's session.
+        let (seq, ack) = self.snap.frame_ids(who);
+        let frame = snapclone_egui::snap_wire::SnapFrame::announce(
+            seq, ack, &me, &name, media, now_s, duration_secs, bytes);
+        self.sending.push(std::thread::spawn(move || {
+            let out = snapclone_egui::snap_transport::send_snap(addr, &frame);
+            if let Ok(mut r) = results.lock() { r.push((tag, out)); }
+        }));
+    }
+
+    /// THE OUTBOX: requests other apps drop in `snap-handoff`'s directory
+    /// (snapshot-cam's "send to <contact>"). Each names a file and an
+    /// sc-ID; the file is sent through `dispatch_snap` like any snap and
+    /// the outcome written back beside the request, where the asking app
+    /// reads it. Polled every couple of seconds — a directory listing,
+    /// not a watcher, because a watcher is a dependency and a listing of
+    /// a directory that is nearly always empty costs nothing.
+    fn pump_outbox(&mut self) {
+        if self.outbox_polled.elapsed() < std::time::Duration::from_secs(2) { return; }
+        self.outbox_polled = std::time::Instant::now();
+        let dir = snap_handoff::default_dir();
+        
+        for req in snap_handoff::pending(&dir) {
+            if self.outbox_inflight.iter().any(|id| *id == req.id) { continue; }
+            // NOT BEFORE THE PEER HAS BEEN HEARD THIS SESSION. A request
+            // sent from a stale address table at t=2s reached the peer
+            // before it had heard our gossip, and the peer refused it as
+            // "not a known contact" — while the transport reported success,
+            // because the bytes did leave. The receiver decides by ITS
+            // address table, so the honest precondition is symmetric
+            // freshness: they were heard since we started (so their table
+            // has had our announcement round too). A request for someone
+            // not around simply waits, visibly, in the directory.
+            let heard_this_session = self.snap.heard.get(&req.to)
+                .map(|p| p.seen_ms >= self.started_ms).unwrap_or(false);
+            if !heard_this_session {
+                if !self.outbox_waiting.contains(&req.id) {
+                    eprintln!("snapclone: outbox request {} waits — {} not heard yet this session", req.id, req.to);
+                    self.outbox_waiting.push(req.id.clone());
+                }
+                continue;
+            }
+            // …and one of OUR announcement ticks has gone out since we
+            // first heard them, so their table has us too. Hearing them
+            // proves their socket is up; only the tick proves ours reached
+            // it. Without this the very first send after a launch was
+            // refused on the far side (seen: the peer came up a second
+            // after us, we heard its startup announcement at once, sent at
+            // t=2s, and it had not yet heard our next tick at t=3s).
+            let now = wall_ms();
+            let first = *self.outbox_first_heard.entry(req.to.clone()).or_insert(now);
+            if now < first + snapclone_egui::gossip::TICK_MS + 500 {
+                continue;
+            }
+            let bytes = match std::fs::read(&req.file) {
+                Ok(b) if !b.is_empty() => b,
+                Ok(_) => { let _ = snap_handoff::mark(&dir, &req.id, &snap_handoff::Outcome::Failed("empty file".into())); continue; }
+                Err(e) => {
+                    let _ = snap_handoff::mark(&dir, &req.id, &snap_handoff::Outcome::Failed(format!("cannot read {}: {e}", req.file.display())));
+                    continue;
+                }
+            };
+            // Open the path first, as the app's own sends do.
+            if let Some(a) = self.snap.punch.get(&req.to) {
+                let _ = self.nat.initiate(&req.to, std::net::SocketAddr::from((a.ip, a.port)), false, wall_ms());
+            }
+            eprintln!("snapclone: outbox request {} from {}: {} -> {}", req.id, req.from, req.file.display(), req.to);
+            let duration = snapclone_egui::composer::Composer::default().duration.to_secs() as u16;
+            let results = self.outbox_results.clone();
+            let tag = req.id.clone();
+            self.outbox_inflight.push(req.id.clone());
+            self.outbox_waiting.retain(|x| *x != req.id);
+            self.dispatch_snap(&req.to, snapclone_egui::snaps::Media::Image, duration, bytes, tag, results);
+        }
+        // Outcomes back to the directory.
+        let done = self.outbox_results.lock().map(|mut r| std::mem::take(&mut *r)).unwrap_or_default();
+        for (id, out) in done {
+            self.outbox_inflight.retain(|x| *x != id);
+            let outcome = match out {
+                Ok(()) => snap_handoff::Outcome::Sent,
+                Err(e) => snap_handoff::Outcome::Failed(e),
+            };
+            eprintln!("snapclone: outbox request {id}: {outcome:?}");
+            if let Err(e) = snap_handoff::mark(&dir, &id, &outcome) {
+                eprintln!("snapclone: could not write the outbox marker for {id}: {e}");
+            }
         }
     }
 
@@ -1116,10 +1352,13 @@ impl App {
                 // the RGBA we already hold: no encoder dependency, and every
                 // image tool opens it. The path is printed so the photo is
                 // findable the moment it exists.
-                HostCommand::CaptureSnap => {
+                HostCommand::CaptureSnap { crop } => {
                     // The frame on screen: the slot if something newer just
-                    // landed, else the one the pump was last given.
-                    let live = self.rig.shared.peek_frame().or_else(|| self.last_live.clone());
+                    // landed, else the one the pump was last given — cropped
+                    // to the zoom window when there is one, at native
+                    // pixels, so the file is what the viewfinder showed.
+                    let live = self.rig.shared.peek_frame().or_else(|| self.last_live.clone())
+                        .map(|f| match crop { Some(w) => f.crop(w), None => f });
                     let outcome = match live {
                         Some(f) if f.pixels_plausible() => {
                             // ONE ENCODE, used for both the file and the wire.
@@ -1152,6 +1391,7 @@ impl App {
                                         f.width, f.height, enc.bytes.len() / 1024, ratio);
                                     let r = save_snap(&enc);
                                     self.last_snap = Some(enc.bytes);
+                                    self.last_media = snapclone_egui::snaps::Media::Image;
                                     r
                                 }
                                 Err(e) => Err(e),
@@ -1259,17 +1499,25 @@ impl App {
                             let _ = self.nat.initiate(who, std::net::SocketAddr::from((a.ip, a.port)), false, wall_ms());
                         }
                     }
-                    let Some(bytes) = self.last_snap.clone() else {
+                    // Whichever was captured LAST: a clip recorded after a
+                    // photo is what the person means to send.
+                    let is_video = self.last_media == snapclone_egui::snaps::Media::Video
+                        && self.last_video.is_some();
+                    let Some(bytes) = (if is_video { self.last_video.clone() } else { self.last_snap.clone() }) else {
                         eprintln!("snapclone: nothing to send — take a photo first");
                         continue;
                     };
+                    let media = if is_video { snapclone_egui::snaps::Media::Video }
+                                else { snapclone_egui::snaps::Media::Image };
                     // THE CAPTION GOES INTO THE PIXELS, as the Qt build's
                     // renderComposed does: SnapFrame has no text field, and a
                     // caption shown to the sender must be what the recipient
                     // sees. Failing to bake sends the photo without it -- and
                     // says so -- rather than not sending.
                     let bytes = match &snap {
-                        Some(c) if !c.caption.trim().is_empty() => {
+                        // A caption is baked into pixels; a clip has no
+                        // still to bake it into, so it travels as recorded.
+                        Some(c) if !c.caption.trim().is_empty() && !is_video => {
                             match snapclone_egui::media_encode::bake_caption_jpeg(&bytes, &c.caption, c.color, c.caption_y, 85) {
                                 Ok(b) => b,
                                 Err(e) => { eprintln!("snapclone: caption not drawn ({e}); sending the photo without it"); bytes }
@@ -1277,43 +1525,9 @@ impl App {
                         }
                         _ => bytes,
                     };
-                    let me = self.snap.local_id.clone();
-                    let name = self.snap.settings.current.general.display_name.clone();
-                    let now_s = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64).unwrap_or(0);
+                    let results = self.send_results.clone();
                     for who in to {
-                        // AN ADDRESS KNOWN WRONG IS NOT TRIED. Five
-                        // failures or an hour stale and the cached one is
-                        // skipped, so the person waits for a refusal
-                        // instead of a timeout — and the peer falls to
-                        // whatever finds it next, gossip or the DHT.
-                        if !self.snap.addr_health.usable(&who, now_s * 1000) {
-                            if let Ok(mut r) = self.send_results.lock() {
-                                r.push((who.clone(),
-                                        Err("last known address keeps failing".into())));
-                            }
-                            continue;
-                        }
-                        let Some(addr) = self.snap.punch.get(&who) else {
-                            if let Ok(mut r) = self.send_results.lock() {
-                                r.push((who.clone(), Err("no known address".into())));
-                            }
-                            continue;
-                        };
-                        // REAL sequence and ack, from this peer's session.
-                        // Both were hardcoded to 0 here while `next_seq`
-                        // and `take_ack` sat tested and uncalled — the
-                        // fields were on the wire carrying nothing.
-                        let (seq, ack) = self.snap.frame_ids(&who);
-                        let frame = snapclone_egui::snap_wire::SnapFrame::announce(
-                            seq, ack, &me, &name, snapclone_egui::snaps::Media::Image,
-                            now_s, duration_secs, bytes.clone());
-                        let results = self.send_results.clone();
-                        self.sending.push(std::thread::spawn(move || {
-                            let out = snapclone_egui::snap_transport::send_snap(addr, &frame);
-                            if let Ok(mut r) = results.lock() { r.push((who, out)); }
-                        }));
+                        self.dispatch_snap(&who, media, duration_secs, bytes.clone(), who.clone(), results.clone());
                     }
                 }
                 // REAL, not a debug sink: a contact scanned or renamed
@@ -1379,7 +1593,14 @@ impl App {
                 // into the save, because a future host has different work
                 // for each: a read receipt to send for Viewed, a file to
                 // delete for Expired.
-                HostCommand::MarkViewed(_) | HostCommand::MarkExpired(_) => {}
+                HostCommand::MarkViewed(id) | HostCommand::MarkExpired(id) => {
+                    // The file goes the moment the promise is kept: a snap
+                    // that has been seen, or timed out, is not on the disk
+                    // any more than it is on the screen.
+                    if let Err(e) = snapclone_egui::inbox_store::remove(&self.inbox_dir, &id) {
+                        eprintln!("snapclone: could not remove {id} from the inbox: {e}");
+                    }
+                }
                 HostCommand::SaveCodeSvg(svg) => {
                     // Next to the snaps, named by the id, so it is where the
                     // export already looks; the note says the path.
@@ -1530,7 +1751,15 @@ impl eframe::App for App {
         self.pump_capture();
         self.pump_voice();
         self.pump_snaps();
+        if let Some(path) = self.snap.pending_vcard_read.take() {
+            let expanded = uikit_egui::path_picker::expand_tilde(&path);
+            let r = std::fs::read_to_string(&expanded)
+                .map_err(|e| format!("could not read {}: {e}", expanded.display()));
+            let cmds = self.snap.apply(HostEvent::VCardLoaded(r));
+            self.handle(cmds);
+        }
         self.pump_sends();
+        self.pump_outbox();
         self.sweep_snaps(now_secs);
         self.pump_export();
 

@@ -14,6 +14,9 @@ edition = "2021"
 [lib]
 name = "ambient_learner_egui"
 path = "src/egui_lib.rs"
+# The engine's doc snippets were written for the binary, where rustdoc
+# never compiled them; see egui-frontend/Cargo.toml.
+doctest = false
 
 # The GTK binary. Declared rather than auto-discovered from src/main.rs,
 # because an auto-discovered [[bin]] carries no required-features and so builds

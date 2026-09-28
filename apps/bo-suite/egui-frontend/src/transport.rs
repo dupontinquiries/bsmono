@@ -87,10 +87,13 @@ impl Transport {
     /// Where the handle sits: the scrub position while dragging, the
     /// extrapolated clock otherwise.
     pub fn position(&self) -> f64 {
-        match self.scrubbing {
-            Some(p) => p.clamp(0.0, self.duration.max(0.0)),
-            None => (self.reported + self.since).clamp(0.0, self.duration.max(0.0)),
-        }
+        let raw = match self.scrubbing {
+            Some(p) => p,
+            None => self.reported + self.since,
+        };
+        // An unknown length (0) does not pin the clock at zero: a player
+        // that reports no duration still has a position worth showing.
+        if self.duration > 0.0 { raw.clamp(0.0, self.duration) } else { raw.max(0.0) }
     }
 
     pub fn fraction(&self) -> f32 {
@@ -136,6 +139,21 @@ impl Transport {
         if self.playing { self.pause(); None } else { self.resume() }
     }
 
+    /// Forget the remembered pause point — a new track, or a stop.
+    pub fn clear_pause(&mut self) { self.paused_at = None; }
+
+    /// A seek while paused: the next resume starts here, and the handle
+    /// shows it now.
+    pub fn set_paused_at(&mut self, at: f64) {
+        let at = if self.duration > 0.0 { at.clamp(0.0, self.duration) } else { at.max(0.0) };
+        self.paused_at = Some(at);
+        self.reported = at;
+        self.since = 0.0;
+    }
+
+    /// Where a resume would start, if paused.
+    pub fn paused_at(&self) -> Option<f64> { self.paused_at }
+
     /// Select a device. An out-of-range index is ignored rather than clearing
     /// the selection, since silently switching to nothing looks like a dropout.
     pub fn select_device(&mut self, i: usize) {
@@ -151,10 +169,61 @@ pub fn timecode(seconds: f64) -> String {
     if h > 0 { format!("{h}:{m:02}:{sec:02}") } else { format!("{m}:{sec:02}") }
 }
 
-/// Draw the bar. Returns a seek target when the user finished scrubbing.
+/// What the bar asked for. Returned rather than applied: the bar owns
+/// no queue and no player, and a button that flipped `playing` itself
+/// was how the transport became a picture of one — see `Controller::
+/// toggle_play` for the pairing of the flag with the request.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransportAction {
+    Toggle,
+    Previous,
+    Next,
+    Stop,
+    /// The user released the scrub handle here, seconds.
+    Seek(f64),
+    CycleRepeat,
+    ToggleShuffle,
+}
+
+/// Paint a 5x5 identicon into `rect`, the same cells `Identicon.qml` draws.
+///
+/// Cover art without files: every scanned library has tracks with no
+/// embedded picture, and a blank square beside the title reads as a
+/// failed image load. The pattern is a stable function of the title, so
+/// a track looks like itself every time it comes around.
+pub fn identicon_paint(p: &egui::Painter, rect: egui::Rect, title: &str,
+                       colors: &uikit_egui::PaletteColors) {
+    let icon = crate::chrome::Identicon::of(title);
+    let bg = colors.bg_card;
+    p.rect_filled(rect, 4.0, bg);
+    let fill = egui::ecolor::Hsva::new(icon.hue / 360.0, 0.55, 0.85, 1.0);
+    let cell = rect.width() / 5.0;
+    for row in 0..5 {
+        for col in 0..5 {
+            if icon.cells[row * 5 + col] {
+                let r = egui::Rect::from_min_size(
+                    egui::pos2(rect.min.x + col as f32 * cell, rect.min.y + row as f32 * cell),
+                    egui::vec2(cell, cell));
+                p.rect_filled(r.shrink(0.5), 0.0, fill);
+            }
+        }
+    }
+    // Nothing to key on: an empty title still gets a tile rather than a
+    // hole, but a plain one — a face for "nothing" would be a lie.
+    if title.trim().is_empty() {
+        p.rect_filled(rect, 4.0, bg);
+    }
+}
+
+/// Draw the bar. Returns what the user asked for, if anything.
+///
+/// One row: art, title over artist, then the transport buttons and the
+/// mode toggles pushed to the right. Below it the scrub bar with the two
+/// timecodes. The title appears ONCE — three copies of it stacked in
+/// the old strip was the first thing a screenshot showed.
 pub fn transport_ui(ui: &mut egui::Ui, t: &mut Transport,
-                    colors: &uikit_egui::PaletteColors) -> Option<f64> {
-    let mut seek = None;
+                    colors: &uikit_egui::PaletteColors) -> Option<TransportAction> {
+    let mut act = None;
     if t.show_device_strip() {
         ui.horizontal(|ui| {
             for (i, d) in t.devices.clone().iter().enumerate() {
@@ -163,47 +232,112 @@ pub fn transport_ui(ui: &mut egui::Ui, t: &mut Transport,
         });
         ui.separator();
     }
-    ui.horizontal(|ui| {
-        if ui.button(if t.playing { "❚❚" } else { "▶" }).clicked() {
-            // toggle rather than flipping the flag: on BT and local sinks a
-            // resume must seek back to where pause stopped the stream
-            if let Some(at) = t.toggle() { seek = Some(at); }
+    // Below this width the buttons no longer fit beside the title and
+    // take a row of their own — the phone case, which is the deploy
+    // target. One threshold, measured on the bar's own width rather than
+    // the window's, so a split pane gets the same treatment.
+    let compact = ui.available_width() < 560.0;
+    let buttons = |ui: &mut egui::Ui, act: &mut Option<TransportAction>, t: &Transport| {
+        let big = |s: &str| egui::RichText::new(s).size(18.0);
+        if ui.add(egui::Button::new(big("⏹")).min_size(egui::vec2(30.0, 30.0)))
+            .on_hover_text("Stop").clicked() { *act = Some(TransportAction::Stop); }
+        if ui.add(egui::Button::new(big("⏮")).min_size(egui::vec2(34.0, 30.0)))
+            .on_hover_text("Previous").clicked() { *act = Some(TransportAction::Previous); }
+        if ui.add(egui::Button::new(big(if t.playing { "⏸" } else { "▶" }))
+            .min_size(egui::vec2(44.0, 30.0)))
+            .on_hover_text(if t.playing { "Pause" } else { "Play" }).clicked() {
+            *act = Some(TransportAction::Toggle);
         }
-        ui.vertical(|ui| {
-            ui.label(egui::RichText::new(if t.title.is_empty() { "—" } else { &t.title }).strong());
-            ui.label(egui::RichText::new(&t.artist).weak().small());
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.selectable_label(t.repeat != Repeat::Off, t.repeat.tag()).clicked() {
-                t.repeat = t.repeat.next();
-            }
-            if ui.selectable_label(t.shuffle, "shuffle").clicked() { t.shuffle = !t.shuffle; }
-        });
-    });
+        if ui.add(egui::Button::new(big("⏭")).min_size(egui::vec2(34.0, 30.0)))
+            .on_hover_text("Next").clicked() { *act = Some(TransportAction::Next); }
+    };
+    let modes = |ui: &mut egui::Ui, act: &mut Option<TransportAction>, t: &Transport, compact: bool| {
+        let rep = if compact { match t.repeat { Repeat::Off => "↻", Repeat::All => "↻ all", Repeat::One => "↻ 1" }.to_string() }
+                  else { format!("repeat {}", t.repeat.tag()) };
+        if ui.selectable_label(t.repeat != Repeat::Off, rep)
+            .on_hover_text("repeat: off → all → one").clicked() {
+            *act = Some(TransportAction::CycleRepeat);
+        }
+        if ui.selectable_label(t.shuffle, if compact { "⇄" } else { "shuffle" })
+            .on_hover_text("shuffle").clicked() {
+            *act = Some(TransportAction::ToggleShuffle);
+        }
+    };
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(timecode(t.position())).small());
-        let w = ui.available_width() - 46.0;
-        let (rect, resp) = ui.allocate_exact_size(egui::Vec2::new(w.max(40.0), 14.0),
+        let (art, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+        identicon_paint(ui.painter(), art, &t.title, colors);
+        ui.add_space(4.0);
+        // The title gets what the buttons leave, and is truncated rather
+        // than wrapped: a two-line title pushes the scrub bar down and a
+        // wrapped artist under it pushes it further.
+        let reserve = if compact { 0.0 } else { 330.0 };
+        ui.vertical(|ui| {
+            ui.set_max_width((ui.available_width() - reserve).max(80.0));
+            ui.add(egui::Label::new(egui::RichText::new(
+                if t.title.is_empty() { "Nothing playing" } else { &t.title }).strong()).truncate());
+            ui.add(egui::Label::new(egui::RichText::new(
+                if t.artist.is_empty() { "—" } else { &t.artist }).weak().small()).truncate());
+        });
+        if !compact {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Right-to-left, so the order is spelled backwards here.
+                modes(ui, &mut act, t, false);
+                ui.add_space(8.0);
+                let big = |s: &str| egui::RichText::new(s).size(18.0);
+                if ui.add(egui::Button::new(big("⏭")).min_size(egui::vec2(34.0, 30.0)))
+                    .on_hover_text("Next").clicked() { act = Some(TransportAction::Next); }
+                if ui.add(egui::Button::new(big(if t.playing { "⏸" } else { "▶" }))
+                    .min_size(egui::vec2(44.0, 30.0)))
+                    .on_hover_text(if t.playing { "Pause" } else { "Play" }).clicked() {
+                    act = Some(TransportAction::Toggle);
+                }
+                if ui.add(egui::Button::new(big("⏮")).min_size(egui::vec2(34.0, 30.0)))
+                    .on_hover_text("Previous").clicked() { act = Some(TransportAction::Previous); }
+                if ui.add(egui::Button::new(big("⏹")).min_size(egui::vec2(30.0, 30.0)))
+                    .on_hover_text("Stop").clicked() { act = Some(TransportAction::Stop); }
+            });
+        }
+    });
+    if compact {
+        ui.horizontal(|ui| {
+            buttons(ui, &mut act, t);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                modes(ui, &mut act, t, true);
+            });
+        });
+    }
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(timecode(t.position())).small().monospace());
+        let w = ui.available_width() - 52.0;
+        let (rect, resp) = ui.allocate_exact_size(egui::Vec2::new(w.max(40.0), 16.0),
                                                  egui::Sense::click_and_drag());
         let p = ui.painter_at(rect);
         let mid = rect.center().y;
         p.line_segment([egui::Pos2::new(rect.min.x, mid), egui::Pos2::new(rect.max.x, mid)],
                        egui::Stroke::new(3.0_f32, colors.bg_card));
-        let x = rect.min.x + rect.width() * t.fraction();
-        p.line_segment([egui::Pos2::new(rect.min.x, mid), egui::Pos2::new(x, mid)],
-                       egui::Stroke::new(3.0_f32, colors.accent));
-        p.circle_filled(egui::Pos2::new(x, mid), if t.is_scrubbing() { 7.0 } else { 5.0 }, colors.accent);
+        if t.duration > 0.0 {
+            let x = rect.min.x + rect.width() * t.fraction();
+            p.line_segment([egui::Pos2::new(rect.min.x, mid), egui::Pos2::new(x, mid)],
+                           egui::Stroke::new(3.0_f32, colors.accent));
+            p.circle_filled(egui::Pos2::new(x, mid), if t.is_scrubbing() { 7.0 } else { 5.0 }, colors.accent);
+        }
         if resp.drag_started() { t.begin_scrub(); }
         if let Some(pos) = resp.interact_pointer_pos() {
-            if resp.dragged() {
-                let f = ((pos.x - rect.min.x) / rect.width().max(1.0)) as f64;
-                t.scrub_to(f * t.duration);
+            let f = ((pos.x - rect.min.x) / rect.width().max(1.0)).clamp(0.0, 1.0) as f64;
+            if resp.dragged() { t.scrub_to(f * t.duration); }
+            // A tap on the bar is a seek too — the thing every player
+            // does, and the only way to seek precisely on a phone.
+            if resp.clicked() && t.duration > 0.0 {
+                act = Some(TransportAction::Seek(f * t.duration));
             }
         }
-        if resp.drag_stopped() { seek = t.end_scrub(); }
-        ui.label(egui::RichText::new(timecode(t.duration)).small());
+        if resp.drag_stopped() {
+            if let Some(at) = t.end_scrub() { act = Some(TransportAction::Seek(at)); }
+        }
+        ui.label(egui::RichText::new(if t.duration > 0.0 { timecode(t.duration) } else { "–:––".into() })
+            .small().monospace());
     });
-    seek
+    act
 }
 
 #[cfg(test)]
@@ -352,6 +486,32 @@ mod tests {
         u.report(90.0);
         u.pause();
         assert_eq!(u.resume(), Some(30.0), "the first pause wins");
+    }
+
+    #[test]
+    fn an_unknown_length_does_not_pin_the_clock_at_zero() {
+        // ffplay reports a position and no duration; the bar has no end
+        // to draw but the timecode still counts.
+        let mut t = Transport { duration: 0.0, ..playing() };
+        t.report(12.0);
+        t.tick(3.0);
+        assert!((t.position() - 15.0).abs() < 1e-9, "{}", t.position());
+        assert_eq!(t.fraction(), 0.0, "no bar without a length");
+    }
+
+    #[test]
+    fn a_seek_while_paused_becomes_the_resume_point() {
+        let mut t = playing();
+        t.report(20.0);
+        t.pause();
+        t.set_paused_at(90.0);
+        assert_eq!(t.position(), 90.0, "the handle shows it now");
+        assert_eq!(t.resume(), Some(90.0));
+        // and clearing forgets it
+        let mut u = playing();
+        u.report(5.0); u.pause(); u.clear_pause();
+        assert_eq!(u.paused_at(), None);
+        assert_eq!(u.resume(), None);
     }
 
     #[test]

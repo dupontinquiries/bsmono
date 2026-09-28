@@ -238,7 +238,16 @@ impl SendFlow {
             // "photo", not the file name: `snap-1788696974124.jpg` is a
             // sixty-pixel number nobody reads, and it pushed the strip onto a
             // second line at phone width. The path is still on `captured()`.
-            Step::Capture => self.captured.as_ref().map(|_| "photo".to_string()),
+            Step::Capture => self.captured.as_ref().map(|c| {
+                // Named by what was taken. A clip said "photo" in the
+                // stepper until the recipient opened a video.
+                let lower = c.path.to_ascii_lowercase();
+                if lower.ends_with(".mkv") || lower.ends_with(".mp4") || lower.ends_with(".webm") {
+                    "clip".to_string()
+                } else {
+                    "photo".to_string()
+                }
+            }),
             Step::Compose => self.snap.as_ref().map(|sn| {
                 if sn.caption.is_empty() {
                     format!("{} · no caption", sn.duration.label())

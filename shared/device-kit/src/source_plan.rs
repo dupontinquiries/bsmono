@@ -114,6 +114,15 @@ pub fn v4l2_pipeline(path: &str, flip: Option<&str>) -> String {
     format!("v4l2src device={path} ! {}", tail(flip))
 }
 
+/// Any GStreamer source element, with the same tail — `videotestsrc`, a
+/// `filesrc ! decodebin`, whatever a developer wants to point the app at.
+/// Reached through an override of the form `gst:<source>`; it is how a
+/// machine with no camera runs the real `gst-launch-1.0` path end to end,
+/// which a test pattern painted in-process cannot exercise.
+pub fn custom_pipeline(source: &str, flip: Option<&str>) -> String {
+    format!("{} ! {}", source.trim(), tail(flip))
+}
+
 /// Build the ordered plan. `pw_nodes` from a pw-dump probe (libcamera
 /// input nodes only); `v4l2_list_output` is `v4l2-ctl --list-devices`
 /// text (empty when the tool is absent — a desktop without v4l2-utils
@@ -128,7 +137,13 @@ pub fn plan(
     if let Some(ov) = override_source {
         if !ov.trim().is_empty() {
             let ov = ov.trim();
-            if ov.starts_with("/dev/") {
+            if let Some(src) = ov.strip_prefix("gst:") {
+                out.push(SourceCandidate {
+                    kind: SourceKind::V4l2,
+                    label: format!("override gst {}", src.split_whitespace().next().unwrap_or(src)),
+                    pipeline: custom_pipeline(src, flip),
+                });
+            } else if ov.starts_with("/dev/") {
                 out.push(SourceCandidate {
                     kind: SourceKind::V4l2,
                     label: format!("override {ov}"),
@@ -170,6 +185,23 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gst_override_becomes_a_custom_source_with_the_same_tail() {
+        // `gst:videotestsrc pattern=ball` is how a machine with no camera
+        // runs the real gst-launch path. It gets the same tail as a device
+        // candidate, so `to_fdsink` retargets it like any other.
+        let got = plan(&[], "", Some("gst:videotestsrc pattern=ball"), None);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].label, "override gst videotestsrc");
+        assert!(got[0].pipeline.starts_with("videotestsrc pattern=ball ! videoconvert !"), "{}", got[0].pipeline);
+        let fd = to_fdsink(&got[0].pipeline, 64, 48).expect("retargetable");
+        assert!(fd.ends_with("fdsink fd=1"));
+        assert!(fd.contains("width=64,height=48"));
+        // A mirrored front preview carries its flip through too.
+        let flipped = plan(&[], "", Some("gst:videotestsrc"), Some("horizontal-flip"));
+        assert!(to_fdsink(&flipped[0].pipeline, 8, 8).unwrap().contains("horizontal-flip"));
+    }
 
     // A real desktop's v4l2-ctl shape: a uvc webcam whose metadata node is
     // the second path (must not be picked), plus a v4l2loopback sink (must

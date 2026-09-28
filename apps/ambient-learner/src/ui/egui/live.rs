@@ -129,6 +129,15 @@ pub struct Live {
     pub light: Reading,
     /// Model confidence, 0..=1.
     pub confidence: Option<f32>,
+    /// How many of the four readings this device can produce at all.
+    ///
+    /// `None` means "assume all four", the QML's behaviour. The host sets it
+    /// from what has ever reported, so a phone with no barometer reads
+    /// "locked" with its one thermal sensor answering rather than
+    /// "degraded" forever — the difference between a sensor that stopped
+    /// and a sensor that was never there, which `Reading` alone cannot
+    /// carry.
+    pub expected: Option<usize>,
 }
 
 impl Default for Live {
@@ -139,6 +148,7 @@ impl Default for Live {
             pressure_hpa: Reading::missing(),
             light: Reading::missing(),
             confidence: None,
+            expected: None,
         }
     }
 }
@@ -155,7 +165,11 @@ impl Live {
     /// Health, derived from what answered rather than reported separately.
     pub fn health(&self) -> Health {
         let all = self.readings();
-        Health::from_counts(all.iter().filter(|(_, _, r)| r.available()).count(), all.len())
+        let available = all.iter().filter(|(_, _, r)| r.available()).count();
+        // Never fewer expected than answered: a host that undercounts must
+        // not turn a full set of readings into a "degraded" row.
+        let expected = self.expected.unwrap_or(all.len()).clamp(available, all.len());
+        Health::from_counts(available, expected)
     }
 
     /// The page's accent, from temperature.
@@ -257,6 +271,7 @@ mod tests {
             pressure_hpa: Reading::new(Some(1013.0), 0),
             light: Reading::new(Some(120.0), 0),
             confidence: Some(0.82),
+            expected: None,
         }
     }
 
@@ -374,5 +389,22 @@ mod tests {
             d.tick(DOT_PERIOD_MS / 50.0);
             assert!((0.0..=1.0).contains(&d.alpha()));
         }
+    }
+
+    #[test]
+    fn a_device_without_optional_sensors_is_locked_not_degraded() {
+        // One thermal sensor answering on a phone that has no barometer,
+        // hygrometer or light sensor is the whole set answering.
+        let mut l = Live { temp_c: Reading::new(Some(21.0), 1), ..Default::default() };
+        assert_eq!(l.health(), Health::Degraded, "without the count, absence reads as failure");
+        l.expected = Some(1);
+        assert_eq!(l.health(), Health::Ok);
+        // A humidity sensor that once reported and stopped IS degradation.
+        l.expected = Some(2);
+        assert_eq!(l.health(), Health::Degraded);
+        // And an undercount cannot manufacture one.
+        l.humidity_pct = Reading::new(Some(40.0), 0);
+        l.expected = Some(1);
+        assert_eq!(l.health(), Health::Ok);
     }
 }

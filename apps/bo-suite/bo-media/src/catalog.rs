@@ -56,6 +56,11 @@ pub struct Track {
 
 pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path)?;
+    // Before the pragmas and the migration: both take the write lock,
+    // and a second opener arriving mid-migration should wait rather than
+    // get SQLITE_BUSY. rusqlite's default is 5 s; said explicitly so a
+    // change to that default cannot reintroduce the race.
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -99,6 +104,23 @@ pub fn prune_orphans(conn: &Connection) -> rusqlite::Result<usize> {
 }
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    // ATOMIC, and serialized against any other connection opening the
+    // same file. Two front-ends (the Qt controller and the egui one, or
+    // the egui UI thread and its own media worker) opening a fresh
+    // database at once both read user_version 0 and both ran CREATE
+    // TABLE; the second failed with "table tracks already exists" and
+    // that side of the app ran with no library. BEGIN IMMEDIATE takes
+    // the write lock up front, so the second opener waits on the busy
+    // handler, then re-reads a version that says there is nothing to do.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let r = migrate_in_tx(conn);
+    match r {
+        Ok(()) => conn.execute_batch("COMMIT"),
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK"); Err(e) }
+    }
+}
+
+fn migrate_in_tx(conn: &Connection) -> rusqlite::Result<()> {
     let current: i32 = conn.query_row(
         "PRAGMA user_version", [], |r| r.get(0),
     ).unwrap_or(0);
@@ -1264,4 +1286,32 @@ pub fn set_app_state(conn: &Connection, key: &str, value: &str) -> rusqlite::Res
         rusqlite::params![key, value],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod open_race_tests {
+    use super::*;
+
+    #[test]
+    fn two_connections_opening_a_fresh_database_at_once_both_succeed() {
+        // The first-launch race: the UI thread and the media worker both
+        // open the same new file. Before the migration was atomic the
+        // loser got "table tracks already exists".
+        let dir = std::env::temp_dir().join(format!("bo-media-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("media.sqlite");
+        let _ = std::fs::remove_file(&path);
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let p = path.clone();
+            handles.push(std::thread::spawn(move || open(&p).map(|_| ())));
+        }
+        for h in handles {
+            h.join().unwrap().expect("a concurrent open failed");
+        }
+        let conn = open(&path).unwrap();
+        let v: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert!(v >= 5, "migrated to the current schema: {v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -420,11 +420,48 @@ mod real {
     /// can drop in without a blind hand-port. Until then, return an error
     /// that names the real blocker.
     pub struct ProtonSrp;
+
+    /// The handshake through ProtonMail's own `proton-srp`, with the
+    /// modulus verifier as a parameter so a test can run the client
+    /// against the crate's own server with an unsigned modulus. The
+    /// production path (`compute`) uses rPGP to verify the signed
+    /// modulus from `/auth/info`; nothing is pinned by hand.
+    #[cfg(feature = "mail-proton-srp")]
+    pub fn srp_proofs_with(
+        verifier: &impl proton_srp::ModulusSignatureVerifier,
+        password: &[u8],
+        info: &SrpInfo,
+    ) -> Result<SrpProofs> {
+        use proton_srp::{SRPAuth, SrpHashVersion};
+        let pw = std::str::from_utf8(password)
+            .map_err(|_| MailError::Other("password is not utf-8".into()))?;
+        let version = SrpHashVersion::try_from(info.version.clamp(0, 255) as u8)
+            .map_err(|e| MailError::Other(format!("bad SRP version {}: {e:?}", info.version)))?;
+        // username = None is right for hash version >= 3, which is every
+        // current account; the crate ignores it there.
+        let auth = SRPAuth::new(verifier, None, pw, version, &info.salt, &info.modulus,
+                                &info.server_ephemeral)
+            .map_err(|e| MailError::Other(format!("SRP init: {e}")))?;
+        let proof = auth.generate_proofs()
+            .map_err(|e| MailError::Other(format!("SRP proof: {e}")))?;
+        let b64: proton_srp::SRPProofB64 = proof.into();
+        Ok(SrpProofs {
+            client_ephemeral: b64.client_ephemeral,
+            client_proof: b64.client_proof,
+            expected_server_proof: b64.expected_server_proof,
+        })
+    }
+
     impl Srp for ProtonSrp {
+        #[cfg(feature = "mail-proton-srp")]
+        fn compute(&self, password: &[u8], info: &SrpInfo) -> Result<SrpProofs> {
+            srp_proofs_with(&proton_srp::RPGPVerifier::default(), password, info)
+        }
+        #[cfg(not(feature = "mail-proton-srp"))]
         fn compute(&self, _password: &[u8], _info: &SrpInfo) -> Result<SrpProofs> {
             Err(MailError::Other(
-                "Proton SRP login isn't wired in this build yet (needs the \
-                 proton-srp crate + a toolchain bump — see TODO_mail_srp_login.md)"
+                "Proton SRP login is not in this build — build with the \
+                 mail-proton-srp feature (see TODO_mail_srp_login.md)"
                     .into(),
             ))
         }
@@ -437,6 +474,73 @@ mod real {
             } else {
                 Err(MailError::SrpServerProof)
             }
+        }
+    }
+
+    /// The client half against the crate's own server half: what the
+    /// wire will do, minus the wire. The modulus is unsigned here (a
+    /// no-op verifier), because the signed one only exists on Proton's
+    /// side — the mapping from `SrpInfo` to proofs and the server's
+    /// acceptance of them is what this checks.
+    #[cfg(all(test, feature = "mail-proton-srp"))]
+    mod srp_round_trip {
+        use super::*;
+        use proton_srp::{ModulusSignatureVerifier, ModulusVerifyError, SRPAuth, SRPVerifierB64,
+                         ServerClientProof, ServerClientVerifier, ServerInteraction};
+
+        struct NoOp;
+        impl ModulusSignatureVerifier for NoOp {
+            fn verify_and_extract_modulus(&self, modulus: &str, _key: &str)
+                -> std::result::Result<String, ModulusVerifyError> {
+                Ok(modulus.to_string())
+            }
+        }
+
+        const MODULUS: &str = "y6TtufhYg2mIeauZYOti+GPbd/0vP66kP34TgE6elK/kXkTW/Yfrp1jMmtLiWWSq5cszTMRIEighuwPbZ/z3RrWPxsOg0+jYgbFu8yZ8vOAwrPtLxZl94x0PFTAZBrVapmCn+VYcM+UXdO9v70xFDLwj34tpPbvpODHVWHSlGlhOwndWg3XBE2D9PJopFZajNZiqOScBXree5rDgzU5BBaPbIb6nySpyaeThMCcNzpcEqE8r3ro+E/VdXBvSSJpusr1dvAwHc3IDGUzAhodqV5mjYy9nXwq/9gHWpYNtm76Ols7ReWAhZwy1+cQllQZwGfzzOVGpc+3WutOntQjM6Q==";
+
+        #[test]
+        fn the_proofs_this_side_computes_are_the_ones_the_server_accepts() {
+            let password = "correct horse battery staple";
+            // Registration: the verifier the server would hold.
+            let verifier: SRPVerifierB64 = SRPAuth::generate_verifier(&NoOp, password, None, MODULUS)
+                .expect("verifier").into();
+            let server_verifier = ServerClientVerifier::try_from(&verifier).expect("server verifier");
+            let mut server = ServerInteraction::new_with_modulus_extractor(&NoOp, MODULUS, &server_verifier)
+                .expect("server");
+            let challenge = server.generate_challenge();
+            // Login: what /auth/info would say, through OUR types.
+            let info = SrpInfo {
+                version: 4,
+                modulus: MODULUS.to_string(),
+                server_ephemeral: challenge.encode_b64(),
+                salt: verifier.salt.clone(),
+                srp_session: "session".into(),
+            };
+            let proofs = srp_proofs_with(&NoOp, password.as_bytes(), &info).expect("proofs");
+            assert!(!proofs.client_ephemeral.is_empty() && !proofs.client_proof.is_empty());
+            let client_proof = ServerClientProof::new(&proofs.client_ephemeral, &proofs.client_proof)
+                .expect("decodes");
+            let server_proof = server.verify_proof(&client_proof).expect("the server accepted the login");
+            // And the server's proof is the one we expected — the check
+            // `verify_server` makes on the real reply.
+            ProtonSrp.verify_server(&proofs, &server_proof.encode_b64())
+                .expect("the server proof matched");
+            // A wrong password is refused by the server, not by us.
+            let wrong = srp_proofs_with(&NoOp, b"wrong", &info).expect("proofs compute regardless");
+            let wrong_proof = ServerClientProof::new(&wrong.client_ephemeral, &wrong.client_proof).unwrap();
+            let mut server2 = ServerInteraction::new_with_modulus_extractor(&NoOp, MODULUS, &server_verifier).unwrap();
+            let _ = server2.generate_challenge();
+            assert!(server2.verify_proof(&wrong_proof).is_err(), "a wrong password was accepted");
+        }
+
+        #[test]
+        fn a_bad_version_or_a_bad_ephemeral_is_an_error_not_a_panic() {
+            let info = SrpInfo { version: 99, modulus: MODULUS.into(), server_ephemeral: "x".into(),
+                                 salt: "AA==".into(), srp_session: String::new() };
+            assert!(srp_proofs_with(&NoOp, b"pw", &info).is_err());
+            let info = SrpInfo { version: 4, modulus: MODULUS.into(), server_ephemeral: "not base64!".into(),
+                                 salt: "AA==".into(), srp_session: String::new() };
+            assert!(srp_proofs_with(&NoOp, b"pw", &info).is_err());
         }
     }
 

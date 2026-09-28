@@ -666,6 +666,15 @@ struct VoicetermApp {
     /// said "1 message(s)" while "Inbox" right below still said "No
     /// messages."
     mail_all: Vec<voiceterm_egui::mail_view::Message>,
+    /// Proton sign-in: the form, the worker, and the inbox it fetched.
+    mail_login: voiceterm_egui::mail_login_view::Form,
+    mail_signin: voiceterm_egui::mail_signin::SignIn,
+    mail_proton: Vec<voiceterm_egui::mail_view::Message>,
+    /// A TOTP code a 2FA account asked for, after the password.
+    mail_totp_code: String,
+    /// The Proton section collapsed: the pane is also the local mail
+    /// reader, and a sign-in form on top of a working inbox is noise.
+    mail_login_open: bool,
     /// How many blocks had been scanned for mail last time. The scan walks
     /// closed blocks and parses the email-shaped ones; re-parsing every
     /// block every frame would re-read the whole session's output at frame
@@ -1202,6 +1211,75 @@ impl VoicetermApp {
         }
     }
 
+    /// Push-to-talk: open the voice popup listening, from the FAB, the
+    /// pane menu or Ctrl+Space. Before this the only way in was the
+    /// Ctrl+P dwell — hold the palette open and say nothing for a while —
+    /// and a tap on the mic button cleared the terminal.
+    fn start_voice(&mut self) {
+        if self.surfaces.is(Surface::Voice) { return; }
+        if self.voice_popup.start(self.password_mode) {
+            self.surfaces.close_if(Surface::Palette);
+            self.surfaces.open(Surface::Voice);
+        } else {
+            self.toasts.info("the microphone is off while a password is being typed", 0.0);
+        }
+    }
+
+    /// A transcript arrived: through the one router, then the effects.
+    ///
+    /// Same chain as the typed `say:` box — a phrase means the same thing
+    /// however it got here. Shell lines are STAGED on the input line and
+    /// never run; the person presses Enter, or erases it.
+    fn on_transcript(&mut self, said: &str) {
+        use voiceterm_egui::voice_router::{route, Ctx, Routed};
+        let ctx = Ctx { jotting: self.jotting, editor: self.editor_kind };
+        let routed = route(said, &ctx, &self.cmd_docs);
+        let summary = routed.summary();
+        match routed {
+            Routed::Jot { prose, exit } => {
+                if let Some(t) = prose {
+                    self.clip_note.push_prose(&t);
+                    let saved = match &self.clip_note_path {
+                        Some(p) => voiceterm_egui::note_store::save_to(p, &self.clip_note),
+                        None => voiceterm_egui::note_store::save(&self.clip_note)
+                            .map(|p| self.clip_note_path = Some(p)),
+                    };
+                    if let Err(e) = saved {
+                        self.toasts.warning(&format!("jotted, but not saved: {e}"), 0.0);
+                    }
+                }
+                if exit { self.jotting = false; }
+                self.toasts.info(&summary, 0.0);
+            }
+            Routed::Prose(_) => self.toasts.info(&summary, 0.0),
+            Routed::Editor(a) if a.confirm => {
+                // Destructive actions WAIT for the existing confirm card.
+                self.editor_pending = Some(a);
+            }
+            Routed::Editor(a) => {
+                self.session.pty_out.extend_from_slice(a.keys.as_bytes());
+            }
+            Routed::Command(cmd) => {
+                self.run_command(cmd);
+                self.cmd_hits.clear();
+            }
+            Routed::Stage(line) => {
+                self.stage_command(&line);
+                self.bar_note = format!("staged: {line}");
+                self.cmd_hits.clear();
+            }
+            Routed::Described(_) => {
+                self.toasts.info(&summary, 0.0);
+                self.cmd_hits.clear();
+            }
+            Routed::Candidates(hits) => {
+                if hits.is_empty() { self.toasts.info(&summary, 0.0); }
+                self.cmd_hits = hits;
+            }
+        }
+        eprintln!("voiceterm: heard {said:?} -> {summary}");
+    }
+
     fn run_command(&mut self, cmd: voiceterm_egui::palette::Command) {
         use voiceterm_egui::gesture_menus::WsCall;
         use voiceterm_egui::palette::{Command, Target};
@@ -1719,10 +1797,43 @@ impl VoicetermApp {
         // for it copied the loop instead of calling it — proving that a
         // reimplementation worked, which is the one thing a test cannot
         // usefully prove.
-        let all = voiceterm_egui::mail_store::merge(
+        let mut all = voiceterm_egui::mail_store::merge(
             &self.mail_from_disk, &self.mail_messages);
-        self.mail.set_messages(&all);
-        self.mail_all = all;
+        // The account's inbox, ahead of what was found on disk and in the
+        // terminal: it is the live source, and its ids are Proton's own,
+        // so nothing on disk shares them. Same de-dup rule as the merge
+        // — by id — so a re-fetch does not double the list.
+        let mut merged: Vec<voiceterm_egui::mail_view::Message> = self.mail_proton.clone();
+        for m in all.drain(..) {
+            if !merged.iter().any(|p| p.id == m.id) { merged.push(m); }
+        }
+        self.mail.set_messages(&merged);
+        self.mail_all = merged;
+    }
+
+    /// Drain the sign-in worker and fold what it fetched into the view.
+    fn pump_mail_signin(&mut self) {
+        for ev in self.mail_signin.poll() {
+            use voiceterm_egui::mail_signin::Event;
+            match ev {
+                Event::Inbox { messages, .. } => {
+                    self.mail_login.busy = false;
+                    self.mail_proton = messages;
+                    self.rebuild_mail();
+                    self.mail_login_open = false;
+                }
+                Event::Failed { message, retryable } => {
+                    self.mail_login.busy = false;
+                    self.mail_login.error = Some(message);
+                    if !retryable { self.mail_login_open = false; }
+                }
+                Event::Unavailable => {
+                    self.mail_login.busy = false;
+                    self.mail_login.error = Some(self.mail_signin.status.clone());
+                }
+                Event::NeedsTotp | Event::SignedIn { .. } => {}
+            }
+        }
     }
 
     fn harvest_mail_from_blocks(&mut self) {
@@ -3325,9 +3436,26 @@ impl eframe::App for VoicetermApp {
             i.events.iter().any(|e| matches!(
                 e,
                 egui::Event::Key { key: egui::Key::P, pressed: true, repeat: false, modifiers, .. }
-                    if modifiers.command
+                    if modifiers.command && !modifiers.shift
             ))
         });
+        // Ctrl+Space is push-to-talk, as in the Qt build (main.qml's
+        // `Ctrl+Space` shortcut); Ctrl+Shift+P opens the palette straight
+        // to typing, the Qt v0.1.880 binding, so the two ways in match.
+        let (ctrl_space, ctrl_shift_p) = ctx.input(|i| (
+            i.events.iter().any(|e| matches!(e,
+                egui::Event::Key { key: egui::Key::Space, pressed: true, repeat: false, modifiers, .. }
+                    if modifiers.command)),
+            i.events.iter().any(|e| matches!(e,
+                egui::Event::Key { key: egui::Key::P, pressed: true, repeat: false, modifiers, .. }
+                    if modifiers.command && modifiers.shift)),
+        ));
+        if ctrl_space { self.start_voice(); }
+        if ctrl_shift_p && !self.surfaces.is(Surface::Palette) {
+            self.surfaces.open(Surface::Palette);
+            self.palette_query.clear();
+            self.palette_sel = 0;
+        }
         if ctrl_p_pressed {
             match self.palette_flow.ctrl_p_tapped() {
                 uikit_egui::palette_flow::Transition::Opened => {
@@ -3398,6 +3526,20 @@ impl eframe::App for VoicetermApp {
         let voice_open_t = overlay::openness(ctx, Surface::Voice, self.surfaces.is(Surface::Voice));
         if voice_open_t > 0.0 {
             self.voice_popup.tick();
+            // THE TRANSCRIPT REACHES THE ROUTER. `Stage::Done` was drawn
+            // and read by nothing: the voice terminal listened and did
+            // not act. Once per utterance — `take_result` hands it over
+            // a single time.
+            if let Some(said) = self.voice_popup.take_result() {
+                self.on_transcript(&said);
+                // The popup has said its piece; close it the way the Qt
+                // build's voicePopup closes after an intent is handled,
+                // so the next tap starts a fresh listen.
+                self.surfaces.close_if(Surface::Voice);
+                if self.palette_flow.mode() == uikit_egui::palette_flow::Mode::Voice {
+                    self.palette_flow.ctrl_p_tapped(); // Voice -> Off
+                }
+            }
             let close_now = overlay::show(ctx, Surface::Voice, voice_open_t, |ui| {
                 self.voice_popup.draw(ui, &self.colors);
             })
@@ -3490,6 +3632,12 @@ impl eframe::App for VoicetermApp {
 
         // Mail read in the terminal becomes mail in the mail view.
         self.harvest_mail_from_blocks();
+        self.pump_mail_signin();
+        if self.mail_signin.is_running() {
+            // The worker answers on its own thread; keep frames coming so
+            // the answer is drawn when it lands, not on the next click.
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // SAFE AREA. Nothing in the fleet applied these until now — the
@@ -3708,6 +3856,55 @@ impl eframe::App for VoicetermApp {
                             ui.label(egui::RichText::new(format!(
                                 "{} → {} thread(s)", parts.join(", "), hits.len()))
                                 .weak().size(11.0));
+                        }
+                        // THE ACCOUNT. Proton sign-in through the engine the Qt
+                        // build carried and never finished (SRP was a stub); the
+                        // proofs are real now and the inbox headers come back
+                        // over the wire. One line when signed in or collapsed,
+                        // the form when open.
+                        ui.horizontal(|ui| {
+                            let label = match &self.mail_signin.signed_in {
+                                Some(who) => format!("Proton: {who}"),
+                                None if self.mail_signin.is_running() => "Proton: signing in…".to_string(),
+                                None => "Proton: not signed in".to_string(),
+                            };
+                            let arrow = if self.mail_login_open { "▾" } else { "▸" };
+                            if ui.button(format!("{arrow} {label}")).clicked() {
+                                self.mail_login_open = !self.mail_login_open;
+                            }
+                            // Only while the form is closed: open, the form
+                            // shows the same message in full under the button.
+                            if !self.mail_signin.status.is_empty() && !self.mail_login_open {
+                                ui.add(egui::Label::new(egui::RichText::new(&self.mail_signin.status)
+                                    .weak().size(11.0)).truncate());
+                            }
+                        });
+                        if self.mail_login_open {
+                            if self.mail_signin.needs_totp {
+                                ui.horizontal(|ui| {
+                                    ui.label("code:");
+                                    let r = ui.add(egui::TextEdit::singleline(&mut self.mail_totp_code)
+                                        .id_salt("mail-totp").hint_text("6 digits").desired_width(120.0));
+                                    let go = ui.button("verify").clicked()
+                                        || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                                    if go && !self.mail_totp_code.trim().is_empty() {
+                                        let code = std::mem::take(&mut self.mail_totp_code);
+                                        self.mail_signin.totp(&code);
+                                    }
+                                });
+                            } else if let Some(creds) = voiceterm_egui::mail_login_view::login_ui(ui, &mut self.mail_login, &c) {
+                                self.mail_login.busy = true;
+                                self.mail_login.error = None;
+                                self.mail_signin.start(&creds.username, &creds.password);
+                                // A code typed up front is used the moment the
+                                // account asks for one.
+                                if let Some(t) = creds.totp { self.mail_totp_code = t; }
+                            }
+                            ui.separator();
+                        }
+                        if self.mail_signin.needs_totp && !self.mail_totp_code.is_empty() && !self.mail_login_open {
+                            let code = std::mem::take(&mut self.mail_totp_code);
+                            self.mail_signin.totp(&code);
                         }
                         // WHERE THE MAIL CAME FROM, and how to look again.
                         // An empty inbox with no explanation is
@@ -6199,7 +6396,7 @@ impl eframe::App for VoicetermApp {
                     Some(PaneAction::NewTab) => {
                         self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command("new tab".into()));
                     }
-                    Some(PaneAction::Mic) => {}
+                    Some(PaneAction::Mic) => self.start_voice(),
                     // Onto app.terminal.grid, which is what render_at
                     // draws. Paging session.grid moved a buffer nobody
                     // sees — the mistake this whole area kept making,
@@ -6242,7 +6439,10 @@ impl eframe::App for VoicetermApp {
             if self.app.prefs.voice.mic_enabled {
                 let fab = fab_rect(term_rect.shrink(10.0), 56.0);
                 let resp = mic_fab_ui(ui, fab, &self.colors);
-                let _ = self.compass.ui_from_host(ui, &resp, &mut self.app);
+                if let Some(voiceterm_egui::action_compass::TermAction::Listen)
+                    = self.compass.ui_from_host(ui, &resp, &mut self.app) {
+                    self.start_voice();
+                }
             }
         });
     }
@@ -6495,6 +6695,11 @@ fn main() -> eframe::Result<()> {
                 archive: Default::default(),
                 mail_messages: Vec::new(),
                 mail_all: Vec::new(),
+                mail_login: Default::default(),
+                mail_signin: Default::default(),
+                mail_proton: Vec::new(),
+                mail_totp_code: String::new(),
+                mail_login_open: false,
                 mail_scanned_blocks: 0,
                 mail_from_disk: Vec::new(),
                 mail_bodies_disk: std::collections::HashMap::new(),

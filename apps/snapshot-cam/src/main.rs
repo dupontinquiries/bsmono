@@ -1,166 +1,26 @@
-//! The snapshot-cam shell. The core (`lib.rs`) owns what a photo IS and where
-//! it may go; this owns the window.
-//!
-//! Deliberately thin, and behind the `app` feature, so `--no-default-features`
-//! tests the rules without a camera or a display attached.
-
-use snapshot_cam::{Roll, ShareTarget, Shot, capture_filename};
+//! The snapshot-cam window. Everything drawn is `shell::Cam`; this is the
+//! eframe host around it, behind the `app` feature.
 
 fn main() -> eframe::Result<()> {
+    const APP_ID: &str = "org.vidkit.SnapshotCam";
     eframe::run_native(
         "snapshot-cam",
-        // Glow SAID, not merely implied by the feature list.
-        //
-        // This crate's Cargo.toml documents the crash it learned first:
-        // eframe 0.34 defaults include wgpu but not glow, so
-        // Renderer::default() picks wgpu, whose default device
-        // descriptor asks for 8 colour attachments and dies on a phone
-        // GPU that allows 5.
-        //
-        // The manifest fix works only while nothing else in the build
-        // pulls egui-wgpu in. gitmind-egui declared the same glow-only
-        // features and still got wgpu through feature unification — so
-        // relying on the dependency graph to hold this steady is the
-        // part that already failed once, elsewhere.
+        // Glow SAID, not merely implied by the feature list: eframe 0.34's
+        // defaults include wgpu, whose device descriptor asks for eight
+        // colour attachments and dies on a phone GPU that allows five.
         eframe::NativeOptions {
             renderer: eframe::Renderer::Glow,
+            viewport: uikit_egui::desktop::viewport(APP_ID, "snapshot-cam", [420.0, 760.0]),
             ..Default::default()
         },
-        Box::new(|_cc| Ok(Box::new(Cam::default()))),
+        Box::new(|cc| Ok(Box::new(Host(snapshot_cam::shell::Cam::open(&cc.egui_ctx))))),
     )
 }
 
-#[derive(Default)]
-struct Cam {
-    roll: Roll,
-    /// The viewfinder's geometry. 16:9 to match what the capture stub
-    /// records, so the preview and the file agree about shape.
-    preview: snapshot_cam::preview::Preview,
-    /// The contact to send to. Free text until snapclone's contact list is
-    /// wired in — a picker over a list this app cannot yet read would be a
-    /// dropdown with nothing in it.
-    contact: String,
-    note: String,
-}
+struct Host(snapshot_cam::shell::Cam);
 
-impl eframe::App for Cam {
-    // `ui`, not `update`. eframe 0.34 makes `ui` the required method, which
-    // already hands this method a `&mut Ui` for the frame's content area —
-    // CentralPanel::show_inside(ui, ...) nests inside that Ui. The previous
-    // shape here, `.show(ui.ctx(), ...)`, called the deprecated top-level
-    // constructor with a Context pulled back out of the Ui eframe already
-    // gave us, building a second, separately-laid-out CentralPanel instead
-    // of reusing the one eframe already provides.
+impl eframe::App for Host {
     fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
-        // Fonts and the IME request, from the shared hook. Not `apply_palette`:
-        // this app sets no Visuals, so that would recolour it as well, which is
-        // a separate change. Idempotent, so per-frame is free.
-        uikit_egui::fonts::install(ui.ctx());
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            ui.heading("snapshot-cam");
-            ui.label(egui::RichText::new(
-                "photos stay on this device until you send them").weak().small());
-
-            // THE VIEWFINDER, above the shutter where a camera app puts
-            // it. 16:9 because that is what the capture stub records
-            // (1920x1080) — the preview and the photo agreeing about
-            // shape is the whole point, and a preview at a different
-            // aspect from the file would mis-teach framing.
-            //
-            // A tap sets focus in normalised sensor coordinates, which
-            // is the geometry a real frame source will need; nothing
-            // consumes it yet, so it is shown rather than stored.
-            let shown = snapshot_cam::preview::show(
-                ui, &self.preview,
-                "no camera attached — this is where the photo will be");
-            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                if ui.input(|i| i.pointer.primary_clicked()) {
-                    if let Some(s) = self.preview.to_sensor(pos, shown) {
-                        self.note = format!("focus {:.2}, {:.2}", s[0], s[1]);
-                    }
-                }
-            }
-            ui.horizontal(|ui| {
-                if ui.selectable_label(
-                    self.preview.facing == snapshot_cam::preview::Facing::Front,
-                    "front").clicked()
-                {
-                    self.preview.facing = snapshot_cam::preview::Facing::Front;
-                }
-                if ui.selectable_label(
-                    self.preview.facing == snapshot_cam::preview::Facing::Rear,
-                    "rear").clicked()
-                {
-                    self.preview.facing = snapshot_cam::preview::Facing::Rear;
-                }
-                ui.checkbox(&mut self.preview.full_bleed, "fill");
-            });
-
-            if ui.button("take photo").clicked() {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64).unwrap_or(0);
-                // The capture itself is a stub: wiring a real frame means
-                // snapclone's camera_select + frame_pump, which belong to that
-                // app's shell. The ROLL and the sharing rules are what this
-                // crate exists to get right, and they are real.
-                let name = capture_filename(now, "front", "jpg");
-                self.roll.push(Shot::new(&name, 1920, 1080, now, "front"));
-                self.note = format!("captured {name}");
-            }
-
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("send to:");
-                ui.add(egui::TextEdit::singleline(&mut self.contact).id_salt("main-self_contact"));
-            });
-
-            if !self.note.is_empty() {
-                ui.label(egui::RichText::new(&self.note).weak().small());
-            }
-
-            ui.add_space(8.0);
-            ui.separator();
-            // Counts first: "what have I shared" answered without scrolling.
-            ui.label(format!("{} photo(s) · {} local · {} shared with someone",
-                             self.roll.len(),
-                             self.roll.local_only().len(),
-                             self.roll.disclosed().len()));
-
-            let contact = self.contact.trim().to_string();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let mut acted: Option<(usize, ShareTarget)> = None;
-                for (i, s) in self.roll.shots().iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(&s.file).monospace().small());
-                        // The DISPOSITION is always visible, not on hover: a
-                        // photo somebody else can see should say so from across
-                        // the room.
-                        ui.label(egui::RichText::new(if s.disclosed() { "shared" } else { "local" })
-                            .small().weak());
-                        if s.is_local() {
-                            if ui.small_button("back up").clicked() {
-                                acted = Some((i, ShareTarget::PhotoSync));
-                            }
-                            if !contact.is_empty()
-                                && ui.small_button(format!("send to {contact}")).clicked()
-                            {
-                                acted = Some((i, ShareTarget::Contact(contact.clone())));
-                            }
-                        }
-                    });
-                }
-                if let Some((i, target)) = acted {
-                    let label = target.label();
-                    match self.roll.shots_mut()[i].share_to(target) {
-                        // Pending, not sent: the transport is not wired, and
-                        // claiming success here would be the exact lie the core
-                        // is written to avoid.
-                        Ok(()) => self.note = format!("queued for {label}"),
-                        Err(e) => self.note = e,
-                    }
-                }
-            });
-        });
+        egui::CentralPanel::default().show_inside(ui, |ui| self.0.ui(ui));
     }
 }

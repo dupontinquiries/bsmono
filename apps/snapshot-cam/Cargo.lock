@@ -238,6 +238,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "capture-kit"
+version = "0.1.0"
+dependencies = [
+ "device-kit",
+]
+
+[[package]]
+name = "capture-kit"
+version = "0.1.0"
+dependencies = [
+ "device-kit",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -317,6 +331,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "config-kit"
+version = "0.1.0"
+
+[[package]]
+name = "config-kit"
+version = "0.1.0"
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -382,6 +404,14 @@ name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
+
+[[package]]
+name = "device-kit"
+version = "0.1.0"
+
+[[package]]
+name = "device-kit"
+version = "0.1.0"
 
 [[package]]
 name = "dispatch"
@@ -628,6 +658,18 @@ checksum = "f1a05365e3b1c6d1650318537c7460c6923f1abdd272ad6842baa2b509957a06"
 dependencies = [
  "num-traits",
 ]
+
+[[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fax"
@@ -1021,6 +1063,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2160,6 +2204,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "snap-handoff"
+version = "0.1.0"
+dependencies = [
+ "config-kit",
+]
+
+[[package]]
+name = "snap-handoff"
+version = "0.1.0"
+dependencies = [
+ "config-kit",
+]
+
+[[package]]
 name = "snapclone-theme"
 version = "0.1.0"
 dependencies = [
@@ -2170,8 +2228,13 @@ dependencies = [
 name = "snapshot-cam"
 version = "0.1.0"
 dependencies = [
+ "capture-kit",
+ "config-kit",
  "eframe",
  "egui",
+ "image",
+ "snap-handoff",
+ "tempfile",
  "uikit-egui",
 ]
 
@@ -2218,6 +2281,32 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix 1.1.4",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix 1.1.4",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

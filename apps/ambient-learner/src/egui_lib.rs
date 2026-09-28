@@ -30,6 +30,41 @@ pub mod ui {
     pub mod egui;
 }
 
+/// The GTK-free core, shared with `main.rs`: `Model`, `ThermalPoller`,
+/// `Database`, the locations file, the device-state readers. Mounted here so
+/// the egui frontend opens the REAL database and polls the REAL sensors —
+/// until this line existed it could only show demo numbers, because every
+/// piece of the engine lived inside the GTK binary's `main.rs`.
+///
+/// The modules below it are the engine's own dependencies, none of which
+/// touch GTK either (`helpers` gates its two toast helpers behind the `gtk`
+/// feature, which this build never enables).
+// `dead_code` allowed on the engine modules under THIS root only: they are
+// shared with the GTK binary, which uses the maintenance and export paths
+// this frontend does not reach yet, and the warnings would say "never used"
+// about code that is used — by the other root.
+#[allow(dead_code)] pub mod engine;
+#[allow(dead_code)] pub mod dbmaint;
+#[allow(dead_code)] pub mod db_writer;
+#[allow(dead_code)] pub mod environment;
+#[allow(dead_code)] pub mod forecast;
+#[allow(dead_code)] pub mod helpers;
+#[allow(dead_code)] pub mod screen_temp_hints;
+#[allow(dead_code)] pub mod screen_temps;
+#[allow(dead_code)] pub mod seasons;
+#[allow(dead_code)] pub mod systems;
+#[allow(dead_code)] pub mod temperature_field;
+#[allow(dead_code)] pub mod world_state;
+
+// The worker systems and the DB writer were written against `main.rs`'s
+// flat namespace (`crate::Model`, `crate::ThermalPoller`, ...). Re-exported
+// at this root so the same files compile unchanged under both roots.
+pub use engine::{get_device_state, Model, SensorReading, ThermalPoller};
+
+/// The bridge from the engine to the pages: opens the store, runs the poll
+/// loop on its own thread, and turns engine values into page state.
+pub mod host;
+
 pub use ui::egui::{confidence_tint, format_temp, norm, LiveSnapshot};
 pub use ui::egui::shell::Shell;
 
@@ -62,7 +97,7 @@ impl App {
     ///
     /// Drained rather than read, so the host cannot apply the same add twice
     /// by rendering two frames before handling one.
-    pub fn take_actions(&mut self) -> Vec<ui::egui::locations::LocationAction> {
+    pub fn take_actions(&mut self) -> Vec<ui::egui::shell::Action> {
         std::mem::take(&mut self.shell.pending)
     }
 }

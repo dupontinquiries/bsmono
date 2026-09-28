@@ -55,6 +55,17 @@ nat-kit = { path = "../../../shared/nat-kit" }
 # and the Qt build's format is defined in terms of SHA-256, so matching it
 # byte for byte is not a place to substitute a different primitive.
 sha2 = "0.10"
+# SO_REUSEADDR/SO_REUSEPORT on the gossip socket, so two instances on one
+# machine can both hear the multicast group — which is how the send path
+# gets verified without two phones. std's UdpSocket exposes neither.
+# Already in the lockfile as a dependency of mio; naming it moves nothing.
+socket2 = { version = "0.5", features = ["all"] }
+# The outbox other apps drop send requests into (snapshot-cam). The
+# directory and the file shapes live in this one crate for both sides.
+snap-handoff = { path = "../../../shared/snap-handoff" }
+# The capture engine, hoisted from this crate's capture.rs so snapshot-cam
+# runs the same one. capture.rs re-exports it and keeps the coded pattern.
+capture-kit = { path = "../../../shared/capture-kit" }
 # Location freshness. Its opacity/presentation/last_seen_label are view
 # functions with no view; the wayfinder was drawing arrows without asking
 # whether the position behind them was worth pointing at.

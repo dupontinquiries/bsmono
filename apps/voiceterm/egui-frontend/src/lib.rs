@@ -475,6 +475,9 @@ pub mod voice_popup {
         pub fn finish(&mut self) {}
         /// `false` — nothing became ready.
         pub fn tick(&mut self) -> bool { false }
+        /// Nothing was ever transcribed.
+        pub fn take_result(&mut self) -> Option<String> { None }
+        pub fn start_by_wake(&mut self, _password_mode: bool) -> bool { false }
         /// Draws nothing. Not even a "voice unavailable" notice: this build
         /// has no voice controls to press, so there is nothing to explain.
         pub fn draw(&mut self, _ui: &mut egui::Ui, _colors: &uikit_egui::PaletteColors) {}
@@ -514,6 +517,28 @@ pub mod util;
 #[macro_use]
 #[path = "../../src/log.rs"]
 pub mod log;
+
+/// The Proton mail engine, mounted from the Qt build. Four modules and
+/// all of them Qt-free: typed errors, the hand-rolled JSON, the crypto
+/// seams (with the SRP handshake behind `mail-proton-srp`), and the
+/// `ureq` client for `mail.proton.me/api`. `mail.rs` — the MailHub that
+/// drives QML generators — stays behind; `mail_signin` below is its
+/// egui-side counterpart for the one flow that matters first: sign in
+/// and list the inbox.
+#[cfg(feature = "mail-proton")]
+#[path = "../../src/mail_error.rs"]
+pub mod mail_error;
+#[cfg(feature = "mail-proton")]
+#[path = "../../src/mail_json.rs"]
+pub mod mail_json;
+#[cfg(feature = "mail-proton")]
+#[path = "../../src/mail_crypto.rs"]
+pub mod mail_crypto;
+#[cfg(feature = "mail-proton")]
+#[path = "../../src/mail_proton.rs"]
+pub mod mail_proton;
+/// Sign in and list the inbox, on a worker thread, for the Mail pane.
+pub mod mail_signin;
 
 /// The detection engines, same terms again: `entity_extract` is
 /// terminal-output-as-menu, `dumb_summary` spots ASCII progress bars. Both are
@@ -714,6 +739,8 @@ pub mod note_clip;
 pub mod note_store;
 /// Jot mode: dictation into the note instead of the command parser.
 pub mod jot;
+/// The one chain from a transcript to an effect — typed or spoken.
+pub mod voice_router;
 /// Which `note_clip::Source` a clip should be filed under.
 pub mod clip_source;
 /// Finding the notes a piece of text belongs with.

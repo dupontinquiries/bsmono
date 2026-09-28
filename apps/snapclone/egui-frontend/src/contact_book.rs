@@ -188,10 +188,20 @@ impl ContactBook {
     /// honest state at load. Presence is learned from gossip after the network
     /// comes up, and a roster that showed everyone green on launch would be
     /// showing yesterday's news as today's.
+    /// KEYED BY sc-ID, not by nickname. A row named "Bee" and a gossip
+    /// record for sc-2dd464a4 are the same person, and the roster used to
+    /// show them as two — the saved contact permanently offline beside a
+    /// discovered stranger who was online. The nickname is looked up at
+    /// draw time (`Snapclone::friend_of`).
     pub fn to_peers(&self) -> Vec<crate::Peer> {
         self.entries.iter()
-            .map(|c| crate::Peer { name: c.label().to_string(), online: false })
+            .map(|c| crate::Peer { name: c.sc_id.clone(), online: false })
             .collect()
+    }
+
+    /// What to call a contact: the nickname if one was given, else the id.
+    pub fn display_name(&self, sc_id: &str) -> Option<String> {
+        self.get(sc_id).map(|c| c.label().to_string())
     }
 }
 
@@ -433,12 +443,18 @@ mod tests {
     }
 
     #[test]
-    fn a_display_row_uses_the_nickname_when_there_is_one() {
+    fn a_peer_row_is_keyed_by_id_and_the_nickname_is_looked_up() {
+        // The row's string is the ROUTING KEY, always — a nickname there
+        // split a renamed contact from their own announcements into two
+        // rows, one offline forever. The nickname is a display lookup.
         let mut b = book();
         b.rename("sc-aabbccdd", "Ada");
         let names: Vec<String> = b.to_peers().into_iter().map(|p| p.name).collect();
-        assert!(names.contains(&"Ada".to_string()));
-        assert!(names.contains(&"sc-11223344".to_string()), "and the bare id otherwise");
+        assert!(names.contains(&"sc-aabbccdd".to_string()), "{names:?}");
+        assert!(!names.contains(&"Ada".to_string()), "the nickname leaked into the key");
+        assert_eq!(b.display_name("sc-aabbccdd").as_deref(), Some("Ada"));
+        assert_eq!(b.display_name("sc-11223344").as_deref(), Some("sc-11223344"), "the bare id otherwise");
+        assert_eq!(b.display_name("sc-00000000"), None, "a stranger has no entry");
     }
 
     #[test]

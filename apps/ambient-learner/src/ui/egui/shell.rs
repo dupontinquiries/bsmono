@@ -23,6 +23,25 @@
 use super::chrome::{self, Section};
 use super::router::{self, Router};
 
+/// From this width the Live page draws its cards beside the reading
+/// rather than under it.
+pub const WIDE_LIVE_PX: f32 = 700.0;
+
+/// Everything a page can ask the host to do, in one queue.
+///
+/// The pages return their own action types (each page is testable on its
+/// own); the shell wraps them so the host drains ONE list per frame and a
+/// new page cannot add a second queue the host forgets to read — the
+/// `locations_ui` return value was dropped with `let _ =` for exactly that
+/// long, and the fix was making the queue the only path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    Location(super::locations::LocationAction),
+    Calibrate(super::calibrate::CalibrateAction),
+    History(super::history::HistoryAction),
+    Sync(super::sync::SyncAction),
+}
+
 /// Everything the pages draw from.
 ///
 /// `Default` throughout: a shell that cannot be constructed without live
@@ -80,7 +99,23 @@ pub struct Shell {
     /// Queued rather than handled here: adding or removing a location touches
     /// the database, and a UI module that writes to storage is the coupling
     /// the port was built to avoid. The host drains this.
-    pub pending: Vec<super::locations::LocationAction>,
+    pub pending: Vec<Action>,
+    /// The GTK Live page's "🎯 Calibrate" — entry, button, outcome.
+    pub calibrate: super::calibrate::Calibrate,
+    /// The GTK Live page's "🔮 Forecast" box.
+    pub forecast: super::forecast_card::ForecastCard,
+    /// Week navigation for the History page.
+    pub history_nav: super::history::Nav,
+    /// The GTK status lines under the reading: "Active sensors: 3 |
+    /// Calibrations: 2 | Model: Linear" and "● Sensors locked". Filled by
+    /// the host from the world state; empty means the host has not
+    /// reported yet, and the lines are simply not drawn.
+    pub status: Vec<String>,
+    /// The host's own log, newest last — what it opened, polled, saved,
+    /// refused. Drawn on the Debug page so the loop is visible: an app
+    /// whose engine is a black box cannot be steered when a number looks
+    /// wrong.
+    pub host_log: Vec<String>,
 }
 
 impl Shell {
@@ -144,12 +179,18 @@ impl Shell {
         }
         ui.separator();
 
-        // Keyboard shortcuts, from the table Section already owns.
-        let typed: Vec<char> = ui.ctx().input(|i| i.events.iter().filter_map(|e| match e {
-            egui::Event::Text(t) => t.chars().next(),
-            _ => None,
-        }).collect());
-        for c in typed { self.router.shortcut(c); }
+        // Keyboard shortcuts, from the table Section already owns — but
+        // not while a text field has the keyboard. Typing "21.5" into the
+        // calibrate entry used to land on "2" as a page shortcut and switch
+        // to the Model page mid-word; found by the first screenshot that
+        // typed into the field.
+        if !ui.ctx().egui_wants_keyboard_input() {
+            let typed: Vec<char> = ui.ctx().input(|i| i.events.iter().filter_map(|e| match e {
+                egui::Event::Text(t) => t.chars().next(),
+                _ => None,
+            }).collect());
+            for c in typed { self.router.shortcut(c); }
+        }
 
         // BACK. Written and tested two commits ago and called from nowhere —
         // found by the new tested-but-uncalled check, which is a fair first
@@ -165,27 +206,76 @@ impl Shell {
             self.back_unhandled = true;
         }
 
+        // Every page scrolls. The GTK pages sit in a ScrolledWindow for the
+        // same reason: on a 720px-tall phone the Live page's headline,
+        // status, sensors, forecast and calibrate card do not fit, and a
+        // page that clips its own calibrate button is a page without one.
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            self.page_ui(ui, colors, t_ms);
+        });
+    }
+
+    /// The Live page's left half: headline reading, status lines, the
+    /// sensor panel.
+    fn live_reading_ui(&mut self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors, dt_ms: f32) {
+        self.live_state.tick(dt_ms / 1000.0);
+        self.live_state.ui(ui);
+        for line in &self.status {
+            ui.colored_label(colors.text_weak, egui::RichText::new(line).small());
+        }
+        self.dot.live = self.live.readings().iter().any(|(_, _, r)| r.available());
+        self.dot.tick(dt_ms);
+        if self.dot.live { ui.ctx().request_repaint(); }
+        ui.add_space(6.0);
+        super::live::live_ui(ui, &self.live, &self.dot, colors);
+    }
+
+    /// The Live page's right half: the forecast box, the calibrate card,
+    /// the share row.
+    fn live_cards_ui(&mut self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
+        super::forecast_card::forecast_ui(ui, &self.forecast, colors);
+        ui.add_space(10.0);
+        if let Some(a) = super::calibrate::calibrate_ui(ui, &mut self.calibrate, colors) {
+            self.pending.push(Action::Calibrate(a));
+        }
+        ui.add_space(12.0);
+        ui.separator();
+        super::share_row_ui(ui, &self.live_state.snapshot, &self.contacts,
+                             &mut self.share, &mut self.shared_note);
+    }
+
+    /// The current page, inside the scroll area.
+    fn page_ui(&mut self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors, t_ms: f32) {
         match self.router.current() {
             Section::Live => {
-                // Ported from `main.rs`'s own `Page::Live` arm: headline
-                // reading, then the sensor panel, then weather-sharing —
-                // the composition that arm's own comments established as
-                // correct, not a new choice made here. `Shell` previously
-                // called only the sensor panel, which was the whole
-                // parity gap (see the module doc's history).
+                // The GTK Live page, top to bottom: the big reading with its
+                // confidence, the status lines ("Active sensors … | Model …",
+                // "● Sensors locked"), the forecast box, the calibrate
+                // button. The sensor panel and the share row are this
+                // port's own additions and keep their places after the
+                // headline and at the end.
+                //
+                // One column on a phone; two side by side where there is
+                // room, because a 960px-wide single column puts the sensor
+                // values a screen's width from their labels.
                 let dt_ms = self.advance_clock(t_ms);
-                self.live_state.tick(dt_ms / 1000.0);
-                self.live_state.ui(ui);
-                self.dot.live = self.live.readings().iter().any(|(_, _, r)| r.available());
-                self.dot.tick(dt_ms);
-                if self.dot.live { ui.ctx().request_repaint(); }
-                super::live::live_ui(ui, &self.live, &self.dot, colors);
-                ui.add_space(12.0);
-                ui.separator();
-                super::share_row_ui(ui, &self.live_state.snapshot, &self.contacts,
-                                     &mut self.share, &mut self.shared_note);
+                if ui.available_width() >= WIDE_LIVE_PX {
+                    ui.columns(2, |cols| {
+                        self.live_reading_ui(&mut cols[0], colors, dt_ms);
+                        self.live_cards_ui(&mut cols[1], colors);
+                    });
+                } else {
+                    self.live_reading_ui(ui, colors, dt_ms);
+                    ui.add_space(10.0);
+                    self.live_cards_ui(ui, colors);
+                }
             }
-            Section::History => super::history::history_ui(ui, &self.history, colors),
+            Section::History => {
+                if let Some(a) = super::history::history_page_ui(
+                    ui, &self.history, &self.history_nav, colors) {
+                    self.pending.push(Action::History(a));
+                }
+            }
             Section::Places => {
                 // locations_ui RETURNS AN ACTION and the other pages do not.
                 // Dropping it with `let _ =` would compile and would make
@@ -193,12 +283,16 @@ impl Shell {
                 // whole file exists to fix, one level down.
                 if let Some(a) = super::locations::locations_ui(
                     ui, &mut self.locations, colors, &mut self.a11y) {
-                    self.pending.push(a);
+                    self.pending.push(Action::Location(a));
                 }
             }
             Section::Map => super::map::map_ui(ui, &mut self.map, colors),
             Section::Model => super::model::model_ui(ui, &self.model, colors),
-            Section::Sync => super::sync::sync_ui(ui, &self.sync, colors),
+            Section::Sync => {
+                if let Some(a) = super::sync::sync_ui(ui, &mut self.sync, colors) {
+                    self.pending.push(Action::Sync(a));
+                }
+            }
             // DEBUG IS THE DEVELOPER SURFACES, not a placeholder. The ambience
             // background and the screen-temperature frames are both ported and
             // neither is a top-level page in the GTK build either — they live
@@ -211,8 +305,23 @@ impl Shell {
                 super::ambience::ambience_ui(
                     ui, &self.ambience, &self.sparkles, t_ms, rect, colors);
                 ui.separator();
+                // Unix nanoseconds, because that is the clock the publisher
+                // stamps frames with (`timestamp_unix_nanos`). The app's
+                // own animation clock was passed here before, and every
+                // frame showed an age of minus fifty-six years.
+                let now_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64).unwrap_or(0);
                 super::screen_temps::screen_temps_ui(
-                    ui, &self.screen_temps, (t_ms as u64) * 1_000_000, colors);
+                    ui, &self.screen_temps, now_ns, colors);
+                ui.separator();
+                chrome::card_heading(ui, "Host log");
+                if self.host_log.is_empty() {
+                    ui.colored_label(colors.text_weak, "nothing yet");
+                }
+                for line in self.host_log.iter().rev().take(40) {
+                    ui.colored_label(colors.text_weak, egui::RichText::new(line).small().monospace());
+                }
             }
         }
     }
@@ -254,13 +363,37 @@ mod tests {
     #[test]
     fn the_live_arm_draws_the_headline_and_the_share_row_too() {
         let src = include_str!("shell.rs");
-        let body = &src[src.find("match self.router.current()").expect("the dispatch moved")..];
-        let at = body.find("Section::Live").expect("Live has no arm");
-        let rest = &body[at + "Section::Live".len()..];
-        let end = rest.find("Section::").unwrap_or(rest.len());
-        let arm = &rest[..end];
+        // The composition lives in two helpers the arm calls for both the
+        // one- and two-column layouts; scan from the first to the end of
+        // the second.
+        let start = src.find("fn live_reading_ui(").expect("the reading helper moved");
+        let end = src.find("fn page_ui(").expect("page_ui moved");
+        let arm = &src[start..end];
         assert!(arm.contains("live_state.ui("), "the headline reading is missing:\n{arm}");
         assert!(arm.contains("share_row_ui("), "weather-sharing is missing:\n{arm}");
+        // The GTK page's two boxes under the reading.
+        assert!(arm.contains("forecast_ui("), "the forecast box is missing:\n{arm}");
+        assert!(arm.contains("calibrate_ui("), "the calibrate card is missing:\n{arm}");
+        // and the arm itself calls both helpers in both layouts
+        let body = &src[src.find("match self.router.current()").unwrap()..];
+        let live = &body[body.find("Section::Live").unwrap()..];
+        let live = &live[..live.find("Section::History").unwrap()];
+        assert_eq!(live.matches("live_reading_ui(").count(), 2, "both layouts draw the reading");
+        assert_eq!(live.matches("live_cards_ui(").count(), 2, "both layouts draw the cards");
+    }
+
+    #[test]
+    fn every_page_action_lands_in_the_one_queue() {
+        // Four pages return actions. Each must push into `pending`; a page
+        // whose return value is dropped has dead buttons, which is the bug
+        // the queue exists to make impossible to write quietly.
+        let src = include_str!("shell.rs");
+        let body = &src[src.find("fn live_cards_ui(").expect("the cards helper moved")..];
+        for call in ["calibrate_ui(", "history_page_ui(", "locations_ui(", "sync_ui("] {
+            let at = body.find(call).unwrap_or_else(|| panic!("{call} is not called"));
+            let after = &body[at..at + 400];
+            assert!(after.contains("self.pending.push("), "{call}'s action is dropped:\n{after}");
+        }
     }
 
     #[test]
@@ -327,6 +460,116 @@ mod tests {
 }
 
 
+/// The whole shell through egui's headless context, every section at a
+/// phone width and a desktop width, with every page holding data.
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    fn filled() -> Shell {
+        let mut s = Shell::default();
+        s.status = vec!["Active sensors: 3 | Calibrations: 4 | Model: Linear".into(), "● Sensors locked".into()];
+        s.live = super::super::live::Live {
+            temp_c: super::super::live::Reading::new(Some(21.4), 1),
+            humidity_pct: super::super::live::Reading::new(Some(48.0), 0),
+            pressure_hpa: super::super::live::Reading::new(Some(1008.0), 0),
+            light: super::super::live::Reading::new(Some(120.0), 0),
+            confidence: Some(0.65),
+            expected: Some(4),
+        };
+        s.forecast = super::super::forecast_card::ForecastCard {
+            one_hour: Some(super::super::forecast_card::Band { temp: 21.3, low: 20.8, high: 21.9 }),
+            one_day: Some(super::super::forecast_card::Band { temp: 20.1, low: 18.0, high: 22.4 }),
+            observations: 30,
+        };
+        s.calibrate.status = Some("calibrated to 21.5°C (4 total)".into());
+        s.calibrate.session = vec![(21.5, 0)];
+        s.history = super::super::history::History::new((0..7).map(|i| super::super::history::Point {
+            at: 1_700_000_000 + i * 86_400, temp_c: 19.0 + i as f32 * 0.4 }).collect());
+        s.history_nav.range = "Sep 21 – Sep 27".into();
+        s.history_nav.note = Some("exported weather_data/exports/ambient-history-20260927_040903.csv".into());
+        s.locations.set(vec![
+            super::super::locations::Location { id: 0, name: "Unknown".into(), coords: None, current: false },
+            super::super::locations::Location { id: 1, name: "Home".into(), coords: None, current: true },
+        ]);
+        s.model.stats = super::super::model::ModelStats { model_type: "Linear".into(), linear: 4, neural: 4, confidence: 0.65 };
+        s.model.set_log(vec![super::super::model::CalEntry {
+            source: super::super::model::Source::Egui, target_c: 21.5, at: 1_700_000_000 }]);
+        s.sync.db = super::super::sync::DbSummary { calibrations: 3, linear: 4, neural: 4, model_type: "Linear".into() };
+        s.sync.backend = Some(super::super::sync::TransferBackend { can_export: true, can_import: true, exports_locations: false });
+        s.sync.export_dir = "weather_data/exports".into();
+        s.sync.note = Some("exported weather_data/exports/sensors_export_20260927_041126.db".into());
+        s.host_log = (0..12).map(|i| format!("log line {i}: something the host did, at some length")).collect();
+        s
+    }
+
+    fn run(size: egui::Vec2, section: Section) -> (uikit_egui::layout_probe::Report, Vec<uikit_egui::layout_probe::Text>) {
+        let mut shell = filled();
+        shell.router.go(section);
+        let colors = uikit_egui::palette_colors("cloudscape");
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(screen);
+        let mut last = Vec::new();
+        for i in 0..4 {
+            #[allow(deprecated)]
+            let out = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    shell.ui(ui, &colors, i as f32 * 16.0);
+                });
+            });
+            last = out.shapes;
+        }
+        let compact = size.x < 600.0;
+        (uikit_egui::layout_probe::analyse(screen, &last, compact), uikit_egui::layout_probe::texts(&last))
+    }
+
+    #[test]
+    fn every_section_lays_out_without_collisions_at_phone_and_desktop_widths() {
+        for section in Section::ALL {
+            for size in [egui::vec2(360.0, 640.0), egui::vec2(1000.0, 700.0)] {
+                let (r, _) = run(size, section);
+                assert!(r.overlaps.is_empty(), "{section:?} at {size:?}: {}", r.describe());
+            }
+        }
+    }
+
+    #[test]
+    fn the_live_page_shows_the_gtk_pages_parts_on_a_phone() {
+        let (r, texts) = run(egui::vec2(360.0, 640.0), Section::Live);
+        let has = |t: &str| texts.iter().any(|g| g.text.contains(t));
+        assert!(has("Active sensors: 3"), "status line: {}", r.describe());
+        assert!(has("Forecast"), "forecast box");
+        assert!(has("Calibrate"), "calibrate card");
+        assert!(has("1 hour"), "forecast lines");
+        // The reading is the focal point: the largest text on the page.
+        let big = texts.iter().max_by(|a, b| a.rect.height().partial_cmp(&b.rect.height()).unwrap()).unwrap();
+        assert!(big.text.contains('°'), "the biggest text is not the reading: {:?}", big.text);
+    }
+
+    #[test]
+    fn on_a_desktop_the_cards_sit_beside_the_reading() {
+        let (r, texts) = run(egui::vec2(1000.0, 700.0), Section::Live);
+        assert!(r.overlaps.is_empty(), "{}", r.describe());
+        let reading = texts.iter().find(|g| g.text.contains("Active sensors")).expect("status line");
+        let forecast = texts.iter().find(|g| g.text == "1 hour").expect("forecast line");
+        assert!(forecast.rect.left() > 450.0, "the forecast is not in the right column: {:?}", forecast.rect);
+        assert!(forecast.rect.top() < reading.rect.top(),
+                "the right column starts at the top, not under the left one");
+    }
+
+    #[test]
+    fn the_calibrate_card_is_reachable_by_scrolling_on_a_short_phone() {
+        // On a 640px-tall phone the card sits below the fold; the page
+        // scrolls, so the card exists in the frame (clipped), rather than
+        // being cut off by a fixed layout that never draws it.
+        let (_, texts) = run(egui::vec2(360.0, 640.0), Section::Live);
+        assert!(texts.iter().any(|g| g.text.contains("Calibrate")), "the calibrate card was never drawn");
+    }
+}
+
+
 impl Default for Shell {
     fn default() -> Self {
         Shell {
@@ -353,6 +596,11 @@ impl Default for Shell {
             shared_note: None,
             pending: Vec::new(),
             back_unhandled: false,
+            calibrate: Default::default(),
+            forecast: Default::default(),
+            history_nav: Default::default(),
+            status: Vec::new(),
+            host_log: Vec::new(),
         }
     }
 }

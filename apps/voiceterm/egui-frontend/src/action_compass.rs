@@ -25,6 +25,12 @@ pub enum TermAction {
     StageClear,
     /// Open the in-screen find bar.
     Search,
+    /// Start listening. The centre tap of the MIC button: in the Qt build
+    /// a tap on `voiceFab` starts a capture, and here it cleared the
+    /// terminal — the one action a microphone button must never have.
+    /// `apply` does nothing for it; the host owns the voice popup and
+    /// acts on the returned action.
+    Listen,
 }
 
 impl TermAction {
@@ -35,6 +41,7 @@ impl TermAction {
             TermAction::Interrupt => "interrupt",
             TermAction::StageClear => "stage-clear",
             TermAction::Search => "search",
+            TermAction::Listen => "listen",
         }
     }
     pub fn from_id(id: &str) -> Option<TermAction> {
@@ -44,6 +51,7 @@ impl TermAction {
             "interrupt" => TermAction::Interrupt,
             "stage-clear" => TermAction::StageClear,
             "search" => TermAction::Search,
+            "listen" => TermAction::Listen,
             _ => return None,
         })
     }
@@ -55,6 +63,7 @@ impl TermAction {
             TermAction::Interrupt => "^C",
             TermAction::StageClear => "clear",
             TermAction::Search => "find",
+            TermAction::Listen => "\u{1F3A4}",
         }
     }
 }
@@ -77,6 +86,8 @@ pub fn apply(action: TermAction, app: &mut App, ctx: &egui::Context) {
         TermAction::Interrupt => app.terminal.interrupt(),
         TermAction::StageClear => app.terminal.stage("clear"),
         TermAction::Search => app.open_search(),
+        // The host's: see the variant.
+        TermAction::Listen => {}
     }
 }
 
@@ -90,7 +101,8 @@ pub struct ActionCompass {
 
 impl Default for ActionCompass {
     fn default() -> Self {
-        Self { menu: SlideMenu::new("voiceterm-action-compass").item_size(46.0), tap: TermAction::Clear }
+        // A tap on the mic LISTENS. Clear stays reachable on the compass.
+        Self { menu: SlideMenu::new("voiceterm-action-compass").item_size(46.0), tap: TermAction::Listen }
     }
 }
 
@@ -133,7 +145,7 @@ mod tests {
 
     #[test]
     fn action_ids_round_trip() {
-        for a in [TermAction::Clear, TermAction::Copy, TermAction::Interrupt, TermAction::StageClear, TermAction::Search] {
+        for a in [TermAction::Clear, TermAction::Copy, TermAction::Interrupt, TermAction::StageClear, TermAction::Search, TermAction::Listen] {
             assert_eq!(TermAction::from_id(a.id()), Some(a));
         }
         assert_eq!(TermAction::from_id("nope"), None);

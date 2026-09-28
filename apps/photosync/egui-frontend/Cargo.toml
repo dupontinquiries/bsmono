@@ -1,0 +1,86 @@
+# photosync-egui — the photo library on top of the headless `photosync` core.
+#
+# A separate crate, like every egui frontend in this tree: the core keeps its
+# "no dependencies" rule (it takes greyscale pixels and returns hashes), and
+# everything that needs a decoder, a window or a disk lives here.
+[package]
+name = "photosync-egui"
+version = "0.1.0"
+edition = "2021"
+description = "Browse, view, deduplicate, tag and share a photo library. The egui frontend for photosync."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "photosync-egui"
+path = "src/bin/photosync_egui.rs"
+required-features = ["app"]
+
+[features]
+# The fleet convention: the binary behind a default-on `app` feature, so
+# `--no-default-features` builds and tests the pages headless. The pages
+# use egui types either way; eframe (the window host) is the only thing
+# the feature adds.
+default = ["app"]
+app = ["dep:eframe"]
+
+[dependencies]
+photosync = { path = ".." }
+egui = "0.34"
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+# Decoding only, the formats a phone's camera roll actually contains.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# The index beside the library, and the XDG paths for it.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+config-kit = { path = "../../../shared/config-kit" }
+# Sharing: the per-contact exposed database weather-share is built on.
+datashare-core = { path = "../../../shared/datashare-core" }
+
+[dev-dependencies]
+tempfile = "3.8"
+# photosync-egui — the photo library on top of the headless `photosync` core.
+#
+# A separate crate, like every egui frontend in this tree: the core keeps its
+# "no dependencies" rule (it takes greyscale pixels and returns hashes), and
+# everything that needs a decoder, a window or a disk lives here.
+[package]
+name = "photosync-egui"
+version = "0.1.0"
+edition = "2021"
+description = "Browse, view, deduplicate, tag and share a photo library. The egui frontend for photosync."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "photosync-egui"
+path = "src/bin/photosync_egui.rs"
+required-features = ["app"]
+
+[features]
+# The fleet convention: the binary behind a default-on `app` feature, so
+# `--no-default-features` builds and tests the pages headless. The pages
+# use egui types either way; eframe (the window host) is the only thing
+# the feature adds.
+default = ["app"]
+app = ["dep:eframe"]
+
+[dependencies]
+photosync = { path = ".." }
+egui = "0.34"
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+# Decoding only, the formats a phone's camera roll actually contains.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# The index beside the library, and the XDG paths for it.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+config-kit = { path = "../../../shared/config-kit" }
+# Sharing: the per-contact exposed database weather-share is built on.
+datashare-core = { path = "../../../shared/datashare-core" }
+
+[dev-dependencies]
+tempfile = "3.8"

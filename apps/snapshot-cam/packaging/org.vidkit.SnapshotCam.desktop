@@ -1,0 +1,24 @@
+[Desktop Entry]
+Type=Application
+Name=snapshot-cam
+GenericName=Camera
+Comment=Take a photo, keep it on this device, and hand it to photosync or a snapclone contact when you choose to
+Exec=snapshot-cam
+Icon=org.vidkit.SnapshotCam
+Terminal=false
+Categories=Graphics;Photography;
+Keywords=camera;photo;snap;selfie;
+StartupNotify=true
+StartupWMClass=org.vidkit.SnapshotCam
+[Desktop Entry]
+Type=Application
+Name=snapshot-cam
+GenericName=Camera
+Comment=Take a photo, keep it on this device, and hand it to photosync or a snapclone contact when you choose to
+Exec=snapshot-cam
+Icon=org.vidkit.SnapshotCam
+Terminal=false
+Categories=Graphics;Photography;
+Keywords=camera;photo;snap;selfie;
+StartupNotify=true
+StartupWMClass=org.vidkit.SnapshotCam

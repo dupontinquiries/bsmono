@@ -1,0 +1,30 @@
+[package]
+name = "snap-handoff"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The file-based handoff from a camera app (snapshot-cam) to snapclone: a request file naming a photo and a contact, dropped in snapclone's outbox; snapclone sends it through its own transport and writes an outcome marker beside it. Both sides depend on this crate and on nothing of each other's. std + config-kit."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+config-kit = { path = "../config-kit" }
+
+[dev-dependencies]
+tempfile = "3.8"
+[package]
+name = "snap-handoff"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The file-based handoff from a camera app (snapshot-cam) to snapclone: a request file naming a photo and a contact, dropped in snapclone's outbox; snapclone sends it through its own transport and writes an outcome marker beside it. Both sides depend on this crate and on nothing of each other's. std + config-kit."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+config-kit = { path = "../config-kit" }
+
+[dev-dependencies]
+tempfile = "3.8"

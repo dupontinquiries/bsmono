@@ -1,0 +1,24 @@
+[package]
+name = "capture-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A camera frame source for the fleet's shells: probe the machine (pw-dump, v4l2-ctl), build a plan with device-kit, run each candidate pipeline as a gst-launch-1.0 subprocess reading fixed-size RGBA frames off its stdout, latest-frame-wins into a shared slot, with a stop contract and a bounded restart policy. Plus a test pattern for machines with no camera. Hoisted from snapclone's capture.rs so snapshot-cam (and the next camera app) do not carry a second copy. std-only; no GStreamer is linked."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+device-kit = { path = "../device-kit" }
+[package]
+name = "capture-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A camera frame source for the fleet's shells: probe the machine (pw-dump, v4l2-ctl), build a plan with device-kit, run each candidate pipeline as a gst-launch-1.0 subprocess reading fixed-size RGBA frames off its stdout, latest-frame-wins into a shared slot, with a stop contract and a bounded restart policy. Plus a test pattern for machines with no camera. Hoisted from snapclone's capture.rs so snapshot-cam (and the next camera app) do not carry a second copy. std-only; no GStreamer is linked."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+device-kit = { path = "../device-kit" }

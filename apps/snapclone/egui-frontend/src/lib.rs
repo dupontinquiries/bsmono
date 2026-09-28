@@ -47,6 +47,7 @@ pub mod unified_nav;
 pub mod friends;
 pub mod modal;
 pub mod snaps;
+pub mod inbox_store;
 pub mod session;
 pub mod ring;
 /// Camera pixels to a payload string -- the half of the scanner that did not
@@ -320,6 +321,11 @@ pub struct Snapclone {
     /// file. `None` until a file picker exists — which is why the import
     /// action reports what is missing rather than failing silently.
     pub pending_vcard_text: Option<String>,
+    /// The path row under the add-peer form, and its field.
+    pub vcard_row_open: bool,
+    pub vcard_path: String,
+    /// A file the host should read and hand back as `VCardLoaded`.
+    pub pending_vcard_read: Option<String>,
     /// What the last import attempt did, shown to the person. A count of
     /// what was read and what was skipped, because "3 imported, 1
     /// skipped" is actionable and a silent difference is not.
@@ -420,6 +426,8 @@ pub struct Snapclone {
     /// Confirm layer — it is a question that must be answered, so it sits above
     /// any dialog already open.
     pub incoming_call: Option<crate::ring::IncomingCall>,
+    /// The sc-ID behind `incoming_call`, whose sheet shows a nickname.
+    pub ringing_from: Option<String>,
     /// Calls that ended without being taken, for the missed-call list. A
     /// timeout and a decline are recorded apart: same effect, different history.
     pub missed_calls: Vec<String>,
@@ -486,6 +494,10 @@ pub struct Snapclone {
     /// badge. Bounded by count and bytes; a snap is view-once and the
     /// oldest go first.
     pub received: Vec<crate::snaps::Snap>,
+    /// The open snap's decoded picture. Lives beside the viewer rather
+    /// than in it so `snaps.rs` stays free of the GPU: the texture needs a
+    /// context, the viewer's tests do not have one.
+    pub snap_picture: crate::snaps::SnapTexture,
     /// A menu chose "View": opened on the next frame, which has a surface.
     pub pending_open: Option<String>,
     /// "Someone is looking at this screen", from the gaze layer.
@@ -783,6 +795,19 @@ pub struct Snapclone {
     pub wayfinder_snaps: Vec<(String, String)>,
     gesture: GestureLayer,
     palette: String,
+    /// The kit's touch bridge for the viewfinder's pinch: two fingers, a
+    /// trackpad pinch and ctrl+wheel all arrive as one `Gesture::Pinch`.
+    /// Polled once per frame in `ui`; the camera page reads the batch.
+    zoom_touch: uikit_egui::touch::TouchSource,
+    zoom_rec: uikit_egui::touch::GestureRecognizer,
+    frame_gestures: Vec<uikit_egui::touch::Gesture>,
+    /// A second finger went down during this press: the page swipe stands
+    /// down until every finger lifts. Without this the first finger of a
+    /// pinch, which egui also reports as the pointer, drags the page.
+    two_finger_latch: bool,
+    /// A press event `tick_feedback` saw at the top of the frame that the
+    /// camera page has yet to read — see `tick_feedback`.
+    press_pending: Option<crate::press_gesture::Event>,
 }
 
 
@@ -858,6 +883,9 @@ impl Snapclone {
             reachable_shown: false,
             a11y: uikit_egui::a11y::A11yScene::new(),
             pending_vcard_text: None,
+            vcard_row_open: false,
+            vcard_path: String::new(),
+            pending_vcard_read: None,
             import_report: None,
             group_voice: Default::default(),
             voice_fx: Default::default(),
@@ -877,6 +905,7 @@ impl Snapclone {
             login: Default::default(),
             now_secs: 0,
             incoming_call: None,
+            ringing_from: None,
             missed_calls: Vec::new(),
             qr: None,
             voicebar: crate::voicebar::VoiceBar::new(),
@@ -896,6 +925,7 @@ impl Snapclone {
             video: None,
             menu: Default::default(),
             received: Vec::new(),
+            snap_picture: Default::default(),
             pending_open: None,
             attention: Default::default(),
             menu_target: None,
@@ -1078,10 +1108,18 @@ impl Snapclone {
             bg: LiveBackground::new(BgStyle::Aurora),
             gesture: GestureLayer::horizontal_page(320.0),
             palette: String::new(),
+            zoom_touch: uikit_egui::touch::TouchSource::new(),
+            zoom_rec: uikit_egui::touch::GestureRecognizer::default(),
+            frame_gestures: Vec::new(),
+            two_finger_latch: false,
+            press_pending: None,
             // Built from the same peers, once, so the two cannot drift.
             roster: {
+                // No book yet at construction, so the id is the label;
+                // `sync_roster` re-derives once contacts load.
                 let mut r = crate::friends::Roster::default();
-                r.set(peers.iter().map(Snapclone::friend_of).collect());
+                r.set(peers.iter().map(|p| crate::friends::Friend {
+                    id: p.name.clone(), name: p.name.clone(), online: p.online }).collect());
                 r
             },
             peers,
@@ -1099,12 +1137,15 @@ impl Snapclone {
         s
     }
 
-    fn friend_of(p: &Peer) -> crate::friends::Friend {
+    fn friend_of(&self, p: &Peer) -> crate::friends::Friend {
         crate::friends::Friend {
-            // A discovered Peer has one string standing for both its routable
-            // id and its name; a real contact record separates them, and the
-            // Friend row is built to take either.
-            id: p.name.clone(), name: p.name.clone(), online: p.online,
+            // The Peer's one string is its routable id. The name is the
+            // contact book's nickname when there is one — looked up here,
+            // at draw time, so a rename changes the label and never the
+            // key a gossip record has to match.
+            id: p.name.clone(),
+            name: self.contact_book.display_name(&p.name).unwrap_or_else(|| p.name.clone()),
+            online: p.online,
         }
     }
 
@@ -1112,7 +1153,8 @@ impl Snapclone {
     /// keeping a second list in parallel means the day an update misses one of
     /// them, the page shows someone as online who left an hour ago.
     pub fn sync_roster(&mut self) {
-        self.roster.set(self.peers.iter().map(Snapclone::friend_of).collect());
+        let friends: Vec<crate::friends::Friend> = self.peers.iter().map(|p| self.friend_of(p)).collect();
+        self.roster.set(friends);
     }
 
     /// A gossip record arrived. Returns whether it was accepted.
@@ -1124,8 +1166,15 @@ impl Snapclone {
     /// peer.
     pub fn on_gossip(&mut self, rec: crate::gossip::PeerRecord, datagram_len: usize,
                      public: Option<[u8; 32]>) -> bool {
-        if crate::gossip::accept(&rec, datagram_len, &self.local_id).is_err() {
-            return false;
+        match crate::gossip::accept(&rec, datagram_len, &self.local_id) {
+            Ok(()) => {}
+            // Our own announce, back off the multicast group: the ordinary
+            // consequence of loopback being on, not a refusal worth a
+            // warning. Reported as admitted so the host's "gossip refused"
+            // line stays about strangers — it fired on every launch for
+            // the echo and made discovery look broken from the start.
+            Err(crate::gossip::Reject::SelfEcho) => return true,
+            Err(_) => return false,
         }
         // THE PIN, checked before anything is believed. `accept` proves the
         // datagram was signed by the key whose fingerprint is its sc-ID; it
@@ -2362,10 +2411,11 @@ impl Snapclone {
                 // for this contact, so it is refused rather than applied — the
                 // row would become unidentifiable and unfindable.
                 if !to.is_empty() {
+                    // The book only. The Peer row keeps the id as its key;
+                    // `friend_of` reads the nickname back out of the book.
+                    // Writing the nickname over the id here is what split a
+                    // renamed contact from their own gossip announcements.
                     if self.contact_book.rename(&id, &to) { self.contacts_dirty = true; }
-                    if let Some(p) = self.peers.iter_mut().find(|p| p.name == id) {
-                        p.name = to;
-                    }
                     self.sync_roster();
                 }
             }
@@ -2460,7 +2510,10 @@ impl Snapclone {
                             id: id.clone(), name, is_self: false });
                     }
                     self.group_voice.set_participants(people);
-                    self.group_voice.join();
+                    // Through set_in_call, which also starts play-out and
+                    // resets the sender. `group_voice.join()` alone left
+                    // the previous call's frames queued into this one.
+                    self.set_in_call(true);
                     self.call_note = match self.punch.get(&id) {
                         Some(_) => format!("calling {id}"),
                         // The honest version of a call that cannot work: no
@@ -2496,16 +2549,12 @@ impl Snapclone {
                 // file dialog and the store write, so this reports what
                 // it would have imported rather than pretending to have
                 // done it.
-                self.import_report = Some(match &self.pending_vcard_text {
-                    Some(text) => {
-                        let (found, skipped) = crate::vcard::parse(text);
-                        format!(
-                            "vCard: {} contact(s) read, {skipped} skipped — no store yet",
-                            found.len()
-                        )
-                    }
-                    None => "vCard import needs a file picker — not wired yet".to_string(),
-                });
+                match self.pending_vcard_text.take() {
+                    // Text handed in directly (a share, a test): import it.
+                    Some(text) => self.import_vcard_text(&text),
+                    // Otherwise open the path row under the form.
+                    None => { self.vcard_row_open = true; self.import_report = None; }
+                }
             }
         }
     }
@@ -2533,9 +2582,23 @@ impl Snapclone {
         const EDGE_BACK_WIDTH: f32 = 32.0;
         use crate::swipe_physics::Intent;
         let t_ms = ui.input(|i| i.time) as f32 * 1000.0;
-        let (down, pos) = ui.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos()));
+        let (down, pos, two_fingers) = ui.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos(), i.multi_touch().is_some()));
 
-        if down {
+        // TWO FINGERS ARE A PINCH, NOT A PAGE. egui reports the first finger
+        // as the pointer too, so without this the start of every pinch on
+        // the viewfinder was a page drag. Whatever the first finger began
+        // springs back, and nothing begins again until every finger lifts.
+        if two_fingers && !self.two_finger_latch {
+            self.two_finger_latch = true;
+            if let Some(sw) = self.swipe.take() {
+                self.swipe_settle = Some((sw.offset(), 150.0, 150.0));
+            }
+            self.touch_origin = None;
+            self.axis_lock.release();
+        }
+        if !down { self.two_finger_latch = false; }
+
+        if down && !self.two_finger_latch {
             if let Some(p) = pos {
                 let origin = *self.touch_origin.get_or_insert(p);
                 let (dx, dy) = (p.x - origin.x, p.y - origin.y);
@@ -2764,7 +2827,10 @@ impl Snapclone {
         // is looking at this page.
         if let Some(call) = self.incoming_call.as_mut() {
             let caller = call.caller_name.clone();
-            if let Some(a) = call.tick(dt * 1000.0) { self.finish_call(&caller, a); }
+            if let Some(a) = call.tick(dt * 1000.0) {
+                let caller = self.ringing_from.take().unwrap_or(caller);
+                self.finish_call(&caller, a);
+            }
         }
     }
 
@@ -2896,7 +2962,7 @@ impl Snapclone {
     /// Join or leave the group voice channel.
     pub fn toggle_voice(&mut self) {
         if self.group_voice.joined {
-            self.group_voice.leave();
+            self.set_in_call(false);
             self.voicebar.set_on_air(false);
             // The floor goes with the call. Left set, the bar names
             // whoever spoke last for as long as the app is open — a label
@@ -2904,7 +2970,7 @@ impl Snapclone {
             // is over.
             self.voicebar.clear_talker();
         } else {
-            self.group_voice.join();
+            self.set_in_call(true);
         }
     }
 
@@ -2925,6 +2991,12 @@ impl Snapclone {
     pub fn open_qr_scan(&mut self, camera: bool) {
         self.qr = Some(if camera { crate::qr::QrScan::scanning() }
                        else { crate::qr::QrScan::manual_only() });
+        // The viewfinder's scan mode follows the dialog: it throttles the
+        // frame rate while the decoder runs, and nothing else. It used to be
+        // a toggle of its own on the camera page that ran NO decoder — the
+        // decoder is driven by `qr.is_scanning()` — so "scan" there lit a
+        // label and did nothing.
+        self.viewfinder.scan_mode = camera;
         // THE REVEAL RESTARTS ON EVERY OPEN. `qr_shown_at` is the clock the
         // fractal reveal runs from, and it used to be cleared only by the
         // dialog's own "close" button — so a dialog dismissed any other way
@@ -2951,7 +3023,16 @@ impl Snapclone {
     pub fn apply_scan(&mut self, c: crate::qr::ScannedContact) {
         self.apply_friends(crate::friends::Action::Add(
             crate::friends::AddPeer { host: c.sc_id, port: c.port }));
+        self.close_qr();
+    }
+
+    /// Close the scanner however it was opened: the dialog, the reveal
+    /// clock and the viewfinder's scan mode together, so no path leaves
+    /// the camera throttled to scan speed with nothing scanning.
+    pub fn close_qr(&mut self) {
         self.qr = None;
+        self.qr_shown_at = None;
+        self.viewfinder.scan_mode = false;
         self.modal.dismiss("qr");
     }
 
@@ -2962,7 +3043,12 @@ impl Snapclone {
 
     /// A voice packet arrived for a conversation whose thread is not open.
     pub fn ring(&mut self, caller: &str) {
-        self.incoming_call = Some(crate::ring::IncomingCall::new(caller));
+        // Named by the book, so the sheet says "Ada" rather than an id.
+        let shown = self.contact_book.display_name(caller).unwrap_or_else(|| caller.to_string());
+        self.incoming_call = Some(crate::ring::IncomingCall::new(&shown));
+        // The sc-ID, which is what answering needs to join: the sheet
+        // carries the display name, this carries the key.
+        self.ringing_from = Some(caller.to_string());
         self.modal.present(&format!("call:{caller}"), crate::modal::Layer::Confirm,
                            crate::modal::Rect::new(0.0, 400.0, 400.0, 300.0),
                            // NOT dismiss-on-tap-outside: a stray tap while the
@@ -2974,8 +3060,11 @@ impl Snapclone {
     /// Apply an answer: dismiss the sheet, and open the thread if it was taken.
     pub fn answer_call(&mut self, a: crate::ring::Answer) {
         let Some(call) = self.incoming_call.as_mut() else { return };
-        let caller = call.caller_name.clone();
+        let shown = call.caller_name.clone();
         if call.answer(a).is_none() { return; }
+        // The sheet shows a nickname; the call is joined, and the modal
+        // keyed, by the sc-ID it came from.
+        let caller = self.ringing_from.take().unwrap_or(shown);
         self.finish_call(&caller, a);
     }
 
@@ -2985,7 +3074,17 @@ impl Snapclone {
         match a {
             Answer::Accepted => {
                 self.conversation_peer = caller.to_string();
-                self.group_voice.joined = true;
+                // The caller is a participant, or the host's peer table —
+                // built from the participant list — never admits their
+                // frames and an answered call is silent.
+                let mut people = self.group_voice.participants.clone();
+                if !people.iter().any(|p| p.id == caller) {
+                    let name = self.contact_book.display_name(caller).unwrap_or_else(|| caller.to_string());
+                    people.push(crate::group_voice::Participant {
+                        id: caller.to_string(), name, is_self: false });
+                }
+                self.group_voice.set_participants(people);
+                self.set_in_call(true);
             }
             // Both rejections drop the buffered packets; only the ignored one
             // is a MISSED call.
@@ -3235,10 +3334,15 @@ impl Snapclone {
     /// The routing lives here, once, rather than at each tile: a tile that
     /// picked its own viewer would eventually pick the wrong one.
     /// Remember an arrived snap so it can be opened. See `received`.
-    pub fn keep_received(&mut self, snap: crate::snaps::Snap) {
+    pub fn keep_received(&mut self, mut snap: crate::snaps::Snap) {
         const MAX_COUNT: usize = 48;
         const MAX_BYTES: usize = 96 * 1024 * 1024;
         if self.received.iter().any(|s| s.id == snap.id) { return; }
+        // Named by OUR book, not by the sender: the viewer's header read
+        // "sc-8fd30abd" over a photo from a friend saved as Ada. Here
+        // rather than at the wire, so a snap restored from the inbox on
+        // disk gets the same name as one that just arrived.
+        if let Some(name) = self.contact_book.display_name(&snap.sender_id) { snap.sender_name = name; }
         self.received.push(snap);
         while self.received.len() > MAX_COUNT
             || self.received.iter().map(|s| s.bytes.len()).sum::<usize>() > MAX_BYTES
@@ -3290,6 +3394,9 @@ impl Snapclone {
     pub fn close_snap(&mut self) {
         let id = self.viewer.current().map(|s| s.id.clone()).unwrap_or_default();
         self.viewer.close();
+        // The picture goes with the bytes: a texture outliving the wipe is
+        // the ephemeral promise kept in RAM and broken in VRAM.
+        self.snap_picture.clear();
         self.modal.dismiss(&format!("snap:{id}"));
     }
 
@@ -3322,6 +3429,11 @@ impl Snapclone {
                     self.snap_state_dirty = true;
                 }
                 if !self.snaps_expired.contains(&id) { self.snaps_expired.push(id.clone()); }
+                self.snap_picture.clear();
+                // And it leaves the received set: an expired snap that
+                // `open_received` could still find is one that can be
+                // reopened after its timer ran out.
+                self.received.retain(|s| s.id != id);
                 self.modal.dismiss(&format!("snap:{id}"));
             }
             V::Saved(_, path) => self.last_saved = Some(path),
@@ -3439,7 +3551,7 @@ impl Snapclone {
             self.modal.dismiss_all();
             self.viewer.close();
             self.video = None;
-            self.qr = None;
+            self.close_qr();
             self.editor_id.clear();
         }
         let dt_ms = ui.input(|i| i.stable_dt).min(0.1) * 1000.0;
@@ -3474,6 +3586,10 @@ impl Snapclone {
         // was a guess that either worked or did nothing, with no feedback
         // in between. On a phone that is the difference between a control
         // and a lottery.
+        // The pinch bridge, every frame whatever page is up: it tracks
+        // live contacts from raw events, and a frame it does not see leaves
+        // a finger "down" that lifted elsewhere.
+        self.frame_gestures = self.zoom_touch.poll(ui.ctx(), &mut self.zoom_rec).0;
         let page_offset = self.tick_page_swipe(ui, surface, dt_ms);
 
         // The layer still runs, for the trackpad two-finger path and the
@@ -3587,8 +3703,17 @@ impl Snapclone {
                     if child.button("close").clicked() {
                         self.close_video(&vid);
                     }
-                    if let Some(crate::video_viewer::VideoEvent::Closed) = ev {
-                        self.close_video(&vid);
+                    match ev {
+                        Some(crate::video_viewer::VideoEvent::Closed) => self.close_video(&vid),
+                        // SAVE WROTE NOTHING: the event named a destination
+                        // and no arm existed for it, so "Save" was a button
+                        // that closed nothing and copied nothing. The
+                        // received bytes go through the same KeepSnap path
+                        // the feed menu uses, into snap storage.
+                        Some(crate::video_viewer::VideoEvent::Saved(_)) => {
+                            if !self.snaps_saved.contains(&vid) { self.snaps_saved.push(vid.clone()); }
+                        }
+                        Some(crate::video_viewer::VideoEvent::Unplayable) | None => {}
                     }
                 });
             }
@@ -3610,7 +3735,18 @@ impl Snapclone {
                 let ctx = ui.ctx().clone();
                 crate::modal::body_ui(&ctx, "snap", crate::modal::Layer::Dialog, area,
                         colors.bg_base, |child: &mut egui::Ui| {
-                    let evs = crate::snaps::viewer_ui(child, &mut self.viewer, &colors);
+                    // THE PICTURE. The viewer drew a frame, a countdown and
+                    // a caption around an empty rectangle: the one thing a
+                    // snap app must show was the one thing it never did.
+                    let tex = match self.viewer.current() {
+                        Some(s) if s.media == crate::snaps::Media::Image =>
+                            self.snap_picture.get(child.ctx(), s).cloned(),
+                        _ => None,
+                    };
+                    let evs = crate::snaps::viewer_ui_with(child, &mut self.viewer, &colors, tex.as_ref());
+                    if let Some(why) = self.snap_picture.error() {
+                        child.colored_label(colors.warning, why);
+                    }
                     if child.button("close").clicked() { self.close_snap(); }
                     // Events go through the SAME handler open_snap uses, so a snap
                     // viewed and one expired reach storage by one path.
@@ -3724,6 +3860,11 @@ impl Snapclone {
                 let ctx = ui.ctx().clone();
                 let scanned = crate::modal::body_ui(&ctx, "qr", crate::modal::Layer::Dialog, area,
                         colors.bg_card, |child: &mut egui::Ui| {
+                    // The body scrolls: with the live picture in the well the
+                    // scanner, the typed-code form and MY CODE are taller
+                    // than a short phone's dialog, and the alternative — a
+                    // smaller well — is a smaller code to aim at.
+                    egui::ScrollArea::vertical().id_salt("qr-dialog").auto_shrink([false, true]).show(child, |child| {
                     let mut scanned = None;
                     if let Some(q) = self.qr.as_mut() {
                         // With the diagnosis, so the scanner can say whether it is looking or
@@ -3734,7 +3875,11 @@ impl Snapclone {
                             self.scan_counts,
                             self.scan_hit.as_deref(),
                         );
-                        scanned = crate::qr::qr_ui_diag(child, q, &colors, diag);
+                        // THE LIVE PICTURE, in the popup. The camera page's
+                        // "scan" toggle used to leave the code under the
+                        // shutter, the dropdown and the step strip; the
+                        // dialog is above all of them.
+                        scanned = crate::qr::qr_ui_diag(child, q, &colors, diag, self.cam_texture.as_ref());
                     }
                     // BOTH HALVES. qr_ui reads somebody else's code; my_code_ui
                     // shows yours so they can read it back. With only the scanner,
@@ -3746,9 +3891,7 @@ impl Snapclone {
                         self.qr_expanded = Some(uikit_egui::qr::Expanded::open(ui.input(|i| i.time)));
                     }
                     if child.button("close").clicked() {
-                        self.qr = None;
-                        self.qr_shown_at = None;
-                        self.modal.dismiss("qr");
+                        self.close_qr();
                     }
                     // apply_scan is the EXISTING path — it adds the peer the same
                     // way a typed address does and dismisses the dialog itself. I
@@ -3757,6 +3900,7 @@ impl Snapclone {
                     // a different kind of contact from a typed one, which is
                     // exactly what apply_scan's doc says it exists to prevent.
                     scanned
+                    }).inner
                 });
                 if let Some(sc) = scanned {
                     self.apply_scan(sc);
@@ -4004,6 +4148,9 @@ impl Snapclone {
         // costs nothing on the overwhelming majority of frames — the phone is
         // not at your ear.
         crate::posture::dim_overlay_ui(ui, posture, ui.ctx().screen_rect());
+        // A press event no page read this frame (the press began on the
+        // viewfinder and the user swiped away) is not saved for later.
+        self.press_pending = None;
     }
 
     /// Advance the interaction layer. Called once per frame from `ui` so the
@@ -4033,9 +4180,14 @@ impl Snapclone {
         }
         if !pointer_down && !self.press.is_idle() {
             // The finger is gone. A release from Held emits nothing (the long
-            // press already fired), which is exactly right — this is cleanup,
-            // not a second event.
-            let _ = self.press.release();
+            // press already fired), which is exactly right — this is cleanup.
+            // A release from Pressing is a TAP, and this runs at the top of
+            // the frame, before the camera page reads the machine: dropping
+            // it here (which this did, with a `let _`) meant no tap on the
+            // viewfinder ever focused and no double tap ever flipped — the
+            // page always found the machine already idle. Kept for the
+            // page; `ui` clears it at the end of the frame if no page took it.
+            if let Some(ev) = self.press.release() { self.press_pending = Some(ev); }
         }
         // Still consulted: it is the suspend/resume path, where a single huge
         // dt lands and no pointer state is trustworthy.
@@ -4155,6 +4307,16 @@ impl Snapclone {
             });
             r.response.rect
         };
+        // DIGITAL ZOOM, while the picture is live. A pinch over the picture
+        // (two fingers, a trackpad, ctrl+wheel) zooms about the fingers; a
+        // one-finger drag pans while zoomed. Not while composing — the frame
+        // is frozen and the file already taken, so a zoom then would show
+        // a picture the file does not hold — and not while the QR popup is
+        // scanning over this page.
+        if live && !self.viewfinder.scan_mode && !self.modal.blocks_input() {
+            let gestures = std::mem::take(&mut self.frame_gestures);
+            if self.viewfinder.zoom_gestures(&gestures, vf_rect) { ui.ctx().request_repaint(); }
+        }
         // THE CAPTION ON THE PHOTO, from Compose on — the composer's paintEvent.
         if self.send_flow.step() >= crate::send_flow::Step::Compose {
             crate::composer_ui::caption_overlay(&ui.painter_at(vf_rect), vf_rect, &self.composer);
@@ -4186,7 +4348,7 @@ impl Snapclone {
                     self.advance_to_recipients();
                 }
             }
-            let ev = self.press.tick(dt_ms).or_else(|| {
+            let ev = self.press_pending.take().or_else(|| self.press.tick(dt_ms)).or_else(|| {
                 if ui.input(|i| i.pointer.any_released()) { self.press.release() } else { None }
             });
             match ev {
@@ -4234,6 +4396,13 @@ impl Snapclone {
                     egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(
                         c.accent.r(), c.accent.g(), c.accent.b(), a)));
             }
+        }
+        // THE ZOOM CHIP, after the press surface above so it is the topmost
+        // widget where it sits: a tap on it goes back to 1× and is not also
+        // a focus tap. Only drawn while zoomed.
+        {
+            let picture = self.viewfinder.image_rect(vf_rect).intersect(vf_rect);
+            uikit_egui::zoom::chip_ui(ui, &mut self.viewfinder.zoom, picture, ui.id().with("zoom-chip"));
         }
         // THE CAPTURE FLASH, over the preview and under the chrome: the
         // confirmation the shutter never had. Advanced here rather than in a
@@ -4506,7 +4675,16 @@ impl Snapclone {
                                 Some(Ok(r)) => Some(r.clone()),
                                 _ => None,
                             };
-                            let out = crate::video_spill::spill_path(0).with_extension("mkv");
+                            // Named after THIS spill, not spill 0: every clip
+                            // encoded to `0.mkv`, ffmpeg (rightly, no `-y`)
+                            // refused to overwrite the first one, and every
+                            // recording after it failed with "Error opening
+                            // output file". Seen on the second clip of a
+                            // session under Xvfb.
+                            let out = match &ready {
+                                Some(r) => r.path.with_extension("mkv"),
+                                None => crate::video_spill::spill_path(0).with_extension("mkv"),
+                            };
                             let why = match &spilled {
                                 Some(Err(e)) => format!("nothing to encode \u{2014} {e}"),
                                 // No spill at all means no recording was running — not a
@@ -4615,8 +4793,11 @@ impl Snapclone {
             if ui.selectable_label(self.viewfinder.full_bleed, "fill").clicked() {
                 self.viewfinder.full_bleed = !self.viewfinder.full_bleed;
             }
+            // THE POPUP, not an in-place mode: the code being aimed at is
+            // shown big in a dialog above the controls, and the decoder
+            // runs — the old toggle throttled the camera and lit a label.
             if ui.selectable_label(self.viewfinder.scan_mode, "scan").clicked() {
-                self.viewfinder.scan_mode = !self.viewfinder.scan_mode;
+                if self.qr.is_some() { self.close_qr(); } else { self.open_qr_scan(true); }
             }
         });
         } // end of the camera's chrome (step 1 only)
@@ -4964,6 +5145,52 @@ impl Snapclone {
             ui, &self.roster, &mut self.cards, &mut self.add_form, &info, c) {
             self.apply_friends(a);
         }
+        // THE IMPORT ROW. "Import vCard" opened nothing: the parse was
+        // ported and the button reported "needs a file picker". A path
+        // field is the picker a phone can type or paste into; the host
+        // reads the file and the parse lands in the book.
+        if self.vcard_row_open {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.vcard_path)
+                    .hint_text("~/contacts.vcf").desired_width(220.0).id_salt("vcard-path"));
+                if ui.button("read").clicked() && !self.vcard_path.trim().is_empty() {
+                    self.pending_vcard_read = Some(self.vcard_path.trim().to_string());
+                }
+                if ui.button("×").clicked() { self.vcard_row_open = false; }
+            });
+        }
+        if let Some(r) = &self.import_report {
+            ui.colored_label(c.text_weak, r);
+        }
+    }
+
+    /// The host read a vCard file (or failed to). Every card carrying a
+    /// snapclone id becomes a contact — named as the card names it — and
+    /// the rest are counted: a card with no sc-ID has nothing to route to.
+    pub fn import_vcard_text(&mut self, text: &str) {
+        let (found, skipped) = crate::vcard::parse(text);
+        let mut added = 0;
+        let mut no_id = 0;
+        let now = self.now_secs.max(0) as u64 * 1000;
+        for c in found {
+            match c.snapclone_id.as_deref().filter(|id| crate::identity::is_valid(id)) {
+                Some(id) => {
+                    if self.contact_book.upsert(id, crate::friends::DEFAULT_PORT, now) { added += 1; }
+                    if !c.name.trim().is_empty() {
+                        if self.contact_book.rename(id, c.name.trim()) { self.contacts_dirty = true; }
+                    }
+                    self.contacts_dirty = true;
+                    if !self.peers.iter().any(|p| p.name == id) {
+                        self.peers.push(Peer { name: id.to_string(), online: false });
+                    }
+                }
+                None => no_id += 1,
+            }
+        }
+        self.sync_roster();
+        self.import_report = Some(format!(
+            "vCard: {added} added, {no_id} without a snapclone id, {skipped} unreadable"));
+        self.vcard_row_open = false;
     }
 
     /// Switch to the camera facing the other way. `false` when there is
@@ -5612,6 +5839,9 @@ impl Snapclone {
             crate::snaps::Media::Image if snap.bytes.starts_with(&[0xff, 0xd8]) => "jpg",
             crate::snaps::Media::Image if snap.bytes.starts_with(b"\x89PNG") => "png",
             crate::snaps::Media::Image => "img",
+            // What the recorder writes: Matroska (see av1_encode). A
+            // clip saved as .mp4 was refused by every player.
+            crate::snaps::Media::Video if snap.bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) => "mkv",
             crate::snaps::Media::Video => "mp4",
             crate::snaps::Media::Audio => "opus",
         };
@@ -5985,7 +6215,10 @@ impl Snapclone {
             crate::session::outbox_ui(ui, &self.outbox, self.now_secs, c);
             return;
         }
-        if let Some(id) = crate::inbox::inbox_ui(ui, &mut self.inbox, c) {
+        // The ribbon's segment IS the filter: one selection, drawn once.
+        self.inbox.filter = if self.bar.sub[1] == 1 { crate::inbox::Filter::Unread }
+                            else { crate::inbox::Filter::All };
+        if let Some(id) = crate::inbox::inbox_ui_with(ui, &mut self.inbox, c, false) {
             self.inbox.mark_read(id);
             self.conversation_peer = id.to_string();
         }
@@ -6556,6 +6789,104 @@ mod tests {
         d.drag(&mut app, 380.0, 20.0, 40);
         assert_eq!((app.position().page, app.position().section), (1, 0),
             "a single slow swipe from Camera did not land on Inbox's first section");
+    }
+
+    #[test]
+    fn a_pinch_on_the_viewfinder_zooms_and_the_shutter_carries_the_window() {
+        // A trackpad pinch / ctrl+wheel (egui's Zoom event) with the pointer
+        // on the live viewfinder. The command the host gets names the window,
+        // so the file is what was on screen.
+        let mut d = Drive::new();
+        let mut app = app();
+        d.frame(&mut app, vec![]);
+        assert_eq!(app.nav.page(), 0, "the camera page");
+        d.frame(&mut app, vec![egui::Event::PointerMoved(egui::Pos2::new(200.0, 300.0))]);
+        d.frame(&mut app, vec![egui::Event::Zoom(2.0)]);
+        d.frame(&mut app, vec![]);
+        assert!((app.viewfinder.zoom.factor - 2.0).abs() < 1e-3, "factor {}", app.viewfinder.zoom.factor);
+        app.shutter_pressed = true;
+        let cmds = app.drain_commands();
+        let crop = cmds.iter().find_map(|c| match c { crate::host::HostCommand::CaptureSnap { crop } => Some(*crop), _ => None })
+            .expect("the shutter became a capture");
+        assert_eq!(crop, Some(app.viewfinder.zoom.window()));
+        // Back at 1× the command carries no crop.
+        app.viewfinder.zoom.reset();
+        app.shutter_pressed = true;
+        let cmds = app.drain_commands();
+        assert!(cmds.iter().any(|c| matches!(c, crate::host::HostCommand::CaptureSnap { crop: None })), "{cmds:?}");
+        // While composing (the frame frozen, the file taken) a pinch does nothing.
+        app.send_flow.on_captured(crate::send_flow::Captured { path: "snap.jpg".into(), at_ms: 1 });
+        assert_eq!(app.send_flow.step(), crate::send_flow::Step::Compose);
+        d.frame(&mut app, vec![egui::Event::PointerMoved(egui::Pos2::new(200.0, 300.0))]);
+        d.frame(&mut app, vec![egui::Event::Zoom(2.0)]);
+        d.frame(&mut app, vec![]);
+        assert!(!app.viewfinder.zoom.is_zoomed(), "a zoom while composing would show what the file does not hold");
+    }
+
+    #[test]
+    fn a_tap_on_the_zoomed_viewfinder_puts_the_reticle_under_the_finger() {
+        use egui::{Event, PointerButton, Pos2};
+        let mut d = Drive::new();
+        let mut app = app();
+        d.frame(&mut app, vec![]);
+        d.frame(&mut app, vec![Event::PointerMoved(Pos2::new(200.0, 300.0))]);
+        d.frame(&mut app, vec![Event::Zoom(2.0)]);
+        let at = Pos2::new(120.0, 180.0);
+        d.frame(&mut app, vec![Event::PointerMoved(at)]);
+        d.frame(&mut app, vec![Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: true, modifiers: Default::default() }]);
+        d.frame(&mut app, vec![]);
+        d.frame(&mut app, vec![Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
+        d.frame(&mut app, vec![]);
+        assert!(app.viewfinder.reticle.visible(), "the tap did not start a focus sweep");
+        let (nx, ny) = app.viewfinder.reticle.at().unwrap();
+        // The stored point is a SENSOR point inside the zoom window…
+        let w = app.viewfinder.zoom.window();
+        assert!(nx >= w[0] && nx <= w[2] && ny >= w[1] && ny <= w[3], "({nx}, {ny}) outside {w:?}");
+        // …and off the window's centre, on the side the finger was: a tap
+        // stored as a fraction of the whole sensor would sit outside the
+        // window or on its centre. (The exact screen mapping is
+        // `to_screen`, tested in camera.rs; here the point is that a real
+        // pointer tap reaches the reticle at all — it did not, before
+        // `tick_feedback` stopped eating the release.)
+        let cx = (w[0] + w[2]) * 0.5;
+        assert!(nx < cx, "the finger was left of centre; stored {nx} vs window centre {cx}");
+    }
+
+    #[test]
+    fn two_fingers_on_the_camera_page_pinch_and_do_not_turn_it() {
+        // egui reports the first finger as the pointer too, so before the
+        // gate a pinch that spread horizontally was a page drag. Two
+        // fingers: the first sweeps most of the width, the second holds.
+        use egui::{Event, PointerButton, Pos2, TouchDeviceId, TouchId, TouchPhase};
+        let touch = |id: u64, phase: TouchPhase, pos: Pos2| Event::Touch {
+            device_id: TouchDeviceId(0), id: TouchId(id), phase, pos, force: None };
+        let mut d = Drive::new();
+        let mut app = app();
+        d.frame(&mut app, vec![]);
+        let (a0, b) = (Pos2::new(380.0, 300.0), Pos2::new(180.0, 300.0));
+        d.frame(&mut app, vec![
+            touch(1, TouchPhase::Start, a0), Event::PointerMoved(a0),
+            Event::PointerButton { pos: a0, button: PointerButton::Primary, pressed: true, modifiers: Default::default() },
+            touch(2, TouchPhase::Start, b),
+        ]);
+        for f in 1..=30 {
+            let x = 380.0 - 360.0 * f as f32 / 30.0;
+            let a = Pos2::new(x, 300.0);
+            d.frame(&mut app, vec![touch(1, TouchPhase::Move, a), Event::PointerMoved(a), touch(2, TouchPhase::Move, b)]);
+        }
+        let end = Pos2::new(20.0, 300.0);
+        d.frame(&mut app, vec![
+            touch(1, TouchPhase::End, end),
+            Event::PointerButton { pos: end, button: PointerButton::Primary, pressed: false, modifiers: Default::default() },
+            touch(2, TouchPhase::End, b),
+        ]);
+        for _ in 0..20 { d.frame(&mut app, vec![]); }
+        assert_eq!(app.nav.page(), 0, "two fingers turned the page");
+        assert!(app.viewfinder.zoom.is_zoomed(), "the spread was not a pinch: {:?}", app.viewfinder.zoom);
+        // And a one-finger drag afterwards still pages — the latch lifted.
+        app.viewfinder.zoom.reset();
+        d.drag(&mut app, 380.0, 20.0, 40);
+        assert_eq!(app.nav.page(), 1, "the gate stuck after the fingers lifted");
     }
 
     #[test]
@@ -7734,6 +8065,37 @@ mod tests {
         assert_eq!(s.qr_shown_at, None);
     }
 
+    /// The camera page's "scan" used to be a toggle that throttled the
+    /// viewfinder and lit a label; the decoder is driven by `qr.is_scanning()`
+    /// and never ran from it. It opens the same popup the Friends page does
+    /// now, and every close path — the button, a hit, Escape — puts the
+    /// viewfinder's scan mode back.
+    #[test]
+    fn scanning_is_the_popup_and_every_close_path_clears_scan_mode() {
+        let mut s = app();
+        assert!(!s.viewfinder.scan_mode);
+        s.open_qr_scan(true);
+        assert!(s.qr.as_ref().is_some_and(|q| q.is_scanning()), "the decoder's gate is open");
+        assert!(s.viewfinder.scan_mode, "the viewfinder throttles while the decoder runs");
+        assert!(s.modal.topmost(crate::modal::Layer::Dialog).is_some_and(|p| p.id == "qr"),
+                "the scanner is a dialog above the page");
+        // Closed by a hit.
+        assert!(s.qr_frame("snapclone://sc-deadbeef:9000"));
+        s.tick(0.3);
+        s.tick(0.4);
+        assert!(s.qr.is_none());
+        assert!(!s.viewfinder.scan_mode, "a hit must not leave the camera at scan speed");
+        // Closed by the close path.
+        s.open_qr_scan(true);
+        s.close_qr();
+        assert!(s.qr.is_none() && !s.viewfinder.scan_mode);
+        assert!(s.modal.topmost(crate::modal::Layer::Dialog).is_none(), "the dialog is gone too");
+        // The manual-only form does not throttle a camera nobody is aiming.
+        s.open_qr_scan(false);
+        assert!(!s.viewfinder.scan_mode);
+        s.close_qr();
+    }
+
     #[test]
     fn a_scanned_code_becomes_a_peer_through_the_same_path_as_a_typed_address() {
         // A contact added by camera and one added by hand must be the same kind
@@ -8510,8 +8872,33 @@ mod gossip_wiring_tests {
     fn our_own_echo_does_not_add_us_to_our_own_roster() {
         let mut s = Snapclone::new(vec![]);
         s.local_id = "sc-me".into();
-        assert!(!s.on_gossip(rec("sc-me", 0), 100, None));
-        assert!(s.peers.is_empty());
+        // Admitted-and-ignored rather than refused: the echo is loopback
+        // working, and the host warns about refusals. It fired that
+        // warning on every launch before.
+        assert!(s.on_gossip(rec("sc-me", 0), 100, None));
+        assert!(s.peers.is_empty(), "but we are not our own peer");
+    }
+
+    #[test]
+    fn a_saved_contact_that_announces_itself_is_one_row_not_two() {
+        // The two-instance walk showed "Bee" offline beside "sc-2dd464a4"
+        // online: the same person, split by nickname keying.
+        let mut s = Snapclone::new(vec![]);
+        let mut book = crate::contact_book::ContactBook::default();
+        book.upsert("sc-2dd464a4", 41235, 1);
+        book.rename("sc-2dd464a4", "Bee");
+        s.apply(crate::host::HostEvent::ContactsLoaded(Box::new(book)));
+        assert_eq!(s.peers.len(), 1);
+        assert!(s.on_gossip(rec("sc-2dd464a4", 41235), 100, None));
+        assert_eq!(s.peers.len(), 1, "the announce made a second row: {:?}",
+                   s.peers.iter().map(|p| &p.name).collect::<Vec<_>>());
+        assert!(s.peers[0].online, "and the saved contact came online");
+        let f = s.roster.get("sc-2dd464a4").expect("the row");
+        assert_eq!(f.name, "Bee", "shown by nickname");
+        // a rename keeps the key
+        s.apply_friends(crate::friends::Action::Rename("sc-2dd464a4".into(), "Bumble".into()));
+        assert_eq!(s.peers[0].name, "sc-2dd464a4");
+        assert_eq!(s.roster.rows()[0].name, "Bumble");
     }
 
     #[test]

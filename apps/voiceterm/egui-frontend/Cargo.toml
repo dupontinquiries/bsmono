@@ -22,7 +22,7 @@ required-features = ["shell"]
 default = ["app"]
 # Default-on so `cargo build --release` (what the build orchestrator runs, no extra flags — see
 # manifest/projects.toml) produces the deploy binary directly, same convention as rusty-board-egui.
-app = ["shell", "x11", "wayland", "voice"]
+app = ["shell", "x11", "wayland", "voice", "mail-proton"]
 # `app` without dictation, for targets where whisper-rs cannot build — the
 # static-musl case in `voice` below. Same binary, no listening.
 app-novoice = ["shell", "x11", "wayland"]
@@ -30,6 +30,14 @@ app-novoice = ["shell", "x11", "wayland"]
 # is AND-only, so `app` and `app-novoice` cannot both satisfy a gate naming
 # either of them — they share this one instead.
 shell = ["dep:eframe"]
+
+# Proton sign-in from this front-end: the Qt build's Qt-free mail engine
+# (mail_error/json/crypto/proton, mounted by #[path]) plus the SRP crate.
+# The engine's own `mail-crypto`/`mail-proton-srp` cfgs are declared here
+# too, because a #[path]-mounted file sees THIS crate's features.
+mail-proton = ["dep:ureq", "dep:net-kit", "mail-crypto", "mail-proton-srp"]
+mail-crypto = ["dep:crypto_secretbox", "dep:bcrypt", "dep:crypto_box"]
+mail-proton-srp = ["dep:proton-srp"]
 
 # Dictation. ON in `app` because it is a voice terminal, and SEPARABLE because
 # it is the only thing here that needs whisper-rs — which needs bindgen, which
@@ -170,6 +178,14 @@ secret-kit = { path = "../../../shared/secret-kit" }
 scene-kit = { path = "../../../shared/scene-kit" }
 nifty-core = { path = "../../../shared/nifty-core" }
 eframe = { version = "0.34", default-features = false, features = ["glow"], optional = true }
+# The Proton engine's transport and crypto — all optional, behind mail-proton.
+ureq = { version = "2", features = ["gzip"], optional = true }
+# mail_crypto's constant-time compare.
+net-kit = { path = "../../../shared/net-kit", optional = true }
+crypto_secretbox = { version = "0.1", optional = true }
+bcrypt = { version = "0.15", optional = true }
+crypto_box = { version = "0.9", optional = true, default-features = false, features = ["std", "salsa20", "getrandom"] }
+proton-srp = { version = "0.8", optional = true, features = ["pgpinternal"] }
 
 [workspace]
 

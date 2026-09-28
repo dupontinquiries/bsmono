@@ -86,12 +86,17 @@ pub const ROUTING_FILE: &str = "routing.conf";
 
 pub const VIEWS: [&str; 6] = ["Devices", "Spaces", "Library", "Mixer", "Soundscape", "Settings"];
 
+/// How much of the session "previous" and Repeat All can reach back
+/// through. A cap because the list is walked on every draw of the
+/// history-aware controls, and a day of radio is thousands of rows.
+pub const HISTORY_CAP: usize = 200;
+
 /// The three ways into the library. The QML keeps AlbumsPage and ArtistsPage as
 /// SwipeView siblings of the track list; here they are tabs of one view, because
 /// a six-page swipe with three more pages inside it is a maze — but the pages,
 /// their modes and their detail drill-downs are the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LibraryTab { Tracks, AllTracks, Albums, Artists, Tags, Playlists }
+pub enum LibraryTab { Home, Search, AllTracks, Albums, Artists, Tags, Playlists }
 
 /// The Library tab names, in tab order.
 ///
@@ -106,24 +111,44 @@ pub enum LibraryTab { Tracks, AllTracks, Albums, Artists, Tags, Playlists }
 /// least important thing on the page.
 pub const MIXER_CARDS: [&str; 4] = ["Output", "Channels", "Crossover", "Steps"];
 
-pub const LIBRARY_TABS: [&str; 6] =
-    ["Tracks", "All tracks", "Albums", "Artists", "Tags", "Playlists"];
+pub const LIBRARY_TABS: [&str; 7] =
+    ["Home", "Search", "All tracks", "Albums", "Artists", "Tags", "Playlists"];
 
 impl LibraryTab {
     pub fn label(self) -> &'static str { LIBRARY_TABS[self as usize] }
 
     pub fn from_index(i: usize) -> Option<LibraryTab> {
         Some(match i {
-            0 => LibraryTab::Tracks,
-            1 => LibraryTab::AllTracks,
-            2 => LibraryTab::Albums,
-            3 => LibraryTab::Artists,
-            4 => LibraryTab::Tags,
-            5 => LibraryTab::Playlists,
+            0 => LibraryTab::Home,
+            1 => LibraryTab::Search,
+            2 => LibraryTab::AllTracks,
+            3 => LibraryTab::Albums,
+            4 => LibraryTab::Artists,
+            5 => LibraryTab::Tags,
+            6 => LibraryTab::Playlists,
             _ => return None,
         })
     }
 }
+
+/// The Home tab's lists, each a short answer to a question a listener
+/// actually asks — what was I just playing, what did I add, what do I
+/// keep coming back to, what have I never heard. Filled by the host from
+/// the catalogue; empty is honest until it has.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HomeLists {
+    pub recently_played: Vec<crate::browse::BrowseTrack>,
+    pub recently_added: Vec<crate::browse::BrowseTrack>,
+    pub most_played: Vec<crate::browse::BrowseTrack>,
+    pub never_played: Vec<crate::browse::BrowseTrack>,
+    /// True once a host has answered, so "nothing here yet" can be told
+    /// from "nobody asked".
+    pub loaded: bool,
+}
+
+/// How many rows each Home list shows. Enough to be useful, few enough
+/// that four of them fit a phone with the transport bar still visible.
+pub const HOME_ROWS: usize = 8;
 
 /// Move the view index by a swipe sign, clamped to the ends.
 /// Paint a product silhouette badge: thin strokes (the module pins 1.0–1.2px),
@@ -252,7 +277,7 @@ pub fn browse_tracks_from_source(
 /// page by id; the source has no artist table, so this derives one that is
 /// consistent for the same name. Two different artists sharing a name collide
 /// — which is the same thing the name itself does, so nothing is lost.
-fn artist_id_of(name: &str) -> i64 {
+pub fn artist_id_of(name: &str) -> i64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in name.trim().to_lowercase().bytes() {
         h ^= b as u64;
@@ -415,6 +440,8 @@ pub struct Controller {
     pub pending_playlist_open: Option<i64>,
     /// A playlist the host hasn't deleted yet (set by `Delete`).
     pub pending_playlist_delete: Option<i64>,
+    /// (playlist_id, track_id) the host hasn't removed yet.
+    pub pending_playlist_remove: Option<(i64, i64)>,
     /// A "+" on a track was tapped and a playlist chosen in the dialog —
     /// (track_id, playlist_id), resolved from the dialog's name-based
     /// `add()` via `playlists_page`. Cleared by the host.
@@ -585,6 +612,35 @@ pub struct Controller {
     a11y: A11yScene,
     /// The user's selected palette id (empty ⇒ default); set from prefs in apply_settings.
     palette: String,
+    /// What has played this session, oldest first, capped. This is what
+    /// makes "previous" mean the previous TRACK rather than the start of
+    /// this one, and what Repeat All loops over when the queue runs dry.
+    pub history: Vec<crate::queue::QueueEntry>,
+    /// The shuffle draw's state. xorshift, seeded by the host or the
+    /// clock — no `rand` dependency for one draw a track, and a seed a
+    /// test can fix.
+    pub shuffle_seed: u64,
+    /// A search the host has not answered yet, and its answer.
+    pub pending_search: Option<String>,
+    pub search_results: Vec<crate::browse::BrowseTrack>,
+    /// The query the results are for, so a stale answer is not shown
+    /// under a newer question.
+    pub search_answered: String,
+    /// The tracks of the open playlist. Their own field: they used to
+    /// land in `browse_tracks`, which is the album/artist aggregate
+    /// source, so opening a playlist emptied every album grid until the
+    /// next reload.
+    pub playlist_tracks: Vec<crate::browse::BrowseTrack>,
+    /// The Home tab's lists, and the request for them.
+    pub home: HomeLists,
+    pub pending_home: bool,
+    /// The browse aggregates should be re-read from the catalogue: set at
+    /// start and after a scan, cleared by the host when it supplies them.
+    pub browse_stale: bool,
+    /// The last volume the host applied, for the keyboard steps and the
+    /// unmute — the dial's own value is what it shows, this is what the
+    /// room is set to.
+    pub volume: f32,
 }
 
 impl Controller {
@@ -604,7 +660,7 @@ impl Controller {
             plays: Vec::new(),
             browse: Default::default(),
             browse_tracks: Vec::new(),
-            library_tab: LibraryTab::Tracks,
+            library_tab: LibraryTab::Home,
             all_tracks: crate::all_tracks::AllTracksPage::default(),
             tracks_kinetic: crate::scrollfeel::KineticScroll::default(),
             pending_tracks: None,
@@ -626,6 +682,7 @@ impl Controller {
             open_playlist: None,
             pending_playlist_open: None,
             pending_playlist_delete: None,
+            pending_playlist_remove: None,
             pending_add_to_playlist: None,
             edit_track: Default::default(),
             pending_track_edit_open: None,
@@ -684,7 +741,18 @@ impl Controller {
             toast: Default::default(),
             dot: Default::default(),
             safety: Default::default(),
-            add_to_playlist: Default::default(), gesture: GestureLayer::horizontal_page(320.0), a11y: A11yScene::new(), palette: String::new() }
+            add_to_playlist: Default::default(), gesture: GestureLayer::horizontal_page(320.0), a11y: A11yScene::new(), palette: String::new(),
+            history: Vec::new(),
+            shuffle_seed: 0x9E37_79B9_7F4A_7C15,
+            pending_search: None,
+            search_results: Vec::new(),
+            search_answered: String::new(),
+            playlist_tracks: Vec::new(),
+            home: HomeLists::default(),
+            pending_home: true,
+            browse_stale: true,
+            volume: 50.0,
+        }
     }
 
     /// The views this product actually has, in `VIEWS` order.
@@ -888,6 +956,30 @@ impl Controller {
     pub fn ui(&mut self, ui: &mut Ui, adaptive: &Adaptive) {
         let colors = uikit_egui::palette_colors(&self.palette);
         self.a11y.begin_frame();
+        let dt = ui.input(|i| i.stable_dt);
+        // THE TOAST CLOCK. `Toast::tick` had no caller, so every message
+        // stayed up until the next one replaced it — "queued 1 track"
+        // from an hour ago, still in the bar.
+        self.toast.tick(dt);
+        if self.toast.visible().is_some() { ui.ctx().request_repaint(); }
+        self.keyboard(ui);
+
+        // THE TRANSPORT BAR IS A PANEL, not the last thing in a column.
+        // Drawn as a column it sat under whatever the page allocated, and
+        // every page with a scroll list took the whole height — so the
+        // one control that must be on every page was the one control
+        // that was on none of them once the library had rows. A bottom
+        // panel is laid out FIRST and the page gets what is left.
+        //
+        // Both layouts. The compact branch had no bar at all: a phone,
+        // the deploy target, could start music and never pause it.
+        let bar_bg = colors.bg_card.gamma_multiply(0.6);
+        egui::Panel::bottom("bo-transport")
+            .frame(egui::Frame::NONE.fill(bar_bg).inner_margin(egui::Margin::symmetric(10, 6)))
+            .show_separator_line(true)
+            .show_inside(ui, |ui| {
+                self.transport_strip(ui, &colors);
+            });
 
         if !adaptive.is_compact() {
             // The kit's strip on wide, the kit's vertical_tabs on compact —
@@ -903,7 +995,6 @@ impl Controller {
             // The safety toast slides down from the TOP, above everything, and
             // is drawn before the header so it cannot be pushed off by a view
             // that changes height.
-            let dt = ui.input(|i| i.stable_dt);
             self.safety.tick(dt);
             self.poll_daemon(dt);
             // The playback position, interpolated between network reports. Its
@@ -956,18 +1047,7 @@ impl Controller {
                     ui.ctx().request_repaint();
                 }
             }
-            match self.nav.page() {
-                0 => self.devices_view(ui, &colors),
-                1 => self.spaces_view(ui, &colors),
-                2 => self.library_view(ui, &colors),
-                3 => self.mixer_view(ui, &colors),
-                4 => self.soundscape_view(ui, &colors),
-                _ => self.settings_view(ui, &colors),
-            }
-            // The transport bar is always on screen, which is the point of a
-            // controller: whatever page you are on, you can pause.
-            ui.separator();
-            self.transport_strip(ui, &colors);
+            self.page_view(ui, &colors);
         } else {
             // Compact width: a vertical-tabs sidebar instead of a whole-surface swipe gesture. The
             // devices view has volume Sliders, which claim horizontal drag themselves — a whole-surface
@@ -982,12 +1062,19 @@ impl Controller {
                     }
                 });
                 ui.separator();
+                // The same clocks the wide branch runs. They lived only
+                // there, so on a phone the scene status never polled and
+                // the position never advanced between reports.
+                self.safety.tick(dt);
+                self.poll_daemon(dt);
+                self.transport.tick(dt as f64);
                 ui.vertical(|ui| {
-                    match self.nav.page() {
-                        0 => self.devices_view(ui, &colors),
-                        1 => self.scenes_view(ui, &colors),
-                        _ => self.library_view(ui, &colors),
-                    }
+                    // The SAME six pages as the wide layout. This mapped
+                    // Spaces to the scene list and Mixer, Soundscape and
+                    // Settings all to the Library, so on the phone — the
+                    // deploy target — three of the six tabs opened the
+                    // wrong page and the settings were unreachable.
+                    self.page_view(ui, &colors);
                 });
             });
         }
@@ -1038,6 +1125,31 @@ impl Controller {
                     seen: 0, total: None, path: String::new() };
                 self.pending_scan_with_roots = Some(paths);
                 self.scan_picker.close();
+            }
+        }
+    }
+
+    /// The current page, in the space above the transport bar.
+    ///
+    /// The Library manages its own scrolling (its lists are windowed);
+    /// every other page is a column of cards that is taller than a phone
+    /// and scrolls as a whole. Without the scroll the mixer's lower cards
+    /// were painted across the transport bar, which the layout test
+    /// reports as its text colliding with the bar's.
+    fn page_view(&mut self, ui: &mut Ui, colors: &PaletteColors) {
+        match self.nav.page() {
+            2 => self.library_view(ui, colors),
+            page => {
+                egui::ScrollArea::vertical().id_salt(("page-scroll", page))
+                    .auto_shrink([false, false]).show(ui, |ui| {
+                    match page {
+                        0 => self.devices_view(ui, colors),
+                        1 => self.spaces_view(ui, colors),
+                        3 => self.mixer_view(ui, colors),
+                        4 => self.soundscape_view(ui, colors),
+                        _ => self.settings_view(ui, colors),
+                    }
+                });
             }
         }
     }
@@ -1395,9 +1507,22 @@ impl Controller {
     /// Look up browse tracks by id, in the order given — "play all" on an album
     /// means the album, in its order, not in id order.
     fn tracks_for(&self, ids: &[i64]) -> Vec<(i64, String, String)> {
-        ids.iter().filter_map(|id| self.browse_tracks.iter().find(|t| t.id == *id))
+        ids.iter().filter_map(|id| self.find_track(*id))
             .map(|t| (t.id, t.title.clone(), t.primary_artist.clone()))
             .collect()
+    }
+
+    /// A row by id, from whichever list it is showing in — the browse
+    /// aggregate source, the open playlist, a search answer, the Home
+    /// lists. One lookup so a new list cannot forget to be playable.
+    fn find_track(&self, id: i64) -> Option<&crate::browse::BrowseTrack> {
+        self.browse_tracks.iter().find(|t| t.id == id)
+            .or_else(|| self.playlist_tracks.iter().find(|t| t.id == id))
+            .or_else(|| self.search_results.iter().find(|t| t.id == id))
+            .or_else(|| self.home.recently_played.iter().find(|t| t.id == id))
+            .or_else(|| self.home.recently_added.iter().find(|t| t.id == id))
+            .or_else(|| self.home.most_played.iter().find(|t| t.id == id))
+            .or_else(|| self.home.never_played.iter().find(|t| t.id == id))
     }
 
     /// How often to ask the daemon what it is doing.
@@ -1456,6 +1581,25 @@ impl Controller {
 
     /// Reflect a queue entry as the thing now playing.
     fn start_playing(&mut self, e: &crate::queue::QueueEntry) {
+        self.remember_current();
+        self.start_playing_no_history(e);
+    }
+
+    /// The track that was playing goes into the history — unless nothing
+    /// was, or it is the same track again (Repeat One, a restart).
+    fn remember_current(&mut self) {
+        if let Some(id) = self.now_playing_id {
+            if self.history.last().map(|h| h.track_id) != Some(id) {
+                self.history.push(crate::queue::QueueEntry {
+                    queue_id: 0, track_id: id,
+                    title: self.transport.title.clone(), artist: self.transport.artist.clone(),
+                });
+                if self.history.len() > HISTORY_CAP { self.history.remove(0); }
+            }
+        }
+    }
+
+    fn start_playing_no_history(&mut self, e: &crate::queue::QueueEntry) {
         let (title, artist) = (e.title.clone(), e.artist.clone());
         self.set_now_playing(&title, &artist);
         // Recorded here because this is where a track id exists. QueueEntry
@@ -1468,6 +1612,27 @@ impl Controller {
         // missing, which is why "play album" queued, showed a title and
         // played nothing.
         self.request_play(e.track_id);
+    }
+
+    /// Start a track by id from any of the row lists, as a tap on a row
+    /// does. Goes through the queue entry path so history and the sound
+    /// both happen — this used to set two labels and play nothing.
+    pub fn play_track_id(&mut self, id: i64) {
+        if let Some((_, title, artist)) = self.tracks_for(&[id]).into_iter().next() {
+            let e = crate::queue::QueueEntry { queue_id: 0, track_id: id, title, artist };
+            self.start_playing(&e);
+        } else {
+            self.toast.show("that track is not in view");
+        }
+    }
+
+    /// Queue a track by id from any of the row lists.
+    pub fn queue_track_id(&mut self, id: i64) {
+        let t = self.tracks_for(&[id]);
+        if t.is_empty() { self.toast.show("that track is not in view"); return; }
+        self.queue.mode = crate::queue::EnqueueMode::Stack;
+        self.queue.add_all(&t);
+        self.toast.show(&format!("queued {}", t[0].1));
     }
 
     /// Act on something the person said.
@@ -1512,22 +1677,9 @@ impl Controller {
             C::Play => { if !self.transport.playing { self.toggle_play(); } }
             C::Pause => { if self.transport.playing { self.toggle_play(); } }
             C::Toggle => self.toggle_play(),
-            C::Stop => {
-                self.transport.pause();
-                self.pending_playback = Some(crate::playback::Request::Stop);
-            }
-            C::Next => self.on_track_ended(),
-            // "Previous" restarts the current track rather than reaching
-            // backwards: nothing here keeps a history of what played, and
-            // a control that silently does the wrong thing is worse than
-            // one that does the modest right thing. It is what a physical
-            // transport does on the first press too.
-            C::Previous => {
-                if let Some(id) = self.now_playing_id {
-                    self.transport.report(0.0);
-                    self.request_play(id);
-                }
-            }
+            C::Stop => self.stop(),
+            C::Next => self.next(),
+            C::Previous => self.previous(),
             C::Search(q) => {
                 self.search.query = q;
                 self.voice_confirm = None;
@@ -1546,75 +1698,12 @@ impl Controller {
             // previous volume is not remembered here, and restoring a
             // guessed loud one in a room where someone just asked for
             // quiet is the wrong way to be wrong.
-            C::Unmute => self.pending_volume = Some(30.0),
+            C::Unmute => self.pending_volume = Some(30.0_f32.max(self.volume.min(30.0))),
             C::ShuffleOn => self.transport.shuffle = true,
             C::ShuffleOff => self.transport.shuffle = false,
             C::RepeatOne => self.transport.repeat = Repeat::One,
             C::RepeatAll => self.transport.repeat = Repeat::All,
             C::RepeatOff => self.transport.repeat = Repeat::Off,
-        }
-    }
-
-    /// Start or stop, the same way the transport button does.
-    ///
-    /// Extracted from the draw path rather than duplicated: the button
-    /// flips `playing` and then queues a request, and a voice command that
-    /// set the flag directly would show as playing and make no sound —
-    /// which is exactly the bug the tap path had before it was fixed. One
-    /// function, so there is one place that can be wrong about it.
-    pub fn toggle_play(&mut self) {
-        let now_playing = !self.transport.playing;
-        self.transport.playing = now_playing;
-        self.pending_playback = Some(if now_playing {
-            crate::playback::Request::Play {
-                url: self.now_playing_url(),
-                sink: self.audio_sink.clone(),
-            }
-        } else {
-            crate::playback::Request::Stop
-        });
-    }
-
-    /// Move the volume by a step, clamped.
-    fn nudge_volume(&mut self, by: i32) {
-        let cur = self.pending_volume.unwrap_or_else(
-            || self.devices.first().map(|d| d.volume as f32).unwrap_or(50.0));
-        self.pending_volume = Some((cur + by as f32).clamp(0.0, 100.0));
-    }
-
-    /// A track finished on its own. Decide what plays next.
-    ///
-    /// Called ONLY for a natural end. A stop is not an end — the player
-    /// distinguishes them for exactly this reason, because advancing on a
-    /// pause means pressing pause skips a track.
-    pub fn on_track_ended(&mut self) {
-        use crate::transport::Repeat;
-        match self.transport.repeat {
-            // Repeat one replays the SAME track rather than consuming the
-            // queue. Popping the head here would empty the queue one track
-            // per repeat, which is the mode quietly destroying the thing it
-            // is looping inside.
-            Repeat::One => {
-                if let Some(id) = self.now_playing_id {
-                    self.transport.report(0.0);
-                    self.request_play(id);
-                    return;
-                }
-            }
-            Repeat::Off | Repeat::All => {}
-        }
-        match self.queue.advance() {
-            Some(next) => {
-                self.transport.report(0.0);
-                self.start_playing(&next);
-            }
-            None => {
-                // Nothing queued. Stopped rather than left "playing" over
-                // silence, which is the state this app kept showing before
-                // there was any audio at all.
-                self.transport.playing = false;
-                self.now_playing.playing = false;
-            }
         }
     }
 
@@ -1651,10 +1740,9 @@ impl Controller {
     }
 
     fn play_browse_track(&mut self, id: i64) {
-        if let Some(t) = self.browse_tracks.iter().find(|t| t.id == id) {
-            let (title, artist) = (t.title.clone(), t.primary_artist.clone());
-            self.set_now_playing(&title, &artist);
-        }
+        // Through the queue-entry path. This set the labels and stopped:
+        // a tap on an album track showed the title and played nothing.
+        self.play_track_id(id);
     }
 
     fn library_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
@@ -1702,39 +1790,31 @@ impl Controller {
                     ui.horizontal(|ui| {
                         if ui.button("‹").clicked() { self.open_playlist = None; }
                         ui.strong(name);
-                        if ui.small_button("delete").clicked() {
-                            self.apply_playlist(crate::sources::PlaylistAction::Delete(id));
+                        if !self.playlist_tracks.is_empty() {
+                            if ui.button("▶ play all").clicked() {
+                                let ids: Vec<i64> = self.playlist_tracks.iter().map(|t| t.id).collect();
+                                self.apply_browse(crate::browse::Action::PlayAll(ids));
+                            }
+                            if ui.button("+ queue all").clicked() {
+                                let ids: Vec<i64> = self.playlist_tracks.iter().map(|t| t.id).collect();
+                                self.apply_browse(crate::browse::Action::QueueAll(ids));
+                            }
                         }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("delete").clicked() {
+                                self.apply_playlist(crate::sources::PlaylistAction::Delete(id));
+                            }
+                        });
                     });
-                    if !self.browse_tracks.is_empty() {
-                        if ui.button("▶ play all").clicked() {
-                            let ids: Vec<i64> = self.browse_tracks.iter().map(|t| t.id).collect();
-                            self.apply_browse(crate::browse::Action::PlayAll(ids));
-                        }
-                    }
-                    // The loaded tracks — same field and row shape Albums/
-                    // Artists detail views already use, so tapping a row
-                    // here goes through the one tested play/queue path
-                    // rather than a playlist-specific copy of it.
+                    // The loaded tracks, in their OWN field. Tapping a row
+                    // goes through the one tested play/queue path.
                     egui::ScrollArea::vertical().id_salt("playlist-tracks").show(ui, |ui| {
-                        if self.browse_tracks.is_empty() {
-                            ui.colored_label(c.text_weak, "no tracks in this playlist yet");
+                        if self.playlist_tracks.is_empty() {
+                            ui.colored_label(c.text_weak, "no tracks in this playlist yet — use + on any track");
                         }
-                        for t in self.browse_tracks.clone() {
-                            ui.horizontal(|ui| {
-                                let label = if t.title.trim().is_empty() { "(untitled)" } else { &t.title };
-                                if ui.selectable_label(false, label).clicked() {
-                                    self.apply_browse(crate::browse::Action::Play(t.id));
-                                }
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("queue").clicked() {
-                                        self.apply_browse(crate::browse::Action::Queue(t.id));
-                                    }
-                                    if ui.small_button("edit").clicked() {
-                                        self.pending_track_edit_open = Some(t.id);
-                                    }
-                                });
-                            });
+                        let rows = self.playlist_tracks.clone();
+                        for t in rows {
+                            self.track_row(ui, &t, c, true);
                         }
                     });
                 }
@@ -1770,7 +1850,7 @@ impl Controller {
             }
             return;
         }
-        if self.library_tab != LibraryTab::Tracks {
+        if matches!(self.library_tab, LibraryTab::Albums | LibraryTab::Artists) {
             ui.separator();
             self.browse.tab = match self.library_tab {
                 LibraryTab::Artists => crate::browse::Tab::Artists,
@@ -1781,101 +1861,154 @@ impl Controller {
             }
             return;
         }
-        // The real paged list: sort tabs, search, and the empty state that says
-        // WHICH empty it is.
+        if self.library_tab == LibraryTab::Search {
+            self.search_view(ui, c);
+            return;
+        }
+        self.home_view(ui, c);
+    }
+
+    /// One track row, the same in every list: title over artist, and the
+    /// actions on the right. Tapping the title plays it. `in_playlist`
+    /// adds a remove button in place of the add-to-playlist one.
+    fn track_row(&mut self, ui: &mut Ui, t: &crate::browse::BrowseTrack, c: &PaletteColors,
+                 in_playlist: bool) {
+        let playing = self.now_playing_id == Some(t.id);
+        // The buttons are laid out first, from the right, and the title
+        // truncates into what they leave — a long title drawn as a button
+        // ran under the buttons at phone width.
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.search.query).id_salt("lib-self_search_query"));
-            if !self.search.tag.is_empty() {
-                if ui.button(format!("tag: {} ×", self.search.tag)).clicked() {
-                    self.search.tag.clear();
-                }
-            }
-        });
-        // the tag cloud, most-used first
-        let tags = crate::library::Search::tags(&self.tracks);
-        if !tags.is_empty() && self.search.tag.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                for (t, n) in tags.iter().take(8) {
-                    if ui.small_button(format!("{t} ({n})")).clicked() {
-                        self.search.tag = t.clone();
-                    }
-                }
-            });
-        }
-        ui.separator();
-        // Prefer the real catalogue. `self.tracks` remains for the in-memory
-        // demo path; when a source has been supplied, the catalogue is the
-        // truth and the search filters what it returned.
-        if self.catalog.loaded {
-            if let Some(why) = self.catalog.empty_reason() {
-                ui.colored_label(c.text_weak, why);
-                return;
-            }
-            let q = self.search.query.trim().to_lowercase();
-            let mut picked: Option<(String, String)> = None;
-            let hits: Vec<crate::catalog_source::CatalogTrack> = self.catalog.rows.iter()
-                .filter(|t| q.is_empty() || t.label().to_lowercase().contains(&q)
-                            || t.sub().to_lowercase().contains(&q))
-                .cloned().collect();
-            if hits.is_empty() { ui.colored_label(c.text_weak, "nothing matches"); return; }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for t in hits {
-                    ui.horizontal(|ui| {
-                        if ui.selectable_label(false, t.label()).clicked() {
-                            // Deferred out of the closure: `set_now_playing`
-                            // takes &mut self and this borrows it. Setting the
-                            // fields inline here is what let this path drift
-                            // out of step with the queue strip in the first
-                            // place.
-                            picked = Some((t.label(), t.artists.join(", ")));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if in_playlist {
+                    if let Some(pid) = self.open_playlist {
+                        if ui.small_button("−").on_hover_text("Remove from playlist").clicked() {
+                            self.pending_playlist_remove = Some((pid, t.id));
                         }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.colored_label(c.text_weak, t.sub());
-                        });
-                    });
-                }
-            });
-            if let Some((title, artist)) = picked {
-                self.set_now_playing(&title, &artist);
-            }
-            return;
-        }
-        let rows: Vec<crate::library::Track> =
-            self.search.results(&self.tracks).into_iter().cloned().collect();
-        if rows.is_empty() {
-            // Which empty it is: an unsearched library and one with no matches
-            // look the same otherwise.
-            ui.colored_label(c.text_weak,
-                if self.tracks.is_empty() { "catalogue not opened" } else { "nothing matches" });
-            return;
-        }
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for t in rows {
-                ui.horizontal(|ui| {
-                    if ui.selectable_label(false, t.title.as_str()).clicked() {
-                        // Direct, unlike the catalogue list above: this closure
-                        // already takes `self` mutably (`add_to_playlist.open`
-                        // below), so the setter is callable here.
-                        let (title, artist) = (t.title.clone(), t.artist.clone());
-                        self.set_now_playing(&title, &artist);
-                        // The demo duration this arm used to set is dropped:
-                        // 210.0 was a placeholder that made the scrubber claim
-                        // a length the file does not have, which is worse than
-                        // an unknown one.
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.colored_label(c.text_weak, t.album.as_str());
-                        if ui.small_button("+").clicked() {
-                            self.add_to_playlist.open(&t.id.to_string());
-                            // The dialog's model is name-based (see its own
-                            // doc); real ids are resolved back out through
-                            // playlists_page when a name is picked (see
-                            // pending_add_to_playlist).
-                            self.add_to_playlist.playlists =
-                                self.playlists_page.all().iter().map(|p| p.name.clone()).collect();
-                        }
+                } else if ui.small_button("♪+").on_hover_text("Add to playlist").clicked() {
+                    self.add_to_playlist.open(&t.id.to_string());
+                    self.add_to_playlist.playlists =
+                        self.playlists_page.all().iter().map(|p| p.name.clone()).collect();
+                }
+                if ui.small_button("+").on_hover_text("Add to queue").clicked() {
+                    self.queue_track_id(t.id);
+                }
+                if ui.small_button("edit").on_hover_text("Edit title, artist, album, year").clicked() {
+                    self.pending_track_edit_open = Some(t.id);
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let (art, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
+                    crate::transport::identicon_paint(ui.painter(), art, &t.title, c);
+                    ui.vertical(|ui| {
+                        let label = if t.title.trim().is_empty() { "(untitled)".to_string() } else { t.title.clone() };
+                        let text = if playing { egui::RichText::new(label).color(c.accent).strong() }
+                                   else { egui::RichText::new(label) };
+                        let r = ui.add(egui::Label::new(text).truncate().sense(egui::Sense::click()))
+                            .on_hover_text("Play");
+                        if r.clicked() { self.play_track_id(t.id); }
+                        let mut sub = t.primary_artist.clone();
+                        if let Some(a) = &t.album { if !a.is_empty() {
+                            if !sub.is_empty() { sub.push_str(" — "); }
+                            sub.push_str(a);
+                        } }
+                        if t.play_count > 0 { sub.push_str(&format!("  ·  {} plays", t.play_count)); }
+                        ui.add(egui::Label::new(egui::RichText::new(sub).small().color(c.text_weak)).truncate());
                     });
                 });
+            });
+        });
+    }
+
+    /// The Search tab: one box, the catalogue's own folded multi-term
+    /// search behind it, rows that play. The old Tracks tab filtered an
+    /// in-memory demo list the host never filled and said "catalogue
+    /// not opened" forever.
+    fn search_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
+        ui.horizontal(|ui| {
+            let r = ui.add(egui::TextEdit::singleline(&mut self.search.query)
+                .hint_text("title, artist or album — several words narrow it")
+                .desired_width(ui.available_width() - 60.0)
+                .id_salt("lib-self_search_query"));
+            if r.changed() {
+                // Asked on every keystroke; the host answers when it can
+                // and the answer carries its question, so a slow answer to
+                // an old query cannot overwrite a newer one's.
+                self.pending_search = Some(self.search.query.clone());
+            }
+            if ui.button("×").clicked() {
+                self.search.query.clear();
+                self.search_results.clear();
+                self.search_answered.clear();
+            }
+        });
+        ui.separator();
+        let q = self.search.query.trim().to_string();
+        if q.is_empty() {
+            ui.colored_label(c.text_weak, "type to search the library");
+            return;
+        }
+        if self.search_answered != q {
+            ui.colored_label(c.text_weak, "searching…");
+            if self.pending_search.is_none() { self.pending_search = Some(q); }
+            return;
+        }
+        if self.search_results.is_empty() {
+            ui.colored_label(c.text_weak, "nothing matches");
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.colored_label(c.text_weak, format!("{}", crate::browse::plural(self.search_results.len() as i64, "match")));
+            if ui.small_button("▶ play all").clicked() {
+                let ids: Vec<i64> = self.search_results.iter().map(|t| t.id).collect();
+                self.apply_browse(crate::browse::Action::PlayAll(ids));
+            }
+            if ui.small_button("+ queue all").clicked() {
+                let ids: Vec<i64> = self.search_results.iter().map(|t| t.id).collect();
+                self.apply_browse(crate::browse::Action::QueueAll(ids));
+            }
+        });
+        let rows = self.search_results.clone();
+        egui::ScrollArea::vertical().id_salt("search-rows").show(ui, |ui| {
+            for t in &rows { self.track_row(ui, t, c, false); }
+        });
+    }
+
+    /// The Home tab: the four lists a listener actually wants first.
+    fn home_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
+        if !self.home.loaded {
+            ui.colored_label(c.text_weak, "reading the library…");
+            self.pending_home = true;
+            return;
+        }
+        let empty = self.home.recently_played.is_empty() && self.home.recently_added.is_empty()
+            && self.home.most_played.is_empty() && self.home.never_played.is_empty();
+        if empty {
+            ui.colored_label(c.text_weak, "no music yet — scan a folder from Settings");
+            if ui.button("scan ~/Music now").clicked() { self.pending_rescan = true; }
+            return;
+        }
+        egui::ScrollArea::vertical().id_salt("home-scroll").show(ui, |ui| {
+            let sections: [(&str, Vec<crate::browse::BrowseTrack>); 4] = [
+                ("Recently played", self.home.recently_played.clone()),
+                ("Recently added", self.home.recently_added.clone()),
+                ("Most played", self.home.most_played.clone()),
+                ("Never played", self.home.never_played.clone()),
+            ];
+            for (title, rows) in sections {
+                if rows.is_empty() { continue; }
+                ui.horizontal(|ui| {
+                    ui.strong(title);
+                    if ui.small_button("▶ play").on_hover_text("Play this list").clicked() {
+                        let ids: Vec<i64> = rows.iter().map(|t| t.id).collect();
+                        self.apply_browse(crate::browse::Action::PlayAll(ids));
+                    }
+                    if ui.small_button("+ queue").clicked() {
+                        let ids: Vec<i64> = rows.iter().map(|t| t.id).collect();
+                        self.apply_browse(crate::browse::Action::QueueAll(ids));
+                    }
+                });
+                for t in rows.iter().take(HOME_ROWS) { self.track_row(ui, t, c, false); }
+                ui.add_space(6.0);
             }
         });
     }
@@ -1910,6 +2043,11 @@ impl Controller {
                 }
             }
         });
+        // The scene presets, under the room. They had a page of their
+        // own only in the compact layout — where that page was mislabelled
+        // "Spaces" — and none in the wide one.
+        ui.separator();
+        self.scenes_view(ui, c);
     }
 
     fn mixer_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
@@ -1976,9 +2114,7 @@ impl Controller {
         }
         // The toast is drawn once, in the header strip above — not here.
         // Two call sites would render it twice whenever this view is open.
-        if let Some(v) = self.pending_volume {
-            ui.colored_label(c.text_weak, format!("volume {v:.0}"));
-        }
+        ui.colored_label(c.text_weak, format!("volume {:.0}", self.pending_volume.unwrap_or(self.volume)));
         if self.mixer.is_flat() {
             ui.colored_label(c.text_weak, "flat — no correction applied");
         }
@@ -2215,48 +2351,78 @@ impl Controller {
         if let Some(msg) = self.toast.visible() {
             ui.colored_label(c.warning, msg);
         }
-
-        // NOW PLAYING AND THE QUEUE. Both renderers were built and tested and
-        // neither was ever called: the controller adds tracks (add, add_all,
-        // advance, both enqueue modes) into a queue no screen showed. Tracks
-        // accumulated where the operator could not see or reorder them.
-        //
-        // They live in the transport strip rather than a seventh page for the
-        // reason the strip exists: whatever page you are on, you can pause —
-        // and for the same reason you should be able to see what is next.
         self.breath.tick(ui.input(|i| i.stable_dt) * 1000.0);
-        crate::queue::now_playing_ui(ui, &self.now_playing, &self.breath, c);
+        if self.transport.playing { ui.ctx().request_repaint(); }
 
-        // THE STAR ROW, on the track being played. stars_ui was ported, `rate`
-        // and `confirm_rating` were written with their optimistic-echo
-        // reasoning, and the ratings map was keyed and reachable — with no way
-        // to press a star.
-        //
-        // Here rather than in the track list: TracksAction has Load, Play and
-        // Enqueue and no Rate, so putting it there means changing that
-        // contract. Rating what you are hearing needs no new verb, and is the
-        // moment you actually have an opinion.
-        if let Some(id) = self.now_playing_id {
-            let r = self.ratings.entry(id)
-                .or_insert_with(|| crate::tags::StarRating::new(id, 0));
-            if let Some(stars) = crate::tags::stars_ui(ui, r, c) {
-                // rate() re-enters the map to apply the tap and returns what to
-                // send. Going through it rather than writing here keeps the
-                // optimistic path in one place.
-                if let Some(send) = self.rate(id, stars) {
-                    self.pending_rating = Some((id, send));
-                }
+        // THE BAR: art, title once, the buttons, the scrub. What it
+        // asks for goes through the same functions a key press or a
+        // voice command uses — one state machine, three ways in.
+        if let Some(act) = crate::transport::transport_ui(ui, &mut self.transport, c) {
+            use crate::transport::TransportAction as A;
+            match act {
+                A::Toggle => self.toggle_play(),
+                A::Previous => self.previous(),
+                A::Next => self.next(),
+                A::Stop => self.stop(),
+                A::Seek(at) => self.seek_to(at),
+                A::CycleRepeat => self.transport.repeat = self.transport.repeat.next(),
+                A::ToggleShuffle => self.transport.shuffle = !self.transport.shuffle,
             }
         }
 
-        if !self.queue.is_empty() {
-            let n = self.queue.len();
-            let label = if self.queue_open { format!("▾ queue ({n})") }
-                        else { format!("▸ queue ({n})") };
-            if ui.small_button(label).clicked() {
-                self.queue_open = !self.queue_open;
-            }
-            if self.queue_open {
+        // The second row: stars for what is playing, the queue toggle,
+        // the ANC chip. Small things that belong beside the transport
+        // because they are about what is playing right now.
+        // The chip is laid out first, from the right, so the truncating
+        // "next:" label takes what is left rather than everything.
+        //
+        // INSIDE `horizontal`. A right-to-left layout placed straight
+        // into the panel's vertical ui centres its widgets in ALL the
+        // height the panel has left — and a bottom panel's height is
+        // whatever it was last frame, so the row sank lower each frame
+        // until the bar was the whole window. `horizontal` bounds the
+        // row to one line first. Caught by `shell_layout_tests`.
+        ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            crate::anc::anc_chip(ui, &mut self.anc, &mut self.a11y, c);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                // A source with no track — line in, radio — has no title
+                // for the bar, so its name is drawn here; a track gets
+                // the bars.
+                if self.now_playing.title.trim().is_empty() && !self.now_playing.source.trim().is_empty() {
+                    crate::queue::now_playing_ui(ui, &self.now_playing, &self.breath, c);
+                } else {
+                    crate::queue::equalizer_ui(ui, &self.now_playing, &self.breath, c);
+                }
+                if let Some(id) = self.now_playing_id {
+                    let r = self.ratings.entry(id)
+                        .or_insert_with(|| crate::tags::StarRating::new(id, 0));
+                    if let Some(stars) = crate::tags::stars_ui(ui, r, c) {
+                        if let Some(send) = self.rate(id, stars) {
+                            self.pending_rating = Some((id, send));
+                        }
+                    }
+                    ui.add_space(8.0);
+                }
+                let n = self.queue.len();
+                let label = if self.queue_open { format!("▾ queue ({n})") }
+                            else { format!("▸ queue ({n})") };
+                if ui.small_button(label).clicked() {
+                    self.queue_open = !self.queue_open;
+                }
+                if let Some(next) = self.queue.up_next() {
+                    // Only where a few words of it fit; three dots tell
+                    // nobody what is next.
+                    if ui.available_width() > 140.0 {
+                        ui.add(egui::Label::new(egui::RichText::new(format!("next: {}", next.label()))
+                            .small().color(c.text_weak)).truncate());
+                    }
+                }
+            });
+        });
+        });
+        if self.queue_open {
+            {
                 if let Some(act) = crate::queue::queue_ui(ui, &self.queue, c) {
                     // Applied HERE rather than inside the renderer: queue_ui
                     // takes &Queue and returns an intent, which is what lets
@@ -2269,31 +2435,198 @@ impl Controller {
                         crate::queue::QueueAction::Remove(id) => { self.queue.remove(id); }
                         crate::queue::QueueAction::Clear => self.queue.clear(),
                         crate::queue::QueueAction::SetMode(m) => self.queue.mode = m,
+                        crate::queue::QueueAction::MoveUp(id) => { self.queue.move_up(id); }
+                        crate::queue::QueueAction::MoveDown(id) => { self.queue.move_down(id); }
                     }
                 }
             }
         }
-        // THE ANC CHIP, in the playbar. This app is three products over an
-        // ANC mesh, and the operator must be able to reach the anti-noise
-        // from wherever they are — a page for it means switching away from
-        // the sleep engine to turn it off, which is when they most want it.
-        // The engine's own gates decide in Auto; this only says which mode.
-        crate::anc::anc_chip(ui, &mut self.anc, &mut self.a11y, c);
-        if self.now.active() { ui.label(self.now.line()); }
-        // THE PLAY BUTTON NOW MAKES A SOUND. `transport_ui` has always
-        // flipped `playing` and returned a seek target, and nothing in the
-        // tree opened an audio device — so the control was a picture of a
-        // transport. The request is queued for the host to perform; see
-        // `playback::Request` on why this view does not own a process.
-        let was_playing = self.transport.playing;
-        crate::transport::transport_ui(ui, &mut self.transport, c);
-        if self.transport.playing != was_playing {
-            // `transport_ui` already flipped the flag, so put it back and
-            // go through `toggle_play` — the one place that pairs the flag
-            // with the request. Two places doing it is how one of them
-            // ends up showing "playing" over silence.
-            self.transport.playing = was_playing;
-            self.toggle_play();
+    }
+
+    /// Keys, when no text field has the keyboard.
+    ///
+    /// Space and the arrows are what every desktop player answers, and
+    /// the check for focus is what keeps a space typed into the search
+    /// box from pausing the music.
+    fn keyboard(&mut self, ui: &mut Ui) {
+        if ui.memory(|m| m.focused().is_some()) { return; }
+        let (space, left, right, ctrl, n, p, s, m, up, down) = ui.input(|i| (
+            i.key_pressed(egui::Key::Space),
+            i.key_pressed(egui::Key::ArrowLeft),
+            i.key_pressed(egui::Key::ArrowRight),
+            i.modifiers.command,
+            i.key_pressed(egui::Key::N),
+            i.key_pressed(egui::Key::P),
+            i.key_pressed(egui::Key::S),
+            i.key_pressed(egui::Key::M),
+            i.key_pressed(egui::Key::ArrowUp),
+            i.key_pressed(egui::Key::ArrowDown),
+        ));
+        if space { self.toggle_play(); }
+        if right { if ctrl { self.next() } else { self.seek_by(10.0) } }
+        if left { if ctrl { self.previous() } else { self.seek_by(-10.0) } }
+        if n { self.next(); }
+        if p { self.previous(); }
+        if s { self.stop(); }
+        if m { self.pending_volume = Some(if self.volume > 0.0 { 0.0 } else { 30.0 }); }
+        if up { self.nudge_volume(5); }
+        if down { self.nudge_volume(-5); }
+    }
+
+    /// Play/pause, the one place the flag and the request are paired.
+    ///
+    /// Three cases, in the order a person hits them: something is
+    /// playing (pause it, in place if the player can); something is
+    /// loaded and paused (continue it from where the transport says);
+    /// nothing is loaded (start the queue, or say there is nothing).
+    pub fn toggle_play(&mut self) {
+        if self.transport.playing {
+            self.transport.pause();
+            self.now_playing.playing = false;
+            self.pending_playback = Some(crate::playback::Request::Pause);
+            return;
+        }
+        if self.now_playing_id.is_some() && !self.track_url.is_empty() {
+            let at = self.transport.resume().unwrap_or(0.0);
+            self.now_playing.playing = true;
+            self.pending_playback = Some(crate::playback::Request::Resume {
+                url: self.track_url.clone(), sink: self.audio_sink.clone(), at });
+            return;
+        }
+        match self.queue.advance() {
+            Some(e) => self.start_playing(&e),
+            None => self.toast.show("nothing to play — pick a track"),
+        }
+    }
+
+    /// Stop: silence, position back to the start, the track stays loaded.
+    pub fn stop(&mut self) {
+        self.transport.pause();
+        self.transport.report(0.0);
+        self.transport.clear_pause();
+        self.now_playing.playing = false;
+        self.pending_playback = Some(crate::playback::Request::Stop);
+    }
+
+    /// Seek to an absolute position in the loaded track.
+    pub fn seek_to(&mut self, at: f64) {
+        if self.track_url.is_empty() { return; }
+        let at = at.clamp(0.0, self.transport.duration.max(0.0));
+        self.transport.report(at);
+        if self.transport.playing {
+            self.pending_playback = Some(crate::playback::Request::Seek {
+                url: self.track_url.clone(), sink: self.audio_sink.clone(), at });
+        } else {
+            // Paused: the next resume starts from here. No request now —
+            // there is nothing running to move.
+            self.transport.set_paused_at(at);
+        }
+    }
+
+    /// Seek relative to the current position.
+    pub fn seek_by(&mut self, delta: f64) {
+        let at = (self.transport.position() + delta).max(0.0);
+        self.seek_to(at);
+    }
+
+    /// The next track, the same decision a finished track makes.
+    pub fn next(&mut self) {
+        // A skip is deliberate; Repeat One must not trap it on the same
+        // track, which is what routing through `on_track_ended` would do.
+        match self.draw_next() {
+            Some(e) => { self.transport.report(0.0); self.start_playing(&e); }
+            None => self.toast.show("end of queue"),
+        }
+    }
+
+    /// Previous. Within the first three seconds of a track it means the
+    /// track before; after that it means the start of this one — the rule
+    /// every CD player and every phone follows, and the reason a double
+    /// tap goes back two.
+    pub fn previous(&mut self) {
+        if self.transport.position() > 3.0 || self.history.is_empty() {
+            if let Some(id) = self.now_playing_id {
+                self.transport.report(0.0);
+                self.request_play(id);
+            }
+            return;
+        }
+        let prev = self.history.pop().expect("checked non-empty");
+        // What was playing goes back to the head of the queue, so
+        // "previous" then "next" lands where you were.
+        if let Some(id) = self.now_playing_id {
+            let (t, a) = (self.transport.title.clone(), self.transport.artist.clone());
+            self.queue.push_front(id, &t, &a);
+        }
+        self.transport.report(0.0);
+        self.start_playing_no_history(&prev);
+    }
+
+    /// Take the next entry out of the queue, honouring shuffle.
+    fn draw_next(&mut self) -> Option<crate::queue::QueueEntry> {
+        if self.transport.shuffle && self.queue.len() > 1 {
+            // xorshift64*: one draw a track, no dependency, seedable.
+            let mut x = self.shuffle_seed;
+            x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+            self.shuffle_seed = x;
+            let r = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            let i = (r % self.queue.len() as u64) as usize;
+            let id = self.queue.entries()[i].queue_id;
+            return self.queue.take(id);
+        }
+        self.queue.advance()
+    }
+
+    /// Move the volume by a step, clamped, from what the room is set to.
+    fn nudge_volume(&mut self, by: i32) {
+        let cur = self.pending_volume.unwrap_or(self.volume);
+        self.pending_volume = Some((cur + by as f32).clamp(0.0, 100.0));
+    }
+
+    /// A track finished on its own. Decide what plays next.
+    ///
+    /// Called ONLY for a natural end. A stop is not an end — the player
+    /// distinguishes them for exactly this reason, because advancing on a
+    /// pause means pressing pause skips a track.
+    pub fn on_track_ended(&mut self) {
+        use crate::transport::Repeat;
+        if self.transport.repeat == Repeat::One {
+            // Repeat one replays the SAME track rather than consuming the
+            // queue. Popping the head here would empty the queue one track
+            // per repeat, which is the mode quietly destroying the thing it
+            // is looping inside.
+            if let Some(id) = self.now_playing_id {
+                self.transport.report(0.0);
+                self.request_play(id);
+                return;
+            }
+        }
+        if self.queue.is_empty() && self.transport.repeat == Repeat::All {
+            // The queue ran dry under Repeat All: everything that played
+            // this session goes round again, in the order it played (or
+            // shuffled, if that is on). The current track is the last of
+            // them, so it is included too.
+            let mut again: Vec<(i64, String, String)> = self.history.drain(..)
+                .map(|e| (e.track_id, e.title, e.artist)).collect();
+            if let Some(id) = self.now_playing_id {
+                again.push((id, self.transport.title.clone(), self.transport.artist.clone()));
+            }
+            self.queue.mode = crate::queue::EnqueueMode::Stack;
+            self.queue.add_all(&again);
+        }
+        match self.draw_next() {
+            Some(next) => {
+                self.transport.report(0.0);
+                self.start_playing(&next);
+            }
+            None => {
+                // Nothing queued. Stopped rather than left "playing" over
+                // silence, which is the state this app kept showing before
+                // there was any audio at all.
+                self.transport.playing = false;
+                self.transport.report(0.0);
+                self.now_playing.playing = false;
+            }
         }
     }
 
@@ -2308,15 +2641,35 @@ impl Controller {
             Some((_, path)) => {
                 self.track_url = path.clone();
                 self.last_played_track = Some(id);
+                // A fresh track has no remembered pause and no length
+                // yet; the host reports both. Leaving the old duration
+                // would draw the new track's handle against the old
+                // track's end.
+                self.transport.clear_pause();
+                self.transport.duration = 0.0;
+                self.transport.report(0.0);
+                self.transport.playing = true;
+                self.now_playing.playing = true;
                 self.pending_playback = Some(crate::playback::Request::Play {
                     url: path.clone(),
                     sink: self.audio_sink.clone(),
+                    start_secs: 0.0,
                 });
             }
             None => {
                 self.transport.playing = false;
+                self.now_playing.playing = false;
                 self.toast.show("no file for that track");
             }
+        }
+    }
+
+    /// The host tells the transport how long the track is, when the
+    /// player itself cannot (ffplay, paplay). A length the player has
+    /// already reported wins: it is measuring the stream, this is a tag.
+    pub fn set_duration_hint(&mut self, secs: f64) {
+        if self.transport.duration <= 0.0 && secs > 0.0 {
+            self.transport.duration = secs;
         }
     }
 
@@ -2351,6 +2704,110 @@ impl Controller {
 
     pub fn set_track_paths(&mut self, paths: Vec<(i64, String)>) {
         self.track_paths = paths;
+    }
+
+    /// Add or replace paths for some tracks, keeping the rest. What a host
+    /// calls after each list it fetches, since every list carries the
+    /// paths for its own rows.
+    pub fn merge_track_paths(&mut self, paths: Vec<(i64, String)>) {
+        for (id, path) in paths {
+            match self.track_paths.iter_mut().find(|(k, _)| *k == id) {
+                Some(slot) => slot.1 = path,
+                None => self.track_paths.push((id, path)),
+            }
+        }
+    }
+
+    /// The host hands over the browse aggregate source, read from SQL
+    /// with real play counts and years — which is what makes the TOP
+    /// albums view non-empty and the "most played" rows true.
+    pub fn supply_browse_tracks(&mut self, tracks: Vec<crate::browse::BrowseTrack>) {
+        self.browse_tracks = tracks;
+        self.browse.load_local(&self.browse_tracks);
+        self.browse.invalidate();
+        self.browse_stale = false;
+    }
+
+    /// The host answers a search. Ignored unless it answers the query
+    /// currently asked, so a slow answer cannot land under a newer
+    /// question.
+    pub fn supply_search(&mut self, query: &str, rows: Vec<crate::browse::BrowseTrack>) {
+        if query.trim() != self.search.query.trim() { return; }
+        self.search_results = rows;
+        self.search_answered = query.trim().to_string();
+        self.pending_search = None;
+    }
+
+    pub fn supply_home(&mut self, home: HomeLists) {
+        self.home = home;
+        self.home.loaded = true;
+        self.pending_home = false;
+    }
+
+    /// The session file: queue, modes, what was playing. `[transport]`
+    /// keys then the queue rows, in the flat form config_kit reads.
+    pub fn render_session(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("repeat = {}\nshuffle = {}\nvolume = {}\n",
+            self.transport.repeat.tag(), self.transport.shuffle, self.volume.round() as i64));
+        if let Some(id) = self.now_playing_id {
+            out.push_str(&format!("now_playing = {id}\nposition = {:.1}\n", self.transport.position()));
+        }
+        out.push_str("[queue]\n");
+        for line in self.queue.render().lines() {
+            out.push_str("row = ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Restore what `render_session` wrote. The track that was playing is
+    /// LOADED, paused at its position, not started: an app that starts
+    /// playing when it opens is an app that plays at 3am when the phone
+    /// reboots. Returns the track id to load, for the host to resolve.
+    pub fn restore_session(&mut self, text: &str) -> Option<i64> {
+        use crate::transport::Repeat;
+        let ini = config_kit::Ini::parse(text);
+        self.transport.repeat = match ini.top("repeat") {
+            Some("all") => Repeat::All, Some("one") => Repeat::One, _ => Repeat::Off };
+        self.transport.shuffle = ini.top("shuffle") == Some("true");
+        if let Some(v) = ini.top("volume").and_then(|v| v.parse::<f32>().ok()) {
+            self.volume = v.clamp(0.0, 100.0);
+        }
+        // The Ini keeps one value per key; the queue rows are re-read
+        // line by line from the section, which is the one place a
+        // repeated key is the point.
+        let mut in_queue = false;
+        let mut rows = String::new();
+        for line in text.lines() {
+            let l = line.trim();
+            if l.starts_with('[') { in_queue = l == "[queue]"; continue; }
+            if in_queue {
+                if let Some(rest) = l.strip_prefix("row =") {
+                    rows.push_str(rest.trim_start());
+                    rows.push('\n');
+                }
+            }
+        }
+        self.queue.restore(&rows);
+        let id = ini.top("now_playing").and_then(|v| v.parse::<i64>().ok())?;
+        let at = ini.top("position").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        self.transport.report(at);
+        self.transport.set_paused_at(at);
+        Some(id)
+    }
+
+    /// Load a track into the transport without playing it — what a
+    /// restored session does. The host resolves the path.
+    pub fn load_paused(&mut self, id: i64, title: &str, artist: &str, path: &str, at: f64) {
+        self.set_now_playing(title, artist);
+        self.transport.playing = false;
+        self.now_playing.playing = false;
+        self.now_playing_id = Some(id);
+        self.track_url = path.to_string();
+        self.transport.report(at);
+        self.transport.set_paused_at(at);
     }
 
     /// What to play. The queue's head, or the current track.
@@ -2502,6 +2959,207 @@ mod queue_advance_tests {
         assert!(!c.transport.playing, "the queue ran out and it still says playing");
         assert!(!c.now_playing.playing);
         assert_eq!(played(&mut c), None, "it asked for a track that does not exist");
+    }
+
+    fn three_queued() -> Controller {
+        let mut c = app();
+        c.queue.add_all(&[(1, "One".into(), "A".into()), (2, "Two".into(), "A".into()),
+                          (3, "Three".into(), "A".into())]);
+        c
+    }
+
+    #[test]
+    fn repeat_all_goes_round_again_when_the_queue_runs_dry() {
+        // The mode did nothing: `Repeat::All` fell through to "stop at the
+        // end", which is what Off does. It now replays the session in the
+        // order it played.
+        let mut c = three_queued();
+        c.transport.repeat = Repeat::All;
+        let first = c.queue.advance().unwrap();
+        c.start_playing(&first);
+        assert_eq!(played(&mut c).as_deref(), Some("/m/one.flac"));
+        c.on_track_ended();
+        assert_eq!(played(&mut c).as_deref(), Some("/m/two.flac"));
+        c.on_track_ended();
+        assert_eq!(played(&mut c).as_deref(), Some("/m/three.flac"));
+        assert!(c.queue.is_empty());
+        // The wrap: one, two, three again — including the track that just
+        // ended, which is the last of the session, not outside it.
+        c.on_track_ended();
+        assert_eq!(played(&mut c).as_deref(), Some("/m/one.flac"), "did not wrap");
+        assert!(c.transport.playing);
+        assert_eq!(c.queue.len(), 2, "two and three are queued behind it");
+        assert_eq!(c.queue.entries()[0].track_id, 2);
+        assert_eq!(c.queue.entries()[1].track_id, 3);
+    }
+
+    #[test]
+    fn shuffle_draws_from_the_queue_rather_than_its_head() {
+        let mut c = three_queued();
+        c.transport.shuffle = true;
+        // Fixed seed: the draw is deterministic, and with three entries
+        // some seed picks a non-head entry. Search the seeds so the test
+        // asserts the mechanism rather than one magic number.
+        let mut saw_non_head = false;
+        for seed in 1..40u64 {
+            let mut d = three_queued();
+            d.transport.shuffle = true;
+            d.shuffle_seed = seed;
+            d.next();
+            let url = played(&mut d).unwrap();
+            assert_eq!(d.queue.len(), 2, "one entry left the queue");
+            if url != "/m/one.flac" { saw_non_head = true; }
+            // whichever was drawn, the two others remain in their order
+            let left: Vec<i64> = d.queue.entries().iter().map(|e| e.track_id).collect();
+            assert!(left.windows(2).all(|w| w[0] < w[1]), "order disturbed: {left:?}");
+        }
+        assert!(saw_non_head, "forty seeds never drew past the head — that is not a shuffle");
+        // and with shuffle off the head plays, always
+        c.transport.shuffle = false;
+        c.next();
+        assert_eq!(played(&mut c).as_deref(), Some("/m/one.flac"));
+    }
+
+    #[test]
+    fn previous_early_in_a_track_goes_back_and_late_restarts_it() {
+        let mut c = three_queued();
+        c.transport.duration = 300.0;
+        c.next();
+        played(&mut c);
+        c.next();
+        assert_eq!(played(&mut c).as_deref(), Some("/m/two.flac"));
+        assert_eq!(c.history.len(), 1, "one played before this");
+        // Late in the track: restart this one.
+        c.transport.duration = 300.0;
+        c.transport.report(30.0);
+        c.previous();
+        assert_eq!(played(&mut c).as_deref(), Some("/m/two.flac"), "late means restart");
+        assert_eq!(c.transport.position(), 0.0);
+        // Early: the previous track, and this one goes back to the head.
+        c.transport.duration = 300.0;
+        c.transport.report(1.0);
+        c.previous();
+        assert_eq!(played(&mut c).as_deref(), Some("/m/one.flac"), "early means the one before");
+        assert_eq!(c.queue.up_next().map(|e| e.track_id), Some(2), "two is next again");
+        assert!(c.history.is_empty());
+        // Nothing before that: restart rather than nothing.
+        c.transport.duration = 300.0;
+        c.transport.report(1.0);
+        c.previous();
+        assert_eq!(played(&mut c).as_deref(), Some("/m/one.flac"));
+    }
+
+    #[test]
+    fn next_is_deliberate_and_escapes_repeat_one() {
+        let mut c = three_queued();
+        c.transport.repeat = Repeat::One;
+        c.next();
+        played(&mut c);
+        c.next();
+        assert_eq!(played(&mut c).as_deref(), Some("/m/two.flac"), "a skip stayed on repeat");
+        // and at the end it says so rather than pretending
+        c.queue.clear();
+        c.next();
+        assert_eq!(played(&mut c), None);
+        assert_eq!(c.toast.visible(), Some("end of queue"));
+    }
+
+    #[test]
+    fn a_seek_while_playing_asks_the_host_and_while_paused_only_moves_the_handle() {
+        let mut c = three_queued();
+        c.next();
+        played(&mut c);
+        c.transport.duration = 200.0;
+        c.seek_to(50.0);
+        assert!(matches!(c.pending_playback.take(),
+                Some(crate::playback::Request::Seek { at, .. }) if (at - 50.0).abs() < 1e-9));
+        assert_eq!(c.transport.position(), 50.0);
+        c.toggle_play();
+        assert_eq!(c.pending_playback.take(), Some(crate::playback::Request::Pause));
+        c.seek_to(120.0);
+        assert!(c.pending_playback.is_none(), "nothing is running to move");
+        assert_eq!(c.transport.position(), 120.0, "but the handle shows it");
+        c.toggle_play();
+        assert!(matches!(c.pending_playback.take(),
+                Some(crate::playback::Request::Resume { at, .. }) if (at - 120.0).abs() < 1e-9),
+                "the resume starts where the paused seek pointed");
+        // a seek past the end clamps, and one with nothing loaded is ignored
+        c.seek_to(999.0);
+        assert_eq!(c.transport.position(), 200.0);
+        let mut empty = app();
+        empty.seek_to(10.0);
+        assert!(empty.pending_playback.is_none());
+    }
+
+    #[test]
+    fn stop_silences_and_rewinds_but_keeps_the_track_loaded() {
+        let mut c = three_queued();
+        c.next();
+        played(&mut c);
+        c.transport.duration = 200.0;
+        c.transport.report(80.0);
+        c.stop();
+        assert_eq!(c.pending_playback.take(), Some(crate::playback::Request::Stop));
+        assert!(!c.transport.playing);
+        assert_eq!(c.transport.position(), 0.0);
+        assert_eq!(c.now_playing_id, Some(1), "still loaded");
+        // play again starts from the top of the same track
+        c.toggle_play();
+        assert!(matches!(c.pending_playback.take(),
+                Some(crate::playback::Request::Resume { ref url, at, .. }) if url == "/m/one.flac" && at == 0.0));
+    }
+
+    #[test]
+    fn play_with_nothing_loaded_starts_the_queue_or_says_so() {
+        let mut c = app();
+        c.toggle_play();
+        assert!(c.pending_playback.is_none());
+        assert_eq!(c.toast.visible(), Some("nothing to play — pick a track"));
+        let mut q = three_queued();
+        q.toggle_play();
+        assert_eq!(played(&mut q).as_deref(), Some("/m/one.flac"));
+        assert!(q.transport.playing);
+    }
+
+    #[test]
+    fn a_session_round_trips_through_its_file() {
+        let mut c = three_queued();
+        c.transport.repeat = Repeat::All;
+        c.transport.shuffle = true;
+        c.volume = 37.0;
+        c.next();
+        played(&mut c);
+        c.transport.duration = 200.0;
+        c.transport.report(66.0);
+        let text = c.render_session();
+        let mut back = app();
+        let id = back.restore_session(&text);
+        assert_eq!(id, Some(1), "the loaded track is named for the host to resolve");
+        assert_eq!(back.transport.repeat, Repeat::All);
+        assert!(back.transport.shuffle);
+        assert_eq!(back.volume, 37.0);
+        assert_eq!(back.queue.len(), 2);
+        assert_eq!(back.queue.entries()[0].track_id, 2);
+        assert_eq!(back.queue.entries()[1].title, "Three");
+        assert!((back.transport.position() - 66.0).abs() < 0.2);
+        assert!(!back.transport.playing, "a restored session does not start playing by itself");
+        // and loading it paused keeps the position for the resume
+        back.load_paused(1, "One", "A", "/m/one.flac", 66.0);
+        back.toggle_play();
+        assert!(matches!(back.pending_playback.take(),
+                Some(crate::playback::Request::Resume { at, .. }) if (at - 66.0).abs() < 0.2));
+    }
+
+    #[test]
+    fn the_history_is_capped() {
+        let mut c = app();
+        let paths: Vec<(i64, String)> = (1..=(HISTORY_CAP as i64 + 20)).map(|i| (i, format!("/m/{i}.flac"))).collect();
+        c.set_track_paths(paths);
+        for i in 1..=(HISTORY_CAP as i64 + 20) {
+            c.start_playing(&crate::queue::QueueEntry { queue_id: 0, track_id: i, title: String::new(), artist: String::new() });
+        }
+        assert_eq!(c.history.len(), HISTORY_CAP);
+        assert_eq!(c.history[0].track_id, 20, "the oldest were dropped");
     }
 
     #[test]
@@ -2888,10 +3546,19 @@ mod tests {
         c.apply_browse(crate::browse::Action::OpenAlbum(
             crate::browse::AlbumKey { title: "Blue".into(), artist: "Ada".into() }));
         assert_eq!(c.browse.detail_tracks.len(), 2, "the detail page got the album's tracks");
+        // No file known for it yet: the transport must NOT claim to play.
+        c.apply_browse(crate::browse::Action::Play(2));
+        assert_eq!(c.transport.title, "Closer");
+        assert!(!c.transport.playing, "playing with no file is a picture of a transport");
+        assert!(c.pending_playback.is_none());
+        // With the path resolved, the same tap asks for the sound.
+        c.set_track_paths(vec![(2, "/m/closer.flac".into())]);
         c.apply_browse(crate::browse::Action::Play(2));
         assert_eq!(c.transport.title, "Closer");
         assert_eq!(c.transport.artist, "Ada");
         assert!(c.transport.playing);
+        assert!(matches!(c.pending_playback, Some(crate::playback::Request::Play { ref url, .. }) if url == "/m/closer.flac"),
+                "{:?}", c.pending_playback);
     }
 
     #[test]
@@ -3356,20 +4023,26 @@ mod voice_command_tests {
         // A voice command that set `playing` directly would show as
         // playing and make no sound — the exact bug the tap path had.
         let mut c = app(true);
+        c.set_track_paths(vec![(1, "/m/one.flac".into())]);
         c.queue.add_all(&[(1, "One".into(), "A".into())]);
         let first = c.queue.advance().unwrap();
         c.start_playing(&first);
         c.pending_playback = None;
+        c.transport.duration = 200.0;
+        c.transport.report(42.0);
 
         assert_eq!(c.heard("pause"), Outcome::Run(Command::Pause));
         assert!(!c.transport.playing);
-        assert_eq!(c.pending_playback, Some(crate::playback::Request::Stop));
+        assert_eq!(c.pending_playback, Some(crate::playback::Request::Pause));
 
         c.pending_playback = None;
         assert_eq!(c.heard("play"), Outcome::Run(Command::Play));
         assert!(c.transport.playing);
-        assert!(matches!(c.pending_playback, Some(crate::playback::Request::Play { .. })),
-                "resuming asked for no audio");
+        // Resumed WHERE IT WAS, carrying the file so a player that cannot
+        // pause in place can start again at the same second.
+        assert!(matches!(c.pending_playback,
+                Some(crate::playback::Request::Resume { ref url, at, .. }) if url == "/m/one.flac" && (at - 42.0).abs() < 1e-9),
+                "resuming asked for the wrong thing: {:?}", c.pending_playback);
     }
 
     #[test]
@@ -3524,4 +4197,106 @@ mod view_reconcile_tests {
         }
     }
 }
+}
+
+/// The whole shell through real frames, at both breakpoints, with the
+/// states a screenshot caught misbehaving. `layout_probe` reports text
+/// that is off-screen, clipped or drawn over other text — which is how
+/// the transport bar taking the entire window when the queue opened
+/// would have failed here rather than in a screenshot.
+#[cfg(test)]
+mod shell_layout_tests {
+    use super::*;
+
+    fn library_with_queue() -> Controller {
+        let mut c = Controller::new(vec![], vec![]);
+        let rows: Vec<crate::browse::BrowseTrack> = (1..=40).map(|i| crate::browse::BrowseTrack {
+            id: i, title: format!("Track number {i} with a fairly long title"),
+            album: Some(format!("Album {}", i % 5)), primary_artist: "Some Artist".into(),
+            artist_id: (i % 5) as i64, year: Some(2000), play_count: (i % 3) as u32,
+            last_played_at: None,
+        }).collect();
+        c.set_track_paths(rows.iter().map(|t| (t.id, format!("/m/{}.flac", t.id))).collect());
+        c.supply_browse_tracks(rows.clone());
+        c.supply_home(HomeLists { recently_played: rows[..8].to_vec(), recently_added: rows[8..16].to_vec(),
+            most_played: rows[16..24].to_vec(), never_played: rows[24..32].to_vec(), loaded: true });
+        c.nav.go_page(2);
+        let ids: Vec<i64> = (1..=12).collect();
+        c.apply_browse(crate::browse::Action::PlayAll(ids));
+        c.pending_playback = None;
+        c.transport.duration = 240.0;
+        c.transport.report(61.0);
+        c
+    }
+
+    /// Frames through the real shell; the report plus every text drawn
+    /// in the last frame, positioned.
+    fn run(size: egui::Vec2, compact: bool, mut c: Controller)
+        -> (uikit_egui::layout_probe::Report, Vec<uikit_egui::layout_probe::Text>) {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(screen);
+        let mut last = Vec::new();
+        for _ in 0..4 {
+            let out = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut adaptive = Adaptive::default();
+                    adaptive.class = if compact { uikit_egui::adaptive::DeviceClass::Phone }
+                                     else { uikit_egui::adaptive::DeviceClass::Desktop };
+                    adaptive.size = (size.x, size.y);
+                    c.ui(ui, &adaptive);
+                });
+            });
+            last = out.shapes;
+        }
+        (uikit_egui::layout_probe::analyse(screen, &last, compact),
+         uikit_egui::layout_probe::texts(&last))
+    }
+
+    /// The bar's own text must be on screen at the bottom, on every page,
+    /// and nothing in the page may be drawn across it.
+    fn bar_is_pinned(r: &uikit_egui::layout_probe::Report, texts: &[uikit_egui::layout_probe::Text], size: egui::Vec2) {
+        assert!(r.overlaps.is_empty(), "text collisions: {}", r.describe());
+        assert!(r.offscreen.is_empty(), "text off screen: {}", r.describe());
+        let title = texts.iter().find(|g| g.text.starts_with("Track number 1 "))
+            .unwrap_or_else(|| panic!("the transport title is not drawn: {}", r.describe()));
+        assert!(title.rect.bottom() > size.y * 0.6, "the bar is not at the bottom: {:?}", title.rect);
+        // and the page above it is still there: the library heading is
+        // drawn at the top, not under the bar
+        let heading = texts.iter().find(|g| g.text == "Library").expect("the page heading");
+        assert!(heading.rect.top() < size.y * 0.2, "the page was pushed down: {:?}", heading.rect);
+        assert!(heading.rect.bottom() < title.rect.top(), "the bar overlaps the page");
+    }
+
+    #[test]
+    fn the_transport_bar_stays_at_the_bottom_with_the_queue_open_wide() {
+        let mut c = library_with_queue();
+        c.queue_open = true;
+        let size = egui::vec2(1000.0, 720.0);
+        let (r, texts) = run(size, false, c);
+        bar_is_pinned(&r, &texts, size);
+        assert!(texts.iter().any(|g| g.text.contains("Queue")), "the queue list is not drawn");
+    }
+
+    #[test]
+    fn the_transport_bar_stays_at_the_bottom_with_the_queue_open_compact() {
+        let mut c = library_with_queue();
+        c.queue_open = true;
+        let size = egui::vec2(420.0, 820.0);
+        let (r, texts) = run(size, true, c);
+        bar_is_pinned(&r, &texts, size);
+    }
+
+    #[test]
+    fn every_page_lays_out_without_text_collisions_at_both_widths() {
+        for page in 0..VIEWS.len() {
+            for (size, compact) in [(egui::vec2(1000.0, 720.0), false), (egui::vec2(420.0, 820.0), true)] {
+                let mut c = library_with_queue();
+                c.nav.go_page(page);
+                let (r, _) = run(size, compact, c);
+                assert!(r.overlaps.is_empty(), "page {} at {size:?}: {}", VIEWS[page], r.describe());
+            }
+        }
+    }
 }

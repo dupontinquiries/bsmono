@@ -157,6 +157,156 @@ impl RealCatalog {
         bo_media::library::delete_playlist(&self.conn, playlist_id).is_ok()
     }
 
+    /// Take one track out of a playlist. Needs `&mut` because the
+    /// library function renumbers the remaining rows in a transaction.
+    pub fn remove_from_playlist(&mut self, playlist_id: i64, track_id: i64) -> bool {
+        bo_media::library::remove_from_playlist(&mut self.conn, playlist_id, track_id).is_ok()
+    }
+
+    /// Ask the worker for the track's path, display fields and — the
+    /// part the player cannot always supply — its duration from the tag
+    /// reader. Answered as `MediaResult::TrackForPlay`.
+    pub fn resolve_for_play(&self, track_id: i64) {
+        let _ = self.cmd_tx.send(MediaCmd::ResolveForPlay(track_id));
+    }
+
+    /// Record a play in the history table as well as the play count, so
+    /// "recently played" has rows. `device_url` names where it played.
+    pub fn record_history(&self, track_id: i64, device_url: &str, secs: Option<i64>) {
+        let _ = self.cmd_tx.send(MediaCmd::RecordPlayHistory {
+            track_id, device_url: device_url.to_string(), duration_seconds: secs });
+    }
+
+    /// Every track with the fields the browse aggregates need — real
+    /// play counts, last-played times, years, a real artist id. The
+    /// CatalogSource page carries none of those, which is why the TOP
+    /// album view was always empty: it filters on plays and every row
+    /// had zero.
+    pub fn browse_tracks(&self) -> Vec<crate::browse::BrowseTrack> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT t.id, COALESCE(ov.title, t.title), COALESCE(ov.album, t.album),
+                    COALESCE(ov.year, t.year), t.play_count, t.last_played_at,
+                    COALESCE(ov.artist, (SELECT a.name FROM artists a
+                        JOIN track_artists ta ON ta.artist_id = a.id
+                        WHERE ta.track_id = t.id AND ta.role = 'primary'
+                        ORDER BY ta.ord LIMIT 1), ''),
+                    COALESCE((SELECT ta.artist_id FROM track_artists ta
+                        WHERE ta.track_id = t.id AND ta.role = 'primary'
+                        ORDER BY ta.ord LIMIT 1), 0)
+             FROM tracks t LEFT JOIN track_overrides ov ON ov.track_id = t.id
+             ORDER BY t.title") else { return Vec::new() };
+        let rows = stmt.query_map([], |r| Ok(crate::browse::BrowseTrack {
+            id: r.get(0)?,
+            title: r.get::<_, String>(1)?,
+            album: r.get::<_, Option<String>>(2)?,
+            year: r.get::<_, Option<i64>>(3)?.map(|y| y as u16),
+            play_count: r.get::<_, i64>(4)?.max(0) as u32,
+            last_played_at: r.get(5)?,
+            primary_artist: r.get(6)?,
+            artist_id: r.get(7)?,
+        }));
+        let mut out: Vec<crate::browse::BrowseTrack> = match rows {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => Vec::new(),
+        };
+        // An override can name an artist with no artists row; give
+        // those a stable id from the name so browse still groups them.
+        for t in out.iter_mut() {
+            if t.artist_id == 0 && !t.primary_artist.is_empty() {
+                t.artist_id = crate::artist_id_of(&t.primary_artist);
+            }
+        }
+        out
+    }
+
+    /// The paths for a set of rows, for `Controller::merge_track_paths`.
+    /// One query, not one per row — the previous per-page sync ran a
+    /// statement per track and an O(n²) merge on every page load.
+    pub fn paths_for(&self, ids: &[i64]) -> Vec<(i64, String)> {
+        if ids.is_empty() { return Vec::new(); }
+        let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let Ok(mut stmt) = self.conn.prepare(
+            &format!("SELECT id, path FROM tracks WHERE id IN ({list})")) else { return Vec::new() };
+        let out: Vec<(i64, String)> = match stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => Vec::new(),
+        };
+        out
+    }
+
+    fn summaries_to_browse(rows: Vec<bo_media::catalog::TrackSummary>) -> Vec<crate::browse::BrowseTrack> {
+        rows.into_iter().map(|t| crate::browse::BrowseTrack {
+            id: t.id, title: t.title, album: t.album,
+            artist_id: crate::artist_id_of(&t.primary_artist),
+            primary_artist: t.primary_artist,
+            year: t.year, play_count: 0, last_played_at: None,
+        }).collect()
+    }
+
+    /// The catalogue's own search: folded (so "bjork" finds "Björk"),
+    /// every term must match, most-played first. An empty query is the
+    /// recent tracks, which the caller treats as "nothing asked".
+    pub fn search(&self, query: &str, limit: usize) -> Vec<crate::browse::BrowseTrack> {
+        if query.trim().is_empty() { return Vec::new(); }
+        let mut rows = Self::summaries_to_browse(
+            bo_media::library::search_advanced(&self.conn, query, limit).unwrap_or_default());
+        self.fill_counts(&mut rows);
+        rows
+    }
+
+    /// The Home lists, straight from the library's own queries.
+    pub fn home(&self, rows: usize) -> crate::HomeLists {
+        let recently_played: Vec<crate::browse::BrowseTrack> =
+            bo_media::library::recent_history(&self.conn, rows * 3).unwrap_or_default()
+            .into_iter().fold(Vec::new(), |mut acc: Vec<crate::browse::BrowseTrack>, h| {
+                // One row per track, most recent play wins: a track
+                // played five times in a row is one line, not five.
+                if !acc.iter().any(|t| t.id == h.track_id) && acc.len() < rows {
+                    acc.push(crate::browse::BrowseTrack {
+                        id: h.track_id, title: h.title, album: None,
+                        artist_id: crate::artist_id_of(h.primary_artist.as_deref().unwrap_or("")),
+                        primary_artist: h.primary_artist.unwrap_or_default(),
+                        year: None, play_count: 0, last_played_at: Some(h.played_at),
+                    });
+                }
+                acc
+            });
+        let mut home = crate::HomeLists {
+            recently_played,
+            recently_added: Self::summaries_to_browse(
+                bo_media::library::recently_added(&self.conn, rows).unwrap_or_default()),
+            most_played: Self::summaries_to_browse(
+                bo_media::library::top_tracks_by_plays(&self.conn, rows).unwrap_or_default()),
+            never_played: Self::summaries_to_browse(
+                bo_media::library::never_played(&self.conn, rows).unwrap_or_default()),
+            loaded: true,
+        };
+        self.fill_counts(&mut home.recently_played);
+        self.fill_counts(&mut home.recently_added);
+        self.fill_counts(&mut home.most_played);
+        home
+    }
+
+    /// Fill play counts and albums on rows that came from a query that
+    /// does not carry them, in one statement.
+    fn fill_counts(&self, rows: &mut [crate::browse::BrowseTrack]) {
+        if rows.is_empty() { return; }
+        let ids: Vec<i64> = rows.iter().map(|t| t.id).collect();
+        let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let Ok(mut stmt) = self.conn.prepare(&format!(
+            "SELECT id, play_count, last_played_at, album FROM tracks WHERE id IN ({list})")) else { return };
+        let Ok(found) = stmt.query_map([], |r| Ok((
+            r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<String>>(3)?))) else { return };
+        for (id, plays, last, album) in found.flatten() {
+            if let Some(t) = rows.iter_mut().find(|t| t.id == id) {
+                t.play_count = plays.max(0) as u32;
+                t.last_played_at = last;
+                if t.album.is_none() { t.album = album; }
+            }
+        }
+    }
+
     // ── Track edits ─────────────────────────────────────────────────
     // Backs `dialogs::EditTrack`. Goes through `MediaCmd::SetOverride`
     // (a DB-only overlay row) rather than `WriteTagsToFile` (which
@@ -387,6 +537,90 @@ mod tests {
         assert_eq!(f.album, "An Album");
         assert_eq!(f.year, "2020");
         assert_eq!(f.artist, "", "no artist row linked yet");
+    }
+
+    fn insert(cat: &RealCatalog, path: &str, title: &str, album: &str, plays: i64) -> i64 {
+        cat.conn.execute(
+            "INSERT INTO tracks (path, size, mtime, title, album, year, rating, play_count, last_played_at)
+             VALUES (?1, 100, 0, ?2, ?3, 2020, 0, ?4, ?5)",
+            rusqlite::params![path, title, album, plays, if plays > 0 { Some(plays * 100) } else { None }],
+        ).unwrap();
+        cat.conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn browse_rows_carry_real_play_counts_so_the_top_view_can_rank() {
+        let (_dir, cat) = temp_catalog();
+        let a = insert(&cat, "/m/a.flac", "A", "Blue", 4);
+        let b = insert(&cat, "/m/b.flac", "B", "Blue", 0);
+        let rows = cat.browse_tracks();
+        assert_eq!(rows.len(), 2);
+        let ra = rows.iter().find(|t| t.id == a).unwrap();
+        assert_eq!(ra.play_count, 4);
+        assert_eq!(ra.last_played_at, Some(400));
+        assert_eq!(ra.year, Some(2020));
+        assert_eq!(rows.iter().find(|t| t.id == b).unwrap().play_count, 0);
+        // and the album aggregate now has a play total the TOP view accepts
+        let albums = crate::browse::aggregate_albums(&rows);
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].total_plays, 4);
+        assert!(!crate::browse::top_albums(&albums, 10).is_empty(), "TOP was always empty before");
+    }
+
+    #[test]
+    fn paths_come_back_for_a_set_in_one_query() {
+        let (_dir, cat) = temp_catalog();
+        let a = insert(&cat, "/m/a.flac", "A", "", 0);
+        let b = insert(&cat, "/m/b.flac", "B", "", 0);
+        let mut got = cat.paths_for(&[a, b, 999]);
+        got.sort();
+        assert_eq!(got, vec![(a, "/m/a.flac".to_string()), (b, "/m/b.flac".to_string())]);
+        assert!(cat.paths_for(&[]).is_empty());
+    }
+
+    #[test]
+    fn search_is_folded_and_multi_term() {
+        let (_dir, cat) = temp_catalog();
+        // The search blob is what the scanner writes; mimic it the way
+        // apply_parse does so this exercises the real query.
+        let id = insert(&cat, "/m/bjork.flac", "Jóga", "Homogenic", 2);
+        cat.conn.execute("UPDATE tracks SET search = ?1 WHERE id = ?2",
+            rusqlite::params![bo_media::catalog::build_search_blob("Jóga", &["Björk".to_string()], Some("Homogenic")), id]).unwrap();
+        let hits = cat.search("bjork joga", 20);
+        assert_eq!(hits.len(), 1, "ascii typed finds the accented tag");
+        assert_eq!(hits[0].id, id);
+        assert_eq!(hits[0].play_count, 2, "counts are filled in");
+        assert!(cat.search("bjork nothingelse", 20).is_empty(), "every term must match");
+        assert!(cat.search("   ", 20).is_empty(), "an empty query is not a search");
+    }
+
+    #[test]
+    fn home_lists_answer_the_four_questions() {
+        let (_dir, cat) = temp_catalog();
+        let hot = insert(&cat, "/m/hot.flac", "Hot", "", 9);
+        let cold = insert(&cat, "/m/cold.flac", "Cold", "", 0);
+        bo_media::library::record_history(&cat.conn, hot, "local", None).unwrap();
+        bo_media::library::record_history(&cat.conn, hot, "local", None).unwrap();
+        let home = cat.home(8);
+        assert!(home.loaded);
+        assert_eq!(home.recently_played.iter().map(|t| t.id).collect::<Vec<_>>(), vec![hot],
+                   "one row per track, however many plays");
+        assert_eq!(home.most_played.first().map(|t| t.id), Some(hot));
+        assert_eq!(home.never_played.iter().map(|t| t.id).collect::<Vec<_>>(), vec![cold]);
+        assert_eq!(home.recently_added.len(), 2);
+    }
+
+    #[test]
+    fn a_track_can_be_removed_from_a_playlist() {
+        let (_dir, mut cat) = temp_catalog();
+        let pl = cat.create_playlist("Mix", "").unwrap();
+        let a = insert(&cat, "/m/a.flac", "A", "", 0);
+        let b = insert(&cat, "/m/b.flac", "B", "", 0);
+        assert!(cat.add_to_playlist(pl, a) && cat.add_to_playlist(pl, b));
+        assert!(cat.remove_from_playlist(pl, a));
+        let left = cat.playlist_tracks(pl);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, b);
     }
 
     #[test]

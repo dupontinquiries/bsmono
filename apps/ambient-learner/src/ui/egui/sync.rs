@@ -153,6 +153,24 @@ pub struct SyncPage {
     /// `sync.rs::SyncManager` from inside the view would trade that away
     /// for a capability check the host already has cheaply.
     pub backend: Option<TransferBackend>,
+    /// The path typed into the import row. The GTK page opens a file
+    /// chooser; egui has no native one without another dependency, and a
+    /// phone's file chooser is a portal this build does not talk to yet,
+    /// so the path is typed (or pasted) instead.
+    pub import_path: String,
+    /// The last export or import's outcome, from the host.
+    pub note: Option<String>,
+    /// Where exports go, so the note can say it before the first one.
+    pub export_dir: String,
+}
+
+/// What the page asks the host to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncAction {
+    /// Snapshot the live database to the export directory.
+    Export,
+    /// Merge calibrations from the database at this path.
+    Import(String),
 }
 
 /// What the host's transfer backend can currently do.
@@ -240,8 +258,9 @@ pub struct ButtonState {
     pub notes: Vec<String>,
 }
 
-/// Draw the page.
-pub fn sync_ui(ui: &mut egui::Ui, p: &SyncPage, c: &uikit_egui::PaletteColors) {
+/// Draw the page. Returns what was pressed; the host performs it.
+pub fn sync_ui(ui: &mut egui::Ui, p: &mut SyncPage, c: &uikit_egui::PaletteColors) -> Option<SyncAction> {
+    let mut out = None;
     crate::ui::egui::chrome::card_heading(ui, "📍 Local database");
     ui.add_space(6.0);
     egui::Grid::new("sync_db").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
@@ -264,8 +283,24 @@ pub fn sync_ui(ui: &mut egui::Ui, p: &SyncPage, c: &uikit_egui::PaletteColors) {
     // Disabled rather than hidden: a greyed button with a reason underneath
     // tells the user the capability exists and is coming. A missing button
     // tells them nothing, and they go looking for it in settings.
-    ui.add_enabled(st.export, egui::Button::new("📤 Export database"));
-    ui.add_enabled(st.import, egui::Button::new("📥 Import database"));
+    if ui.add_enabled(st.export, egui::Button::new("📤 Export database")).clicked() {
+        out = Some(SyncAction::Export);
+    }
+    if !p.export_dir.is_empty() {
+        ui.colored_label(c.text_weak, egui::RichText::new(format!("to {}", p.export_dir)).small());
+    }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_enabled(st.import, egui::TextEdit::singleline(&mut p.import_path)
+            .hint_text("path to a sensors_*.db file").desired_width(220.0));
+        let can = st.import && !p.import_path.trim().is_empty();
+        if ui.add_enabled(can, egui::Button::new("📥 Import database")).clicked() {
+            out = Some(SyncAction::Import(p.import_path.trim().to_string()));
+        }
+    });
+    if let Some(n) = &p.note {
+        ui.colored_label(c.text, egui::RichText::new(n).small());
+    }
 
     let notes = st.notes;
     if !notes.is_empty() {
@@ -275,6 +310,7 @@ pub fn sync_ui(ui: &mut egui::Ui, p: &SyncPage, c: &uikit_egui::PaletteColors) {
             ui.colored_label(c.text_weak, n);
         }
     }
+    out
 }
 
 #[cfg(test)]
@@ -325,6 +361,7 @@ mod tests {
                 can_import: true,
                 exports_locations: false,
             }),
+            ..Default::default()
         };
         assert_eq!(
             stub.export(),

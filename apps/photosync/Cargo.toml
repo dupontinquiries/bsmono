@@ -3,7 +3,7 @@ name = "photosync"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.96"
-description = "Photo library: perceptual dedup, metadata tracking, and an ascii + tag pipeline so a language model can drive an image search. Headless core; the egui shell is behind the `app` feature."
+description = "Photo library: perceptual dedup, metadata tracking, and an ascii + tag pipeline so a language model can drive an image search. Headless core; the egui frontend is the separate egui-frontend crate."
 
 [dependencies]
 # Nothing yet, deliberately. The core takes greyscale pixels and returns

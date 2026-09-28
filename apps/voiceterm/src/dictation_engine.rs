@@ -671,11 +671,11 @@ mod tests {
                 e.capture_start(now);
                 e.level((rng.next() % 300) as f32 / 100.0 - 0.5, now);
                 if rng.next() % 3 == 0 {
-                    e.preview(rng.pick(&corpus), now);
+                    e.preview(*rng.pick(&corpus), now);
                 }
                 let tier = *rng.pick(&tiers);
                 let conf = (rng.next() % 120) as f32 / 100.0;
-                e.recognize(tier, rng.pick(&corpus), conf, now + 300);
+                e.recognize(tier, *rng.pick(&corpus), conf, now + 300);
                 e.tick(now + 400);
 
                 // invariants

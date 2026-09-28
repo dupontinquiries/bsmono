@@ -35,37 +35,14 @@
 //! into a background window it is the difference between idle and a warm phone.
 
 /// A frame as it arrives, before any conversion.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct RawFrame {
-    pub width: u32,
-    pub height: u32,
-    /// Monotonic capture time, for staleness and for measuring end-to-end lag.
-    pub captured_ms: u64,
-    /// Sequence from the producer, so drops can be counted rather than guessed.
-    pub seq: u64,
-    /// The pixels, RGBA8, `width * height * 4` bytes. An `Arc` because the
-    /// frame travels by value through `HostEvent::CameraFrame` and is cloned
-    /// into the slot — at 30 fps a deep copy per hop is the difference
-    /// between an idle phone and a warm one. Empty is legal and means a
-    /// metadata-only frame (the pre-capture tests use it); the texture
-    /// upload checks the length rather than trusting it.
-    pub rgba: std::sync::Arc<[u8]>,
-}
-
-impl RawFrame {
-    /// Do the pixels actually describe the claimed geometry? A torn frame —
-    /// a reader that got EOF mid-frame, a stride mismatch — must be refused
-    /// at the upload, not panicked on inside egui.
-    pub fn pixels_plausible(&self) -> bool {
-        // A NON-ZERO geometry, as well as a buffer matching it. Comparing
-        // lengths alone lets a 0x0 frame through — 0 == 0 — and the
-        // shutter would write an empty file and report success, leaving
-        // the person with a snap they cannot open and no reason why.
-        self.width > 0
-            && self.height > 0
-            && self.rgba.len() == (self.width as usize) * (self.height as usize) * 4
-    }
-}
+///
+/// The kit's type, re-exported: `capture_kit::RawFrame` is what the capture
+/// engine now produces (the engine moved out of this crate's `capture.rs`),
+/// and a second struct with the same five fields would only mean a copy at
+/// every hop between the two. Its `pixels_plausible` carries the same
+/// non-zero-geometry rule this file's own used to: a 0×0 frame with an
+/// empty buffer is not a frame, and the shutter must not write it.
+pub use capture_kit::RawFrame;
 
 /// A frame slot: one deep, latest wins.
 ///

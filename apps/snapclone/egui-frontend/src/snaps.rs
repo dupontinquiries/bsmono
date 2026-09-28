@@ -441,6 +441,106 @@ pub fn feed_ui(ui: &mut egui::Ui, feed: &SnapFeed, press: &mut Press, now: i64,
 }
 
 #[cfg(test)]
+mod picture_tests {
+    use super::*;
+
+    fn jpeg(w: u32, h: u32) -> Vec<u8> {
+        let f = crate::frame_pump::RawFrame {
+            width: w, height: h, captured_ms: 0, seq: 0,
+            rgba: std::sync::Arc::from(vec![120u8; (w * h * 4) as usize]) };
+        crate::media_encode::encode_still(&f, 80).expect("encodes").bytes
+    }
+
+    #[test]
+    fn a_sent_jpeg_decodes_back_to_its_size() {
+        let img = decode_image(&jpeg(64, 48)).expect("decodes");
+        assert_eq!(img.size, [64, 48]);
+        assert!(decode_image(b"not a picture").is_err());
+    }
+
+    #[test]
+    fn the_picture_is_fitted_not_stretched() {
+        let frame = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 200.0));
+        let r = fit_rect(frame, egui::vec2(100.0, 400.0));
+        assert!((r.height() - 200.0).abs() < 1e-3 && (r.width() - 50.0).abs() < 1e-3, "{r:?}");
+        assert_eq!(r.center(), frame.center());
+        let wide = fit_rect(frame, egui::vec2(600.0, 100.0));
+        assert!((wide.width() - 300.0).abs() < 1e-3 && (wide.height() - 50.0).abs() < 1e-3);
+        assert_eq!(fit_rect(frame, egui::vec2(0.0, 0.0)), frame, "a degenerate size fills the frame");
+    }
+
+    #[test]
+    fn the_texture_follows_the_open_snap_and_is_gone_on_close() {
+        let ctx = egui::Context::default();
+        let mut t = SnapTexture::default();
+        let snap = |id: &str, bytes: Vec<u8>| Snap { id: id.into(), sender_id: "s".into(),
+            sender_name: "s".into(), sent_at: 0, media: Media::Image, duration_secs: 5, bytes };
+        let good = snap("one", jpeg(8, 8));
+        // Textures need a frame to be allocated in; run one.
+        let _ = ctx.run(Default::default(), |ctx| {
+            assert!(t.get(ctx, &good).is_some(), "the first call decodes");
+            assert!(t.is_loaded());
+            assert!(t.get(ctx, &good).is_some(), "the second call reuses it");
+            let bad = snap("two", b"garbage".to_vec());
+            assert!(t.get(ctx, &bad).is_none());
+            assert!(t.error().is_some(), "a decode failure says why");
+            t.clear();
+            assert!(!t.is_loaded() && t.error().is_none());
+        });
+    }
+}
+
+#[cfg(test)]
+mod picture_tests {
+    use super::*;
+
+    fn jpeg(w: u32, h: u32) -> Vec<u8> {
+        let f = crate::frame_pump::RawFrame {
+            width: w, height: h, captured_ms: 0, seq: 0,
+            rgba: std::sync::Arc::from(vec![120u8; (w * h * 4) as usize]) };
+        crate::media_encode::encode_still(&f, 80).expect("encodes").bytes
+    }
+
+    #[test]
+    fn a_sent_jpeg_decodes_back_to_its_size() {
+        let img = decode_image(&jpeg(64, 48)).expect("decodes");
+        assert_eq!(img.size, [64, 48]);
+        assert!(decode_image(b"not a picture").is_err());
+    }
+
+    #[test]
+    fn the_picture_is_fitted_not_stretched() {
+        let frame = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 200.0));
+        let r = fit_rect(frame, egui::vec2(100.0, 400.0));
+        assert!((r.height() - 200.0).abs() < 1e-3 && (r.width() - 50.0).abs() < 1e-3, "{r:?}");
+        assert_eq!(r.center(), frame.center());
+        let wide = fit_rect(frame, egui::vec2(600.0, 100.0));
+        assert!((wide.width() - 300.0).abs() < 1e-3 && (wide.height() - 50.0).abs() < 1e-3);
+        assert_eq!(fit_rect(frame, egui::vec2(0.0, 0.0)), frame, "a degenerate size fills the frame");
+    }
+
+    #[test]
+    fn the_texture_follows_the_open_snap_and_is_gone_on_close() {
+        let ctx = egui::Context::default();
+        let mut t = SnapTexture::default();
+        let snap = |id: &str, bytes: Vec<u8>| Snap { id: id.into(), sender_id: "s".into(),
+            sender_name: "s".into(), sent_at: 0, media: Media::Image, duration_secs: 5, bytes };
+        let good = snap("one", jpeg(8, 8));
+        // Textures need a frame to be allocated in; run one.
+        let _ = ctx.run(Default::default(), |ctx| {
+            assert!(t.get(ctx, &good).is_some(), "the first call decodes");
+            assert!(t.is_loaded());
+            assert!(t.get(ctx, &good).is_some(), "the second call reuses it");
+            let bad = snap("two", b"garbage".to_vec());
+            assert!(t.get(ctx, &bad).is_none());
+            assert!(t.error().is_some(), "a decode failure says why");
+            t.clear();
+            assert!(!t.is_loaded() && t.error().is_none());
+        });
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn the_feed_is_drawn_and_a_hold_reaches_the_conversation() {
@@ -798,8 +898,75 @@ mod tests {
 /// anything". Drawing a full-but-frozen bar there would say the opposite of
 /// what is happening, so there is no bar at all — the position counter takes
 /// its place.
+/// Decode a snap's bytes into an egui image. JPEG is what the send path
+/// produces (`media_encode`), so that is the one format compiled in; a
+/// snap that does not decode is reported rather than drawn as a hole.
+pub fn decode_image(bytes: &[u8]) -> Result<egui::ColorImage, String> {
+    let img = image::load_from_memory(bytes).map_err(|e| format!("not an image: {e}"))?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    Ok(egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw()))
+}
+
+/// The decoded picture for the open snap, uploaded once and kept only
+/// while the viewer holds that snap — the bytes are wiped on close and so
+/// is this, which is the same promise kept in GPU memory.
+#[derive(Default)]
+pub struct SnapTexture {
+    id: String,
+    texture: Option<egui::TextureHandle>,
+    /// Why there is no picture, for the frame to say.
+    error: Option<String>,
+}
+
+impl SnapTexture {
+    /// The texture for `snap`, decoding on the first call for a new id.
+    pub fn get(&mut self, ctx: &egui::Context, snap: &Snap) -> Option<&egui::TextureHandle> {
+        if self.id != snap.id {
+            self.id = snap.id.clone();
+            self.texture = None;
+            self.error = None;
+            match decode_image(&snap.bytes) {
+                Ok(img) => {
+                    self.texture = Some(ctx.load_texture(
+                        format!("snap-{}", snap.id), img, egui::TextureOptions::LINEAR));
+                }
+                Err(e) => self.error = Some(e),
+            }
+        }
+        self.texture.as_ref()
+    }
+
+    pub fn error(&self) -> Option<&str> { self.error.as_deref() }
+
+    /// Drop the picture. Called when the viewer closes; the texture would
+    /// otherwise outlive the bytes it was made from.
+    pub fn clear(&mut self) {
+        self.id.clear();
+        self.texture = None;
+        self.error = None;
+    }
+
+    pub fn is_loaded(&self) -> bool { self.texture.is_some() }
+}
+
+/// Fit `image` inside `rect`, centred, keeping its aspect.
+pub fn fit_rect(rect: egui::Rect, image: egui::Vec2) -> egui::Rect {
+    if image.x <= 0.0 || image.y <= 0.0 { return rect; }
+    let scale = (rect.width() / image.x).min(rect.height() / image.y);
+    let size = image * scale;
+    egui::Rect::from_center_size(rect.center(), size)
+}
+
 pub fn viewer_ui(ui: &mut egui::Ui, v: &mut Viewer, c: &uikit_egui::PaletteColors)
     -> Vec<ViewerEvent> {
+    viewer_ui_with(ui, v, c, None)
+}
+
+/// The viewer with the picture: `tex` is the open snap's decoded image,
+/// or `None` (a video, a decode failure, or a test with no context).
+pub fn viewer_ui_with(ui: &mut egui::Ui, v: &mut Viewer, c: &uikit_egui::PaletteColors,
+                      tex: Option<&egui::TextureHandle>) -> Vec<ViewerEvent> {
     if !v.is_open() { return Vec::new(); }
     // Ticked here rather than by the caller: the countdown is the whole
     // feature, and a viewer drawn without being ticked shows a frozen timer on
@@ -823,11 +990,29 @@ pub fn viewer_ui(ui: &mut egui::Ui, v: &mut Viewer, c: &uikit_egui::PaletteColor
 
     ui.vertical_centered(|ui| {
         ui.colored_label(c.text, &who);
+        // As much of the dialog as the controls leave: a snap is the
+        // whole point of the screen it opens on, not a thumbnail.
+        let h = (ui.available_height() - 80.0).max(160.0);
         let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width().min(300.0), 220.0), egui::Sense::hover());
-        // The image itself belongs to the media layer; this owns the frame,
-        // the timer and the controls.
+            egui::vec2(ui.available_width(), h), egui::Sense::hover());
         ui.painter().rect_filled(rect, 6.0, c.bg_base);
+        match tex {
+            Some(t) => {
+                // Letterboxed, never stretched: a portrait photo in a
+                // landscape frame keeps its shape.
+                let dst = fit_rect(rect.shrink(4.0), t.size_vec2());
+                ui.painter().image(t.id(), dst,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE);
+            }
+            None => {
+                // The frame says why it is empty. An empty rectangle over
+                // a running countdown was the old viewer, and it read as
+                // a broken app rather than as a snap being kept private.
+                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
+                    "(no picture to show)", egui::FontId::proportional(13.0), c.text_weak);
+            }
+        }
         if !caption.trim().is_empty() {
             ui.colored_label(c.text_weak, &caption);
         }

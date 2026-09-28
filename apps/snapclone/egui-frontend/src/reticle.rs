@@ -150,10 +150,19 @@ impl Reticle {
 pub fn reticle_ui(ui: &mut egui::Ui, r: &Reticle, view: egui::Rect,
                   c: &uikit_egui::PaletteColors) {
     let Some((nx, ny)) = r.at() else { return };
-    let a = r.alpha();
-    if a <= 0.001 { return; }
     let centre = egui::pos2(view.left() + nx * view.width(),
                             view.top() + ny * view.height());
+    reticle_ui_at(ui, r, centre, c);
+}
+
+/// The reticle at a screen point the caller mapped — the viewfinder's
+/// `to_screen`, which knows the mirror, the turn and the zoom window that
+/// `reticle_ui`'s fraction-of-the-view placement does not.
+pub fn reticle_ui_at(ui: &mut egui::Ui, r: &Reticle, centre: egui::Pos2,
+                     c: &uikit_egui::PaletteColors) {
+    if r.at().is_none() { return; }
+    let a = r.alpha();
+    if a <= 0.001 { return; }
     let size = 34.0 * r.pulse_scale();
     // Colour carries the state: the shape alone cannot say whether focus
     // succeeded, and that is the one thing the user needs from it.
@@ -177,7 +186,7 @@ mod tests {
         // paint still used a fixed-timer fade, so this module never reached a
         // screen. The old path is gone; this fails if it comes back.
         let cam = include_str!("camera.rs");
-        assert!(cam.contains("reticle::reticle_ui("), "the reticle is not drawn");
+        assert!(cam.contains("reticle::reticle_ui_at("), "the reticle is not drawn");
         assert!(!cam.contains("let a = vf.reticle_alpha();"),
                 "the timer-based fade is back alongside the reticle");
     }

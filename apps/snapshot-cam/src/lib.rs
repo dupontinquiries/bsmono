@@ -39,6 +39,43 @@
 /// crate's header describes.
 #[cfg(feature = "app")]
 pub mod preview;
+/// The window's contents, in the library so its layout is testable.
+#[cfg(feature = "app")]
+pub mod shell;
+
+/// The capture directory and the roll file: where photos and their
+/// dispositions live between launches.
+pub mod store;
+/// The camera: probe, plan, the capture-kit rig, facing.
+pub mod camera;
+/// The two ways a photo leaves: a copy into photosync's library, or a
+/// request in snapclone's outbox.
+pub mod handoff;
+/// snapclone's contact book, read for the picker.
+pub mod contacts;
+/// The one pass from frame to photo: lens correction, crop, zoom,
+/// desqueeze, white balance, exposure; and the histogram/zebra/peaking
+/// measurements the viewfinder draws.
+pub mod develop;
+/// Clip-on lens profiles (Moment and others) and the black-border autocrop.
+pub mod lens;
+/// The camera's own manual controls through `v4l2-ctl`, where it has them.
+pub mod hwctl;
+/// The preview's develop pass on a worker thread, latest frame wins.
+pub mod developer;
+/// The camera cover's tint and haze, measured from a grey card.
+pub mod cover;
+/// Merging frames: exposure fusion (HDR), focus stacking, burst average,
+/// with alignment; and the sharpness score the primed shutter picks by.
+pub mod stack;
+/// Taking the several frames a merge needs: HDR, focus and burst brackets.
+pub mod bracket;
+/// Volume/power keys from evdev and shake from the IIO accelerometer.
+pub mod triggers;
+/// A trigger arms the shutter; the sharpest frame in the next second is kept.
+pub mod prime;
+/// The DSLR-style settings as data, and the render they add up to.
+pub mod pro;
 
 /// Where a photo is allowed to go.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -93,6 +130,16 @@ pub struct Shot {
     /// Which camera took it, for the case where a phone has two.
     pub camera: String,
     disposition: Disposition,
+    /// The outbox request id while a contact send is pending, so the
+    /// outcome marker can be matched back to this shot after a restart.
+    pub handoff: Option<String>,
+    /// Everyone this photo has been sent to (asked, in flight, or
+    /// confirmed), in order. STICKY: `disposition` is the latest act, and
+    /// a back-up after a send would otherwise overwrite "shared with Bee"
+    /// with "backed up" — a photo somebody has, reported as private, which
+    /// is the one lie this type exists to prevent. `disclosed()` reads
+    /// this as well as the disposition.
+    pub sent_to: Vec<String>,
 }
 
 impl Shot {
@@ -103,10 +150,17 @@ impl Shot {
             file: file.to_string(), width, height, taken_ms,
             camera: camera.to_string(),
             disposition: Disposition::Local,
+            handoff: None,
+            sent_to: Vec::new(),
         }
     }
 
     pub fn disposition(&self) -> &Disposition { &self.disposition }
+
+    /// Restore a disposition read back from the roll file. The only way
+    /// to construct a non-local shot, and it exists for one caller: the
+    /// store, putting back what this app itself recorded.
+    pub fn with_disposition(mut self, d: Disposition) -> Shot { self.disposition = d; self }
     pub fn is_local(&self) -> bool { self.disposition == Disposition::Local }
 
     /// Ask to send this photo somewhere.
@@ -117,6 +171,9 @@ impl Shot {
     pub fn share_to(&mut self, target: ShareTarget) -> Result<(), String> {
         if let Disposition::Pending(t) = &self.disposition {
             return Err(format!("already sending to {}", t.label()));
+        }
+        if let ShareTarget::Contact(id) = &target {
+            if !self.sent_to.contains(id) { self.sent_to.push(id.clone()); }
         }
         self.disposition = Disposition::Pending(target);
         Ok(())
@@ -145,6 +202,9 @@ impl Shot {
     /// did not arrive, and a UI claiming otherwise would be guessing on the
     /// user's behalf about something they cannot undo.
     pub fn disclosed(&self) -> bool {
+        // The sticky record first: a back-up after a send must not turn a
+        // photo somebody has back into a private one.
+        if !self.sent_to.is_empty() { return true; }
         match &self.disposition {
             Disposition::Pending(t) | Disposition::Shared(t) => t.is_disclosure(),
             // A FAILED disclosure also counts: "failed" means we did not get
@@ -152,8 +212,7 @@ impl Shot {
             Disposition::Failed(t, _) => t.is_disclosure(),
             Disposition::Local => false,
         }
-    }
-}
+    }}
 
 /// A filename for a capture.
 ///
@@ -210,6 +269,11 @@ impl Roll {
     /// Add a capture. Newest first, because that is what the user just took and
     /// what they will act on.
     pub fn push(&mut self, s: Shot) { self.shots.insert(0, s); }
+
+    /// Take a shot off the roll (the file has been moved to the trash).
+    pub fn remove(&mut self, i: usize) -> Option<Shot> {
+        if i < self.shots.len() { Some(self.shots.remove(i)) } else { None }
+    }
 
     /// Photos that have never left this device.
     pub fn local_only(&self) -> Vec<&Shot> {
@@ -310,6 +374,23 @@ mod tests {
         s.share_to(ShareTarget::Contact("bob".into())).unwrap();
         s.fail("unreachable");
         assert!(s.share_to(ShareTarget::PhotoSync).is_ok());
+    }
+
+    #[test]
+    fn a_later_backup_does_not_erase_a_disclosure() {
+        // The photo went to Bob and was then backed up. The latest act is
+        // the back-up; the fact that Bob has it does not go away.
+        let mut s = shot();
+        s.share_to(ShareTarget::Contact("bob".into())).unwrap();
+        s.confirm_sent();
+        s.share_to(ShareTarget::PhotoSync).unwrap();
+        s.confirm_sent();
+        assert!(matches!(s.disposition(), Disposition::Shared(ShareTarget::PhotoSync)));
+        assert!(s.disclosed(), "backed up after a send: Bob still has it");
+        assert_eq!(s.sent_to, vec!["bob"]);
+        // Sending to the same person twice records them once.
+        s.share_to(ShareTarget::Contact("bob".into())).unwrap();
+        assert_eq!(s.sent_to, vec!["bob"]);
     }
 
     #[test]

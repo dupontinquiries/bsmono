@@ -294,7 +294,16 @@ pub fn ascii_similarity(a: &str, b: &str) -> f32 {
     close as f32 / ab.len() as f32
 }
 
-/// Jaccard over tags: shared / total.
+/// Weighted Jaccard over tags: shared / total, each tag counting its
+/// weight.
+///
+/// A written tag counts 1.0 and a machine-derived `auto:` tag counts
+/// [`cv::AUTO_TAG_WEIGHT`]. `cv`'s own doc promised this — "derived
+/// tags are worth less than written ones and the caller has to be able
+/// to say so" — and then nothing applied the constant: two photos that
+/// were both `auto:dark` and `auto:centred` scored exactly as similar as
+/// two both labelled `ada` and `wedding`, which is composition matching
+/// presented as semantic matching, the failure the module names.
 pub fn tag_similarity(a: &[String], b: &[String]) -> f32 {
     if a.is_empty() && b.is_empty() {
         // Two untagged photos are not "perfectly similar" — they are
@@ -302,8 +311,9 @@ pub fn tag_similarity(a: &[String], b: &[String]) -> f32 {
         // pair top the results in a library that is mostly untagged.
         return 0.0;
     }
-    let shared = a.iter().filter(|t| b.contains(t)).count() as f32;
-    let total = (a.len() + b.len()) as f32 - shared;
+    let weight = |t: &String| if cv::is_auto(t) { cv::AUTO_TAG_WEIGHT } else { 1.0 };
+    let shared: f32 = a.iter().filter(|t| b.contains(t)).map(weight).sum();
+    let total: f32 = a.iter().map(weight).sum::<f32>() + b.iter().map(weight).sum::<f32>() - shared;
     if total <= 0.0 { 0.0 } else { shared / total }
 }
 
@@ -484,6 +494,25 @@ mod tests {
         let written: Vec<&String> = a.tags.iter().filter(|t| !cv::is_auto(t)).collect();
         assert_eq!(written, vec!["dancing", "party"]);
         assert!(a.tags.iter().any(|t| cv::is_auto(t)), "no derived tags: {:?}", a.tags);
+    }
+
+    #[test]
+    fn a_written_tag_in_common_outweighs_a_derived_one() {
+        // Both pairs share exactly one tag; the pair sharing a word a
+        // person wrote must score higher than the pair sharing a word
+        // the scanner derived from brightness.
+        let written = tag_similarity(&["wedding".into()], &["wedding".into()]);
+        let derived = tag_similarity(&["auto:dark".into()], &["auto:dark".into()]);
+        assert_eq!(written, 1.0);
+        assert_eq!(derived, 1.0, "two identical sets are still identical");
+        // Mixed: one written match against one derived mismatch.
+        let a = vec!["wedding".to_string(), "auto:dark".to_string()];
+        let b = vec!["wedding".to_string(), "auto:bright".to_string()];
+        let c = vec!["auto:dark".to_string(), "party".to_string()];
+        let d = vec!["auto:dark".to_string(), "picnic".to_string()];
+        assert!(tag_similarity(&a, &b) > tag_similarity(&c, &d),
+                "a shared written tag ({}) must beat a shared derived one ({})",
+                tag_similarity(&a, &b), tag_similarity(&c, &d));
     }
 
     #[test]

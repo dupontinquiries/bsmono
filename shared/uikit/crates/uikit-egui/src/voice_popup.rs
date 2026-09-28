@@ -85,6 +85,9 @@ pub enum Stage {
 /// the source of truth for that.
 pub struct VoicePopup {
     pub stage: Stage,
+    /// The `Done` text has been handed to the app once. The popup keeps
+    /// showing it; the app must not act on it twice.
+    delivered: bool,
     /// Set when a future wake-open path starts this popup already
     /// listening, so the header can say "(wake)" the way QML's
     /// `openedByWake` does. Not set anywhere yet (manual-trigger only,
@@ -129,7 +132,32 @@ impl VoicePopup {
         }
         self.opened_by_wake = false;
         self.stage = Stage::Listening;
+        self.delivered = false;
         self.spawn_listen();
+        true
+    }
+
+    /// The finished transcript, ONCE. `None` until `tick` reaches `Done`
+    /// and `None` again after the first call — the app reads this every
+    /// frame and acts on what it gets, and a transcript acted on per
+    /// frame would run the same command sixty times a second.
+    ///
+    /// This is the seam the transcript had been missing: `Done` was
+    /// displayed and nothing read it, so speech reached the screen and
+    /// never the shell.
+    pub fn take_result(&mut self) -> Option<String> {
+        if self.delivered { return None; }
+        match &self.stage {
+            Stage::Done { text } => { self.delivered = true; Some(text.clone()) }
+            _ => None,
+        }
+    }
+
+    /// Start listening as a wake word did — same as `start`, with the
+    /// header saying so.
+    pub fn start_by_wake(&mut self, password_mode: bool) -> bool {
+        if !self.start(password_mode) { return false; }
+        self.opened_by_wake = true;
         true
     }
 
@@ -168,10 +196,24 @@ impl VoicePopup {
             p.running = true;
             p.result = None;
         }
+        // A TEST HOOK, and the only one: with `UIKIT_VOICE_FAKE_TRANSCRIPT`
+        // set, the popup "hears" that text after a moment instead of
+        // opening a microphone. It is how the whole chain below the
+        // popup — router, staging, the effect on screen — gets walked on
+        // a machine with no input device, which is every CI box and this
+        // sandbox. Never set in a packaged launcher.
+        let fake = std::env::var("UIKIT_VOICE_FAKE_TRANSCRIPT").ok().filter(|t| !t.is_empty());
         std::thread::Builder::new()
             .name("voice-popup-listen".to_string())
             .spawn(move || {
-                let (text, audio) = listen_with_audio();
+                let (text, audio) = match fake {
+                    Some(t) => {
+                        std::thread::sleep(std::time::Duration::from_millis(800));
+                        cancel_recording();
+                        (t, Vec::new())
+                    }
+                    None => listen_with_audio(),
+                };
                 let mut p = pending.lock().unwrap_or_else(|e| e.into_inner());
                 p.result = Some((text, audio));
                 p.running = false;
@@ -244,6 +286,14 @@ impl VoicePopup {
     /// Layout follows the QML's real structure (see module doc): a round
     /// badge, a two-line header, then a state-gated action row.
     pub fn draw(&mut self, ui: &mut egui::Ui, colors: &crate::PaletteColors) {
+        // KEEP FRAMES COMING while a thread is working. egui repaints on
+        // input, and the transcript arrives on a thread with no input
+        // attached: with the pointer still, the popup sat on "Listening…"
+        // holding a finished result until the next mouse move. On a phone
+        // with the finger lifted that is forever.
+        if matches!(self.stage, Stage::Listening | Stage::Transcribing) {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             self.draw_badge(ui, colors);
@@ -337,6 +387,7 @@ impl VoicePopup {
     /// module doc).
     fn header_text(&self) -> (&'static str, &'static str) {
         match &self.stage {
+            Stage::Listening if self.opened_by_wake => ("Listening… (wake)", "Speak now (up to 12s, pause 1s when done)"),
             Stage::Listening => ("Listening…", "Speak now (up to 12s, pause 1s when done)"),
             Stage::Transcribing => ("Transcribing…", ""),
             Stage::Done { .. } => ("Voice", ""),
@@ -367,6 +418,7 @@ impl Default for VoicePopup {
         VoicePopup {
             stage: Stage::Listening,
             opened_by_wake: false,
+            delivered: false,
             pending: std::sync::Arc::new(std::sync::Mutex::new(ListenPending::default())),
         }
     }
