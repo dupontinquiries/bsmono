@@ -32,6 +32,7 @@ pub mod carousel;
 pub mod chaingraph;
 pub mod clock;
 pub mod clock3d;
+pub mod gloveflick;
 pub mod nightclock;
 pub mod orbs;
 pub mod cold;
@@ -104,6 +105,9 @@ pub enum Action {
     SummonLauncher,
     /// rusty-board `io.rustyboard.Keyboard1.Show` / `Hide`.
     ShowKeyboard(bool),
+    /// A command for rusty-board's control socket (`$XDG_RUNTIME_DIR/rusty-board.ctl`):
+    /// voice-start | voice-done | voice-cancel | voice-toggle | cold on | cold off.
+    KeyboardCommand(&'static str),
     /// Map or unmap the trackpad overlay surface.
     ShowTrackpad(bool),
     /// Virtual pointer output, sent over cosmic-comp's EI socket.

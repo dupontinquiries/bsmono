@@ -629,6 +629,38 @@ impl Shell {
         self.log(format!("palette step -> {:?}", self.palette.selected));
     }
 
+    /// A glove flick (cold mode; gloveflick.rs). Only acted on in cold mode:
+    /// on a bare-handed phone, turning it over is not a command.
+    pub fn on_flick(&mut self, f: crate::gloveflick::Flick) -> Vec<Action> {
+        use crate::gloveflick::{intent, GloveIntent as G};
+        if !self.cold.on || self.lock.is_locked() || self.sleep.captures_input() {
+            return vec![];
+        }
+        let i = intent(f, self.palette.open);
+        self.log(format!("glove flick {f:?} -> {i:?}"));
+        match i {
+            G::PaletteOpenAndStep { down } => {
+                self.open_palette();
+                self.palette_step(down);
+                vec![]
+            }
+            G::PaletteStep { down } => {
+                self.palette_step(down);
+                vec![]
+            }
+            G::PaletteActivate => self.palette_activate_selected(),
+            G::PaletteClose => {
+                self.palette.close();
+                vec![]
+            }
+            G::Keyboard(cmd) => vec![Action::KeyboardCommand(cmd)],
+            G::EscapeAll => {
+                self.palette.close();
+                vec![Action::KeyboardCommand("voice-cancel")]
+            }
+        }
+    }
+
     /// Activate whatever the keys have walked to.
     pub fn palette_activate_selected(&mut self) -> Vec<Action> {
         match self.palette.activate_selected() {
@@ -1288,6 +1320,21 @@ mod tests {
         let out = edge_drag(&mut sh, (200.0, 895.0), (200.0, 200.0), 30, 5000);
         assert_eq!(out, vec![Action::SummonLauncher]);
         assert!(!sh.switcher.open);
+    }
+
+    #[test]
+    fn glove_flicks_only_act_in_cold_mode_and_reach_the_keyboard_when_the_palette_is_shut() {
+        use crate::gloveflick::Flick;
+        let mut sh = Shell::new(ShellPrefs::default(), S);
+        assert!(sh.on_flick(Flick::Down).is_empty(), "bare hands: turning the phone is not a command");
+        assert!(!sh.palette.open);
+        sh.cold.on = true;
+        assert!(sh.on_flick(Flick::Down).is_empty());
+        assert!(sh.palette.open, "a flick opened the palette, like the volume keys");
+        sh.on_flick(Flick::Left);
+        assert!(!sh.palette.open, "left closes it");
+        assert_eq!(sh.on_flick(Flick::Right), vec![Action::KeyboardCommand("voice-done")]);
+        assert_eq!(sh.on_flick(Flick::Escape), vec![Action::KeyboardCommand("voice-cancel")]);
     }
 
     #[test]

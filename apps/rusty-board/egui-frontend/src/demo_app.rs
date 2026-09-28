@@ -103,6 +103,15 @@ pub struct Feel {
     /// Asking for "everything captured so far" each interval is what makes
     /// partials fall behind the speaker on a phone.
     dictation: crate::voice::DictationService,
+    /// What the last inference cost, for the status row ("the loop is visible").
+    voice_timing: Option<String>,
+    /// The control socket (ctl.rs) and what it has told us.
+    ctl: Option<crate::ctl::Ctl>,
+    /// tideshell's cold mode: a keyboard shown while cold starts voice typing.
+    cold: bool,
+    /// A ctl command changed state while no frame was running; the shell
+    /// should run one (the layer loop asks via `take_needs_frame`).
+    needs_frame: bool,
     /// The real capture + whisper driver (feature `voice`); `Err` = why it could not load
     /// (no model, no mic backend), shown in the status row. Without the feature this field
     /// does not exist and dictation stays the preview it always was here.
@@ -238,9 +247,18 @@ impl Feel {
                     v.remember(&last_audio, &text);
                 }
             }
-            // RELEASED: the keyboard comes back now the voice session is over.
-            let _ = self.service.set_suppressed(false);
+            self.end_voice_session();
         } else {
+            // A build without the `voice` feature has no engine: say so, instead of
+            // latching a microphone that can never hear anything.
+            #[cfg(not(feature = "voice"))]
+            {
+                self.microterm.set_content(crate::microterm::Content::Status(
+                    "Voice typing isn't in this build (rebuild with --features voice).".into(),
+                ));
+                self.microterm.show();
+                return;
+            }
             #[cfg(feature = "voice")]
             match &mut self.voice {
                 Ok(v) => match v.start() {
@@ -265,6 +283,67 @@ impl Feel {
         }
     }
 
+    /// Stop dictating and throw the utterance away: nothing is typed.
+    pub fn cancel_dictation(&mut self) {
+        if !self.dictation.is_active() {
+            return;
+        }
+        #[cfg(feature = "voice")]
+        if let Ok(v) = &mut self.voice {
+            let _ = v.stop();
+        }
+        self.dictation.cancel();
+        self.end_voice_session();
+    }
+
+    /// What every end of a voice session shares, commit or cancel: the mic
+    /// back to Idle (it stayed Live before, which kept the record pulse
+    /// animating and the keyboard repainting forever), the preview put away,
+    /// and the keyboard given back.
+    fn end_voice_session(&mut self) {
+        self.mic = crate::mic_source::MicState::Idle;
+        self.voice_timing = None;
+        if self.microterm.content().page() == "voice" {
+            self.microterm.hide();
+        }
+        // RELEASED: the keyboard comes back now the voice session is over.
+        let _ = self.service.set_suppressed(false);
+    }
+
+    /// Once per frame, whatever chrome is shown: account for captured audio,
+    /// fetch a finished partial, keep the preview current. This used to live
+    /// inside the top bar's closure, which is not drawn unless a top-bar
+    /// feature is enabled (none are by default) -- so on the phone the mic key
+    /// recorded, and nothing was ever transcribed, previewed or typed.
+    fn pump_dictation(&mut self, ctx: &egui::Context) {
+        if !self.dictation.is_active() {
+            return;
+        }
+        #[cfg(feature = "voice")]
+        let mut level = 0.0;
+        #[cfg(not(feature = "voice"))]
+        let level = 0.0;
+        #[cfg(feature = "voice")]
+        if let Ok(v) = &mut self.voice {
+            // Real sample counts from the ring, so the window is bounded over audio
+            // that exists; then the partial in flight, if done.
+            self.dictation.captured(v.captured_samples());
+            let window = self.dictation.next_window();
+            if let Some(text) = v.poll(window) {
+                self.dictation.partial(&text);
+            }
+            level = v.level().clamp(0.0, 1.0);
+            if let Some(t) = v.last_timing() {
+                self.voice_timing = Some(format!("{} · corpus {}", t.describe(), v.corpus_len()));
+            }
+            // Partials and the level meter need frames while listening, at a rate
+            // the eye reads as live (not the display's).
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        }
+        self.microterm.set_content(crate::microterm::Content::VoicePreview { partial: self.dictation.preview().to_string(), level });
+        self.microterm.show();
+    }
+
     /// Advance the sink WITHOUT running a frame. A shell that sleeps between frames (the
     /// layer shell) calls this on every wake, so Activate/Deactivate are seen while idle
     /// without repainting a keyboard nobody is touching. Returns whether the compositor
@@ -272,7 +351,43 @@ impl Feel {
     /// runs a frame (which emits `Visible`) only when they differ.
     pub fn pump_sink(&mut self) -> bool {
         self.sink.pump();
+        self.handle_ctl();
         self.decide_visibility()
+    }
+
+    /// Commands from the shell (ctl.rs). Handled on every wake, frame or not.
+    fn handle_ctl(&mut self) {
+        let cmds = match self.ctl.as_mut() {
+            Some(c) => c.drain(),
+            None => return,
+        };
+        for c in cmds {
+            use crate::ctl::Cmd;
+            tracing::debug!("ctl: {c:?}");
+            match c {
+                Cmd::VoiceStart if !self.dictation.is_active() => self.toggle_dictation(),
+                Cmd::VoiceDone if self.dictation.is_active() => self.toggle_dictation(),
+                Cmd::VoiceCancel => self.cancel_dictation(),
+                Cmd::VoiceToggle => self.toggle_dictation(),
+                Cmd::Cold(on) => self.cold = on,
+                _ => {}
+            }
+            self.needs_frame = true;
+        }
+    }
+
+    /// Whether a ctl command changed something a frame must show. Clears it.
+    pub fn take_needs_frame(&mut self) -> bool {
+        std::mem::take(&mut self.needs_frame)
+    }
+
+    /// The control socket's descriptor, for the layer shell to poll.
+    pub fn ctl_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.ctl.as_ref().map(|c| c.fd())
+    }
+
+    pub fn is_cold(&self) -> bool {
+        self.cold
     }
 
     /// The sink's descriptor, readable when `pump_sink` has work. The layer
@@ -386,7 +501,19 @@ impl Feel {
             microterm: Default::default(),
             // 16kHz: what the transcriber expects, and what the window maths
             // is computed against.
-            dictation: crate::voice::DictationService::new(16_000),
+            dictation: {
+                // The user's voice filter level from the fleet settings (bsettings,
+                // a11y.voice_filter). It was never loaded, so Off/Strict did nothing.
+                let mut d = crate::voice::DictationService::new(16_000);
+                d.set_filter_level(fleet_voice_filter());
+                d
+            },
+            voice_timing: None,
+            // Not in tests: binding replaces the live keyboard's socket, and
+            // tests run on the device too.
+            ctl: if cfg!(test) { None } else { crate::ctl::Ctl::bind() },
+            cold: false,
+            needs_frame: false,
             #[cfg(feature = "voice")]
             voice: crate::config::Config::load_or_default()
                 .map_err(|e| format!("config: {e:#}"))
@@ -485,7 +612,14 @@ impl Feel {
         }
         if should_show && !self.was_visible {
             self.reveal.start();
+            // Cold (gloves): a text field just took focus and nobody can type
+            // on glass with gloves on, so listen. A flick right (tideshell) or
+            // ✓ Done types it; a flick left or ✕ Cancel drops it.
+            if self.cold && !self.dictation.is_active() {
+                self.toggle_dictation();
+            }
         }
+        self.handle_ctl();
         self.was_visible = should_show;
         // Keep ticking even while hidden -- BUT ONLY IN AN EFRAME WINDOW. A
         // hidden/unfocused eframe window may not otherwise get repainted,
@@ -522,6 +656,7 @@ impl Feel {
                 self.microterm.set_content(content);
             }
         }
+        self.pump_dictation(ctx);
         for text in self.service.take_pending() {
             if let Err(e) = self.sink.commit_text(&text) {
                 // Said out loud rather than swallowed: a keyboard that
@@ -620,46 +755,8 @@ impl Feel {
                     if ui.selectable_label(listening, if listening { "● dictating" } else { "dictate" }).clicked() {
                         self.toggle_dictation();
                     }
-                    if listening {
-                        // AUDIO ACCOUNTING. The service needs to know how much
-                        // has been captured to bound the next partial's window;
-                        // with a live mic the host reports real sample counts,
-                        // and with none the count stays zero — which yields an
-                        // empty window rather than a window over audio that
-                        // does not exist.
-                        #[cfg(feature = "voice")]
-                        let mut level = 0.4;
-                        #[cfg(not(feature = "voice"))]
-                        let level = 0.4;
-                        #[cfg(feature = "voice")]
-                        if let Ok(v) = &mut self.voice {
-                            // Real sample counts from the ring, so the window is bounded
-                            // over audio that exists; then the partial in flight, if done.
-                            self.dictation.captured(v.captured_samples());
-                            let window = self.dictation.next_window();
-                            if let Some(text) = v.poll(window) {
-                                self.dictation.partial(&text);
-                            }
-                            level = v.level().clamp(0.0, 1.0);
-                            ctx.request_repaint_after(std::time::Duration::from_millis(60));
-                        }
-                        #[cfg(not(feature = "voice"))]
-                        let _window = self.dictation.next_window();
-                        // The partial goes to the MICROTERM's voice preview,
-                        // which is the surface built for it — showing it in the
-                        // toolbar instead would leave that surface unreachable
-                        // again by a different route.
-                        self.microterm.set_content(crate::microterm::Content::VoicePreview {
-                            partial: self.dictation.preview().to_string(), level });
-                        self.microterm.show();
-                        // What the last inference cost — the loop is visible, so a slow model
-                        // is a number in the status row, not a feeling.
-                        #[cfg(feature = "voice")]
-                        if let Ok(v) = &self.voice {
-                            if let Some(t) = v.last_timing() {
-                                ui.label(egui::RichText::new(format!("{} · corpus {}", t.describe(), v.corpus_len())).small());
-                            }
-                        }
+                    if let Some(t) = &self.voice_timing {
+                        ui.label(egui::RichText::new(t).small());
                     }
                 }
                 // The mic state, including WHY it was refused — the two
@@ -849,6 +946,22 @@ impl Feel {
 
                 let c = uikit_egui::palette_colors(self.board.palette());
 
+                // While dictating: finish (type it) or cancel (type nothing). Big
+                // targets on purpose; a gloved thumb has to hit them.
+                if self.dictation.is_active() {
+                    let mut done = false;
+                    let mut cancel = false;
+                    ui.horizontal(|ui| {
+                        let h = 44.0;
+                        done = ui.add(egui::Button::new("✓  Done").min_size(egui::vec2(120.0, h))).clicked();
+                        cancel = ui.add(egui::Button::new("✕  Cancel").min_size(egui::vec2(120.0, h))).clicked();
+                    });
+                    if done {
+                        self.toggle_dictation();
+                    } else if cancel {
+                        self.cancel_dictation();
+                    }
+                }
                 if let Some(tapped) = crate::microterm::microterm_ui(ui, &mut self.microterm, &c) {
 
                     // Every candidate `microterm_ui` can return today comes
@@ -1477,4 +1590,57 @@ pub fn run(title: &str) -> eframe::Result<()> {
     // cleared at logout anyway, so a missed release costs nothing.
     uikit_egui::single_instance::release(APP_ID);
     r
+}
+
+/// The user's voice filter strength from the fleet settings file settingsd
+/// persists (bsettings edits it): `$XDG_CONFIG_HOME/gitmind/settings.conf`,
+/// `k = v` lines. Standard when there is no file or no key.
+pub fn fleet_voice_filter() -> settings_kit::VoiceFilter {
+    let path = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .map(|b| b.join("gitmind").join("settings.conf"));
+    let text = path.and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    voice_filter_from_settings(&text)
+}
+
+pub fn voice_filter_from_settings(text: &str) -> settings_kit::VoiceFilter {
+    let kv: Vec<(String, String)> = text
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+        .collect();
+    settings_kit::Prefs::from_kv(&kv).a11y.voice_filter
+}
+
+#[cfg(test)]
+mod voice_session_tests {
+    use super::*;
+
+    #[test]
+    fn the_filter_level_comes_from_the_fleet_settings() {
+        assert_eq!(voice_filter_from_settings("a11y.voice_filter = off\n"), settings_kit::VoiceFilter::Off);
+        assert_eq!(voice_filter_from_settings(""), settings_kit::Prefs::default().a11y.voice_filter);
+    }
+
+    #[test]
+    fn cancel_types_nothing_and_every_stop_idles_the_mic_and_gives_the_keyboard_back() {
+        let mut f = Feel::new();
+        // Without the voice engine the key must not pretend to listen.
+        f.toggle_dictation();
+        #[cfg(not(feature = "voice"))]
+        {
+            assert!(!f.dictation.is_active());
+            assert!(matches!(f.microterm.content(), crate::microterm::Content::Status(s) if s.contains("isn't in this build")));
+            return;
+        }
+        #[allow(unreachable_code)]
+        {
+            f.dictation.start();
+            f.dictation.partial("hello there");
+            f.cancel_dictation();
+            assert!(!f.dictation.is_active());
+            assert!(matches!(f.mic, crate::mic_source::MicState::Idle));
+            assert!(f.service.take_pending().is_empty(), "cancel typed nothing");
+        }
+    }
 }

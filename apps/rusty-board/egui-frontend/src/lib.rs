@@ -28,6 +28,7 @@ pub mod tap_hold;
 pub mod keyboard_service;
 /// Where a keypress actually goes: the system, or a preview box.
 pub mod sink;
+pub mod ctl;
 pub mod focus_policy;
 pub mod adaptive;
 pub mod nudge;
