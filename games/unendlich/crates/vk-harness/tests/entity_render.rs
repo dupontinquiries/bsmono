@@ -39,10 +39,15 @@ fn pixel(px: &[u8], dim: u32, x: u32, y: u32) -> [u8; 4] {
     [px[i], px[i + 1], px[i + 2], px[i + 3]]
 }
 
-// CameraUbo is 256 bytes: mat4 view_proj, 8x vec4, mat4 light_view_proj.
-// Only view_proj matters here; the rest is zero.
+// CameraUbo starts with mat4 view_proj, 8x vec4, mat4 light_view_proj (256
+// bytes), and entity.frag reads on to the light-volume and point-light fields
+// at the end of chunk.frag's block (3808 bytes). Only view_proj matters here;
+// the rest is zero, which switches the light volume off (w = 0) and leaves no
+// point lights. A 256-byte buffer made those reads go past the binding and
+// crashed lavapipe once entity.frag learned them.
+const CAMERA_UBO_BYTES: usize = 4096;
 fn camera_ubo(view_proj: [f32; 16]) -> Vec<u8> {
-    let mut b = vec![0u8; 256];
+    let mut b = vec![0u8; CAMERA_UBO_BYTES];
     for (i, f) in view_proj.iter().enumerate() {
         b[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
     }

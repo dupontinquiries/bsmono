@@ -84,6 +84,11 @@ layout(std430, set = 0, binding = 3) readonly buffer Chunks {
 
 layout(location = 0) out vec3 v_color;
 layout(location = 1) out vec3 v_world_pos;
+// r-ctm: connected-face flags for chunk.frag (0 = none). A face that carries
+// them has sway tag 3; the four edge bits ride the low two bits of red and
+// green, SEAMLESS the low bit of blue (see mesher.rs `ctm`, `with_ctm`).
+// Bit 8 marks "present". Flat: all four vertices of a face agree.
+layout(location = 2) flat out uint v_ctm;
 
 const float CHUNK_EXTENT = 32.0;
 
@@ -192,4 +197,12 @@ void main() {
     gl_Position = ubo.view_proj * vec4(world_pos, 1.0);
     v_color     = in_color_unorm.rgb;
     v_world_pos = world_pos;
+    if (_sway_bits == 3u) {
+        uint r8 = uint(in_color_unorm.r * 255.0 + 0.5);
+        uint g8 = uint(in_color_unorm.g * 255.0 + 0.5);
+        uint b8 = uint(in_color_unorm.b * 255.0 + 0.5);
+        v_ctm = 0x100u | (r8 & 3u) | ((g8 & 3u) << 2) | ((b8 & 1u) << 4);
+    } else {
+        v_ctm = 0u;
+    }
 }

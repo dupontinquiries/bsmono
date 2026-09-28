@@ -135,6 +135,18 @@ pub fn procedural_subgrid(host_id: BlockId, world_x: i32, world_y: i32, world_z:
         BlockId::Cabbage => recipes::crop(rng01, rng_int, 2),
         // r520: a young seedling — a couple of tiny green shoots.
         BlockId::Sprout  => recipes::sprout(rng01),
+        // Non-cube plants and cave dressing (world::underground). Before
+        // these arms the blocks had no sub-grid and drew nothing.
+        BlockId::Mushroom     => recipes::mushroom(rng01, rng_int, false),
+        BlockId::Glowshroom   => recipes::mushroom(rng01, rng_int, true),
+        BlockId::Vine         => recipes::vine(rng01, rng_int),
+        BlockId::DeadBush     => recipes::dead_bush(rng_int),
+        BlockId::Cobweb       => recipes::cobweb(rng_int),
+        BlockId::IronRootFern => recipes::iron_root_fern(rng01),
+        BlockId::StoneFlower  => recipes::stone_flower(rng01, rng_int),
+        BlockId::Cattail      => recipes::cattail(rng01, rng_int),
+        BlockId::Torch        => recipes::torch(),
+        BlockId::Lichen       => recipes::lichen(rng_int),
         // Default for any other host: empty grid (no decoration).
         _ => SubVoxelGrid::empty(),
     })
@@ -244,6 +256,173 @@ mod recipes {
         for &(x, z) in &[(3u8, 3u8), (3, 4), (4, 3), (4, 4), (5, 4), (4, 5)] {
             cell(&mut grid, x, 4, z, head);
         }
+        grid
+    }
+
+    /// Mushroom cluster: one or two stems with flat caps. `glow` picks the
+    /// Glowshroom palette (pale stem, teal cap with a bright rim) and makes
+    /// the cluster denser and smaller-capped.
+    pub fn mushroom(shade: f32, rng_int: u32, glow: bool) -> SubVoxelGrid {
+        let mut grid = SubVoxelGrid::empty();
+        let stem = [0.86 - 0.1 * shade, 0.83 - 0.1 * shade, 0.74 - 0.1 * shade];
+        let (cap, rim) = if glow {
+            ([0.30, 0.80, 0.74], [0.62, 0.98, 0.92])
+        } else if rng_int & 1 == 0 {
+            ([0.78, 0.22, 0.18], [0.92, 0.86, 0.80]) // red, pale spots
+        } else {
+            ([0.55, 0.38, 0.24], [0.66, 0.50, 0.34]) // brown
+        };
+        let spots: &[(u8, u8, u8)] = if glow {
+            &[(2, 2, 2), (5, 3, 3), (3, 5, 2)]
+        } else if (rng_int >> 3) & 1 == 0 {
+            &[(4, 4, 4)]
+        } else {
+            &[(3, 3, 4), (6, 5, 2)]
+        };
+        for &(x, z, h) in spots {
+            for y in 0..h { cell(&mut grid, x, y, z, stem); }
+            let r: i32 = if h >= 4 { 1 } else { 0 };
+            for dx in -r..=r {
+                for dz in -r..=r {
+                    let (cx, cz) = (x as i32 + dx, z as i32 + dz);
+                    if !(0..8).contains(&cx) || !(0..8).contains(&cz) { continue; }
+                    let edge = dx.abs() + dz.abs() == 2;
+                    cell(&mut grid, cx as u8, h, cz as u8, if edge { rim } else { cap });
+                }
+            }
+            if glow { cell(&mut grid, x, h + 1, z, rim); }
+        }
+        grid
+    }
+
+    /// Vine: strands hanging from the top of the cell, different lengths,
+    /// with a leaf every other cell.
+    pub fn vine(shade: f32, rng_int: u32) -> SubVoxelGrid {
+        let mut grid = SubVoxelGrid::empty();
+        let stem = green(shade * 0.4);
+        let leaf = green(shade * 0.6 + 0.3);
+        for k in 0..3u32 {
+            // Strands on x 1/3/5 and leaves on x 2/4/6, so no two cells coincide.
+            let x = (1 + 2 * k) as u8;
+            let z = (1 + ((rng_int >> (k * 5 + 3)) % 6)) as u8;
+            let len = 4 + ((rng_int >> (k * 3 + 16)) % 5) as u8; // 4..8
+            for i in 0..len.min(8) {
+                let y = 7 - i;
+                cell(&mut grid, x, y, z, stem);
+                if i % 2 == 1 { cell(&mut grid, x + 1, y, z, leaf); }
+            }
+        }
+        grid
+    }
+
+    /// Dead bush: a few dry brown twigs forking out of one base.
+    pub fn dead_bush(rng_int: u32) -> SubVoxelGrid {
+        let mut grid = SubVoxelGrid::empty();
+        let twig = [0.46, 0.33, 0.18];
+        for y in 0..2 { cell(&mut grid, 4, y, 4, twig); }
+        let dirs: [(i8, i8); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+        for (k, &(dx, dz)) in dirs.iter().enumerate() {
+            if (rng_int >> k) & 1 == 1 && k > 1 { continue; }
+            for i in 1..4i8 {
+                let x = (4 + dx * i) as u8;
+                let z = (4 + dz * i) as u8;
+                cell(&mut grid, x, 1 + i as u8, z, twig);
+            }
+        }
+        grid
+    }
+
+    /// Cobweb: two sparse diagonal strands and a ring, pale grey.
+    pub fn cobweb(rng_int: u32) -> SubVoxelGrid {
+        let mut grid = SubVoxelGrid::empty();
+        let silk = [0.86, 0.86, 0.88];
+        let flip = rng_int & 1 == 1;
+        for i in 0..8u8 {
+            let z = if flip { 7 - i } else { i };
+            cell(&mut grid, i, 7 - i, z, silk);
+            if i % 2 == 0 { cell(&mut grid, 7 - i, 7 - i, z, silk); }
+        }
+        for &(x, y) in &[(2u8, 5u8), (5, 5), (2, 2), (5, 2)] {
+            cell(&mut grid, x, y, 4, silk);
+        }
+        grid
+    }
+
+    /// Iron Root Fern: the fern shape with rust-tinted fronds and a reddish
+    /// root collar, so it reads apart from an ordinary fern at a glance.
+    pub fn iron_root_fern(shade: f32) -> SubVoxelGrid {
+        let mut grid = SubVoxelGrid::empty();
+        let stem = [0.42, 0.26, 0.16];
+        let frond = [0.46 + 0.1 * shade, 0.44 + 0.08 * shade, 0.20];
+        let tip = [0.62, 0.36, 0.18];
+        for &(x, z) in &[(3u8, 4u8), (5, 4), (4, 3), (4, 5)] { cell(&mut grid, x, 0, z, stem); }
+        for y in 0..7 { cell(&mut grid, 4, y, 4, stem); }
+        for &y in &[1u8, 3, 5] {
+            let c = if y == 5 { tip } else { frond };
+            for &(x, z) in &[(2u8, 4u8), (3, 4), (5, 4), (6, 4), (4, 2), (4, 3), (4, 5), (4, 6)] {
+                cell(&mut grid, x, y, z, c);
+            }
+        }
+        grid
+    }
+
+    /// Stone Flower: a low grey-green rosette with a pale, faceted head.
+    pub fn stone_flower(shade: f32, rng_int: u32) -> SubVoxelGrid {
+        let mut grid = SubVoxelGrid::empty();
+        let leaf = [0.44 + 0.06 * shade, 0.52 + 0.06 * shade, 0.46];
+        let heads = [[0.80, 0.78, 0.90], [0.86, 0.84, 0.80], [0.72, 0.74, 0.86]];
+        let head = heads[(rng_int >> 4) as usize % heads.len()];
+        for &(x, z) in &[(2u8, 4u8), (6, 4), (4, 2), (4, 6), (3, 3), (5, 5), (3, 5), (5, 3)] {
+            cell(&mut grid, x, 0, z, leaf);
+        }
+        for y in 0..3 { cell(&mut grid, 4, y, 4, leaf); }
+        for &(x, z) in &[(3u8, 4u8), (5, 4), (4, 3), (4, 5), (4, 4)] { cell(&mut grid, x, 3, z, head); }
+        cell(&mut grid, 4, 4, 4, head);
+        grid
+    }
+
+    /// Cattail: two or three full-height reeds, one carrying the brown head.
+    pub fn cattail(shade: f32, rng_int: u32) -> SubVoxelGrid {
+        let mut grid = SubVoxelGrid::empty();
+        let reed = green(shade * 0.5 + 0.2);
+        let head = [0.40, 0.26, 0.14];
+        let n = 2 + (rng_int % 2) as usize;
+        let spots = [(3u8, 3u8), (5, 4), (3, 6)];
+        for (k, &(x, z)) in spots.iter().take(n).enumerate() {
+            let top = if k == 0 { 8 } else { 6 + (k as u8 % 2) };
+            for y in 0..top {
+                let c = if k == 0 && (4..7).contains(&y) { head } else { reed };
+                cell(&mut grid, x, y, z, c);
+            }
+        }
+        grid
+    }
+
+    /// Lichen: flat, pale green-grey patches hugging the floor of the cell.
+    pub fn lichen(rng_int: u32) -> SubVoxelGrid {
+        let mut grid = SubVoxelGrid::empty();
+        let a = [0.42, 0.62, 0.46];
+        let b = [0.55, 0.72, 0.52];
+        for x in 0..8u8 {
+            for z in 0..8u8 {
+                let h = (rng_int ^ (x as u32 * 73856093) ^ (z as u32 * 19349663)).wrapping_mul(0x9e37_79b9) >> 27;
+                if h % 3 == 0 {
+                    cell(&mut grid, x, 0, z, if h % 2 == 0 { a } else { b });
+                }
+            }
+        }
+        grid
+    }
+
+    /// Torch: a dark stick with a bright ember and flame on top.
+    pub fn torch() -> SubVoxelGrid {
+        let mut grid = SubVoxelGrid::empty();
+        let stick = [0.36, 0.24, 0.12];
+        let ember = [1.0, 0.62, 0.20];
+        let flame = [1.0, 0.86, 0.45];
+        for y in 0..5 { cell(&mut grid, 4, y, 4, stick); }
+        cell(&mut grid, 4, 5, 4, ember);
+        cell(&mut grid, 4, 6, 4, flame);
         grid
     }
 
@@ -399,6 +578,26 @@ mod recipes {
 
 #[cfg(test)]
 mod tests {
+    /// The recipes added for the underground pass draw something, stay in
+    /// the 8^3 grid, and never put two mini-cells in one spot (a duplicate
+    /// z-fights).
+    #[test]
+    fn new_plant_recipes_are_nonempty_in_bounds_and_unique() {
+        use crate::world::blocks::BlockId as B;
+        for b in [B::Mushroom, B::Glowshroom, B::Vine, B::DeadBush, B::Cobweb,
+                  B::IronRootFern, B::StoneFlower, B::Cattail, B::Torch, B::Lichen] {
+            for (x, y, z) in [(0, 0, 0), (5, 9, -3), (-17, 40, 22), (123, 64, 7), (8, 8, 8)] {
+                let g = super::procedural_subgrid(b, x, y, z).expect("has_subvoxels");
+                assert!(g.cell_count() >= 4, "{b:?} draws {} cells", g.cell_count());
+                let mut seen = std::collections::HashSet::new();
+                for c in &g.cells {
+                    assert!(c.sub_x < 8 && c.sub_y < 8 && c.sub_z < 8, "{b:?} out of grid");
+                    assert!(seen.insert((c.sub_x, c.sub_y, c.sub_z)), "{b:?} duplicate cell {:?}", (c.sub_x, c.sub_y, c.sub_z));
+                }
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

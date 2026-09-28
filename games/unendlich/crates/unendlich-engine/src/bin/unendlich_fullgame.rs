@@ -157,6 +157,10 @@ struct Roamer {
     /// This is a FAST per-individual path-dependent channel that runs against the
     /// SLOW population-genetic trend (see sim_vectors doc). 0 = naive.
     combat_habit: f32,
+    /// Object permanence (sim::object_permanence, mob_brain_object_permanence
+    /// .docx): where this creature believes the player is after losing them.
+    /// Created on first use, when the creature's kind sets how long it holds.
+    player_memory: Option<unendlich_engine::sim::object_permanence::Tracker>,
     /// r300: cached expressed disposition. Disposition is a pure function of the
     /// genome, which is fixed for life, so `express_disposition` need only run
     /// once per individual instead of every tick (the loop re-derived it each
@@ -502,6 +506,7 @@ fn build_roamer(kind: unendlich_engine::item::CreatureKind, pos: [f32; 3], wseed
         aggro: 0.0,
         prev_behavior: 0,
         combat_habit: 0.0,
+        player_memory: None,
         disposition_cache: None,
         graze_target: None,
         graze_cell: (i32::MIN, i32::MIN),
@@ -2329,6 +2334,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // the player is moving — what creatures hear.
     let mut last_player_xz: Option<(f32, f32)> = None;
     let mut roamer_tick: u32 = 0;
+    // Seconds of play the roamer loop has run (the clock object permanence
+    // ages its ghosts by). UNENDLICH_PERMANENCE=0 turns the memory off.
+    let mut roam_clock: f32 = 0.0;
+    let permanence_enabled = std::env::var("UNENDLICH_PERMANENCE").map_or(true, |v| v != "0");
     const ROAMER_CAP: usize = 96;
     // r139: population dynamics — sim::popdyn's grazing colony models the
     // land's carrying capacity; breeding is gated on it and overshoot culls.
@@ -2956,6 +2965,25 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     };
     let mut hand_pose_debug: Option<(unendlich_engine::sim::weapon_motion::Motion, f32)> =
         std::env::var("UNENDLICH_HAND_POSE").ok().and_then(|v| parse_hand_pose(&v));
+    // UNENDLICH_VIEW=<x>,<y>,<z>,<yaw°>,<pitch°> pins the eye at a world position and
+    // gaze (creative, no body), for screenshots of a particular hillside or cave.
+    // UNENDLICH_VIEW=file:<path> re-reads that line every frame, so one soak can be
+    // moved around without a restart.
+    let view_pin_file: Option<String> = std::env::var("UNENDLICH_VIEW")
+        .ok()
+        .and_then(|v| v.strip_prefix("file:").map(|p| p.to_string()));
+    let parse_view_pin = |v: &str| -> Option<[f32; 5]> {
+        let f: Vec<f32> = v.trim().split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        (f.len() == 5).then(|| [f[0], f[1], f[2], f[3].to_radians(), f[4].to_radians()])
+    };
+    let mut view_pin: Option<[f32; 5]> =
+        std::env::var("UNENDLICH_VIEW").ok().and_then(|v| parse_view_pin(&v));
+    // UNENDLICH_PLACE=<path>: a file of `x,y,z,block` lines (block by its id name,
+    // e.g. `torch`, `lava`, `air`); whenever the file changes, its lines are applied
+    // with set_block. For soaks that need a torch in a cave or a hole in a wall.
+    let place_file: Option<String> = std::env::var("UNENDLICH_PLACE").ok();
+    let mut place_file_seen: Option<std::time::SystemTime> = None;
+    let mut place_pending: Vec<(i32, i32, i32, BlockId)> = Vec::new();
     // r534: third-person / cinematic camera-distance zoom (+/- keys). 1.0 = default
     // pull-back; clamped so the camera can't clip into the player or fly too far.
     let mut cam_zoom: f32 = 1.0;
@@ -3310,6 +3338,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         element: 2, // Fire-leaning by default; match01 drives actual progress
         tier: 2,
     };
+    // UNENDLICH_IMBUE=<element 0..5>: start with a fully attuned artifact of
+    // that element (3 = Dust/earth sense in CO2 basins, 4 = Fire), to test
+    // attunement effects without the attuning.
+    // Applied again on every world launch, which resets the imbue.
+    let imbue_knob = std::env::var("UNENDLICH_IMBUE").ok().and_then(|v| v.parse::<u8>().ok()).map(|e| e.min(5));
+    if let Some(el) = imbue_knob {
+        fg_imbue.element = el;
+        fg_imbue.counter = 1.0;
+        log::info!("[imbue] UNENDLICH_IMBUE: element {} fully attuned", fg_imbue.element);
+    }
     // r150: dragon daily life — activity (sleep/forage/alert) + hunt state.
     let mut scroll_accum: f32 = 0.0;
     let mut scroll_accum_x: f32 = 0.0; // r318: horizontal (trackpad) scroll
@@ -3348,6 +3386,65 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // puddles; it cannot raise a lake.
     let water_sim_enabled =
         std::env::var("UNENDLICH_WATER_SIM").map(|v| v != "0" && !v.is_empty()).unwrap_or(true);
+    // UNENDLICH_WATER_TRACE=1: one log line per sim tick with the cell budget — gathered cells,
+    // the quantized target, rain/boil/evap, the planned and applied adds/removes.
+    let water_trace = std::env::var("UNENDLICH_WATER_TRACE").map_or(false, |v| v == "1");
+    // Lava flows by default (UNENDLICH_LAVA_FLOW=0 freezes it as before), every third water tick.
+    let lava_flow_enabled = std::env::var("UNENDLICH_LAVA_FLOW").map_or(true, |v| v != "0");
+    // Sky + block light (world::light_volume): caves go dark, torches, lava, glow
+    // crystal and glowshrooms light them. UNENDLICH_BLOCK_LIGHT=0 keeps the old
+    // everywhere-outdoor light; UNENDLICH_LIGHT_TRACE=1 logs the loop once a second.
+    let block_light_enabled = std::env::var("UNENDLICH_BLOCK_LIGHT").map_or(true, |v| v != "0");
+    let light_trace = std::env::var("UNENDLICH_LIGHT_TRACE").map_or(false, |v| v == "1");
+    // UNENDLICH_LIGHT_DEBUG=1 shows the light inputs (sky, normals), =2 the final colour
+    // (NaN, sky, brightness) instead of the scene.
+    let light_debug: u8 = std::env::var("UNENDLICH_LIGHT_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // UNENDLICH_LIGHT_AUDIT=<secs>: every <secs>, relight the whole window from the
+    // world as it is and log any chunk whose stored light is stale (a change the
+    // loop missed). Slow; a diagnostic.
+    let light_audit_secs: Option<f32> =
+        std::env::var("UNENDLICH_LIGHT_AUDIT").ok().and_then(|v| v.parse().ok());
+    let mut light_audit_last = std::time::Instant::now();
+    let mut light_sys = unendlich_engine::world::light_volume::LightVolumeSys::new();
+    // CO₂ basins (world::cave_gas) and the breath/flame model (sim::cave_air):
+    // the stage at the player's head, what it does, and the carried flame.
+    // UNENDLICH_CAVE_GAS=0 turns the basins off (no gas anywhere).
+    let cave_gas_enabled = std::env::var("UNENDLICH_CAVE_GAS").map_or(true, |v| v != "0");
+    let mut breath = unendlich_engine::sim::cave_air::Breath::Normal;
+    let mut air_fx = unendlich_engine::sim::cave_air::effects(unendlich_engine::sim::cave_air::Breath::Normal);
+    // Heat stress from the air temperature (sim::cave_air::heat_for).
+    let mut heat = unendlich_engine::sim::cave_air::Heat::None;
+    let mut heat_fx = unendlich_engine::sim::cave_air::heat_effects(heat);
+    // O2 at the head last frame (the bending fields read it before the air
+    // block runs), how muffled the world sounds, and when the earth last spoke.
+    let mut o2_head_last = unendlich_engine::world::cave_gas::O2_AIR;
+    let mut o2_co2_head_last = unendlich_engine::world::cave_gas::O2_AIR;
+    // HUD notices (sim::notices): short messages under the status lines.
+    let mut notices = unendlich_engine::sim::notices::Notices::new();
+    let mut notices_shown_rev = 0u64;
+    let mut air_hush = 0.0f32;
+    // Cave air temperature (world::cave_climate). UNENDLICH_CAVE_CLIMATE=0
+    // keeps the surface climate everywhere, as before.
+    let cave_climate_enabled = std::env::var("UNENDLICH_CAVE_CLIMATE").map_or(true, |v| v != "0");
+    let mut cave_zone_last = unendlich_engine::world::underground::Zone::Soil;
+    let mut ambient_c_last = f32::NAN;
+    // How closed-in the player is (world::cave_climate::enclosure), from the
+    // exposure block; drives the cave drips (sim::cave_sound).
+    let mut enclosure_last = 0.0f32;
+    // Crystal blades cut on a fast transit (sim::crystal_edges).
+    let mut crystal_blades = unendlich_engine::sim::crystal_edges::Blades::default();
+    let mut drip_clock = unendlich_engine::sim::cave_sound::DripClock::new(0xD21F);
+    let mut cave_sound_clock = 0.0f32;
+    // UNENDLICH_CAVE_DRIPS=0 turns the drips off; a number > 1 is a drips-
+    // per-minute override for every wet cave zone (to hear one sooner).
+    let cave_drips_raw = std::env::var("UNENDLICH_CAVE_DRIPS").ok().and_then(|v| v.trim().parse::<f32>().ok());
+    let cave_drips_enabled = cave_drips_raw.map_or(true, |v| v != 0.0);
+    let cave_drips_override = cave_drips_raw.filter(|v| *v > 1.0);
+    let mut gas_sensed: Option<[i32; 2]> = None;
+    let mut held_flame = unendlich_engine::sim::cave_air::Flame::default();
+    let hold_block: Option<BlockId> = std::env::var("UNENDLICH_HOLD").ok().and_then(|v| BlockId::from_id_str(v.trim()));
+    let mut light_trace_last = std::time::Instant::now();
+    let mut lava_tick: u32 = 0;
     // r637: DEFAULT ON. Water lateral spread (settle toward level) was gated off since
     // r539 for perf; the operator wants water to flow to the sides, so it's on by default now.
     // It's budgeted/throttled (radius/budget/interval below). Disable with UNENDLICH_WATER_SIM=0
@@ -4383,11 +4480,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let mut fg_roar_stagger = unendlich_engine::sim::sound_render::Stagger::default();
     #[cfg(feature = "audio")]
     let fg_sfx_clock = Instant::now();
+    // The configured effects volume; the air block scales it down while the
+    // player's head is in a CO2 basin (the docx's "dead silence").
+    let fg_sfx_vol = std::env::var("UNENDLICH_SFX_VOL").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
     #[cfg(feature = "audio")]
     let fg_sfx = {
         let sfx = unendlich_engine::audio::Sfx::start();
-        let vol = std::env::var("UNENDLICH_SFX_VOL").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
-        sfx.set_master_volume(vol);
+        sfx.set_master_volume(fg_sfx_vol);
         sfx
     };
 
@@ -5437,6 +5536,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // The weapon out of the hand leaves it empty (creative_in_hand).
             creative_in_hand(renderer.creative_place_item, &thrown).map(|kind| unendlich_engine::items::ItemId(kind.to_item_id()))
         };
+        // UNENDLICH_HOLD=<block id name>: put that block in the hand (soaks: a
+        // torch into a cave).
+        if let Some(b) = hold_block {
+            hand_item = Some(unendlich_engine::items::ItemId(b as u32));
+        }
         // r509: keep the equipped-weapon durability tracker in sync with what's held —
         // (re)initialise to full when a different forged weapon becomes the hand item, clear
         // when the hand isn't a weapon. Holding the same weapon preserves its current wear.
@@ -7022,6 +7126,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         aggro: 0.0,
                         prev_behavior: 0,
                         combat_habit: 0.0,
+                        player_memory: None,
                         disposition_cache: None,
                         graze_target: None,
                         graze_cell: (i32::MIN, i32::MIN),
@@ -7989,6 +8094,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         aggro: 0.0,
                         prev_behavior: 0,
                         combat_habit: 0.0,
+                        player_memory: None,
                         disposition_cache: None,
                         graze_target: None,
                         graze_cell: (i32::MIN, i32::MIN),
@@ -8262,8 +8368,35 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     )
                 });
                 let heat_near = heat_sources.total_heat_at(ppx.x, ppx.y, ppx.z);
+                // Cave air (world::cave_climate): below the soil line the
+                // surface climate gives way to the cave zone's own steady
+                // temperature, as the sky closes over (light volume sky level).
+                let surface_c = climate_t * 45.0 - 5.0; // normalized T -> [-5, 40] °C
+                let ambient_c = if cave_climate_enabled {
+                    use unendlich_engine::world::cave_climate as cc;
+                    let m = chunk_manager.model_arc();
+                    let (bx, by, bz) = (ppx.x.floor() as i32, (ppx.y + 0.6).floor() as i32, ppx.z.floor() as i32);
+                    let surf = m.surface_target(bx as f64, bz as f64, 0.0).round() as i32;
+                    let depth = surf - by;
+                    let cave = cc::cave_c(bx, by, bz, depth, m.seed());
+                    let sky01 = light_sys.light_at([bx, by, bz]).map_or(1.0, |l| l[0] as f32 / 15.0);
+                    let zone = unendlich_engine::world::underground::zone_of(bx, by, bz, depth, m.seed());
+                    if zone != cave_zone_last {
+                        log::info!(
+                            "[climate] {:?} -> {:?} at depth {} (cave air {}, weather {:.0}°C)",
+                            cave_zone_last, zone, depth,
+                            cave.map_or("none".to_string(), |c| format!("{c:.0}°C")), surface_c
+                        );
+                        cave_zone_last = zone;
+                    }
+                    enclosure_last = cc::enclosure(depth as f32, sky01);
+                    cc::ambient_c(surface_c, cave, depth as f32, sky01)
+                } else {
+                    surface_c
+                };
+                ambient_c_last = ambient_c;
                 let cond = sxp::Conditions {
-                    ambient_c: climate_t * 45.0 - 5.0, // normalized T -> [-5, 40] °C
+                    ambient_c,
                     wind01: (wmagx as f32 * 0.2).clamp(0.0, 1.0),
                     // r156: rain soaks you unless the roof holds.
                     wet01: if in_water {
@@ -8406,6 +8539,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     "[survival] YOU DIED at ({:.0},{:.0},{:.0}) — {} item(s) dropped there; respawned",
                     here[0], here[1], here[2], dropped
                 );
+                notices.push(
+                    "death",
+                    format!("You died. {} item(s) lie where you fell", dropped),
+                );
             }
             // r130: PLAYER BENDING (B) — stance from movement, element from
             // the ENVIRONMENT (in water -> Water, near heat -> Fire, airborne
@@ -8449,6 +8586,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     vegetation_mass: 0.4,
                 };
                 let mut fields = unendlich_engine::sim::bending_field::sample(&raw_env);
+                // Caves have their own bending fields (sim::cave_fields,
+                // cave_biomes.docx property signatures), blended in as the
+                // cave closes over you. Zone and enclosure come from the
+                // exposure block (off with UNENDLICH_CAVE_CLIMATE=0).
+                {
+                    use unendlich_engine::sim::cave_fields as cf;
+                    let t01 = unendlich_engine::world::noise::noise_2d(
+                        pp.x as f64 / 149.0, pp.z as f64 / 149.0, m.seed() ^ 0x0F1E,
+                    ) as f32;
+                    fields = cf::blend(fields, cf::cave_fields(cave_zone_last, t01), enclosure_last);
+                }
                 // r139: ARTIFACT IMBUE — holding an INGOT (ItemId 1000/1001)
                 // attunes it: progress scales with how well the environment
                 // matches its element (heat for the fire-leaning default).
@@ -8494,6 +8642,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     if fg_imbue.counter > 0.99 && lifetime_frame % 1800 == 0 {
                         log::info!("[imbue] the ingot in your hand is fully attuned (tier {})", fg_imbue.tier);
                     }
+                }
+                // CO2 basins (cave_biomes.docx): no fire below 16% O2, no
+                // wind, little water, no light or life to draw on. After the canopy
+                // and artifact boosts: an attuned ingot does not make fire burn in CO2.
+                unendlich_engine::sim::cave_air::gas_fields(&mut fields, o2_co2_head_last);
+                // Fire needs air whatever took it (a basin or the deep band).
+                if o2_head_last < unendlich_engine::sim::cave_air::FLAME_O2_MIN {
+                    fields.r = 0.0;
                 }
                 // fly mode <=> no physics body attached (see flight toggle docs).
                 let airborne_now = body.is_none() || fg_app.swimming();
@@ -8607,7 +8763,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 ability_chain, 1.0, 0.25, 2.0,
                             );
                             let charge = (spent * mult).max(0.0);
-                            let eff = unendlich_engine::sim::ability_cast::cast(fg_imbue.element, charge);
+                            let mut eff = unendlich_engine::sim::ability_cast::cast(fg_imbue.element, charge);
+                            // Fire cannot burn below 16% O2 (cave_biomes.docx).
+                            if fg_imbue.element == 4
+                                && o2_head_last < unendlich_engine::sim::cave_air::FLAME_O2_MIN
+                                && eff.kind != unendlich_engine::sim::ability_cast::KIND_NONE
+                            {
+                                log::info!("[ability] the flame will not catch: O2 {:.1}%", o2_head_last * 100.0);
+                                eff.kind = unendlich_engine::sim::ability_cast::KIND_NONE;
+                            }
                             if eff.kind != unendlich_engine::sim::ability_cast::KIND_NONE {
                                 log::info!(
                                     "[ability] cast kind={} power={:.1} radius={:.1} (combo x{} ×{:.2})",
@@ -9587,9 +9751,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // r561: base walk speed scales with stature (longer stride);
                 // = WALK_SPEED for a default 1.8 character. Sprint multiplies on top.
                 let mut speed = player_stature.move_speed;
+                // sim::cave_air: bad air slows you, and below 8% O₂ you cannot move.
+                speed *= air_fx.move_mult * heat_fx.move_mult;
                 // r118: sprint costs stamina — gate on the meter (ticked above).
+                // Heat III (cave_biomes.docx) disables sprint.
                 if bindings.is_action_pressed(GameAction::Sprint, &input)
-                    && fg_app.stamina().sprinting {
+                    && fg_app.stamina().sprinting
+                    && heat_fx.sprint {
                     speed *= physics::constants::SPRINT_MULTIPLIER;
                 }
                 if bindings.is_action_pressed(GameAction::Sneak, &input) {
@@ -10114,6 +10282,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             aggro: 0.0,
                             prev_behavior: 0,
                             combat_habit: 0.0,
+                            player_memory: None,
                             disposition_cache: None,
                             graze_target: None,
                             graze_cell: (i32::MIN, i32::MIN),
@@ -10148,6 +10317,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             let player_speed = match last_player_xz {
                 Some((lx, lz)) if dt > 1e-4 => ((pp.x - lx).powi(2) + (pp.z - lz).powi(2)).sqrt() / dt,
                 _ => 0.0,
+            };
+            // Horizontal velocity, for a ghost's dead-reckoning.
+            let player_vel3 = match last_player_xz {
+                Some((lx, lz)) if dt > 1e-4 => [(pp.x - lx) / dt, 0.0, (pp.z - lz) / dt],
+                _ => [0.0; 3],
             };
             last_player_xz = Some(player_xz);
             let player_speed_milli = (player_speed * 50.0) as u32;
@@ -10190,6 +10364,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     )
             };
             roamer_tick = roamer_tick.wrapping_add(1);
+            roam_clock += dt;
             // r134: AI BUDGET (operator: mob lag) — distance tick-bands from
             // the REAL sim::ai_budget: distant brains run every 2/4/8 frames,
             // staggered by a per-individual id hash so full-ticks spread out.
@@ -10300,6 +10475,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 Vec::new()
             };
             roamer_budget.begin();
+            // Object-permanence census for the periodic log: creatures that
+            // see the player this frame, and ones acting on a ghost.
+            let (mut perm_seeing, mut perm_ghosting) = (0u32, 0u32);
+            let mut perm_nearest = f32::MAX;
             for r in roamers.iter_mut() {
                 // r265: catch-up count carried from the gate to the tick body.
                 let mut mob_band_catch_up: u32 = 1;
@@ -10387,6 +10566,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     aggro,
                     prev_behavior,
                     combat_habit,
+                    player_memory,
                     genome,
                     disposition_cache,
                     graze_target,
@@ -10734,6 +10914,43 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     } else {
                         None
                     };
+                // Object permanence (sim::object_permanence): a sighting sets
+                // the ghost, a heard footstep nudges it (it cannot start one),
+                // and while neither reaches the creature it keeps acting on the
+                // ghost -- prey stays spooked, a provoked animal keeps coming --
+                // until the trail goes cold, instead of forgetting the player
+                // the moment they step behind a rock.
+                // This roamer's tick length (distant brains tick every few frames).
+                let tick_dt_perm = dt * mob_band_catch_up as f32;
+                let perceived = if permanence_enabled {
+                    use unendlich_engine::sim::object_permanence as op;
+                    let mem = player_memory.get_or_insert_with(|| {
+                        op::Tracker::new(op::PLAYER_MAX_SPEED, 1.0, op::memory_seconds(*kind))
+                    });
+                    let sight = (seen && !player_hidden).then_some((player_pos3, player_vel3));
+                    if sight.is_some() {
+                        perm_seeing += 1;
+                    }
+                    perm_nearest = perm_nearest.min(player_dist);
+                    let heard = if sight.is_none() { perceived.map(|(hx, hz)| [hx, pp.y, hz]) } else { None };
+                    let (act_on, ev) = op::sense_step(mem, sight, heard, roam_clock, tick_dt_perm);
+                    match ev {
+                        op::SenseEvent::LostSight => log::info!(
+                            "[permanence] {:?} lost sight of the player, acting on its belief ({:.0},{:.0})",
+                            kind, act_on.map_or(0.0, |p| p[0]), act_on.map_or(0.0, |p| p[2])
+                        ),
+                        op::SenseEvent::GaveUp(secs) => {
+                            log::info!("[permanence] {:?} gave up on the player after {:.0} s", kind, secs)
+                        }
+                        op::SenseEvent::None => {}
+                    }
+                    if sight.is_none() && heard.is_none() && act_on.is_some() {
+                        perm_ghosting += 1;
+                    }
+                    act_on.map(|p| (p[0], p[2]))
+                } else {
+                    perceived
+                };
                 // Flight-initiation distance: a creature may *notice* the player far
                 // off (and we could surface that as wariness later), but it only
                 // BOLTS once the threat is within a flight distance. Without this,
@@ -12296,6 +12513,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             if let Some(line) = roamer_budget.report() {
                 log::debug!("{line}");
             }
+            if permanence_enabled && lifetime_frame % 120 == 0 && perm_nearest < 64.0 {
+                log::info!(
+                    "[permanence] {} creature(s) see the player, {} act on a lost sighting (nearest ticked {:.0} blocks)",
+                    perm_seeing, perm_ghosting, perm_nearest
+                );
+            }
             if profile_on {
                 prof.record("roamer_blockscan", _t_blockscan_us as f64 / 1000.0);
                 prof.record("roamer_herdscan", _t_herdscan_us as f64 / 1000.0);
@@ -12456,6 +12679,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 aggro: 0.0,
                                 prev_behavior: 0,
                                 combat_habit: 0.0,
+                                player_memory: None,
                                 disposition_cache: None,
                                 graze_target: None,
                                 graze_cell: (i32::MIN, i32::MIN),
@@ -13151,6 +13375,46 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     local_player.view.position.y = local_player.view.position.y.max(160.0);
                     local_player.view.pitch = 0.0;
                 }
+            }
+            if let Some(path) = view_pin_file.as_ref() {
+                view_pin = std::fs::read_to_string(path).ok().and_then(|v| parse_view_pin(&v));
+            }
+            if let Some(path) = place_file.as_ref() {
+                let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+                if mtime.is_some() && mtime != place_file_seen {
+                    place_file_seen = mtime;
+                    let text = std::fs::read_to_string(path).unwrap_or_default();
+                    for line in text.lines() {
+                        let f: Vec<&str> = line.split(',').map(|x| x.trim()).collect();
+                        if f.len() != 4 {
+                            continue;
+                        }
+                        let (Ok(x), Ok(y), Ok(z)) = (f[0].parse::<i32>(), f[1].parse::<i32>(), f[2].parse::<i32>()) else {
+                            continue;
+                        };
+                        match if f[3] == "air" { Some(BlockId::Air) } else { BlockId::from_id_str(f[3]) } {
+                            Some(b) => place_pending.push((x, y, z, b)),
+                            None => log::warn!("[place] unknown block '{}'", f[3]),
+                        }
+                    }
+                }
+                // Lines whose chunk is not loaded yet wait for it (a soak's
+                // place file is read before the world around it streams in).
+                if !place_pending.is_empty() {
+                    let before = place_pending.len();
+                    place_pending.retain(|&(x, y, z, b)| !chunk_manager.set_block(x, y, z, b));
+                    let done = before - place_pending.len();
+                    if done > 0 {
+                        log::info!("[place] set {} block(s), {} waiting for their chunks", done, place_pending.len());
+                    }
+                }
+            }
+            if let (Some(v), None) = (view_pin, body.as_ref()) {
+                local_player.view.position.x = v[0];
+                local_player.view.position.y = v[1];
+                local_player.view.position.z = v[2];
+                local_player.view.yaw = v[3];
+                local_player.view.pitch = v[4];
             }
             if let Some((m, u)) = hand_pose_debug {
                 let mut sw = wm::Swing::of(class, m, 1.0, 0);
@@ -15524,7 +15788,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
             // Periodic readout of the flock's sustained state (so alarm holding
             // while you linger — and decaying as you leave — is visible).
-            if lifetime_frame % 30 == 0 {
+            // Also redraw at once when a notice appears or expires (sim::notices).
+            let notice_due = notices.revision() != notices_shown_rev
+                || notices.next_expiry().map_or(false, |t| start.elapsed().as_secs_f32() >= t);
+            if lifetime_frame % 30 == 0 || notice_due {
                 // r126: on-screen HUD (egui card top-left) — same data as the
                 // [HUD] log line, visible without a terminal.
                 // r545: survival meters for the on-screen bars (hunger + thermal now;
@@ -15691,6 +15958,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         ));
                     }
                 }
+                // HUD notices (sim::notices), newest first.
+                for t in notices.active(start.elapsed().as_secs_f32()) {
+                    renderer.hud_status_lines.push(format!("\u{25b6} {t}"));
+                }
+                notices_shown_rev = notices.revision();
                 // r509: show the held weapon's durability when one is equipped.
                 if let Some((_, cur, max)) = equipped_weapon_dura {
                     renderer.hud_status_lines.push(format!(
@@ -15803,7 +16075,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // r490/r515: the player's own character — shown in third-person and cinematic
             // views, and in first-person when `fp_body` is on (look down to see your body).
             fp_eye_anchor = None;
-            if camera_mode != 0 || fp_body {
+            // A pinned view (UNENDLICH_VIEW) is a camera, not a body: no first-person body
+            // across the bottom of the shot.
+            let view_pinned = view_pin.is_some();
+            if camera_mode != 0 || (fp_body && !view_pinned) {
                 if self_avatar_dirty || self_avatar.is_none() {
                     let p = local_player.view.position;
                     // r561: recompute the stature profile for the (possibly new)
@@ -16933,6 +17208,347 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 start.elapsed().as_secs_f32(),
             );
         }
+        // ---- Air and flame (world::cave_gas, sim::cave_air) ----
+        {
+            use unendlich_engine::sim::cave_air as ca;
+            use unendlich_engine::world::cave_gas as cg;
+            let seed = chunk_manager.model_arc().seed();
+            let gas = cave_gas_enabled.then_some(seed);
+            light_sys.gas_seed = gas;
+            // O2 from every cause (CO2 basins and the geothermal band's thin
+            // air): what breathing and fire use. `co2_only` is the basins'
+            // share alone, for what only CO2 does (the hush, the bending caps).
+            let o2_of = |p: [f32; 3], co2_only: bool| -> f32 {
+                let Some(seed) = gas else { return cg::O2_AIR };
+                // Gas is only breathed (or burned) in open cells.
+                if chunk_manager.block_at(p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32).is_solid() {
+                    return cg::O2_AIR;
+                }
+                if co2_only { cg::o2_at(p[0], p[1], p[2], seed) } else { cg::o2_air_at(p[0], p[1], p[2], seed) }
+            };
+            let o2_at = |p: [f32; 3]| o2_of(p, false);
+            let e = local_player.view.position;
+            let o2_head = o2_at([e.x, e.y, e.z]);
+            let o2_co2_head = o2_of([e.x, e.y, e.z], true);
+            let nb = ca::breath_for(o2_head);
+            if nb != breath {
+                log::info!("[air] O2 {:.1}% at the head: {:?} -> {:?}", o2_head * 100.0, breath, nb);
+                // Breath is a survival matter: creative has no lungs to warn.
+                if survival_mode {
+                    match ca::breath_notice(breath, nb) {
+                        Some(t) => notices.push("breath", t),
+                        None => notices.clear("breath"),
+                    }
+                }
+                breath = nb;
+            }
+            air_fx = ca::effects(if survival_mode { breath } else { ca::Breath::Normal });
+            // Only while the world is being played, like the other survival
+            // ticks (stamina, hunger, exposure): not in a menu or paused.
+            let playing = mouse_captured && !game_paused;
+            if survival_mode && playing && air_fx.vitality_drain > 0.0 {
+                fg_app.vitality_mut().tick(dt, air_fx.vitality_drain);
+            }
+            // Heat stress from the air the exposure block computed.
+            if ambient_c_last.is_finite() {
+                let nh = ca::heat_for(ambient_c_last);
+                if nh != heat {
+                    log::info!("[heat] air {:.0}°C: {:?} -> {:?}", ambient_c_last, heat, nh);
+                    if survival_mode {
+                        match ca::heat_notice(nh) {
+                            Some(t) => notices.push("heat", t),
+                            None => notices.clear("heat"),
+                        }
+                    }
+                    heat = nh;
+                }
+            }
+            heat_fx = ca::heat_effects(if survival_mode { heat } else { ca::Heat::None });
+            let regen = air_fx.stamina_regen_mult.min(heat_fx.stamina_regen_mult);
+            if survival_mode && playing && regen < 1.0 && !fg_app.stamina().sprinting {
+                // Fatigue: bad air or heat takes back that share of what the
+                // meter recovered this frame (stamina::tick ran earlier), so
+                // regen 0 means no recovery at all. The earlier fixed 0.08/s
+                // was under the meter's 0.18/s regen and left it recovering
+                // even at regen 0.
+                let s = fg_app.stamina_mut();
+                s.level = (s.level - (1.0 - regen) * unendlich_engine::sim::stamina::REGEN_PER_SEC * dt).max(0.0);
+            }
+            renderer.set_air_vignette(air_fx.vignette.max(heat_fx.vignette));
+            o2_head_last = o2_head;
+            o2_co2_head_last = o2_co2_head;
+            // Dead silence (docx): below the surface the gas swallows sound.
+            // Eased so crossing the surface is a fade, not a click. This game
+            // has no drip/insect bed yet, so what goes quiet is the effects
+            // bus (roars and the like).
+            let hush_target = ca::hush_for(o2_co2_head);
+            air_hush += (hush_target - air_hush) * (dt * 2.0).min(1.0);
+            #[cfg(feature = "audio")]
+            if lifetime_frame % 6 == 0 {
+                fg_sfx.set_master_volume(fg_sfx_vol * (1.0 - air_hush));
+            }
+            // Crystal blades (sim::crystal_edges, cave_biomes.docx): sprinting
+            // through a dense crystal field cuts, once per transit.
+            if survival_mode && playing {
+                use unendlich_engine::sim::crystal_edges as ce;
+                let feet = (e.y - 1.5).floor() as i32;
+                let (cx, cz) = (e.x.floor() as i32, e.z.floor() as i32);
+                let mut blades = 0usize;
+                for dy in 0..2 {
+                    for dx in -1..=1 {
+                        for dz in -1..=1 {
+                            if ce::is_blade(chunk_manager.block_at(cx + dx, feet + dy, cz + dz)) {
+                                blades += 1;
+                            }
+                        }
+                    }
+                }
+                if let Some(cut) = crystal_blades.tick(blades, last_player_speed) {
+                    fg_app.vitality_mut().tick(1.0, cut * player_dmg_resist);
+                    log::info!(
+                        "[survival] crystal blades cut you ({} blade cells, {:.1} b/s) — vitality {:.0}%",
+                        blades, last_player_speed, fg_app.vitality().energy * 100.0
+                    );
+                    notices.push("crystal", "Crystal edges cut you: go carefully here");
+                }
+            }
+            // Cave drips (sim::cave_sound, cave_biomes.docx): in a closed-in
+            // wet cave a drop falls now and then from the ceiling somewhere
+            // near, and the cave's RT60 rings it out. Not in the gas (its dead
+            // silence is the point), not under open sky.
+            cave_sound_clock += dt;
+            #[cfg(feature = "audio")]
+            {
+                use unendlich_engine::sim::cave_sound as cs;
+                let wet = cave_drips_enabled && enclosure_last > 0.8 && air_hush < 0.2;
+                let zone_rate = cs::drips_per_minute(cave_zone_last);
+                let rate = if !wet || zone_rate <= 0.0 { 0.0 } else { cave_drips_override.unwrap_or(zone_rate) };
+                if let Some(ds) = drip_clock.due(cave_sound_clock, rate) {
+                    let [ox, oz] = cs::drip_offset(ds);
+                    let (bx, bz) = ((e.x + ox).floor() as i32, (e.z + oz).floor() as i32);
+                    // The drop falls from a real ceiling: the first solid block
+                    // over open air above that column, within 16 of the ear.
+                    let by = e.y.floor() as i32;
+                    let ceiling = (-2..16).find(|dy| {
+                        chunk_manager.block_at(bx, by + dy + 1, bz).is_solid()
+                            && !chunk_manager.block_at(bx, by + dy, bz).is_solid()
+                    });
+                    if let Some(dy) = ceiling {
+                        let src = [bx as f32 + 0.5, (by + dy) as f32 + 0.9, bz as f32 + 0.5];
+                        let seed = chunk_manager.model_arc().seed();
+                        let t01 = unendlich_engine::world::noise::noise_2d(e.x as f64 / 131.0, e.z as f64 / 131.0, seed ^ 0x0D21) as f32;
+                        if let Some(rt) = cs::rt60_s(cave_zone_last, t01) {
+                            let f = local_player.forward();
+                            let (ear, fwd) = ([e.x, e.y, e.z], [f.x, f.y, f.z]);
+                            let dist = ((src[0] - ear[0]).powi(2) + (src[1] - ear[1]).powi(2) + (src[2] - ear[2]).powi(2)).sqrt();
+                            let label = format!("drip_{:?}_{}m_rt{:.1}", cave_zone_last, dist as i32, rt);
+                            fg_sfx.submit(unendlich_engine::audio::SfxJob {
+                                label,
+                                render: Box::new(move || {
+                                    use unendlich_engine::sim::sound_render;
+                                    const RATE: u32 = 24_000;
+                                    let dry = cs::drip(RATE, ds);
+                                    let plan = cs::drip_plan(src, ear, fwd, rt);
+                                    Some((sound_render::render(&dry, RATE, &plan, cs::render_opts()), RATE))
+                                }),
+                            });
+                        }
+                    }
+                }
+            }
+            // Earth sensing (docx): an earth-attuned player feels the gas in
+            // the rock pores before walking into it; the HUD notice and the
+            // log both say so.
+            let earth_attuned = fg_imbue.element == 3 && fg_imbue.counter > 0.5;
+            if let (true, Some(seed)) = (earth_attuned, gas) {
+                let s = cg::sense(e.x, e.y, e.z, seed, 24.0);
+                let key = s.map(|s| s.basin.center);
+                if key != gas_sensed {
+                    if let Some(s) = s {
+                        log::info!(
+                            "[bending] the stone tells of dead air {:.0} blocks off, below y={} (earth sense)",
+                            s.distance, s.basin.surface_y + 1
+                        );
+                        notices.push(
+                            "earth",
+                            if s.distance < 1.0 {
+                                "The stone tells you: you stand in dead air".to_string()
+                            } else {
+                                format!("The stone tells of dead air {:.0} blocks off, below y {}", s.distance, s.basin.surface_y + 1)
+                            },
+                        );
+                    }
+                    gas_sensed = key;
+                }
+            } else {
+                gas_sensed = None;
+            }
+
+            // Dynamic point lights: what the player carries, and burning
+            // weapons in flight. Fire needs air: a torch is the canary.
+            let now_s = start.elapsed().as_secs_f32();
+            let mut lights: Vec<unendlich_engine::render::dynamic_lights::PointLight> = Vec::new();
+            let held = hand_item.and_then(|h| {
+                unendlich_engine::world::blocks::BlockId::ALL.iter().copied().find(|b| *b as u32 == h.0 && h.0 != 0)
+            });
+            if let Some(b) = held {
+                let em = b.light_emission();
+                if em != [0, 0, 0] {
+                    let f = local_player.forward();
+                    let lp = [e.x + f.x * 0.6, e.y - 0.35, e.z + f.z * 0.6];
+                    let mut k = 1.0;
+                    if b == unendlich_engine::world::blocks::BlockId::Torch {
+                        match held_flame.tick(o2_at(lp), dt) {
+                            ca::FlameEvent::StartedSputtering => {
+                                log::info!("[air] your torch sputters");
+                                notices.push("flame", "Your torch sputters");
+                            }
+                            ca::FlameEvent::Died => {
+                                log::info!("[air] your torch goes out");
+                                notices.push("flame", "Your torch goes out");
+                            }
+                            ca::FlameEvent::Recovered => {
+                                log::info!("[air] your torch steadies");
+                                notices.push("flame", "Your torch steadies");
+                            }
+                            ca::FlameEvent::Rekindled => {
+                                log::info!("[air] your torch rekindles");
+                                notices.push("flame", "Your torch rekindles");
+                            }
+                            ca::FlameEvent::None => {}
+                        }
+                        k = held_flame.intensity(now_s);
+                    }
+                    if k > 0.0 {
+                        let torch = b == unendlich_engine::world::blocks::BlockId::Torch;
+                        lights.push(unendlich_engine::render::dynamic_lights::PointLight {
+                            pos: lp,
+                            color: [em[0] as f32 / 15.0, em[1] as f32 / 15.0, em[2] as f32 / 15.0],
+                            // 1/(1+d²) falls off fast: 12 keeps a carried
+                            // torch readable ~8 blocks out (0.12 at d = 8).
+                            intensity: if torch { 12.0 } else { 3.0 } * k,
+                            radius: if torch { 12.0 } else { 6.0 },
+                        });
+                    }
+                }
+            }
+            if let Some(t) = thrown.as_ref() {
+                // 4 = Fire in the weapon palette (sim::artifact_imbue).
+                if t.threat.element == Some(4) && o2_at(t.t.pos) >= ca::FLAME_O2_MIN {
+                    lights.push(unendlich_engine::render::dynamic_lights::PointLight {
+                        pos: t.t.pos,
+                        color: [1.0, 0.55, 0.2],
+                        intensity: 2.0 * (0.9 + 0.1 * (now_s * 17.0).sin()),
+                        radius: 8.0,
+                    });
+                }
+            }
+            renderer.set_point_lights([e.x, e.y, e.z], &lights);
+        }
+        if block_light_enabled {
+            let e = local_player.view.position;
+            let cs = unendlich_engine::constants::CHUNK_SIZE;
+            let pc = [
+                (e.x.floor() as i32).div_euclid(cs),
+                (e.y.floor() as i32).div_euclid(cs),
+                (e.z.floor() as i32).div_euclid(cs),
+            ];
+            let ups = light_sys.tick(pc, &|c| chunk_manager.get_chunk(c));
+            if !ups.is_empty() {
+                renderer.queue_light_uploads(ups);
+            }
+            if let Some(w) = light_sys.window() {
+                renderer.set_light_debug(light_debug);
+                renderer.set_light_volume(w.origin_blocks(), true);
+            }
+            if let Some(secs) = light_audit_secs {
+                if light_audit_last.elapsed().as_secs_f32() >= secs && light_sys.stats.dirty == 0 && light_sys.stats.in_flight == 0 {
+                    light_audit_last = std::time::Instant::now();
+                    let bad = light_sys.audit(&|c| chunk_manager.get_chunk(c));
+                    log::info!("light audit: {} stale chunk(s) {:?}", bad.len(), bad);
+                }
+            }
+            if light_trace && light_trace_last.elapsed().as_secs_f32() >= 1.0 {
+                light_trace_last = std::time::Instant::now();
+                let (pending, uploaded) = renderer.light_upload_stats();
+                let st = light_sys.stats;
+                // What the view is pointed at, and the light in the cells around it.
+                let cf = local_player.forward();
+                let probe = chunk_manager
+                    .raycast_octree([e.x, e.y, e.z], [cf.x, cf.y, cf.z], 160.0, |b| b.is_solid())
+                    .map(|hit| {
+                        let (hx, hy, hz) = hit.world_cell;
+                        let around: Vec<String> = [[0, 1, 0], [0, -1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]]
+                            .iter()
+                            .map(|d| {
+                                let w = [hx + d[0], hy + d[1], hz + d[2]];
+                                format!("{:?}", light_sys.light_at(w))
+                            })
+                            .collect();
+                        let above = [hx, hy + 1, hz];
+                        let cs = unendlich_engine::constants::CHUNK_SIZE;
+                        let ac = [above[0].div_euclid(cs), above[1].div_euclid(cs), above[2].div_euclid(cs)];
+                        let tx = unendlich_engine::world::light_volume::chunk_texel_origin(ac);
+                        // What is above the aimed cell, chunk by chunk: the first
+                        // light-blocking block, if any (why a column is shaded).
+                        let mut above_col = Vec::new();
+                        for k in 0..8 {
+                            let cy = ac[1] + k;
+                            match chunk_manager.get_chunk(ChunkCoord::new(ac[0], cy, ac[2])) {
+                                None => { above_col.push(format!("{cy}:unloaded")); break; }
+                                Some(ch) => {
+                                    let lx = hx.rem_euclid(cs);
+                                    let lz = hz.rem_euclid(cs);
+                                    let from = if k == 0 { (hy + 1).rem_euclid(cs) } else { 0 };
+                                    let hit_b = (from..cs).find_map(|ly| {
+                                        let b = ch.blocks[unendlich_engine::world::chunk::Chunk::block_index(lx, ly, lz)];
+                                        unendlich_engine::world::light_volume::blocks_light(b).then(|| format!("{:?}@{}", b, cy * cs + ly))
+                                    });
+                                    above_col.push(format!("{cy}:{}", hit_b.unwrap_or_else(|| "open".into())));
+                                }
+                            }
+                        }
+                        format!(
+                            "{:?} ({},{},{}) around[+y,-y,+x,-x,+z,-z] {} | box {:?} of chunk {:?} holds {:?} cpu {:?} | above {}",
+                            hit.block, hx, hy, hz, around.join(" "), tx, ac, renderer.light_box_owner(tx), light_sys.lit_hash(ac), above_col.join(" ")
+                        )
+                    })
+                    .unwrap_or_else(|| "nothing".into());
+                // Does every box on the GPU hold what the CPU thinks it holds?
+                let mut stale: Vec<([i32; 3], Option<[i32; 3]>)> = Vec::new();
+                if let Some(w) = light_sys.window() {
+                    let unlit = unendlich_engine::world::light_volume::box_hash(
+                        &unendlich_engine::world::light_volume::unlit_box(),
+                    );
+                    for c in w.chunks() {
+                        let tx = unendlich_engine::world::light_volume::chunk_texel_origin(c);
+                        let want = light_sys.lit_hash(c).unwrap_or(unlit);
+                        match renderer.light_box_owner(tx) {
+                            Some((oc, h)) if oc == c && h == want => {}
+                            other => stale.push((c, other.map(|o| o.0))),
+                        }
+                    }
+                }
+                {
+                    // The nearest CO₂ basin (world::cave_gas), to find one to walk into.
+                    let seed = chunk_manager.model_arc().seed();
+                    let best = unendlich_engine::world::cave_gas::sense(e.x, e.y, e.z, seed, 160.0);
+                    log::info!(
+                        "light: nearest basin {:?} | breath {:?} (O2 {:.1}%) hush {:.2} flame {:?} | air {:.1}°C in {:?}, heat {:?}, body {:.1}°C",
+                        best, breath, o2_head_last * 100.0, air_hush, held_flame.state,
+                        ambient_c_last, cave_zone_last, heat, fg_thermal.body_c
+                    );
+                }
+                log::info!(
+                    "light: gpu boxes stale {}: {:?}",
+                    stale.len(), &stale[..stale.len().min(8)]
+                );
+                log::info!(
+                    "light: window {:?} dirty {} in_flight {} relit {} ignored {} moves {} uploads pending {} done {} | aim {}",
+                    light_sys.window().map(|w| w.min), st.dirty, st.in_flight, st.relit, st.ignored, st.window_moves, pending, uploaded, probe
+                );
+            }
+        }
         // r598: ROAMER SANITY SWEEP — the wild-chunk producer hunt points at
         // an entity position going non-finite during the menu-phase ecosystem
         // tick (NaN position → streamed chunk at (i32::MIN)³ → generated,
@@ -17430,51 +18046,46 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 };
 
                 // opt-3: gather each column's (floor, water-count) — parallel above 2048 cols.
+                // The scan itself is `water_sim_core::gather` (the tested copy): the floor is
+                // the solid the water RESTS ON — the topmost solid BELOW the topmost water
+                // (r445: a solid ABOVE the water, an overhang or cave roof, is not the floor).
+                // r448: only SOLID blocks (and lava, which water rests on and boils) count as
+                // a floor; non-solid decorations are open, so water floods them (waterlogging).
+                use unendlich_engine::sim::water_sim_core as wsc;
                 let cols: Vec<usize> = (0..n).collect();
-                let gathered: Vec<(i32, f32, bool)> =
+                let gathered: Vec<wsc::Gathered> =
                     unendlich_engine::util::task_lanes::map_pure_threshold(&cols, 2048, |&i| {
                         let cj = (i % side) as i32;
                         let ci = (i / side) as i32;
                         let wx = px - rh + cj;
                         let wz = pz - rh + ci;
-                        // r445: the floor is the solid the water RESTS ON — the topmost solid
-                        // BELOW the topmost water cell — NOT the topmost solid overall. The old
-                        // code took the highest solid, so a column with a solid ABOVE the water (an
-                        // overhang, a cave ceiling, a placed block, a terrain lip) set base above
-                        // that solid and the write-back stacked the water on top of it → the
-                        // "water rises occasionally" reports. Track the last solid seen scanning up
-                        // and commit it as the floor each time water appears above it.
-                        let mut floor_y = i32::MIN;
-                        let mut last_solid = i32::MIN;
-                        let mut last_solid_lava = false;
-                        let mut wc = 0.0f32;
-                        let mut lava = false;
-                        for wy in win_lo..win_hi {
-                            let b = read(wx, wy, wz);
-                            if b == BlockId::Water || b == BlockId::Ice {
-                                wc += 1.0;
-                                floor_y = last_solid; // bed under the (highest-so-far) water
-                                lava = last_solid_lava; // water boils if its BED is lava
-                            } else if b.is_solid() || b == BlockId::Lava {
-                                // r448: only SOLID blocks (and lava, which water rests on + boils)
-                                // count as a floor. Non-solid decorations — grass, flowers, ferns,
-                                // vines, mushrooms, … — fall through and are treated like air, so
-                                // water flows into and floods them (waterlogging) instead of perching
-                                // on top of them.
-                                last_solid = wy;
-                                last_solid_lava = b == BlockId::Lava;
-                            }
-                        }
-                        (floor_y, wc, lava)
+                        let cells: Vec<wsc::Cell> = (win_lo..win_hi)
+                            .map(|wy| match read(wx, wy, wz) {
+                                BlockId::Water | BlockId::Ice => wsc::Cell::Water,
+                                BlockId::Lava => wsc::Cell::Lava,
+                                b if b.is_solid() => wsc::Cell::Solid,
+                                _ => wsc::Cell::Air,
+                            })
+                            .collect();
+                        wsc::gather(&cells, win_lo, wsc::Cell::Water)
                     });
-                let mut floor: Vec<i32> = Vec::with_capacity(n);
+                let mut floor_opt: Vec<Option<i32>> = Vec::with_capacity(n);
                 let mut depth: Vec<f32> = Vec::with_capacity(n);
                 let mut on_lava: Vec<bool> = Vec::with_capacity(n);
-                for (t, d, l) in gathered {
-                    floor.push(t);
-                    depth.push(d);
-                    on_lava.push(l);
+                let mut tops: Vec<Vec<(i32, i32)>> = Vec::with_capacity(n);
+                for g in gathered {
+                    floor_opt.push(g.sample.floor);
+                    depth.push(g.sample.depth);
+                    on_lava.push(g.sample.on_lava);
+                    tops.push(g.tops);
                 }
+                // Dry columns come back floorless from the gather; give the ones water can
+                // reach a floor, or water never runs into a trench, over a ledge, or into a
+                // puddle on dry ground (they were all bottomless = inert before this).
+                wsc::resolve_dry_floors(side, &mut floor_opt, &depth, &tops);
+                let floor: Vec<i32> = floor_opt.iter().map(|f| f.unwrap_or(i32::MIN)).collect();
+                // Cell counts as gathered, before rain/boil/settle: the quantizer's tie-break.
+                let gathered_depth: Vec<f32> = depth.clone();
                 // r424: rain adds shallow water to exposed columns before settling.
                 let rain_added = if water_rain && precip01 > 0.05 {
                     unendlich_engine::world::water_sources::apply_rain(
@@ -17534,99 +18145,25 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     })
                     .collect();
 
-                // Settle (gather-form: per-cell outflux then per-cell net; volume-conserving).
-                // r417: also accumulate the per-column flow vectors for the surface shader.
+                // Settle: `water_sim_core::ColumnGrid::settle_with` (gather-form, volume-
+                // conserving; r680 bottomless columns are infinite sources; r442 per-tick
+                // shed cap). r417: each iteration's sends feed the surface shader's flow field.
                 water_flow.reset(px - rh, pz - rh);
                 let settle_iters = if freezing { 0 } else { water_settle_iters };
-                // r442: cap total water a column may shed per TICK (summed across iters) so a dug
-                // hole fills over a few ticks instead of in one — visible flow, still volume-safe.
-                let mut sent_this_tick = vec![0.0f32; n];
-                for _ in 0..settle_iters {
-                    let mut send = vec![[0.0f32; 4]; n]; // +x, -x, +z, -z
-                    for zz in 0..side {
-                        for xx in 0..side {
-                            let i = xx + zz * side;
-                            let d = depth[i];
-                            if d <= 0.0 {
-                                continue;
-                            }
-                            // r680: a bottomless column (deep ocean, floor below the
-                            // sim window) now acts as an INFINITE SOURCE: it may SEND
-                            // downhill into a lower non-bottomless neighbour (so ocean
-                            // water pours into an adjacent cave / cliff gap until that
-                            // neighbour reaches sea level), but it never depletes (its
-                            // depth is held constant in the write-back below) and never
-                            // receives (neighbours skip `floor[j]==MIN` targets). Its
-                            // gather surface `base+depth` already equals the true sea
-                            // level, so it fills caves TO sea level and then stops
-                            // (df→0) — no runaway rise (the r441 concern) and no ocean
-                            // drain. Previously it was fully inert (`continue`), which is
-                            // why cave/ocean borders never poured.
-                            let is_source = floor[i] == i32::MIN;
-                            let surf = base[i] + d + steam[i];
-                            let mut want = [0.0f32; 4];
-                            let mut wt = 0.0f32;
-                            if xx + 1 < side {
-                                let j = i + 1;
-                                if floor[j] != i32::MIN {
-                                    let df = surf - (base[j] + depth[j] + steam[j]);
-                                    if df > 0.0 { want[0] = water_settle_f * df; wt += want[0]; }
-                                }
-                            }
-                            if xx > 0 {
-                                let j = i - 1;
-                                if floor[j] != i32::MIN {
-                                    let df = surf - (base[j] + depth[j] + steam[j]);
-                                    if df > 0.0 { want[1] = water_settle_f * df; wt += want[1]; }
-                                }
-                            }
-                            if zz + 1 < side {
-                                let j = i + side;
-                                if floor[j] != i32::MIN {
-                                    let df = surf - (base[j] + depth[j] + steam[j]);
-                                    if df > 0.0 { want[2] = water_settle_f * df; wt += want[2]; }
-                                }
-                            }
-                            if zz > 0 {
-                                let j = i - side;
-                                if floor[j] != i32::MIN {
-                                    let df = surf - (base[j] + depth[j] + steam[j]);
-                                    if df > 0.0 { want[3] = water_settle_f * df; wt += want[3]; }
-                                }
-                            }
-                            if wt <= 0.0 {
-                                continue;
-                            }
-                            let scale = if wt > d && !is_source { d / wt } else { 1.0 };
-                            // r442: also cap by remaining per-tick flow budget for this column.
-                            let total = wt * scale;
-                            let cap = (water_max_flow - sent_this_tick[i]).max(0.0);
-                            let scale = if total > cap && total > 0.0 {
-                                scale * (cap / total)
-                            } else {
-                                scale
-                            };
-                            sent_this_tick[i] += wt * scale;
-                            send[i] = [want[0] * scale, want[1] * scale, want[2] * scale, want[3] * scale];
-                        }
-                    }
-                    water_flow.accumulate(&send); // r417: fold this step's transfers into the flow field
-                    for zz in 0..side {
-                        for xx in 0..side {
-                            let i = xx + zz * side;
-                            let mut net = -(send[i][0] + send[i][1] + send[i][2] + send[i][3]);
-                            if xx + 1 < side { net += send[i + 1][1]; }
-                            if xx > 0 { net += send[i - 1][0]; }
-                            if zz + 1 < side { net += send[i + side][3]; }
-                            if zz > 0 { net += send[i - side][2]; }
-                            // r680: a bottomless source holds its level (infinite ocean) —
-                            // discard its own net so it never drains; real columns settle.
-                            if floor[i] != i32::MIN {
-                                depth[i] = (depth[i] + net).max(0.0).min((win_hi - win_lo) as f32);
-                            }
-                        }
-                    }
-                }
+                let mut grid = wsc::ColumnGrid::new(side);
+                grid.base = base;
+                grid.depth = depth;
+                grid.steam = steam;
+                grid.bottomless = floor.iter().map(|&f| f == i32::MIN).collect();
+                let params = wsc::FluidParams {
+                    f: water_settle_f,
+                    max_flow: water_max_flow,
+                    max_depth: (win_hi - win_lo) as f32,
+                    yield_h: 0.0,
+                    infinite_sources: true,
+                };
+                grid.settle_with(settle_iters, &params, |send| water_flow.accumulate(send));
+                let mut depth = std::mem::take(&mut grid.depth);
 
                 // r423: dry isolated shallow puddles (guarded so lakes are never eroded).
                 let evap_removed = if water_evap {
@@ -17637,14 +18174,22 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     0.0
                 };
 
-                // Write back: water from floor+1 up to +depth (rounded); Air<->Water only.
-                let mut budget = water_sim_budget;
-                let mut changes: usize = 0;
-                'wb: for ci in 0..side {
+                // Write back: water from floor+1 up to +q (whole cells); Air<->Water only.
+                // `quantize` shares round(total) cells by largest remainder: per-column
+                // rounding wrote 3+1 cells for a 2.5/0.5 split of 3, and the error compounded
+                // every tick because the next tick gathers what was written.
+                grid.depth = depth.clone();
+                let q: Vec<i32> = grid.quantize(&gathered_depth);
+                // Plan first, then apply within the budget with `split_budget`, which keeps
+                // the tick's net change (sources, rain, boiling) and spends the rest in
+                // matched add/remove pairs. Applying the first `budget` changes in scan order
+                // gave a drained column its removal and the column it drained into nothing,
+                // so water vanished until a later tick caught up.
+                let mut adds: Vec<(i32, i32, i32, BlockId)> = Vec::new();
+                let mut removes: Vec<(i32, i32, i32)> = Vec::new();
+                let mut swaps: Vec<(i32, i32, i32, BlockId)> = Vec::new(); // Water<->Ice, no volume change
+                for ci in 0..side {
                     for cj in 0..side {
-                        if budget == 0 {
-                            break 'wb;
-                        }
                         let i = cj + ci * side;
                         if floor[i] == i32::MIN {
                             continue;
@@ -17652,43 +18197,66 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         let wx = px - rh + cj as i32;
                         let wz = pz - rh + ci as i32;
                         let b0 = floor[i] + 1;
-                        let top = b0 + depth[i].round() as i32;
+                        let top = b0 + q[i];
                         for wy in b0..win_hi {
-                            if budget == 0 {
-                                break;
-                            }
                             let cur = read(wx, wy, wz);
-                            let want = wy < top;
-                            if want {
+                            if wy < top {
                                 // r425: surface cell is Ice when frozen, else Water.
                                 let desired = if freezing && wy == top - 1 {
                                     BlockId::Ice
                                 } else {
                                     BlockId::Water
                                 };
-                                let replaceable = cur == BlockId::Air
-                                    || cur == BlockId::Water
-                                    || cur == BlockId::Ice
+                                if cur == desired {
+                                    continue;
+                                }
+                                if cur == BlockId::Water || cur == BlockId::Ice {
+                                    swaps.push((wx, wy, wz, desired));
+                                } else if cur == BlockId::Air
                                     // r448: flood non-solid decorations (grass, flowers, ferns,
                                     // vines, mushrooms, …) — waterlogging. Never lava (that's the
                                     // lava↔water reaction) or any solid.
-                                    || (!cur.is_solid()
-                                        && cur != BlockId::Lava
-                                        && cur != BlockId::Air);
-                                if cur != desired && replaceable {
-                                    if chunk_manager.set_block(wx, wy, wz, desired) {
-                                        budget -= 1;
-                                        changes += 1;
-                                    }
+                                    || (!cur.is_solid() && cur != BlockId::Lava)
+                                {
+                                    adds.push((wx, wy, wz, desired));
                                 }
                             } else if cur == BlockId::Water || cur == BlockId::Ice {
-                                if chunk_manager.set_block(wx, wy, wz, BlockId::Air) {
-                                    budget -= 1;
-                                    changes += 1;
-                                }
+                                removes.push((wx, wy, wz));
                             }
                         }
                     }
+                }
+                let (n_add, n_rem) =
+                    wsc::split_budget(adds.len(), removes.len(), water_sim_budget);
+                adds.sort_by_key(|a| a.1); // fill from the bottom
+                removes.sort_by_key(|r| std::cmp::Reverse(r.1)); // drain from the top
+                let mut changes: usize = 0;
+                for &(wx, wy, wz, b) in adds.iter().take(n_add) {
+                    if chunk_manager.set_block(wx, wy, wz, b) {
+                        changes += 1;
+                    }
+                }
+                for &(wx, wy, wz) in removes.iter().take(n_rem) {
+                    if chunk_manager.set_block(wx, wy, wz, BlockId::Air) {
+                        changes += 1;
+                    }
+                }
+                let swap_budget = water_sim_budget.saturating_sub(n_add + n_rem);
+                for &(wx, wy, wz, b) in swaps.iter().take(swap_budget) {
+                    if chunk_manager.set_block(wx, wy, wz, b) {
+                        changes += 1;
+                    }
+                }
+                if water_trace {
+                    let real: f32 = gathered_depth.iter().zip(&floor).filter(|(_, &f)| f != i32::MIN).map(|(d, _)| *d).sum();
+                    let target: i32 = q.iter().zip(&floor).filter(|(_, &f)| f != i32::MIN).map(|(c, _)| *c).sum();
+                    log::info!(
+                        "water: cols {} wet {} cells {} -> {} (rain +{:.2} boil -{:.2} evap -{:.2}) plan +{} -{} ~{} applied +{} -{} budget {}",
+                        n,
+                        depth.iter().filter(|&&d| d > 0.0).count(),
+                        real as i64, target, rain_added, boil_removed, evap_removed,
+                        adds.len(), removes.len(), swaps.len(), n_add, n_rem, water_sim_budget
+                    );
                 }
                 // opt-1: keep simulating while water is still moving; otherwise go idle.
                 // r433: shoreline erosion — waves wash exposed Grass/Dirt at the waterline into
@@ -17703,7 +18271,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         if ebudget == 0 { break; }
                         let i = (estart + off) % n;
                         if depth[i] <= 0.0 || floor[i] == i32::MIN { continue; }
-                        let top_i = floor[i] + depth[i].round() as i32; // water surface level
+                        let top_i = floor[i] + q[i]; // water surface level
                         let cj = (i % side) as i32;
                         let ci = (i / side) as i32;
                         // 4 neighbours; erode a land neighbour's surface block at the waterline
@@ -17817,7 +18385,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         let wx = px - rh + cx as i32;
                         let wz = pz - rh + cz as i32;
                         // check a couple of water cells in this column against lava neighbours
-                        let surf_y = floor[i] + depth[i].round() as i32;
+                        let surf_y = floor[i] + q[i];
                         let y_lo = (floor[i] + 1).max(surf_y - 3);
                         for wy in y_lo..=surf_y {
                             if read(wx, wy, wz) != BlockId::Water { continue; }
@@ -17858,6 +18426,95 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 }
                             }
                             if lbudget == 0 { break; }
+                        }
+                    }
+                }
+                // LAVA FLOW. Lava never moved before: worldgen pockets and poured lava stood
+                // as placed. Same column settle as water, with `FluidParams::lava` (slow, a
+                // one-block yield so it stands in steps and a one-deep sheet does not creep,
+                // no infinite reservoir). Every third water tick. Water counts as open space
+                // here; where lava meets water the r444 reaction above solidifies it. Its
+                // changes keep the sim awake, so an opened pocket drains to rest.
+                if lava_flow_enabled {
+                    lava_tick = lava_tick.wrapping_add(1);
+                    if lava_tick % 3 == 0 {
+                        let lg: Vec<wsc::Gathered> =
+                            unendlich_engine::util::task_lanes::map_pure_threshold(&cols, 2048, |&i| {
+                                let wx = px - rh + (i % side) as i32;
+                                let wz = pz - rh + (i / side) as i32;
+                                let cells: Vec<wsc::Cell> = (win_lo..win_hi)
+                                    .map(|wy| match read(wx, wy, wz) {
+                                        BlockId::Lava => wsc::Cell::Lava,
+                                        BlockId::Water | BlockId::Ice => wsc::Cell::Water,
+                                        b if b.is_solid() => wsc::Cell::Solid,
+                                        _ => wsc::Cell::Air,
+                                    })
+                                    .collect();
+                                wsc::gather(&cells, win_lo, wsc::Cell::Lava)
+                            });
+                        if lg.iter().any(|g| g.sample.depth > 0.0) {
+                            let mut lfloor: Vec<Option<i32>> = lg.iter().map(|g| g.sample.floor).collect();
+                            let ldepth: Vec<f32> = lg.iter().map(|g| g.sample.depth).collect();
+                            let ltops: Vec<Vec<(i32, i32)>> = lg.iter().map(|g| g.tops.clone()).collect();
+                            wsc::resolve_dry_floors(side, &mut lfloor, &ldepth, &ltops);
+                            let mut lgrid = wsc::ColumnGrid::new(side);
+                            for i in 0..n {
+                                lgrid.depth[i] = ldepth[i];
+                                match lfloor[i] {
+                                    Some(f) => lgrid.base[i] = f as f32 + 1.0,
+                                    None => {
+                                        lgrid.base[i] = win_lo as f32;
+                                        lgrid.bottomless[i] = true;
+                                    }
+                                }
+                            }
+                            let lp = wsc::FluidParams::lava((win_hi - win_lo) as f32);
+                            let st = lgrid.settle_with(4, &lp, |_| {});
+                            if st.changed > 0 {
+                                let lq = lgrid.quantize(&ldepth);
+                                let mut ladd: Vec<(i32, i32, i32)> = Vec::new();
+                                let mut lrem: Vec<(i32, i32, i32)> = Vec::new();
+                                for i in 0..n {
+                                    let Some(f) = lfloor[i] else { continue };
+                                    let wx = px - rh + (i % side) as i32;
+                                    let wz = pz - rh + (i / side) as i32;
+                                    let top = f + 1 + lq[i];
+                                    for wy in (f + 1)..win_hi {
+                                        let cur = read(wx, wy, wz);
+                                        if wy < top {
+                                            if cur == BlockId::Air
+                                                || (!cur.is_solid() && !cur.is_fluid() && cur != BlockId::Ice)
+                                            {
+                                                ladd.push((wx, wy, wz));
+                                            }
+                                        } else if cur == BlockId::Lava {
+                                            lrem.push((wx, wy, wz));
+                                        }
+                                    }
+                                }
+                                let lbud = (water_sim_budget / 4).max(8);
+                                let (na, nr) = wsc::split_budget(ladd.len(), lrem.len(), lbud);
+                                ladd.sort_by_key(|a| a.1);
+                                lrem.sort_by_key(|r| std::cmp::Reverse(r.1));
+                                for &(wx, wy, wz) in ladd.iter().take(na) {
+                                    if chunk_manager.set_block(wx, wy, wz, BlockId::Lava) {
+                                        changes += 1;
+                                    }
+                                }
+                                for &(wx, wy, wz) in lrem.iter().take(nr) {
+                                    if chunk_manager.set_block(wx, wy, wz, BlockId::Air) {
+                                        changes += 1;
+                                    }
+                                }
+                                if water_trace {
+                                    log::info!(
+                                        "lava: cells {} -> {} plan +{} -{} applied +{} -{}",
+                                        ldepth.iter().sum::<f32>() as i64,
+                                        lq.iter().zip(&lfloor).filter(|(_, f)| f.is_some()).map(|(c, _)| *c).sum::<i32>(),
+                                        ladd.len(), lrem.len(), na, nr
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -18165,7 +18822,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         // Posing (UNENDLICH_HAND_POSE=file:..) wants a steady
                         // shot: creative, hovering where the world put the eye,
                         // clear of water and slopes.
-                        if hand_pose_file.is_some() {
+                        // UNENDLICH_PIN_SURVIVAL=1 keeps the survival ruleset
+                        // under a pinned view (no physics body, so the pin
+                        // still holds the eye): soaks can then see breath,
+                        // heat and vitality at a fixed spot.
+                        let pinned = hand_pose_file.is_some() || view_pin.is_some() || view_pin_file.is_some();
+                        let pin_survival = pinned && std::env::var("UNENDLICH_PIN_SURVIVAL").map_or(false, |v| v == "1");
+                        if pinned && !pin_survival {
                             survival_mode = false;
                         }
                         local_player.permissions.can_toggle_flight = !survival_mode;
@@ -18178,7 +18841,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         // it off"). Mirror the F6 path: attach a physics body so
                         // gravity applies immediately. Creative leaves body as-is
                         // (None = free flight), matching its ruleset.
-                        if survival_mode && body.is_none() {
+                        if survival_mode && body.is_none() && !pin_survival {
                             body = Some(unendlich_engine::physics::PhysicsBody::new_player([
                                 local_player.view.position.x,
                                 local_player.view.position.y,
@@ -18191,7 +18854,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             log::info!("[mode] menu launch set {} mode",
                                 if survival_mode { "SURVIVAL" } else { "CREATIVE" });
                         }
-                        let seed = init.seed;
+                        // UNENDLICH_WORLD_SEED=<u64> overrides the wizard's seed, so two soaks
+                        // (an A/B of a render or worldgen switch) look at the same world.
+                        let seed = std::env::var("UNENDLICH_WORLD_SEED")
+                            .ok()
+                            .and_then(|v| v.trim().parse::<u64>().ok())
+                            .unwrap_or(init.seed);
                         // r163: PER-WORLD PERSISTENCE — save the outgoing
                         // world's edited chunks, then re-root storage under
                         // worlds/<name>/ so each world keeps its OWN edits
@@ -18328,6 +18996,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     element: 2,
                                     tier: 2,
                                 };
+                                if let Some(el) = imbue_knob {
+                                    fg_imbue.element = el;
+                                    fg_imbue.counter = 1.0;
+                                }
                                 bend_resonance =
                                     unendlich_engine::sim::bending_charge::Resonance::full();
                                 fg_app.stamina_mut().level = 1.0;

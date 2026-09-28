@@ -105,13 +105,24 @@ pub enum BlockId {
     Sulfur = 95,
     Magma = 96,
     GlowCrystal = 97,
+    // Underground pass (world::underground): named flora from the design
+    // library. Glowshroom lights cave floors below the limestone zone; Iron
+    // Root Fern and Stone Flower grow over iron and over copper/gold veins
+    // (prospecting by reading plants); Cattail rings still water.
+    Glowshroom = 98,
+    IronRootFern = 99,
+    StoneFlower = 100,
+    Cattail = 101,
+    // Block light (world::light_volume): a wall/floor torch, the light the
+    // cave lore is written around.
+    Torch = 102,
 }
 
 impl BlockId {
     /// Every block variant, in declaration order. Lets tests and tooling
     /// quantify invariants over the whole palette (e.g. "every gate-skippable
     /// block is non-solid"). Kept exhaustive by `all_const_is_exhaustive`.
-    pub const ALL: [BlockId; 76] = [
+    pub const ALL: [BlockId; 81] = [
         BlockId::Air, BlockId::Stone, BlockId::Grass, BlockId::Dirt,
         BlockId::Cobblestone, BlockId::Bedrock, BlockId::Water, BlockId::Lava,
         BlockId::Sand, BlockId::Gravel, BlockId::GoldOre, BlockId::IronOre,
@@ -133,6 +144,8 @@ impl BlockId {
         BlockId::Carrot, BlockId::Potato, BlockId::Cabbage, BlockId::Sprout,
         BlockId::Selenite, BlockId::Gypsum, BlockId::Dolomite, BlockId::Sulfur,
         BlockId::Magma, BlockId::GlowCrystal,
+        BlockId::Glowshroom, BlockId::IronRootFern, BlockId::StoneFlower, BlockId::Cattail,
+        BlockId::Torch,
     ];
 
     pub const fn is_air(self) -> bool {
@@ -161,7 +174,9 @@ impl BlockId {
         !matches!(self, BlockId::Air | BlockId::Water | BlockId::Lava
             | BlockId::Flower | BlockId::TallGrass | BlockId::Fern
             | BlockId::DeadBush | BlockId::Vine | BlockId::Cobweb
-            | BlockId::Mushroom | BlockId::Lichen)
+            | BlockId::Mushroom | BlockId::Lichen
+            | BlockId::Glowshroom | BlockId::IronRootFern | BlockId::StoneFlower
+            | BlockId::Cattail | BlockId::Torch)
     }
 
     /// Does this block stop a body's translational motion (collision)?
@@ -263,13 +278,16 @@ impl BlockId {
             // Crystal and amber are translucent natural materials.
             | BlockId::Crystal | BlockId::Amber
             | BlockId::Selenite | BlockId::GlowCrystal
+            | BlockId::Glowshroom | BlockId::IronRootFern | BlockId::StoneFlower
+            | BlockId::Cattail | BlockId::Torch
             | BlockId::Glass)
     }
 
     pub fn is_replaceable(self) -> bool {
         matches!(self, BlockId::Air | BlockId::Water | BlockId::Lava
             | BlockId::TallGrass | BlockId::Flower | BlockId::Fern
-            | BlockId::Snow | BlockId::DeadBush | BlockId::Vine)
+            | BlockId::Snow | BlockId::DeadBush | BlockId::Vine
+            | BlockId::IronRootFern | BlockId::StoneFlower)
     }
 
     pub fn is_fluid(self) -> bool {
@@ -312,7 +330,8 @@ impl BlockId {
         match self {
             BlockId::Water => 0.45,
             BlockId::Lava => 0.20,
-            BlockId::TallGrass | BlockId::Fern => 0.85,
+            BlockId::TallGrass | BlockId::Fern | BlockId::IronRootFern => 0.85,
+            BlockId::Cattail => 0.75,
             BlockId::Cobweb => 0.10,
             _ => 1.0,
         }
@@ -415,6 +434,11 @@ impl BlockId {
             BlockId::Sulfur              => [222, 201, 62],
             BlockId::Magma               => [182, 60, 30],
             BlockId::GlowCrystal         => [120, 202, 232],
+            BlockId::Glowshroom          => [96, 196, 184],  // teal cap
+            BlockId::IronRootFern        => [128, 124, 70],  // rust-olive fronds
+            BlockId::StoneFlower         => [176, 170, 196], // pale lilac-grey
+            BlockId::Cattail             => [112, 138, 72],
+            BlockId::Torch               => [236, 170, 80],
         }
     }
 
@@ -497,7 +521,33 @@ impl BlockId {
             | BlockId::OakLeaves   // canopy detail — clusters of mini-leaves
             | BlockId::BirchLeaves
             // r513: crops render as small plant shapes, not cubes.
-            | BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
+            | BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout
+            // Non-cube plants and cave dressing. Before these arms they were
+            // non-solid with no sub-grid, so the chunk mesher drew nothing for
+            // them: a generated vine, mushroom or cobweb was invisible.
+            | BlockId::Mushroom | BlockId::Vine | BlockId::DeadBush | BlockId::Cobweb
+            | BlockId::Glowshroom | BlockId::IronRootFern | BlockId::StoneFlower
+            | BlockId::Cattail | BlockId::Torch
+            // The CO₂ basin's microbial ring (world::cave_gas); drew nothing before.
+            | BlockId::Lichen)
+    }
+
+    /// Light this block gives off, per channel 0..=15 (world::light_volume).
+    /// Warm for fire and lava, cold for crystal, teal for the glowshroom.
+    pub const fn light_emission(self) -> [u8; 3] {
+        match self {
+            BlockId::Torch => [15, 13, 9],
+            BlockId::Lava => [15, 8, 3],
+            // The glows are dim on purpose: in the first soak a crystal cave
+            // at [5, 11, 14] washed whole walls saturated blue.
+            BlockId::Magma => [8, 3, 1],
+            BlockId::GlowCrystal => [3, 7, 9],
+            BlockId::Glowshroom => [2, 6, 5],
+            // cave_biomes.docx: "the microbial ring glows ... emits LL 1" — a
+            // faint green, just enough to see the gas line in the dark.
+            BlockId::Lichen => [1, 4, 2],
+            _ => [0, 0, 0],
+        }
     }
 
     /// **Sub-voxel-only** blocks: the sub-voxel grid IS the entire visual.
@@ -666,6 +716,11 @@ impl BlockId {
             "flower"         => BlockId::Flower,
             "tall_grass"     => BlockId::TallGrass,
             "fern"           => BlockId::Fern,
+            "glowshroom"     => BlockId::Glowshroom,
+            "iron_root_fern" => BlockId::IronRootFern,
+            "stone_flower"   => BlockId::StoneFlower,
+            "cattail"        => BlockId::Cattail,
+            "torch"          => BlockId::Torch,
             "dead_bush"      => BlockId::DeadBush,
             "vine"           => BlockId::Vine,
             "dripstone"      => BlockId::Dripstone,
@@ -787,6 +842,11 @@ impl TryFrom<u8> for BlockId {
             95 => Ok(BlockId::Sulfur),
             96 => Ok(BlockId::Magma),
             97 => Ok(BlockId::GlowCrystal),
+            98 => Ok(BlockId::Glowshroom),
+            99 => Ok(BlockId::IronRootFern),
+            100 => Ok(BlockId::StoneFlower),
+            101 => Ok(BlockId::Cattail),
+            102 => Ok(BlockId::Torch),
             other => Err(other),
         }
     }
@@ -831,6 +891,8 @@ mod tests {
                 | BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout => {}
                 BlockId::Selenite | BlockId::Gypsum | BlockId::Dolomite
                 | BlockId::Sulfur | BlockId::Magma | BlockId::GlowCrystal => {}
+                BlockId::Glowshroom | BlockId::IronRootFern | BlockId::StoneFlower
+                | BlockId::Cattail | BlockId::Torch => {}
             }
         }
         for b in BlockId::ALL { _forces_update(b); }

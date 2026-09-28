@@ -46,6 +46,10 @@
 
 layout(location = 0) in vec3 v_color;
 layout(location = 1) in vec3 v_world_pos;
+// r-ctm: connected-face flags from chunk.vert (0 = none: bevel every edge).
+// bits 0..3: the -u, +u, -v, +v edge continues into the same material's
+// exposed face; bit 4: seamless (no bevel at all); bit 8: flags present.
+layout(location = 2) flat in uint v_ctm;
 
 layout(location = 0) out vec4 out_color;
 
@@ -65,7 +69,39 @@ layout(set = 0, binding = 0) uniform CameraUbo {
     vec4 fx_params;        // r427: x=submerged, y=time (underwater shimmer)
     vec4 water_depth_cov;  // r431: origin_x, origin_z, blocks_per_cell, enable
     vec4 water_depth_grid[64]; // r431: 16x16 depth cells (blocks), 4 per vec4
+    vec4 disturbers[8];      // r595 (declared only to reach the fields after it)
+    vec4 disturber_meta;
+    vec4 light_volume;       // world::light_volume: xyz = window corner (blocks), w = enable
+    vec4 point_pos_radius[8];  // render::dynamic_lights: xyz = pos, w = radius
+    vec4 point_color_int[8];   // rgb = colour, a = intensity
+    vec4 point_meta;           // x = live count
 } ubo;
+
+// render::dynamic_lights, wired: up to POINT_LIGHTS point lights (a held torch,
+// a burning weapon) from the camera UBO. The attenuation lines are the ones
+// `dynamic_lights_frag_glsl` emits and `apply_lights` mirrors on the CPU (a
+// test keeps them identical); a Lambert term against `n` is added on top.
+// No occlusion: a point light shines through a thin wall.
+const int POINT_LIGHTS = 8;
+vec3 point_lights_at(vec3 P, vec3 n) {
+    int count = int(ubo.point_meta.x + 0.5);
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < POINT_LIGHTS; i++) {
+        if (i >= count) { break; }
+        vec3 d = ubo.point_pos_radius[i].xyz - P;
+        float r = max(ubo.point_pos_radius[i].w, 0.000100);
+        float d2 = dot(d, d);
+        float r2 = r * r;
+        float window = clamp(1.0 - d2 / r2, 0.0, 1.0);
+        window = window * window;
+        float a = (1.0 / (1.0 + d2)) * window * max(ubo.point_color_int[i].a, 0.0);
+        // n = 0 means "no surface" (the item in hand): no Lambert term.
+        float lambert = (d2 > 1e-6 && dot(n, n) > 0.25) ? max(dot(n, d * inversesqrt(d2)), 0.0) : 1.0;
+        acc += max(ubo.point_color_int[i].rgb, vec3(0.0)) * a * lambert;
+    }
+    return clamp(acc, 0.0, 1.0);
+}
+
 
 // Shadow map sampler. The Vulkan side uses a sampler with comparison
 // enabled (LESS_OR_EQUAL) — so `texture(shadow_map, vec3(uv, ref_z))`
@@ -86,6 +122,11 @@ layout(set = 0, binding = 1) uniform sampler2DShadow shadow_map;
 // will start returning real scattering data and the march loop
 // becomes the fallback for out-of-volume samples.
 layout(set = 0, binding = 2) uniform sampler3D froxel_volume;
+
+// world::light_volume: [sky, r, g, b] per cell, 0..15 levels as unorm bytes,
+// mapped toroidally (world cell mod size), LINEAR + REPEAT.
+layout(set = 0, binding = 4) uniform sampler3D light_volume_tex;
+const vec3 LV_SIZE = vec3(160.0, 96.0, 160.0);
 
 // ─── Material classification ────────────────────────────────────────────
 //
@@ -281,6 +322,10 @@ vec3 seasonal_foliage(vec3 c, float season01) {
 vec3 apply_block_texture(vec3 base, vec3 wpos, vec3 n) {
     vec3 qc = floor(base * 6.0 + 0.5);
     float seed = hash12(qc.xy + qc.z * 23.0);
+    // r-ctm: a connected face's grain is seeded by nothing that changes from
+    // block to block (its colour now does, smoothly), so the world-space grain
+    // runs straight across a slope instead of restarting at every block.
+    if (v_ctm != 0u) seed = 0.0;
     vec2 uv; float face_salt; float face_shade;
     if (n.y > 0.5) {            // TOP — brightest, horizontal grid
         uv = wpos.xz; face_salt = 0.0; face_shade = 1.04;
@@ -420,6 +465,7 @@ float fbm2(vec3 p) {
 #endif
 #ifndef CHUNK_SHADOWS
 #define CHUNK_SHADOWS 1      // 0 = skip shadow-map PCF (fully lit)
+#define CHUNK_BLOCK_LIGHT 1  // 0 = ignore the light volume (outdoor light everywhere)
 #endif
 const float NORMAL_STRENGTH = 0.6;
 const float PI = 3.14159265359;
@@ -686,6 +732,21 @@ void main() {
     float edge = min(d.x, d.y);
     float aa = max(fwidth(edge), 1e-5);
     float bevel = smoothstep(0.0, 0.03 + aa, edge);  // 0 at border → 1 inside
+    // r-ctm: connected textures. Bevel only the edges that are real edges: a
+    // step, a corner, a change of material. An edge whose neighbour in the
+    // same plane is the same exposed material draws no line, and a seamless
+    // (greedy-merged) face draws none inside.
+    if (v_ctm != 0u) {
+        if ((v_ctm & 16u) != 0u) {
+            bevel = 1.0;
+        } else {
+            bool cu = (cell.x < 0.5) ? ((v_ctm & 1u) != 0u) : ((v_ctm & 2u) != 0u);
+            bool cv = (cell.y < 0.5) ? ((v_ctm & 4u) != 0u) : ((v_ctm & 8u) != 0u);
+            float bu = cu ? 1.0 : smoothstep(0.0, 0.03 + aa, d.x);
+            float bv = cv ? 1.0 : smoothstep(0.0, 0.03 + aa, d.y);
+            bevel = min(bu, bv);
+        }
+    }
 
     // r311: foliage skips the block-edge bevel — no hard cube outline on leaves etc.
     if (is_foliage(v_color)) bevel = 1.0;
@@ -795,9 +856,99 @@ void main() {
     color = albedo * (sun_radiance * n_dot_l + ambient_term)
           + sun_radiance * blinn * f0;
 #endif
+#if CHUNK_BLOCK_LIGHT
+    // Sky and block light (world::light_volume). Sample the open cell in front
+    // of the face: its centre is a texel centre along the normal, and the
+    // filter blends neighbours across the face, so light falls off smoothly
+    // along a wall instead of stepping per block. Outside the window (and with
+    // the volume off) this is open sky and no block light: the old look.
+    float lv_sky = 1.0;
+    vec3  lv_blk = vec3(0.0);
+    // Clouds are meshed into the chunks as cubes but are not blocks: the
+    // light volume never saw them, and a cloud cube that dips into a hill
+    // sampled the rock around it and drew as a black shape.
+    if (ubo.light_volume.w > 0.5 && !is_cloud(v_color)) {
+        // Along the normal, snap to the centre of the open cell in front of
+        // the block this face belongs to; across the face, stay continuous.
+        // `v_world_pos + normal * 0.5` alone read the block itself on soft
+        // tops the mesher lowers into a slope (a sand top sagged to y 134.4
+        // sampled the sand cell and drew black under open sky).
+        // The derivative normal's sign follows the screen axes, not the face:
+        // the light debug view showed top faces seen from above coming out
+        // pointing down. A visible face faces the camera, so orient it that
+        // way before stepping into the open cell.
+        // Built from the cross product without normalize() so nothing here
+        // can be NaN (isnan() is not reliable under a driver's fast-math).
+        vec3 cr = cross(dFdx(v_world_pos), dFdy(v_world_pos));
+        float cr2 = dot(cr, cr);
+        vec3 acr = abs(cr);
+        vec3 fn_ = acr.x > acr.y && acr.x > acr.z ? vec3(cr.x > 0.0 ? 1.0 : -1.0, 0.0, 0.0)
+                 : acr.y > acr.z                   ? vec3(0.0, cr.y > 0.0 ? 1.0 : -1.0, 0.0)
+                 :                                   vec3(0.0, 0.0, cr.z > 0.0 ? 1.0 : -1.0);
+        if (dot(fn_, ubo.camera_pos.xyz - v_world_pos) < 0.0) fn_ = -fn_;
+        vec3 lp = v_world_pos;
+        if (abs(fn_.x) > 0.5)      lp.x = floor(v_world_pos.x - fn_.x * 0.01) + 0.5 + fn_.x;
+        else if (abs(fn_.y) > 0.5) lp.y = floor(v_world_pos.y - fn_.y * 0.01) + 0.5 + fn_.y;
+        else                       lp.z = floor(v_world_pos.z - fn_.z * 0.01) + 0.5 + fn_.z;
+        vec3 rel = lp - ubo.light_volume.xyz;
+        if (all(greaterThanEqual(rel, vec3(0.5))) && all(lessThan(rel, LV_SIZE - 0.5))) {
+            vec4 lv = texture(light_volume_tex, lp / LV_SIZE);
+            // A second tap along the unsnapped, camera-facing normal: the
+            // mesher's sloped (diagonal) faces sit inside their cell, and the
+            // snapped step can land in the solid neighbour (black wedges on a
+            // cliff edge in the first outdoor soak). The brighter tap wins.
+            // raw_normal is normalize(cross(dFdx, dFdy)), which is NaN where the
+            // derivatives degenerate (a face seen edge-on far away); a NaN
+            // coordinate samples garbage, so that tap is skipped there.
+            vec3 rn = cr2 > 1e-20 ? cr * inversesqrt(cr2) : fn_;
+            if (dot(rn, ubo.camera_pos.xyz - v_world_pos) < 0.0) rn = -rn;
+            vec4 lv2 = texture(light_volume_tex, (v_world_pos + rn * 0.9) / LV_SIZE);
+            lv = max(lv, lv2);
+            // A third tap half a block up from a side face: the triangular
+            // end caps of the mesher's slopes sit on a cell boundary with rock
+            // in front of their lower half, and both taps above read that rock
+            // (black wedges along every sloped edge). Up is where their light
+            // comes from. Floors and ceilings keep the two taps.
+            if (abs(fn_.y) < 0.5) {
+                vec4 lv3 = texture(light_volume_tex, (v_world_pos + fn_ * 0.5 + vec3(0.0, 0.6, 0.0)) / LV_SIZE);
+                lv = max(lv, lv3);
+            }
+            lv_sky = lv.r;
+            lv_blk = lv.gba;
+        }
+    }
+    // UNENDLICH_LIGHT_DEBUG=1 (w = 2): show the inputs instead of the scene.
+    // r = sky, g = derivative normal points up, b = camera-facing normal points up.
+    if (ubo.light_volume.w > 1.5 && ubo.light_volume.w < 2.5) {
+        vec3 fnd = normal;
+        if (dot(fnd, ubo.camera_pos.xyz - v_world_pos) < 0.0) fnd = -fnd;
+        out_color = vec4(lv_sky, normal.y > 0.5 ? 1.0 : 0.0, fnd.y > 0.5 ? 1.0 : 0.0, 1.0);
+        return;
+    }
+    // Squared, so levels read as a falloff rather than a grey haze: a cave
+    // mouth is bright for a few blocks and dark ten blocks in.
+    color *= lv_sky * lv_sky;
+    // Block light falls off by its strongest channel and keeps the emitter's
+    // hue (squaring each channel separately turned a torch's warm white into
+    // saturated orange-red in the first torch soak).
+    float lv_bi = max(max(lv_blk.r, lv_blk.g), lv_blk.b);
+    vec3  lv_bl = lv_blk * lv_bi;
+    color += albedo * lv_bl * 1.2;
+#if CHUNK_DYNAMIC_LIGHTS
+    {
+        vec3 pn = normal;
+        if (dot(pn, ubo.camera_pos.xyz - v_world_pos) < 0.0) pn = -pn;
+        color += albedo * point_lights_at(v_world_pos, pn) * 1.2;
+    }
+#endif
+    // The faint floor below shrinks from 12% outdoors to 1.5% in the dark
+    // (cave_biomes.docx: L = 0.00-0.05 with no torch).
+    color = max(color, albedo * mix(0.015, 0.12, lv_sky));
+#else
     // Keep a faint floor so deep-shadow faces never crush to pure black
     // (matches the old `max(lighting, 0.15)` intent).
     color = max(color, albedo * 0.12);
+#endif
 
     // r466: snow/ice SPARKLE — sparse twinkling pinpoint glints. A high-frequency world-space hash
     // makes scattered ~1/8-block cells glint; each twinkles on its own phase, brightest when the
@@ -1084,6 +1235,12 @@ void main() {
         color *= mix(1.0, 0.85, wetness);
     }
 
+#if CHUNK_BLOCK_LIGHT
+    // The water branch above rebuilds its colour from the sky and sun, so a
+    // cave pool would glow; darken it by the same light as everything else.
+    if (is_water(v_color)) color = color * (lv_sky * lv_sky) + albedo * lv_bl * 1.2;
+#endif
+
     // ─── Underside shading ──────────────────────────────────────────────
     // Faces pointing down get less light (acts like ambient occlusion).
     float up = dot(normal, vec3(0.0, 1.0, 0.0));
@@ -1190,6 +1347,9 @@ void main() {
     // transmittance, then we add scattered light. This is the
     // standard volumetric compositing formula.
     if (froxel_filled) {
+#if CHUNK_BLOCK_LIGHT
+        fog_color_acc *= max(lv_sky * lv_sky, 0.02);
+#endif
         color = color * fog_trans_acc + fog_color_acc;
 
         // Skip the per-fragment march below — the froxel volume IS
@@ -1431,6 +1591,12 @@ void main() {
     float warm_amount = clamp(hg * 0.6 * sun_power * lit_ratio, 0.0, 1.0);
     vec3  fog_color = mix(base_fog, ubo.sun_color.rgb, warm_amount);
     fog_color = mix(fog_color, vec3(0.85), clamp(dist / 200.0, 0.0, 1.0));
+#if CHUNK_BLOCK_LIGHT
+    // Haze is lit by the sky too: in a dark cave it is dark, or the cave's
+    // far wall would glow sky-blue through it.
+    base_fog  *= max(lv_sky * lv_sky, 0.02);
+    fog_color *= max(lv_sky * lv_sky, 0.02);
+#endif
 
     // ─── r158: Climate white-balance ─────────────────────────────────────
     // atmos_params.z (biome temperature) was an unconsumed channel: cold
@@ -1588,6 +1754,9 @@ void main() {
     float vignette_dist = dot(vv, vv);
     float vignette = 1.0 - smoothstep(0.40, 1.65, vignette_dist) * 0.32; // r476: deeper frame
     color *= vignette;
+    // sim::cave_air: bad air darkens the edges of vision (the docx's Weakness II
+    // and worse). fx_params.w = 0 (clean air) leaves the frame as it was.
+    color *= 1.0 - smoothstep(0.15, 1.2, vignette_dist) * clamp(ubo.fx_params.w, 0.0, 1.0);
 
     // No film-grain dither in v0.11.2: the previous attempt at
     // ±0.5/255 dither was correct in amplitude (truly invisible),
@@ -1612,5 +1781,13 @@ void main() {
         color *= 1.0 - smoothstep(0.2, 1.7, vignette_dist) * 0.35; // murk at edges
     }
 
+    // UNENDLICH_LIGHT_DEBUG=2 (w = 3): r = water (1) / cloud (0.5), g = sky,
+    // b = final colour is NaN.
+    if (ubo.light_volume.w > 2.5) {
+        bool bad = !(color.r == color.r) || !(color.g == color.g) || !(color.b == color.b);
+        float mat = is_water(v_color) ? 1.0 : (is_cloud(v_color) ? 0.5 : 0.0);
+        out_color = vec4(mat, lv_sky, bad ? 1.0 : 0.0, 1.0);
+        return;
+    }
     out_color = vec4(color, 1.0);
 }

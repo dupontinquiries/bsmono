@@ -30,11 +30,18 @@ pub struct RenderOpts {
     /// were triggered together (a pack roaring at once) delays the later ones
     /// so they answer each other instead of stacking.
     pub pre_delay_s: f32,
+    /// Longest tail rendered (s); the plan's decay is clamped to it. 6 s
+    /// suits open land; a cave that rings for 20 s needs more.
+    pub max_tail_s: f32,
+    /// High-frequency damping inside the tail's comb loops (0 = none). 0.3
+    /// dulls a roar's tail naturally; a high, clean sound such as a drip
+    /// needs little, or its tail dies far sooner than the decay it asks for.
+    pub tail_damp: f32,
 }
 
 impl Default for RenderOpts {
     fn default() -> Self {
-        RenderOpts { trim_lead: false, lead_keep_s: 0.0, gain: 1.0, pre_delay_s: 0.0 }
+        RenderOpts { trim_lead: false, lead_keep_s: 0.0, gain: 1.0, pre_delay_s: 0.0, max_tail_s: 6.0, tail_damp: 0.3 }
     }
 }
 
@@ -98,7 +105,9 @@ pub fn render(dry: &[f32], rate: u32, plan: &EchoPlan, opts: RenderOpts) -> Vec<
         .iter()
         .map(|r| r.delay_s)
         .fold(plan.direct.delay_s, f32::max);
-    let tail_s = if plan.tail.level > 1e-5 { plan.tail.decay_s.clamp(0.1, 6.0) } else { 0.0 };
+    let max_tail = if opts.max_tail_s.is_finite() { opts.max_tail_s.clamp(0.1, 30.0) } else { 6.0 };
+    let tail_s = if plan.tail.level > 1e-5 { plan.tail.decay_s.clamp(0.1, max_tail) } else { 0.0 };
+    let damp = if opts.tail_damp.is_finite() { opts.tail_damp.clamp(0.0, 0.9) } else { 0.3 };
     let frames = at(last_path) + dry.len() + at(tail_s) + 1;
     let mut out = vec![0.0f32; frames * 2];
 
@@ -127,8 +136,10 @@ pub fn render(dry: &[f32], rate: u32, plan: &EchoPlan, opts: RenderOpts) -> Vec<
                 .map(|&l| {
                     let len = ((l as f32 * scale) as usize).max(8);
                     // RT60: gain per pass so the loop falls 60 dB in decay_s.
-                    let fb = 10f32.powf(-3.0 * (len as f32 / rate_f) / tail_s).min(0.97);
-                    Comb::new(len, fb, 0.3)
+                    // (Capped below 1 for stability; the cap only binds for
+                    // tails beyond about 20 s.)
+                    let fb = 10f32.powf(-3.0 * (len as f32 / rate_f) / tail_s).min(0.995);
+                    Comb::new(len, fb, damp)
                 })
                 .collect()
         };

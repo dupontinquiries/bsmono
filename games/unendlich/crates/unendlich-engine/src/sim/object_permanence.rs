@@ -13,6 +13,78 @@
 //! `landmark_memory` remember *places*; this remembers a *moving target*. Pure,
 //! deterministic, std-only — time is passed in, never read.
 
+/// How long a creature keeps believing in a target it has lost (seconds until
+/// the trail goes cold). The doc sets the decay per species, with the Lauscher
+/// the patient stalker; the values here are this game's reading of that:
+/// the Lauscher waits longest, the big predators hold a grudge for a while,
+/// the sentinel bird a little less, and ordinary fauna stay spooked only
+/// briefly.
+pub fn memory_seconds(kind: crate::item::CreatureKind) -> f32 {
+    use crate::item::CreatureKind::*;
+    match kind {
+        Lauscher => 40.0,
+        Dragon => 25.0,
+        Dinosaur => 20.0,
+        Spaeher => 15.0,
+        Fauna => 8.0,
+    }
+}
+
+/// Top speed assumed for the player when growing the uncertainty volume
+/// (a sprint, blocks per second).
+pub const PLAYER_MAX_SPEED: f32 = 7.0;
+
+/// Seconds of dead-reckoning before a belief holds still (see
+/// [`Tracker::belief`]).
+pub const MAX_EXTRAPOLATE_S: f32 = 3.0;
+
+/// What one sensing tick did to a creature's belief, for logging.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SenseEvent {
+    None,
+    /// The target has been out of sight for a second: the creature is now
+    /// acting on its ghost.
+    LostSight,
+    /// The trail went cold after this many seconds.
+    GaveUp(f32),
+}
+
+/// One creature's sensing tick, the way the game runs it: a clean sighting
+/// (`seen` = position, velocity) resets the ghost; a heard estimate nudges an
+/// existing ghost but cannot start one; with neither, the creature acts on
+/// the ghost until the trail goes cold. Returns the position to act on (the
+/// sense if there is one, else the belief) and what changed. `dt` is this
+/// tick's length (a distant creature ticks every few frames).
+pub fn sense_step(
+    mem: &mut Tracker,
+    seen: Option<([f32; 3], [f32; 3])>,
+    heard: Option<[f32; 3]>,
+    now: f32,
+    dt: f32,
+) -> (Option<[f32; 3]>, SenseEvent) {
+    let prev_elapsed = mem.elapsed(now - dt.max(0.0));
+    if let Some((p, v)) = seen {
+        mem.observe(p, v, now);
+    } else if let Some(h) = heard {
+        mem.observe_partial(h, 0.5, now);
+    }
+    let lost_for = mem.elapsed(now);
+    if mem.tick(now) {
+        return (heard, SenseEvent::GaveUp(lost_for.unwrap_or(0.0)));
+    }
+    if let Some((p, _)) = seen {
+        return (Some(p), SenseEvent::None);
+    }
+    if heard.is_some() {
+        return (heard, SenseEvent::None);
+    }
+    let belief = mem.belief(now, MAX_EXTRAPOLATE_S).map(|(b, _)| b);
+    let lost = belief.is_some()
+        && prev_elapsed.map_or(false, |e| e < 1.0)
+        && lost_for.map_or(false, |e| e >= 1.0);
+    (belief, if lost { SenseEvent::LostSight } else { SenseEvent::None })
+}
+
 /// The last known state of a tracked target.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ghost {
@@ -135,6 +207,22 @@ impl Tracker {
         }
     }
 
+    /// What the movement system should act on while the target is out of
+    /// sight: the believed position and the confidence in it, or `None` once
+    /// the trail is cold. The dead-reckon runs for at most `max_extrapolate`
+    /// seconds and then holds: a target last seen walking away is believed to
+    /// have gone a little further, not to be still walking in a straight line
+    /// half a minute later (the uncertainty radius keeps growing either way).
+    pub fn belief(&self, now: f32, max_extrapolate: f32) -> Option<([f32; 3], f32)> {
+        let g = self.ghost?;
+        if self.should_give_up(now) {
+            return None;
+        }
+        let e = (now - g.last_seen).clamp(0.0, max_extrapolate.max(0.0));
+        let p = [g.last_pos[0] + g.last_vel[0] * e, g.last_pos[1] + g.last_vel[1] * e, g.last_pos[2] + g.last_vel[2] * e];
+        Some((p, self.confidence(now)))
+    }
+
     /// A deterministic *systematic* search position for the movement system:
     /// sample `i` of a phyllotaxis (sunflower) spiral over the current uncertainty
     /// disc in the XZ plane, centred on the dead-reckoned position. Successive `i`
@@ -162,6 +250,87 @@ impl Tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lauscher_remembers_longest_and_fauna_forget_fastest() {
+        use crate::item::CreatureKind;
+        let l = memory_seconds(CreatureKind::Lauscher);
+        for k in CreatureKind::ALL {
+            let m = memory_seconds(k);
+            assert!((5.0..=60.0).contains(&m), "{k:?} {m}");
+            assert!(m <= l, "{k:?} outlasts the Lauscher");
+            assert!(m >= memory_seconds(CreatureKind::Fauna));
+        }
+        assert!(l > 2.0 * memory_seconds(CreatureKind::Fauna));
+    }
+
+    #[test]
+    fn a_creature_keeps_acting_on_a_lost_sighting_until_the_trail_goes_cold() {
+        let mut m = Tracker::new(PLAYER_MAX_SPEED, 1.0, 8.0);
+        let dt = 0.1;
+        // Hearing alone does not make a creature believe in the player.
+        let (p, e) = sense_step(&mut m, None, Some([5.0, 0.0, 5.0]), 0.0, dt);
+        assert_eq!((p, e), (Some([5.0, 0.0, 5.0]), SenseEvent::None));
+        assert!(!m.is_tracking(), "a sound cannot start a ghost");
+        let (p, _) = sense_step(&mut m, None, None, 0.1, dt);
+        assert_eq!(p, None, "and without a ghost, silence means nothing there");
+        // Seen, standing at (10, 0, 0).
+        let (p, e) = sense_step(&mut m, Some(([10.0, 0.0, 0.0], [0.0; 3])), None, 1.0, dt);
+        assert_eq!((p, e), (Some([10.0, 0.0, 0.0]), SenseEvent::None));
+        // Then out of sight: it still acts on (10, 0, 0), says so once, a
+        // second in, and gives up at 8 s.
+        let mut t = 1.0;
+        let mut lost_events = 0;
+        let mut gave_up_at = None;
+        while t < 12.0 {
+            t += dt;
+            let (p, e) = sense_step(&mut m, None, None, t, dt);
+            match e {
+                SenseEvent::LostSight => lost_events += 1,
+                SenseEvent::GaveUp(s) => {
+                    gave_up_at = Some(s);
+                    assert_eq!(p, None);
+                    break;
+                }
+                SenseEvent::None => {}
+            }
+            assert_eq!(p, Some([10.0, 0.0, 0.0]), "at {t}");
+        }
+        assert_eq!(lost_events, 1);
+        let g = gave_up_at.expect("gave up");
+        assert!((7.9..8.3).contains(&g), "gave up after {g}");
+        assert!(!m.is_tracking());
+    }
+
+    #[test]
+    fn a_heard_footstep_pulls_an_existing_ghost_toward_it() {
+        let mut m = Tracker::new(PLAYER_MAX_SPEED, 1.0, 8.0);
+        sense_step(&mut m, Some(([0.0; 3], [0.0; 3])), None, 0.0, 0.1);
+        let (p, _) = sense_step(&mut m, None, Some([10.0, 0.0, 0.0]), 2.0, 0.1);
+        assert_eq!(p, Some([10.0, 0.0, 0.0]), "a sound in hand is acted on");
+        // Afterwards the ghost sits between the sighting and the sound.
+        let (p, _) = sense_step(&mut m, None, None, 2.1, 0.1);
+        let x = p.unwrap()[0];
+        assert!((3.0..=8.0).contains(&x), "ghost at {x}");
+    }
+
+    #[test]
+    fn belief_dead_reckons_briefly_then_holds_and_goes_cold_on_time() {
+        // Seen at the origin walking +x at 4 m/s; give up after 10 s.
+        let mut t = Tracker::new(6.0, 1.0, 10.0);
+        assert_eq!(t.belief(0.0, 3.0), None, "nothing seen, nothing believed");
+        t.observe([0.0, 0.0, 0.0], [4.0, 0.0, 0.0], 0.0);
+        let (p1, c1) = t.belief(1.0, 3.0).unwrap();
+        assert_eq!(p1, [4.0, 0.0, 0.0], "one second of dead-reckoning");
+        let (p8, c8) = t.belief(8.0, 3.0).unwrap();
+        assert_eq!(p8, [12.0, 0.0, 0.0], "capped at three seconds of it");
+        assert!(c1 > c8 && c8 > 0.0, "confidence falls: {c1} -> {c8}");
+        assert!(t.predicted_position(8.0).unwrap()[0] > 30.0, "the uncapped reckon would have run on");
+        assert_eq!(t.belief(10.0, 3.0), None, "cold at give_up_after");
+        // A fresh sighting restores it.
+        t.observe([1.0, 0.0, 1.0], [0.0; 3], 11.0);
+        assert_eq!(t.belief(11.5, 3.0).map(|b| b.0), Some([1.0, 0.0, 1.0]));
+    }
 
     fn tracker() -> Tracker {
         // target tops out at 4 b/s, 0.5 base radius, gives up after 5 s.

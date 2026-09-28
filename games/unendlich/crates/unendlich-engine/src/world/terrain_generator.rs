@@ -187,6 +187,7 @@ impl TerrainGenerator {
                             self.gpu_batches_ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             for mut g in raw {
                                 self.cpu.stamp_ruins(&mut g.blocks, g.coord);
+                                self.cpu.decorate_underground(&mut g.blocks, g.coord);
                                 all.push(crate::world::chunk::Chunk::from_blocks(g.coord, g.blocks));
                             }
                         }

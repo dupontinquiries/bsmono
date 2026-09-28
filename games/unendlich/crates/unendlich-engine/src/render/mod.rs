@@ -17,6 +17,7 @@ pub mod context;
 pub mod depth;
 pub mod gbuffer;
 pub mod froxel;
+pub mod light_volume_gpu; // binding 4: toroidal 3D sky/block light texture (world::light_volume)
 pub mod froxel_fill_pipeline;
 // T06-R27: offscreen color target — the headless render destination (and the
 // windowed post-FX scene target). ash-only, no glfw.

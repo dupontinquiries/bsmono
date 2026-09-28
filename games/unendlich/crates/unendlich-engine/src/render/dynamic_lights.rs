@@ -6,7 +6,9 @@
 //! lighting sum (inverse-square attenuation × a smooth range window × clamp).
 //! [`dynamic_lights_frag_glsl`] emits a `.frag` that applies the SAME math on the
 //! GPU; the test checks the CPU reference against that formula and validates the
-//! GLSL. NO descriptor/pass wiring — codegen + reference only (SHARED_RULES §1/§2).
+//! GLSL. Wired: chunk.frag and entity.frag carry the same attenuation
+//! (`point_lights_at`, fed from the camera UBO by `WorldRenderer::set_point_lights`);
+//! `shaders_carry_the_reference_attenuation` keeps the three in step.
 //! Mirrors `sim::light_physics` attenuation; kept render-local & dependency-free.
 
 /// An emissive point light.
@@ -114,6 +116,32 @@ pub fn dynamic_lights_frag_glsl(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The live shaders apply the same attenuation as the codegen and the CPU
+    /// reference: the name-independent lines of the generated loop must each
+    /// appear in chunk.frag and entity.frag.
+    #[test]
+    fn shaders_carry_the_reference_attenuation() {
+        let gen = dynamic_lights_frag_glsl(8);
+        let lines = [
+            "float d2 = dot(d, d);",
+            "float r2 = r * r;",
+            "float window = clamp(1.0 - d2 / r2, 0.0, 1.0);",
+            "window = window * window;",
+            "(1.0 / (1.0 + d2)) * window",
+        ];
+        for l in lines {
+            assert!(gen.contains(l), "generator lost {l:?}");
+        }
+        for (name, src) in [
+            ("chunk.frag", include_str!("../shaders/chunk.frag")),
+            ("entity.frag", include_str!("../shaders/entity.frag")),
+        ] {
+            let found = lines.iter().filter(|l| src.contains(*l)).count();
+            assert_eq!(found, lines.len(), "{name} drifted from the reference attenuation");
+            assert!(src.contains("point_lights_at("), "{name} does not call the point lights");
+        }
+    }
     use std::process::Command;
 
     fn pl(pos: [f32; 3], col: [f32; 3], i: f32, r: f32) -> PointLight {

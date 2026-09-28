@@ -1105,6 +1105,9 @@ impl WorldGenerator {
         // worldgen path can run the SAME decoration after read-back (the GPU shader
         // mirrors terrain only — structures are a CPU post-pass in both paths).
         self.stamp_ruins(&mut blocks, coord);
+        // Phase 6b: strata, ore veins, cave dressing and indicator plants. Same
+        // post-pass on the GPU path (terrain_generator.rs), after its ruins.
+        self.decorate_underground(&mut blocks, coord);
 
         // Phase 7: cave flora (r-flora-wiring step 1, per docs/FLORA-WIRING.md).
         //
@@ -1184,6 +1187,22 @@ impl WorldGenerator {
     /// Runs as a CPU post-pass in BOTH the CPU generator and the GPU read-back path,
     /// since the GPU shader produces terrain only. Surface height + biome come from
     /// the analytic generator, which the GPU terrain mirrors.
+/// Run `world::underground::decorate` over a finished chunk. Both terrain
+    /// backends call this after `stamp_ruins`, so they stay byte-identical.
+    /// `UNENDLICH_UNDERGROUND=0` turns it off (for an A/B look at the plain
+    /// terrain); anything else, or unset, leaves it on.
+    pub fn decorate_underground(&self, blocks: &mut [BlockId], coord: ChunkCoord) -> super::underground::Report {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("UNENDLICH_UNDERGROUND").map_or(true, |v| v != "0")) {
+            return super::underground::Report::default();
+        }
+        let origin = coord.block_origin();
+        let model = &self.model;
+        super::underground::decorate(blocks, origin, self.seed(), &|x, z| {
+            model.surface_target(x as f64, z as f64, 0.0).round() as i32
+        })
+    }
+
     pub fn stamp_ruins(&self, blocks: &mut [BlockId], coord: ChunkCoord) {
         let (origin_x, origin_y, origin_z) = coord.block_origin();
         let chunk_x_lo = origin_x;

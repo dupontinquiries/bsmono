@@ -130,7 +130,7 @@ fn gpu_mesh(
             let o = (base + k) * 4;
             f32::from_le_bytes([vfloats[o], vfloats[o+1], vfloats[o+2], vfloats[o+3]])
         };
-        vertices.push(Vertex { position: [g(0), g(1), g(2)], color: [g(3), g(4), g(5)], sway: 0 });
+        vertices.push(Vertex { position: [g(0), g(1), g(2)], color: [g(3), g(4), g(5)], sway: 0, ctm: 0 });
     }
     let ibuf = out[2].as_ref().expect("index readback");
     let indices: Vec<u32> = (0..idx_count).map(|k| rd_u32(ibuf, k)).collect();
