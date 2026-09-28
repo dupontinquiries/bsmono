@@ -408,11 +408,9 @@ impl Game {
                 self.gods[gi].dash = Some(DashState { from, to: dest, t: 0.0, dur: 0.32, dmg: d, arc: 0.2, blast: None });
                 self.lay_slick(from, dest, radius, secs, Vec3::ZERO);
             }
-            Archetype::Mudslide { len, width, push, secs, kits } => {
-                let a = Vec3::new(from.x, 0.0, from.z);
-                let b = crate::map::onto_floor(clamp_arena(a + dir * len), 1.0);
-                self.lay_slick(a, b, width, secs, dir * push);
-                self.shape_kittens(gi, dir, kits);
+            Archetype::Mudslide { len, width, speed, dmg, kits } => {
+                let d = dmg_scale(dmg, ab.power_scale);
+                self.mudslide(gi, dir, len, width, speed, d, kits);
             }
             Archetype::LongLook { range, flight, reveal, exposed } => {
                 let dest = clamp_arena(from + dir * dist.min(range));

@@ -27,7 +27,7 @@ fn main() {
             block.iter_mut().for_each(|x| *x = 0.0);
             m.render_add(&mut block, 2); // let the space settle
         }
-        h.play(Play { clip: 0, bus: Bus::Sfx, gain: 0.8, pan: 0.0, priority: 5, looped: false, speaker: None });
+        h.play(Play { handle: 0, clip: 0, bus: Bus::Sfx, gain: 0.8, pan: 0.0, priority: 5, looped: false, speaker: None });
         for _ in 0..(2.6 * 48_000.0 / 512.0) as usize {
             block.iter_mut().for_each(|x| *x = 0.0);
             m.render_add(&mut block, 2);

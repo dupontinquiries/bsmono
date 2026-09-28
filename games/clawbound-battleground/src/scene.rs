@@ -1095,6 +1095,14 @@ impl Scene {
             } else {
                 base
             };
+            // one of Claypaw's mudslide kittens (`clay`): his body, small --
+            // a little bigger than a litter kitten, it is a fighter
+            if m.clay.is_some() {
+                let hop = ((m.walk_anim * 1.2).sin().abs()) * 0.3;
+                let mk = Mat4::from_translation(m.pos + Vec3::Y * hop) * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - m.yaw) * Mat4::from_scale(Vec3::splat(crate::kit::KITLING_SCALE * 1.5));
+                r.queue_draw(self.clay_kit[ti], mk, [1.0; 4], 0.1, models::GOD_DRAW_VOXEL, false);
+                continue;
+            }
             let mesh = if m.caster { self.minion_caster[ti] } else { self.minion_melee[ti] };
             r.queue_draw(mesh, base, [1.0; 4], 0.0, 0.09, false);
         }
@@ -1248,6 +1256,27 @@ impl Scene {
                 * Mat4::from_scale(Vec3::splat(crate::kit::KITLING_SCALE));
             let mesh = if k.clay { self.clay_kit[k.team as usize] } else { self.kitling[k.team as usize] };
             r.queue_draw(mesh, m, [1.0; 4], 0.15, models::GOD_DRAW_VOXEL, false);
+        }
+        // Claypaw's mudslides: the front, a heaving bank of mud across its
+        // width, surging as it runs
+        for w in &game.mudslides {
+            let side = Vec3::new(-w.dir.z, 0.0, w.dir.x);
+            let n = ((w.width / 2.2).ceil() as i32).max(2);
+            for k in 0..=n {
+                let u = k as f32 / n as f32 - 0.5;
+                let p = w.pos + side * (u * w.width);
+                let p = Vec3::new(p.x, crate::map::ground_y(p.x, p.z), p.z);
+                if !sphere_in_frustum(&vp, p, 3.0) {
+                    continue;
+                }
+                let heave = 0.8 + 0.35 * ((vfx.time * 9.0 + k as f32 * 1.7).sin());
+                let r0 = 1.9 * (0.6 + 0.4 * w.mul);
+                for (back, h) in [(0.0f32, heave), (-1.4, heave * 0.55), (-2.8, heave * 0.25)] {
+                    let q = p + w.dir * back + Vec3::Y * (h * 0.9);
+                    let m = Mat4::from_translation(q) * Mat4::from_axis_angle(Vec3::Y, k as f32 * 0.9) * Mat4::from_scale(Vec3::new(r0, 1.0 + h * 5.0, r0));
+                    r.queue_draw(self.puddle, m, [0.9, 0.8, 0.72, 1.0], 0.0, 0.1, false);
+                }
+            }
         }
         // Claypaw's mud: puddles down each slick's line, shrinking as it
         // dries; a mudslide's darker, and sliding along its way

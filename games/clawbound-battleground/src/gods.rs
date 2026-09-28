@@ -219,10 +219,12 @@ pub enum Archetype {
     /// (`dmg`), leaving a mud slick `radius` either side of its line for
     /// `secs` (`clay`).
     Spin { dist: f32, dmg: f32, radius: f32, secs: f32 },
-    /// Mudslide: a slick `len` long and `width` across along the aim that
-    /// carries everything in it along at `push` u/s for `secs`, and `kits`
-    /// kittens tumbling out (`clay`).
-    Mudslide { len: f32, width: f32, push: f32, secs: f32, kits: u32 },
+    /// Mudslide: a wave of mud `width` across running `len` along the aim at
+    /// `speed`, striking every enemy in its front (`dmg`) and carrying every
+    /// cat in it; it crushes through plants and sloshes back off walls,
+    /// weaker for each; `kits` killable kittens tumble out, and for a while
+    /// his kills shape more (`clay`).
+    Mudslide { len: f32, width: f32, speed: f32, dmg: f32, kits: u32 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -703,7 +705,7 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
             ab("Remold", "He presses the cracks shut with fresh clay: a share of his health back -- his own clay, the only healing that takes on him in full.", Archetype::Remold { heal: 0.22 }, 9.0, 90.0, [0.80, 0.55, 0.38], 0, false, 0.0),
             ab("Quicken", "River water over him: he is wet clay again, quick, and shaping kittens as fast as he can.", Archetype::Quicken { secs: 6.0 }, 14.0, 60.0, [0.55, 0.78, 0.85], 1, false, 0.0),
             ab("Spin", "He spins down the aim like clay on the wheel, striking what he passes, and leaves mud behind him that no one keeps their feet on.", Archetype::Spin { dist: 9.0, dmg: 85.0, radius: 4.0, secs: 5.0 }, 10.0, 70.0, [0.62, 0.42, 0.28], 2, false, 0.55),
-            ab("Mudslide", "The bank gives way: a river of mud down the aim carries everything in it along -- friends forward, enemies away -- and his kittens tumble out of it.", Archetype::Mudslide { len: 22.0, width: 6.0, push: 7.0, secs: 5.0, kits: 4 }, 80.0, 120.0, [0.55, 0.38, 0.25], 3, true, 0.0),
+            ab("Mudslide", "The bank gives way: a wave of mud down the aim strikes everything in front of it and carries it along -- friends forward, enemies away -- crushing through plants and sloshing back off walls. Eight kittens tumble out of it, and for a while every kill he makes shapes more. Each kitten broken is gold to whoever breaks it.", Archetype::Mudslide { len: 40.0, width: 16.0, speed: 16.0, dmg: 280.0, kits: 8 }, 90.0, 130.0, [0.55, 0.38, 0.25], 3, true, 1.1),
         ],
     },
 ];

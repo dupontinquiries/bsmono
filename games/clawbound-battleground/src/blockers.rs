@@ -297,6 +297,12 @@ pub enum Perch {
 }
 
 impl PropKind {
+    /// A growing thing: a mudslide smushes through it (`clay`).
+    pub const fn is_plant(self) -> bool {
+        use PropKind::*;
+        matches!(self, Pine | Oak | JungleTree | Palm | StranglerFig | Bamboo | Fern | Bush | VineCurtain | MegaTree | FallenLog)
+    }
+
     pub const fn perch(self) -> Perch {
         use PropKind::*;
         match self {
@@ -350,6 +356,10 @@ pub struct Blockers {
     /// hand-built blocker (the arena rim, every test double) is unstandable
     /// by default instead of having to say so.
     perches: Vec<Perch>,
+    /// Whether each blocker is a PLANT (a trunk, a stand of bamboo, a
+    /// bush): what Claypaw's mudslide smushes through rather than sloshes
+    /// off (`clay`). Parallel to `all`, like `perches`.
+    plant: Vec<bool>,
     all: Vec<Blocker>,
     /// cell index -> indices into `all`.
     cells: Vec<Vec<u32>>,
@@ -383,6 +393,7 @@ impl Blockers {
         Blockers {
             steps: Vec::new(),
             perches: Vec::new(),
+            plant: Vec::new(),
             all: Vec::new(),
             cells: vec![Vec::new(); (dim * dim) as usize],
             cell,
@@ -485,6 +496,7 @@ impl Blockers {
         }
         self.all.push(b);
         self.perches.push(Perch::None);
+        self.plant.push(false);
     }
 
     /// Add a prop's blocker, if it has one.
@@ -519,6 +531,7 @@ impl Blockers {
         if solid {
             *self.perches.last_mut().expect("just pushed") = kind.perch();
         }
+        *self.plant.last_mut().expect("just pushed") = kind.is_plant();
         solid
     }
 
@@ -644,7 +657,42 @@ impl Blockers {
             cover: Cover::NONE,
         });
         *self.perches.last_mut().expect("just pushed") = kind.perch();
+        *self.plant.last_mut().expect("just pushed") = kind.is_plant();
         true
+    }
+
+    /// What a front `r` across at `p` meets (Claypaw's mudslide, `clay`):
+    /// the plants it is in (blockers by index, and thicket or undergrowth
+    /// ground as `u32::MAX - index`), and -- if it runs into something that
+    /// is NOT a plant and stands above its knees (rock, wall) -- the way
+    /// back out of it (unit, flat).
+    pub fn front_contacts(&self, p: glam::Vec3, r: f32) -> (Vec<u32>, Option<glam::Vec3>) {
+        let mut near = Vec::new();
+        self.near(p.x, p.z, r, &mut near);
+        let mut plants = Vec::new();
+        let mut wall: Option<glam::Vec3> = None;
+        for idx in near {
+            let b = &self.all[idx as usize];
+            let (ax, az, br) = b.shape.nearest_axis(p.x, p.z);
+            let d = glam::Vec3::new(p.x - ax, 0.0, p.z - az);
+            if d.length() >= br + r || b.top < p.y + 0.8 {
+                continue;
+            }
+            if self.plant[idx as usize] {
+                plants.push(idx);
+            } else if wall.is_none() && br > 0.0 {
+                wall = Some(d.normalize_or(glam::Vec3::X));
+            }
+        }
+        for (k, g) in self.going.all().iter().enumerate() {
+            if matches!(g.ground, crate::going::Ground::Thicket | crate::going::Ground::Undergrowth) {
+                let (ax, az, br) = g.shape.nearest_axis(p.x, p.z);
+                if glam::Vec3::new(p.x - ax, 0.0, p.z - az).length() < br + r {
+                    plants.push(u32::MAX - k as u32);
+                }
+            }
+        }
+        (plants, wall)
     }
 
     /// The spine(s) of a long prop in its mesh's own frame, as

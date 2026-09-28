@@ -843,6 +843,7 @@ fn firing_range_every_ability_goes_where_it_is_aimed_and_turns_the_cat() {
                     }
                     // Claypaw's mud (`clay`): the way its slick runs
                     Event::SlickFx { a, b, .. } => dirs.push(Vec3::new(b.x - a.x, 0.0, b.z - a.z).normalize_or_zero()),
+                    Event::MudslideFx { dir, .. } => dirs.push(Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero()),
                     _ => {}
                 }
             }
@@ -990,7 +991,7 @@ fn the_audio_engine_voices_a_cast_end_to_end() {
                 }
                 if let Some(id) = bank.first(&cue.keys) {
                     played.push(cue.keys.clone());
-                    h.play(Play { clip: id, bus: cue.bus, gain, pan, priority: cue.priority, looped: false, speaker: cue.speaker.map(|x| x as u16) });
+                    h.play(Play { handle: 0, clip: id, bus: cue.bus, gain, pan, priority: cue.priority, looped: false, speaker: cue.speaker.map(|x| x as u16) });
                 }
             }
         }

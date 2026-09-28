@@ -18,6 +18,47 @@
 use crate::consts::{lane_clearance, river_dist, water_depth, Team, ARENA_RADIUS};
 use glam::Vec3;
 
+/// The wind, 3 dB down from where it was (it was too loud: reported).
+pub const WIND_TRIM: f32 = 0.708;
+/// The howl comes from a RING of places round the listener: this many,
+/// this far out. Each is sampled for how the wind howls THERE, weighted by
+/// how much it faces into the wind, and heard from its own side -- a gap
+/// in the wall upwind howls from that side, and walking past it sweeps it
+/// across.
+pub const RING: usize = 6;
+pub const RING_R: f32 = 14.0;
+/// The ring's level against the single band it replaced: six bands of
+/// their own noise, each spread across the ears and weighted by exposure,
+/// sum to about the old howl's power at this (set against a measured
+/// before-and-after: `the_wind_is_three_db_down`).
+pub const RING_NORM: f32 = 1.5;
+
+/// One direction's howl: its band, its level, and where it is heard
+/// (-1 left .. 1 right).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DirHowl {
+    pub hz: f32,
+    pub q: f32,
+    pub gain: f32,
+    pub pan: f32,
+}
+
+/// The ring's directions (world, flat), k of RING.
+pub fn ring_dir(k: usize) -> Vec3 {
+    let a = k as f32 / RING as f32 * std::f32::consts::TAU;
+    Vec3::new(a.cos(), 0.0, a.sin())
+}
+
+/// How much a direction `d` faces into the wind blowing along `wind` (the
+/// way the air goes): all of it straight upwind, a floor of 0.3 downwind;
+/// in still air every side alike.
+pub fn exposure(d: Vec3, wind: Vec3) -> f32 {
+    if wind.length() < 0.01 {
+        return 0.5;
+    }
+    0.3 + 0.7 * d.dot(-wind.normalize()).max(0.0)
+}
+
 /// What the game thread hands the synth each frame.
 #[derive(Clone, Copy, Debug)]
 pub struct AudioParams {
@@ -34,6 +75,8 @@ pub struct AudioParams {
     pub howl_hz: f32,
     pub howl_q: f32,
     pub howl_gain: f32,
+    /// The ring (`RING`): the howl by direction.
+    pub howls: [DirHowl; RING],
     pub reverb: f32,
     /// monotonically increasing counter; the synth fires a thunder roll when it changes
     pub thunder_count: u32,
@@ -59,6 +102,8 @@ impl Default for AudioParams {
             howl_hz: 320.0,
             howl_q: 2.0,
             howl_gain: 0.4,
+            // (no heading: every side alike, spread round the ears)
+            howls: std::array::from_fn(|k| DirHowl { hz: 320.0, q: 2.0, gain: 0.4 * exposure(ring_dir(k), Vec3::ZERO), pan: ring_dir(k).x }),
             reverb: 0.12,
             thunder_count: 0,
             thunder_dist: 1.0,
@@ -253,8 +298,9 @@ pub struct WindSynth {
     pan: f32,
     // voices
     roar: Svf,
-    howl_l: Svf,
-    howl_r: Svf,
+    /// The ring's bands, and their smoothed settings.
+    howl: [Svf; RING],
+    ring: [DirHowl; RING],
     keen: Svf,
     rain_hp: Svf,
     lap: Svf,
@@ -289,8 +335,8 @@ impl WindSynth {
             water: 0.0,
             pan: 0.0,
             roar: Svf::default(),
-            howl_l: Svf::default(),
-            howl_r: Svf::default(),
+            howl: std::array::from_fn(|_| Svf::default()),
+            ring: AudioParams::default().howls,
             keen: Svf::default(),
             rain_hp: Svf::default(),
             lap: Svf::default(),
@@ -336,6 +382,17 @@ impl WindSynth {
         self.reverb_amt += (p.reverb.clamp(0.0, 1.0) - self.reverb_amt) * k;
         self.water += (p.water.clamp(0.0, 1.0) - self.water) * k;
         self.pan += (p.wind_pan.clamp(-1.0, 1.0) - self.pan) * k;
+        for (r, t) in self.ring.iter_mut().zip(p.howls.iter()) {
+            r.hz += (t.hz - r.hz) * k;
+            r.q += (t.q - r.q) * k;
+            r.gain += (t.gain - r.gain) * k;
+            r.pan += (t.pan.clamp(-1.0, 1.0) - r.pan) * k;
+        }
+        // each band's ear gains, once a block
+        let ring_ears: [(f32, f32); RING] = std::array::from_fn(|b| {
+            let a = (self.ring[b].pan + 1.0) * std::f32::consts::FRAC_PI_4;
+            (a.cos(), a.sin())
+        });
         if p.thunder_count != self.last_thunder {
             self.last_thunder = p.thunder_count;
             self.thunder_env = 1.0;
@@ -372,11 +429,20 @@ impl WindSynth {
             // --- the howl: resonant band set by the place, pitch bending up
             // with the gust front (the classic rising moan), Q sharper in
             // enclosed places, slightly detuned per ear for width
+            // -- from the ring: each direction its own band, its own noise
+            // (so they do not sum as one), heard from its own side
             let bend = 1.0 + self.gust * 0.65 + lfo * 0.08;
-            let q = self.howl_q * (1.0 + self.gust * 0.6);
-            let (_, hl, _) = self.howl_l.run(w, self.howl_hz * bend * 0.985, q, sr);
-            let (_, hr, _) = self.howl_r.run(w, self.howl_hz * bend * 1.015, q, sr);
-            let howl_amp = self.howl_gain * (0.15 + self.wind * 0.35 + self.gust * 1.3) * (0.7 + 0.3 * lfo);
+            let drive = (0.15 + self.wind * 0.35 + self.gust * 1.3) * (0.7 + 0.3 * lfo);
+            let (mut howl_l, mut howl_r) = (0.0f32, 0.0f32);
+            for b in 0..RING {
+                let nb = self.noise();
+                let q = self.ring[b].q * (1.0 + self.gust * 0.6);
+                let hz = self.ring[b].hz * bend * (0.985 + 0.006 * b as f32);
+                let (_, band, _) = self.howl[b].run(nb, hz, q, sr);
+                let amp = self.ring[b].gain * drive * RING_NORM;
+                howl_l += band * amp * ring_ears[b].0;
+                howl_r += band * amp * ring_ears[b].1;
+            }
             // --- a faint high keen that only the strongest gusts bring out
             let (_, keen_b, _) = self.keen.run(w, 2400.0 + self.gust * 1200.0, 6.0, sr);
             let keen = keen_b * self.gust * self.gust * 0.25;
@@ -404,8 +470,8 @@ impl WindSynth {
             // --- mix, pan the howl by wind heading, then reverb per ear
             let pl = (0.5 - self.pan * 0.35).clamp(0.15, 0.85);
             let pr = 1.0 - pl;
-            let dry_l = roar * 0.7 + (hl * howl_amp + keen) * pl * 2.0 + rain + lap + thunder;
-            let dry_r = roar * 0.7 + (hr * howl_amp + keen) * pr * 2.0 + rain + lap + thunder;
+            let dry_l = (roar * 0.7 + howl_l + keen * pl * 2.0) * WIND_TRIM + rain + lap + thunder;
+            let dry_r = (roar * 0.7 + howl_r + keen * pr * 2.0) * WIND_TRIM + rain + lap + thunder;
             let size = self.reverb_amt;
             let wet_l = self.rev_l.run(dry_l * 0.8, size);
             let wet_r = self.rev_r.run(dry_r * 0.8, size);
@@ -585,9 +651,18 @@ pub fn params_for(game: &crate::sim::Game, listener: Vec3, cam_yaw: f32, thunder
     let atm = game.weather.atmosphere();
     let ac = acoustics_at(listener);
     let ws = atm.wind.length();
-    // wind heading relative to the camera: +1 = from the right
+    // where the wind comes FROM, relative to the camera: +1 = the right.
+    // (`atm.wind` is the way the air goes -- it drifts the snow -- and this
+    // read it as where it came from, putting the keen on the lee side)
     let cam_right = Vec3::new(cam_yaw.sin(), 0.0, -cam_yaw.cos());
-    let pan = if ws > 0.01 { atm.wind.normalize().dot(cam_right) } else { 0.0 };
+    let pan = if ws > 0.01 { (-atm.wind.normalize()).dot(cam_right) } else { 0.0 };
+    // the ring: each direction's place, and how it faces into the wind
+    let muffle = 1.0 - atm.snow * 0.5; // snow muffles
+    let howls = std::array::from_fn(|k| {
+        let d = ring_dir(k);
+        let a = acoustics_at(listener + d * RING_R);
+        DirHowl { hz: a.howl_hz, q: a.howl_q, gain: a.howl_gain * exposure(d, atm.wind) * muffle, pan: d.dot(cam_right) }
+    });
     AudioParams {
         wind: (ws / 10.0).clamp(0.0, 1.0),
         gust: atm.gust,
@@ -597,7 +672,8 @@ pub fn params_for(game: &crate::sim::Game, listener: Vec3, cam_yaw: f32, thunder
         wind_pan: pan,
         howl_hz: ac.howl_hz,
         howl_q: ac.howl_q,
-        howl_gain: ac.howl_gain * (1.0 - atm.snow * 0.5), // snow muffles
+        howl_gain: ac.howl_gain * muffle,
+        howls,
         reverb: ac.reverb * (1.0 - atm.snow * 0.4),
         thunder_count,
         thunder_dist,
@@ -773,4 +849,70 @@ mod buffer_tests {
         assert_eq!(super::pick_buffer(16, 128), 128);
         assert_eq!(super::pick_buffer(0, 0), 1);
     }
+
+    /// The howl comes from where it is: with only the ring's right-hand
+    /// directions howling, the right ear hears it and the left barely; the
+    /// side facing INTO the wind (the air comes from -wind) is weighted
+    /// most, the lee side least; and a direction's pan follows the camera.
+    #[test]
+    fn the_howl_comes_from_its_side_of_the_ring() {
+        use crate::audio::{exposure, ring_dir, AudioParams, DirHowl, WindSynth, RING};
+        let mut p = AudioParams { wind: 0.8, gust: 0.6, ..Default::default() };
+        p.howls = std::array::from_fn(|k| {
+            let d = ring_dir(k);
+            DirHowl { hz: 320.0, q: 3.0, gain: if d.x > 0.3 { 0.8 } else { 0.0 }, pan: d.x }
+        });
+        let mut s = WindSynth::new(48000.0);
+        let mut out = vec![0.0f32; 48000 * 2];
+        for _ in 0..3 {
+            s.render(&p, &mut out, 2);
+        }
+        // the howl's own band: the roar is centred, so compare what is left
+        let side = |ch: usize| (0..48000).map(|f| (out[f * 2 + ch] as f64).powi(2)).sum::<f64>();
+        let (l, r) = (side(0), side(1));
+        assert!(r > l * 1.5, "right {r:.3} not louder than left {l:.3}");
+        // exposure: into the wind most, the lee least, still air even
+        let wind = glam::Vec3::new(5.0, 0.0, 0.0); // blowing toward +x: from -x
+        let up = exposure(glam::Vec3::new(-1.0, 0.0, 0.0), wind);
+        let lee = exposure(glam::Vec3::new(1.0, 0.0, 0.0), wind);
+        assert!((up - 1.0).abs() < 1e-4 && (lee - 0.3).abs() < 1e-4, "upwind {up}, lee {lee}");
+        assert_eq!(exposure(glam::Vec3::X, glam::Vec3::ZERO), exposure(-glam::Vec3::X, glam::Vec3::ZERO));
+        assert_eq!(RING, 6);
+        // through the game's own params: each direction heard from where
+        // it is relative to the camera
+        let g = crate::sim::Game::new_teams(&[0], &[1]);
+        for yaw in [0.0f32, 1.1, -2.4] {
+            let q = crate::audio::params_for(&g, glam::Vec3::new(10.0, 0.0, -20.0), yaw, 0, 1.0);
+            let right = glam::Vec3::new(yaw.sin(), 0.0, -yaw.cos());
+            for k in 0..RING {
+                assert!((q.howls[k].pan - ring_dir(k).dot(right)).abs() < 1e-4, "yaw {yaw}, direction {k}");
+            }
+        }
+    }
+
+    /// The wind is 3 dB down from where it was (reported too loud), across
+    /// its range: the levels below were measured on the synth BEFORE the
+    /// ring (one band, no trim) at these settings, with still air (every
+    /// side alike). The ring's RING_NORM is what makes six bands sum to the
+    /// one they replaced; this holds both.
+    #[test]
+    fn the_wind_is_three_db_down() {
+        let mut got = Vec::new();
+        for (wind, gust, before) in [(0.3f32, 0.0f32, 0.01214f64), (0.6, 0.5, 0.05965), (1.0, 1.0, 0.15065)] {
+            let mut s = crate::audio::WindSynth::new(48000.0);
+            let p = crate::audio::AudioParams { wind, gust, ..Default::default() };
+            let mut out = vec![0.0f32; 48000 * 2];
+            for _ in 0..3 {
+                s.render(&p, &mut out, 2);
+            }
+            let rms = (out.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / out.len() as f64).sqrt();
+            let db = 20.0 * (rms / before).log10();
+            eprintln!("wind {wind} gust {gust}: {rms:.5} ({db:+.2} dB)");
+            got.push((wind, gust, db));
+        }
+        for (wind, gust, db) in got {
+            assert!((-4.0..=-2.0).contains(&db), "wind {wind} gust {gust}: {db:+.2} dB against before, not -3");
+        }
+    }
+
 }
