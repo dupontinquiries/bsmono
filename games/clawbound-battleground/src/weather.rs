@@ -143,6 +143,12 @@ pub fn climate() -> &'static [WeatherKind] {
         // above the cloud sea: mostly clear starlight, a drift of snow, a
         // spirit-mist now and then; no rain up here
         crate::map::MapId::Sky => &[Clear, Clear, Clear, Clear, Snow, Snow, Fog],
+        // under the sea there is no weather: the light from above only
+        // clears and dims as the surface far overhead does
+        crate::map::MapId::Atlantis => &[Clear, Clear, Overcast],
+        // an old labyrinth in a hollow of the hills: grey and misty more
+        // often than not, and rain; no snow
+        crate::map::MapId::Maze => &[Overcast, Overcast, Fog, Fog, Clear, Rain],
     }
 }
 
@@ -162,6 +168,8 @@ pub fn opening() -> WeatherKind {
         crate::map::MapId::Jungle => WeatherKind::Clear,
         crate::map::MapId::Pass => WeatherKind::Overcast,
         crate::map::MapId::Sky => WeatherKind::Clear,
+        crate::map::MapId::Atlantis => WeatherKind::Clear,
+        crate::map::MapId::Maze => WeatherKind::Overcast,
     }
 }
 
@@ -316,7 +324,7 @@ impl Weather {
         let breath = 0.75 + 0.25 * (wp * 0.7).sin() * (wp * 0.23 + 1.0).cos();
         let hd = self.wind_heading;
         let wind = Vec3::new(hd.cos(), 0.0, hd.sin()) * wind_s * (breath + self.gust * 2.2);
-        Atmosphere {
+        let air = Atmosphere {
             sun_dir,
             sun_col: [base_sun[0] * sun_mul[0], base_sun[1] * sun_mul[1], base_sun[2] * sun_mul[2]],
             fog_color,
@@ -329,7 +337,35 @@ impl Weather {
             night: n,
             wind,
             gust: self.gust,
+        };
+        if crate::map::active() == crate::map::MapId::Atlantis {
+            return under_the_sea(air, self.clock);
         }
+        air
+    }
+}
+
+/// The light in the Drowned Halls: the sun almost overhead (it comes
+/// down through forty fathoms, so it swings only a little as the surface
+/// heaves), cool blue-green; the fog is the water itself -- dense and
+/// teal; no rain, snow or lightning; a surface overcast (`Overcast` in the
+/// climate) only dims it.
+pub fn under_the_sea(air: Atmosphere, clock: f32) -> Atmosphere {
+    let sway = Vec3::new((clock * 0.07).sin() * 0.12, 0.0, (clock * 0.05).cos() * 0.12);
+    let dim = 1.0 - air.cloud_cover * 0.35;
+    Atmosphere {
+        sun_dir: (Vec3::new(0.14, 1.0, 0.22) + sway).normalize(),
+        sun_col: [0.66 * dim, 0.98 * dim, 1.02 * dim],
+        fog_color: [0.03, 0.19, 0.23],
+        fog_density: 0.014,
+        cloud_cover: 0.0,
+        rain: 0.0,
+        snow: 0.0,
+        wetness: 0.12,
+        lightning: 0.0,
+        night: 0.0,
+        wind: Vec3::new(0.3, 0.0, 0.2),
+        gust: 0.0,
     }
 }
 

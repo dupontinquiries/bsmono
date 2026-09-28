@@ -83,6 +83,56 @@ pub enum Event {
     KitlingPop { pos: Vec3 },
     /// Sproutkit's laugh went round (`kit`).
     GiggleFx { pos: Vec3, radius: f32 },
+    /// A stalker's footfall (Hollowstep or another of him, `stalker`):
+    /// heard far off.
+    HeavyStep { pos: Vec3 },
+    /// Cat `god`'s heart, pounding in Hollowstep's terror radius; `fear`
+    /// 0..=1.
+    Heartbeat { god: usize, fear: f32 },
+    /// Hollowstep stepped between: from where he was to where his other was.
+    SwapFx { from: Vec3, to: Vec3 },
+    /// An echo of him rose (Every Shadow).
+    EchoRise { pos: Vec3, dmg: f32 },
+    /// Brasshowl raised the lamp (`lantern`).
+    LanternFx { pos: Vec3, radius: f32 },
+    /// A shadow of Hollowstep's was driven out of the light.
+    ShadowDriven { pos: Vec3 },
+    /// A Sentinel's coat changed (`sentinel`): to what, and how far its
+    /// field reaches.
+    CoatShift { god: usize, pos: Vec3, material: crate::gods::Material, radius: f32 },
+    /// A Sentinel's footfall.
+    Tread { pos: Vec3 },
+    /// The Engineer's Quarry's thorns bit a cat (`maze`); `alone`: the heavy bite.
+    ThornBite { pos: Vec3, alone: bool },
+    /// The Engineer's Quarry's labyrinth turned: gates rise and sink (`maze`).
+    LabyrinthTurns,
+    /// A boulder was let go (`machine`), and one rolled over a cat.
+    BoulderRoll { pos: Vec3 },
+    BoulderHit { pos: Vec3 },
+    /// A stone landing off its chute's lip.
+    BoulderLand { pos: Vec3 },
+    /// A lock's pad swinging open as the stone passes it.
+    PadDrop { pos: Vec3 },
+    /// A cat falling through an open pad.
+    CatFell { pos: Vec3 },
+    /// Hourwatch (`hours`): a cat turned back in time (`back`: she turned
+    /// herself; else she sent an enemy back), where from and to.
+    TimeTurned { god: usize, from: Vec3, to: Vec3, back: bool },
+    /// Her friends' hours wound forward, round her.
+    WindFx { pos: Vec3, radius: f32 },
+    /// The long look: up into the stars, and down where she lands.
+    LookUp { god: usize, pos: Vec3, to: Vec3 },
+    LookLand { god: usize, pos: Vec3 },
+    /// Claypaw (`clay`): kittens shaped, a remolding (or a wetting), a
+    /// slick laid.
+    ClayShaped { pos: Vec3, n: u32 },
+    ClayRemold { pos: Vec3 },
+    SlickFx { a: Vec3, b: Vec3, r: f32 },
+    /// A mudslide's front crushing through a plant, and sloshing off a wall.
+    Smush { pos: Vec3 },
+    /// The bank giving way: a mudslide set running from `pos` along `dir`.
+    MudslideFx { pos: Vec3, dir: Vec3 },
+    Slosh { pos: Vec3 },
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +178,12 @@ pub struct AiBrain {
     /// Somewhere it is walking to off its lane this tick (a boss, the
     /// Moonwell): what the floor router routes to, instead of the lane.
     pub goal: Option<Vec3>,
+    /// What it has decided and its body has not yet done (`reaction`):
+    /// each tick's move and cast, due a reaction time after the tick that
+    /// decided them.
+    pub pending: std::collections::VecDeque<crate::reaction::Act>,
+    /// The intent its body is on (None until the first one reaches it).
+    pub body: Option<crate::reaction::Intent>,
 }
 
 impl AiBrain {
@@ -149,6 +205,8 @@ impl AiBrain {
             stance_t: 0.0,
             anchor: None,
             goal: None,
+            pending: Default::default(),
+            body: None,
         }
     }
 }
@@ -178,6 +236,9 @@ pub struct GodUnit {
     pub assists: u32,
     pub items: Vec<u16>,
     pub stacks: Vec<f32>, // parallel to items — stack counters
+    /// The Curios' own state (`curios`): the Ninth Life's recharge, the
+    /// pounce count.
+    pub curio: crate::curios::CurioState,
     pub hp: f32,
     pub max_hp: f32,
     pub mana: f32,
@@ -239,6 +300,52 @@ pub struct GodUnit {
     /// it drags off with when the music stops.
     pub dance_t: f32,
     pub dance_after: (f32, f32),
+    /// Afraid (Hollowstep's terror radius, `stalker`), 0..=1, and the
+    /// seconds to the next heartbeat.
+    pub fear: f32,
+    pub beat_t: f32,
+    /// Units walked since the last heavy footfall (a stalker's tread).
+    pub stride: f32,
+    /// Fleeing Brasshowl's lamp (`lantern`): seconds left, and from where.
+    pub flee_t: f32,
+    pub flee_from: Vec3,
+    /// Shown up by the lamp: seconds left (seen through cloud, no stalking).
+    pub revealed_t: f32,
+    /// Where it has been, the last few seconds (`hours`).
+    pub trail: std::collections::VecDeque<crate::hours::Mark>,
+    /// Hourwatch's long look (`hours`): seconds left aloft (out of reach),
+    /// and what it shows up (for how long) and how long she is seen after.
+    pub aloft_t: f32,
+    pub look_reveal: f32,
+    pub look_exposed: f32,
+    /// How much of any healing takes on this cat (Claypaw's clay: half;
+    /// everyone else all of it). Every heal site multiplies by it.
+    pub heal_mul: f32,
+    /// Claypaw (`clay`): how wet his clay is (1 wet .. 0 dry), how long he
+    /// is quick for, and when his next kitten is shaped.
+    pub clay_wet: f32,
+    pub clay_quick_t: f32,
+    pub clay_kit_t: f32,
+    /// Claypaw's mudslide surge: seconds left in which his kills shape more
+    /// kittens.
+    pub clay_surge_t: f32,
+    /// The way it is sliding on a mud slick (`clay`); zero off one.
+    pub slide: Vec3,
+    /// A Sentinel's coat (`sentinel`): the key she wears, the one a lasting
+    /// coat goes back to, and how long the lasting one has left.
+    pub field_slot: Option<u32>,
+    pub field_back: Option<u32>,
+    pub field_t: f32,
+    /// Seconds toward her next magma burn.
+    pub burn_t: f32,
+    /// The share of each blow this cat takes, this tick: under 1 inside a
+    /// friend's granite (`sentinel`) or in a pack on the Quarry
+    /// (`maze`), 1 otherwise. Reset by `sentinel_tick`, which runs first.
+    pub ward: f32,
+    /// Seconds toward the next thorn bite (`maze`).
+    pub thorn_t: f32,
+    /// The last boulder run that hit this cat (`machine`: once a run).
+    pub boulder_run: u32,
     /// A cast winding up or channelling: fires when `t` reaches `dur`.
     pub casting: Option<Casting>,
     /// Seconds during which movement does not turn the cat: after a cast
@@ -305,6 +412,9 @@ pub struct Minion {
     /// Giggling / dancing (Sproutkit, `kit`): no attacks; a dancer shuffles.
     pub giggle_t: f32,
     pub dance_t: f32,
+    /// One of Claypaw's mudslide kittens (`clay`): not a lane minion but
+    /// his, for a while -- and worth a bounty to whoever breaks it.
+    pub clay: Option<crate::clay::ClayKit>,
 }
 
 pub struct Tower {
@@ -365,6 +475,8 @@ pub struct Projectile {
     pub pen_pct: f32,
     pub pen_flat: f32,
     pub color: [f32; 3],
+    /// A ranged cat's basic attack (not an ability's): see `basic_attack`.
+    pub auto: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -394,14 +506,22 @@ pub enum ZoneKind {
 
 pub struct Game {
     pub t: f32,
+    /// A custom game's rules (`rules`; the default is a normal match).
+    /// Set with [`Game::apply_rules`].
+    pub rules: crate::rules::MatchRules,
     pub gods: Vec<GodUnit>,
     pub minions: Vec<Minion>,
     pub towers: Vec<Tower>,
     pub titans: [Titan; 2],
     pub projectiles: Vec<Projectile>,
     pub zones: Vec<Zone>,
-    /// Sproutkit's litters, running (`kit`).
+    /// Sproutkit's litters, running (`kit`), and Claypaw's clay kittens.
     pub kitlings: Vec<crate::kit::Kitling>,
+    /// Claypaw's mud slicks, and his mudslides running (`clay`).
+    pub slicks: Vec<crate::clay::Slick>,
+    pub mudslides: Vec<crate::clay::Wave>,
+    /// Hollowstep's others -- his standing one and his echoes (`stalker`).
+    pub others: Vec<crate::stalker::Other>,
     pub events: Vec<Event>,
     pub killfeed: Vec<KillEntry>,
     pub next_wave_t: f32,
@@ -410,9 +530,13 @@ pub struct Game {
     pub cast_queue: Vec<(usize, u32, Vec3)>, // (god idx, slot, aim)
     /// Leap requests: (god idx, aim direction). Drained by `move_gods`.
     pub leap_queue: Vec<(usize, Vec3)>,
-    /// Set around a basic attack's damage: the siphon (brawl) pays back
-    /// ability damage only.
-    pub siphon_off: bool,
+    /// Set around a basic attack's damage (melee, or an auto's arrow
+    /// landing): the siphon (brawl) and the Tidecaller Pearl pay back
+    /// ability damage only; the Bramble Lash slows on basic attacks only.
+    pub basic_attack: bool,
+    /// Set while a Thornpelt Mantle's damage goes back, so it is not
+    /// thrown back again.
+    pub reflecting: bool,
     /// The river crossings. See `logs`.
     pub logs: Vec<crate::logs::RollingLog>,
     pub(crate) logs_seen: usize,
@@ -453,6 +577,8 @@ pub struct Game {
     /// A bot's dive on an enemy god, for its teammates to answer:
     /// (target god, when). Indexed by the diving team.
     pub calls: [Option<(usize, f32)>; 2],
+    /// The Engineer's Quarry's waking order (`maze`); unused on other maps.
+    pub wake: crate::maze::Wake,
 }
 
 impl Game {
@@ -512,6 +638,7 @@ impl Game {
                 assists: 0,
                 items: Vec::new(),
                 stacks: Vec::new(),
+                curio: Default::default(),
                 hp,
                 max_hp: hp,
                 mana,
@@ -556,6 +683,29 @@ impl Game {
                 giggle_t: 0.0,
                 dance_t: 0.0,
                 dance_after: (0.0, 0.0),
+                fear: 0.0,
+                beat_t: 0.0,
+                stride: 0.0,
+                flee_t: 0.0,
+                flee_from: Vec3::ZERO,
+                revealed_t: 0.0,
+                trail: Default::default(),
+                aloft_t: 0.0,
+                look_reveal: 0.0,
+                look_exposed: 0.0,
+                heal_mul: if crate::clay::is_clay(def) { crate::clay::HEAL_MUL } else { 1.0 },
+                clay_wet: 1.0,
+                clay_quick_t: 0.0,
+                clay_kit_t: crate::clay::KIT_EVERY,
+                clay_surge_t: 0.0,
+                slide: Vec3::ZERO,
+                field_slot: None,
+                field_back: None,
+                field_t: 0.0,
+                burn_t: 0.0,
+                ward: 1.0,
+                thorn_t: 0.0,
+                boulder_run: 0,
                 last_act_t: -99.0,
                 ai: if is_player { None } else { Some(AiBrain::new(lane, 0.45 + rng.f32() * 0.5)) },
                 prot,
@@ -605,6 +755,9 @@ impl Game {
             projectiles: Vec::new(),
             zones: Vec::new(),
             kitlings: Vec::new(),
+            slicks: Vec::new(),
+            mudslides: Vec::new(),
+            others: Vec::new(),
             events: Vec::new(),
             killfeed: Vec::new(),
             next_wave_t: WAVE_FIRST,
@@ -612,7 +765,8 @@ impl Game {
             rng,
             cast_queue: Vec::new(),
             leap_queue: Vec::new(),
-            siphon_off: false,
+            basic_attack: false,
+            reflecting: false,
             logs: crate::logs::crossings().iter().map(crate::logs::RollingLog::across).collect(),
             logs_seen: 0,
             tower_alive: [0, 0], // counted below
@@ -627,6 +781,9 @@ impl Game {
             plans_this_tick: 0,
             styles: [crate::playbook::even_keel(), crate::playbook::even_keel()],
             calls: [None, None],
+            // its own seed from the match's (not drawn from `rng`, so every
+            // other random thing in a match stays as it was)
+            wake: crate::maze::Wake::new(&mut Rng::new((player_god as u64 + 1).wrapping_mul(0xD6E8_FEB8_6659_FD93) ^ 0x7A0E)),
             ferries: crate::ferry::for_map(),
             star_bolts: Vec::new(),
             starfalls: Vec::new(),
@@ -636,6 +793,7 @@ impl Game {
             vision: Default::default(),
             next_minion_id: 0,
             waves: 0,
+            rules: Default::default(),
         };
         for t in &g.towers {
             g.tower_alive[t.team as usize] += 1;
@@ -706,21 +864,17 @@ impl Game {
         for (k, id) in god.items.iter().enumerate() {
             let item = &cat[*id as usize];
             s.add(&item.stats);
+            // a trophy's growth, on the stat it names. (This matched on the
+            // item's shelf, and every trophy sits on the Stacking shelf, so
+            // no stack ever reached a stat.)
             if let Some(st) = &item.stack {
-                let stacks = god.stacks.get(k).copied().unwrap_or(0.0);
-                match st.kind {
-                    StackKind::MinionKill | StackKind::GodKill | StackKind::TowerKill => {
-                        let gained = stacks * st.per;
-                        match item.cat {
-                            items::Cat::Strength => s.strength += gained,
-                            items::Cat::Intelligence => s.intelligence += gained,
-                            items::Cat::Scaling => s.power += gained,
-                            items::Cat::Protection => s.protection += gained,
-                            items::Cat::Health => s.health += gained,
-                            _ => {}
-                        }
-                    }
-                    StackKind::Time => {}
+                let gained = st.gained(god.stacks.get(k).copied().unwrap_or(0.0));
+                match st.grows {
+                    items::Grow::Strength => s.strength += gained,
+                    items::Grow::Intelligence => s.intelligence += gained,
+                    items::Grow::Power => s.power += gained,
+                    items::Grow::Protection => s.protection += gained,
+                    items::Grow::Health => s.health += gained,
                 }
             }
         }
@@ -729,10 +883,11 @@ impl Game {
 
     pub fn recalc(&mut self, i: usize) {
         let def = self.def(i);
+        let hp_mul = self.rules.hp_mul;
         let g = &mut self.gods[i];
         let (base_hp, base_mana, _, base_power, base_prot) = def.at_level(g.level);
         let st = Self::item_stats(g);
-        let new_max = base_hp + st.health;
+        let new_max = (base_hp + st.health) * hp_mul;
         let hp_frac = if g.max_hp > 0.0 { g.hp / g.max_hp } else { 1.0 };
         g.max_hp = new_max;
         g.hp = (new_max * hp_frac).max(g.hp.min(new_max));
@@ -794,7 +949,8 @@ impl Game {
     pub fn stalking(&self, i: usize) -> bool {
         let g = &self.gods[i];
         let b = crate::consts::STALK_BREAK_SECS;
-        g.sneak && self.t - g.last_dmg_t > b && self.t - g.last_act_t > b
+        // shown up by Brasshowl's lamp (`lantern`): nothing to hide in
+        g.sneak && g.revealed_t <= 0.0 && self.t - g.last_dmg_t > b && self.t - g.last_act_t > b
     }
 
     /// How quietly this cat carries itself, `0..=1`, from every source.
@@ -803,9 +959,14 @@ impl Game {
     /// fighting by what it is tied to: intent that a fight interrupts, a
     /// window some abilities grant (the fast low run before a pounce, at
     /// full speed), and the way a badly hurt animal slinks.
-    /// Can `team` see cat `j`? Always, off the sky map, for its own cats,
-    /// and before the first cloud refresh (`vision_tick`).
+    /// Can `team` see cat `j`? Always for its own cats, on the open maps,
+    /// and before the first refresh (`vision_tick`); through the sky map's
+    /// clouds and the Quarry's walls, only as `vision_tick` found.
     pub fn sees(&self, team: Team, j: usize) -> bool {
+        // shown up by Brasshowl's lamp (`lantern`): seen by everyone
+        if self.gods.get(j).is_some_and(|g| g.revealed_t > 0.0) {
+            return true;
+        }
         self.vision.seen[team as usize].get(j).copied().unwrap_or(true)
     }
 
@@ -825,6 +986,15 @@ impl Game {
     /// Minions give no sight: with 32 a side in every lane, they would see
     /// everything and the cloud nothing.
     pub fn vision_tick(&mut self) {
+        // the Quarry: its walls and shut gates hide (`maze::sight`)
+        if crate::map::active() == crate::map::MapId::Maze {
+            if self.t < self.vision.next_t && self.vision.seen[0].len() == self.gods.len() {
+                return;
+            }
+            self.vision.next_t = self.t + 1.0 / crate::skycloud::VISION_HZ;
+            self.vision.seen = [Team::Blue, Team::Red].map(|team| crate::maze::seen_by(self, team));
+            return;
+        }
         if crate::map::active() != crate::map::MapId::Sky {
             if !self.vision.seen[0].is_empty() {
                 self.vision = Default::default();
@@ -877,7 +1047,9 @@ impl Game {
         let g = &self.gods[i];
         let def = self.def(i);
         let bless = if g.blessing_t > 0.0 { BLESSING_MS } else { 0.0 };
-        let base = def.move_speed * (1.0 + g.ms_bonus + g.buff_ms + bless);
+        // the Catnip Censer's air and the Wanderer's Whiskers (curios.rs)
+        let curio = self.curio_move_bonus(i);
+        let base = def.move_speed * (1.0 + g.ms_bonus + g.buff_ms + bless + curio);
         // wading: the rivers are slow going unless you were born to them
         let depth = self.water_depth_now(g.pos.x, g.pos.z);
         let wade = if g.blessing_t > 0.0 || crate::wild::is_riverborn(def) { 1.0 } else { wade_speed_mul(depth) };
@@ -893,13 +1065,17 @@ impl Game {
         let boon = crate::moonwell::move_mul(g.boon.map(|b| b.0));
         // dancing under Sproutkit's glitter-ball: a shuffle
         let dance = if g.dance_t > 0.0 { crate::kit::DANCE_MOVE } else { 1.0 };
-        dance * base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk * going * boon
+        // afraid (`stalker`): the legs go heavy
+        let fear = 1.0 - crate::stalker::FEAR_SLOW * g.fear;
+        // Claypaw's clay dries, and quickens (`clay`)
+        let clay = if crate::clay::is_clay(def) { crate::clay::dry_mul(g.clay_wet) * if g.clay_quick_t > 0.0 { 1.0 + crate::clay::QUICK_SPEED } else { 1.0 } } else { 1.0 };
+        clay * fear * dance * base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk * going * boon
     }
 
     pub fn auto_interval(&self, i: usize) -> f32 {
         let g = &self.gods[i];
         let bless = if g.blessing_t > 0.0 { BLESSING_AS } else { 0.0 };
-        self.def(i).auto_cd / (1.0 + g.atk_speed + g.buff_atkspd + bless)
+        self.def(i).auto_cd / (1.0 + g.atk_speed + g.buff_atkspd + bless + self.censer_at(i).1)
     }
 
     pub fn auto_damage(&self, i: usize) -> f32 {
@@ -915,6 +1091,12 @@ impl Game {
             return;
         }
         let _ = magic;
+        // Claypaw's mana comes from his claws (`clay`)
+        if self.basic_attack {
+            if let Some(s) = source {
+                self.clay_on_hit(s);
+            }
+        }
         // Stormfire: the Drake's blessing multiplies everything its holders deal
         if let Some(s) = source {
             if s < self.gods.len() {
@@ -935,6 +1117,8 @@ impl Game {
             TargetRef::Boss(bi) => {
                 self.boss_take_damage(bi, dmg, source);
             }
+            // up in the stars (Hourwatch's long look): out of reach
+            TargetRef::God(ti) if self.gods.get(ti).is_some_and(|g| g.aloft_t > 0.0) => {}
             TargetRef::God(ti) => {
                 let g = &mut self.gods[ti];
                 if g.respawn_t > 0.0 {
@@ -944,6 +1128,8 @@ impl Game {
                 dmg *= 100.0 / (100.0 + eff);
                 // Moonshell (the Moonwell): nine-tenths of every blow turned
                 dmg *= crate::moonwell::taken_mul(g.boon.map(|b| b.0));
+                // a friend's granite (`sentinel`)
+                dmg *= g.ward.clamp(0.0, 1.0);
                 let pre = g.hp + g.shield;
                 if g.shield > 0.0 {
                     let absorbed = g.shield.min(dmg);
@@ -954,7 +1140,7 @@ impl Game {
                 g.last_dmg_t = self.t;
                 // the siphon: ability damage from an enemy CAT returns a share
                 // as mana to the one who took it (brawl)
-                let from_enemy_cat = !self.siphon_off && source.is_some_and(|s| s != ti && s < self.gods.len());
+                let from_enemy_cat = !self.basic_attack && source.is_some_and(|s| s != ti && s < self.gods.len());
                 let g = &mut self.gods[ti];
                 if from_enemy_cat && g.hp > 0.0 {
                     let pct = crate::brawl::siphon_pct(&g.items);
@@ -968,10 +1154,13 @@ impl Game {
                     }
                 }
                 let _ = pre;
-                if g.hp <= 0.0 {
+                // the Curios that answer a blow (curios.rs)
+                self.curios_on_hit(ti, source, dmg);
+                if self.gods[ti].hp <= 0.0 && !self.ninth_life(ti) {
                     self.on_god_death(ti, source);
                 } else {
-                    self.events.push(Event::Damage { pos: g.pos + Vec3::Y * 1.6, amount: dmg, big: dmg > 120.0 });
+                    let pos = self.gods[ti].pos;
+                    self.events.push(Event::Damage { pos: pos + Vec3::Y * 1.6, amount: dmg, big: dmg > 120.0 });
                 }
             }
             TargetRef::Minion(mi) => {
@@ -1025,7 +1214,9 @@ impl Game {
 
     fn on_minion_death(&mut self, mi: usize) {
         let m = &self.minions[mi];
-        let gold = if m.caster { GOLD_CASTER } else { GOLD_MELEE };
+        // (one of Claypaw's mudslide kittens: its bounty, the price of his
+        // gamble -- `clay`)
+        let gold = if m.clay.is_some() { crate::clay::SLIDE_KIT_GOLD } else if m.caster { GOLD_CASTER } else { GOLD_MELEE };
         let xp = if m.caster { XP_CASTER } else { XP_MELEE };
         let pos = m.pos;
         let enemy_team = m.team.other();
@@ -1035,6 +1226,7 @@ impl Game {
                 let team = self.gods[killer].team;
                 self.gods[killer].gold += gold * self.map_events.gold_mul() * self.bosses.gold_mul(team);
                 self.add_stacks(killer, StackKind::MinionKill, 1.0);
+                self.clay_kill_credit(killer, crate::clay::KITS_PER_SMALL_KILL, pos);
             }
         }
         for i in 0..self.gods.len() {
@@ -1087,7 +1279,7 @@ impl Game {
             g.deaths += 1;
             // overtime (the sky map) stretches the wait too: a won fight then
             // opens the base long enough for a wave to reach the Elder
-            g.respawn_t = respawn_time(g.level) * crate::map::active().overtime(self.t).min(2.0);
+            g.respawn_t = respawn_time(g.level) * crate::map::active().overtime(self.t).min(2.0) * self.rules.respawn_mul;
             g.hp = 0.0;
             g.shield = 0.0;
             g.dash = None;
@@ -1104,6 +1296,7 @@ impl Game {
                 kg.gold += GOLD_GOD * self.map_events.gold_mul() * self.bosses.gold_mul(kt);
                 self.add_stacks(k, StackKind::GodKill, 1.0);
                 self.grant_xp(k, XP_GOD);
+                self.clay_kill_credit(k, crate::clay::KITS_PER_GOD_KILL, pos);
                 kill_text = format!("{} slew {}", self.god_name(k), name);
             }
         }
@@ -1123,8 +1316,45 @@ impl Game {
         }
     }
 
+    /// Play this match under `rules`: every cat to the starting level (its
+    /// stats and ability ranks with it), full health and mana, the
+    /// starting gold. Call once, at the start, after `new_teams`.
+    ///
+    /// A bot has already made its opening buy from `START_GOLD` by then
+    /// (`new_teams`), so with a different purse that buy is undone and made
+    /// again from the new one; with the normal purse it is left alone, and
+    /// a normal match's rules change nothing.
+    pub fn apply_rules(&mut self, rules: crate::rules::MatchRules) {
+        self.rules = rules;
+        let purse = (rules.start_gold - START_GOLD).abs() > 1e-3;
+        for gi in 0..self.gods.len() {
+            if purse {
+                let g = &mut self.gods[gi];
+                g.items.clear();
+                g.stacks.clear();
+                g.gold = rules.start_gold;
+            }
+            self.set_level(gi, rules.start_level);
+            if purse && !self.gods[gi].is_player {
+                self.auto_buy(gi);
+            }
+            let g = &mut self.gods[gi];
+            g.hp = g.max_hp;
+            g.mana = g.max_mana;
+        }
+    }
+
+    /// Put cat `gi` at `level` (XP cleared), its stats and ability ranks
+    /// with it. For tests and shots that need a kit unlocked.
+    pub fn set_level(&mut self, gi: usize, level: u32) {
+        self.gods[gi].level = level.clamp(1, MAX_LEVEL);
+        self.gods[gi].xp = 0.0;
+        self.recalc(gi);
+    }
+
     pub fn grant_xp(&mut self, gi: usize, mut xp: f32) {
         xp *= 1.0 + 0.02 * (self.t / 60.0).min(8.0); // late-game scaling
+        xp *= self.rules.xp_mul;
         let g = &mut self.gods[gi];
         g.xp += xp;
         let mut leveled = false;
@@ -1138,19 +1368,23 @@ impl Game {
             self.events.push(Event::LevelUp { pos });
             self.recalc(gi);
             let g = &mut self.gods[gi];
-            g.hp = (g.hp + g.max_hp * 0.22).min(g.max_hp);
+            g.hp = (g.hp + g.max_hp * 0.22 * g.heal_mul).min(g.max_hp);
             g.mana = (g.mana + g.max_mana * 0.3).min(g.max_mana);
         }
     }
 
+    /// `n` more stacks on every held trophy of `kind` (to its cap), and the
+    /// stats follow when a stack lands.
     pub fn add_stacks(&mut self, gi: usize, kind: StackKind, n: f32) {
         let cat = items::all();
         let g = &mut self.gods[gi];
+        let mut changed = false;
         for (k, id) in g.items.clone().iter().enumerate() {
             if let Some(st) = &cat[*id as usize].stack {
                 if st.kind == kind {
                     let cur = g.stacks.get(k).copied().unwrap_or(0.0);
-                    let next = (cur + n).min(st.max);
+                    let next = (cur + n).min(st.cap());
+                    changed |= st.gained(next) != st.gained(cur);
                     if k < g.stacks.len() {
                         g.stacks[k] = next;
                     } else {
@@ -1158,6 +1392,9 @@ impl Game {
                     }
                 }
             }
+        }
+        if changed {
+            self.recalc(gi);
         }
     }
 
@@ -1243,7 +1480,8 @@ mod shop_tests {
         assert!(g.buy_item(0, item.id));
         assert_eq!(g.gods[0].items.len(), 1);
         let refund = g.sell_item(0, 0).expect("a real slot");
-        assert!((refund - item.cost * SELL_REFUND).abs() < 1e-3);
+        // the refund is rounded to whole gold (425 x 0.7 = 297.5 -> 298)
+        assert_eq!(refund, (item.cost * SELL_REFUND).round());
         assert_eq!(g.gods[0].gold, refund, "sold with nothing else bought, gold is exactly the refund");
         assert!(g.gods[0].items.is_empty());
         assert!(g.sell_item(0, 0).is_none(), "an empty slot sells nothing");

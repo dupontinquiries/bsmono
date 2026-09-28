@@ -91,6 +91,28 @@ pub struct Scene {
     /// Sproutkit's litter (his own body, drawn small), by team, and his
     /// glitter-ball.
     pub kitling: [u64; 2],
+    /// Claypaw's clay kittens (his own body, small), by team, and a puddle
+    /// of his mud (`clay`).
+    pub clay_kit: [u64; 2],
+    pub puddle: u64,
+    /// Hollowstep's body, by team, for the others of him (`stalker`).
+    pub hollow: [u64; 2],
+    /// The Engineer's Quarry's thorns (three clumps), and where they rise, by the
+    /// class of section (`mazeworld::thorn_spots`); empty on other maps.
+    pub thorns: [u64; 3],
+    pub thorn_spots: Vec<(u8, Vec3, f32)>,
+    /// The Engineer's Quarry's gate slab (one mesh, turned across each passage).
+    pub maze_gate: u64,
+    /// The Engineer's Quarry's machine (`machine`): the gear trains on the walls
+    /// (each with its wheel's mesh, shared by radius), the screws at the
+    /// tracks' heads, and the boulder; empty on other maps.
+    pub gears: Vec<(crate::mazeworld::Gear, u64)>,
+    pub screws: Vec<Vec3>,
+    pub screw_mesh: u64,
+    pub maze_ball: u64,
+    /// The locks' pads (a stone trapdoor, and the dark under it).
+    pub pad: u64,
+    pub pit: u64,
     pub disco: u64,
     /// The sky map's drifting stone and cloud (`skydrift`), and their meshes
     /// by kind (anchor, fragment, puff) and variant.
@@ -249,7 +271,7 @@ impl Scene {
                 for team in [Team::Blue, Team::Red] {
                     let rigged = models::build_god_rigged(def, team);
                     for (s, m) in rigged.meshes.iter().enumerate() {
-                        let mut sm = crate::smoothvox::smooth(m, models::GOD_DRAW_VOXEL, 2);
+                        let mut sm = crate::smoothvox::smooth(m, models::draw_voxel(def), 2);
                         crate::smoothvox::fur_for_part(def, s, &mut sm, crate::render::FurStyle::from_env() == crate::render::FurStyle::Locks);
                         tris += sm.tris();
                         parts[team as usize][s] = r.upload_smooth(&sm);
@@ -379,7 +401,35 @@ impl Scene {
         let star = r.upload_mesh(&crate::skyprops::star_mote());
         let kit_def = ROSTER.iter().find(|d| matches!(d.pelt, crate::gods::PeltKind::Kit)).expect("Sproutkit on the roster");
         let kitling = [r.upload_mesh(&models::build_god(kit_def, Team::Blue)), r.upload_mesh(&models::build_god(kit_def, Team::Red))];
+        let clay_def = ROSTER.iter().find(|d| crate::clay::is_clay(d)).expect("Claypaw on the roster");
+        let clay_kit = [r.upload_mesh(&models::build_god(clay_def, Team::Blue)), r.upload_mesh(&models::build_god(clay_def, Team::Red))];
+        let puddle = r.upload_mesh(&crate::clay::puddle_mesh());
         let disco = r.upload_mesh(&models::disco_ball());
+        let hollow_def = ROSTER.iter().find(|d| matches!(d.pelt, crate::gods::PeltKind::Hollow)).expect("Hollowstep on the roster");
+        let hollow = [r.upload_mesh(&models::build_god(hollow_def, Team::Blue)), r.upload_mesh(&models::build_god(hollow_def, Team::Red))];
+        let thorns = [0, 1, 2].map(|v| r.upload_mesh(&crate::mazeworld::thorn_mesh(v)));
+        let thorn_spots = if crate::map::active() == crate::map::MapId::Maze { crate::mazeworld::thorn_spots() } else { Vec::new() };
+        let maze_gate = r.upload_mesh(&crate::mazeworld::gate_mesh());
+        let (gears, screws) = if crate::map::active() == crate::map::MapId::Maze {
+            // one mesh per wheel size, to the half unit
+            let mut by_r: std::collections::HashMap<i32, u64> = std::collections::HashMap::new();
+            let gears = crate::mazeworld::gears()
+                .into_iter()
+                .map(|g| {
+                    let key = (g.r * 2.0).round() as i32;
+                    let id = *by_r.entry(key).or_insert_with(|| r.upload_mesh(&crate::mazeworld::gear_mesh(key as f32 * 0.5)));
+                    (g, id)
+                })
+                .collect();
+            let screws = crate::mazeworld::placements().into_iter().filter_map(|i| if let crate::mazeworld::Item::Screw { at } = i { Some(at) } else { None }).collect();
+            (gears, screws)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let screw_mesh = r.upload_mesh(&crate::mazeworld::screw_mesh());
+        let maze_ball = r.upload_mesh(&crate::mazeworld::boulder_mesh());
+        let pad = r.upload_mesh(&crate::mazeworld::pad_mesh());
+        let pit = r.upload_mesh(&crate::mazeworld::pit_mesh());
         let sky = crate::map::active() == crate::map::MapId::Sky;
         let drift = if sky { crate::skydrift::placements() } else { Vec::new() };
         let mut drift_mesh = [[0u64; DRIFT_VARIANTS]; 3];
@@ -434,6 +484,18 @@ impl Scene {
             wyrm_seg,
             star,
             kitling,
+            clay_kit,
+            puddle,
+            hollow,
+            thorns,
+            thorn_spots,
+            maze_gate,
+            gears,
+            screws,
+            screw_mesh,
+            maze_ball,
+            pad,
+            pit,
             disco,
             drift,
             drift_mesh,
@@ -842,13 +904,31 @@ impl Scene {
             }
             let mats = slot_transforms(rig, &posed, &legs, &pose.body);
             let smooth = self.ultra && di < self.god_smooth.len();
+            // a Sentinel is built bigger (`models::body_voxel`), and her coat
+            // is whatever she is wearing (`sentinel`)
+            let vox = models::draw_voxel(def);
+            let (coat, glow) = game.worn(i).map_or(([1.0; 4], 0.0), |w| w.material.tint());
+            let glow = if glow > 0.0 { glow * (0.8 + 0.2 * (vfx.time * 2.3 + i as f32).sin()) } else { 0.0 };
             for (s, m) in mats.iter().enumerate() {
                 if smooth {
                     // smooth and furred; the voxel part casts its shadow
-                    r.queue_smooth(self.god_smooth[di][ti][s], base * *m, [1.0; 4]);
-                    r.queue_shadow_only(self.god_parts[di][ti][s], base * *m, models::GOD_DRAW_VOXEL);
+                    r.queue_smooth(self.god_smooth[di][ti][s], base * *m, coat);
+                    r.queue_shadow_only(self.god_parts[di][ti][s], base * *m, vox);
                 } else {
-                    r.queue_draw(self.god_parts[di][ti][s], base * *m, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
+                    r.queue_draw(self.god_parts[di][ti][s], base * *m, coat, glow, vox, false);
+                }
+            }
+            // her field's edge on the ground, in its colour, turning slowly
+            if let Some(w) = game.worn(i) {
+                let col = w.material.edge();
+                let n = ((w.radius * std::f32::consts::TAU) / 1.4).round().max(12.0) as usize;
+                let turn = vfx.time * 0.25 * if w.material == crate::gods::Material::Lodestone { -1.0 } else { 1.0 };
+                for k in 0..n {
+                    let a = k as f32 / n as f32 * std::f32::consts::TAU + turn;
+                    let (x, z) = (g.pos.x + a.cos() * w.radius, g.pos.z + a.sin() * w.radius);
+                    let p = Vec3::new(x, crate::map::ground_y(x, z) + 0.12, z);
+                    let pulse = 0.5 + 0.5 * (vfx.time * 2.0 + k as f32 * 0.7).sin();
+                    r.queue_draw(self.orb, Mat4::from_translation(p) * Mat4::from_scale(Vec3::splat(1.1)), [col[0], col[1], col[2], 0.6 + 0.3 * pulse], 0.5, 0.05, true);
                 }
             }
             // afterimages of a dash or a blink: this pose, where the cat
@@ -858,7 +938,7 @@ impl Scene {
                 let ghost = Mat4::from_translation(gh.pos + Vec3::Y * (pose.lift - sink)) * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - gh.yaw);
                 let tint = [gh.color[0] * 1.3, gh.color[1] * 1.3, gh.color[2] * 1.3, 0.42 * k];
                 for (s, m) in mats.iter().enumerate() {
-                    r.queue_draw(self.god_parts[di][ti][s], ghost * *m, tint, 0.8 * k, models::GOD_DRAW_VOXEL, true);
+                    r.queue_draw(self.god_parts[di][ti][s], ghost * *m, tint, 0.8 * k, vox, true);
                 }
             }
 
@@ -1015,10 +1095,155 @@ impl Scene {
             } else {
                 base
             };
+            // one of Claypaw's mudslide kittens (`clay`): his body, small --
+            // a little bigger than a litter kitten, it is a fighter
+            if m.clay.is_some() {
+                let hop = ((m.walk_anim * 1.2).sin().abs()) * 0.3;
+                let mk = Mat4::from_translation(m.pos + Vec3::Y * hop) * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - m.yaw) * Mat4::from_scale(Vec3::splat(crate::kit::KITLING_SCALE * 1.5));
+                r.queue_draw(self.clay_kit[ti], mk, [1.0; 4], 0.1, models::GOD_DRAW_VOXEL, false);
+                continue;
+            }
             let mesh = if m.caster { self.minion_caster[ti] } else { self.minion_melee[ti] };
             r.queue_draw(mesh, base, [1.0; 4], 0.0, 0.09, false);
         }
 
+        // shown up by Brasshowl's lamp (`lantern`): a small flame over the
+        // cat, bobbing, for everyone to see
+        for g in &game.gods {
+            if g.revealed_t > 0.0 && g.respawn_t <= 0.0 {
+                let p = g.pos + Vec3::Y * (2.6 + (vfx.time * 3.0).sin() * 0.08);
+                let a = g.revealed_t.min(1.0);
+                r.queue_draw(self.orb, Mat4::from_translation(p) * Mat4::from_scale(Vec3::splat(1.6)), [1.0, 0.72, 0.30, a], 2.5, 0.05, false);
+            }
+        }
+        // Hollowstep's others (`stalker`): his standing other is him, a
+        // shade darker, gliding rather than walking (it does not move its
+        // legs -- the tell, for whoever looks long enough); his echoes are
+        // his shape in smoke, see-through
+        for o in &game.others {
+            if !sphere_in_frustum(&vp, o.pos, ACTOR_CULL_R) {
+                continue;
+            }
+            let bob = (o.age * 2.1).sin() * 0.05;
+            let m = Mat4::from_translation(o.pos + Vec3::Y * bob) * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - o.yaw);
+            let mesh = self.hollow[o.team as usize];
+            if o.echo {
+                // fading in over half a second and out over the last one
+                let a = (o.age * 2.0).min(1.0) * o.life.clamp(0.0, 1.0);
+                r.queue_draw(mesh, m, [0.16, 0.17, 0.22, 0.55 * a], 0.05, models::GOD_DRAW_VOXEL, true);
+            } else {
+                r.queue_draw(mesh, m, [0.78, 0.78, 0.82, 1.0], 0.0, models::GOD_DRAW_VOXEL, false);
+            }
+        }
+        // The Engineer's Quarry's gates: each slab at the height the clock gives it
+        // (sunk into the floor when open), glowing red while it is about to
+        // move (a lane's never shuts and is never drawn up)
+        if crate::map::active() == crate::map::MapId::Maze {
+            let pulse = 0.5 + 0.5 * (vfx.time * 6.0).sin();
+            for (g, (h, warn)) in game.wake.gates_at(game.t).into_iter().enumerate() {
+                let p = crate::maze::passages()[g];
+                let mid = p.mid();
+                if (h <= 0.001 && !warn) || !sphere_in_frustum(&vp, mid, 8.0) {
+                    continue;
+                }
+                let d = p.dir();
+                // the mesh is built across x: turn x onto the passage's side
+                let yaw = d.x.atan2(d.z);
+                let sink = (1.0 - h) * crate::maze::WALL_H + if h <= 0.001 { crate::maze::WALL_H - 0.6 } else { 0.0 };
+                let m = Mat4::from_translation(mid - Vec3::Y * sink.min(crate::maze::WALL_H - 0.6)) * Mat4::from_axis_angle(Vec3::Y, yaw);
+                let (tint, glow) = if warn { ([1.3 + 0.5 * pulse, 0.55, 0.45, 1.0], 0.3 * pulse) } else { ([1.0; 4], 0.0) };
+                r.queue_draw(self.maze_gate, m, tint, glow, 0.5, false);
+            }
+        }
+        // The Engineer's Quarry's machine (`machine`): the gear trains turning on
+        // the walls (a wheel turns at the train's pace over its own radius,
+        // so neighbours read as meshed), the screws winding (fastest while a
+        // ball comes up), and the boulders winding up out of the floor,
+        // rolling their tracks and sinking away at the end
+        if crate::map::active() == crate::map::MapId::Maze {
+            let turn = vfx.machine_turn;
+            for (g, mesh) in &self.gears {
+                if !sphere_in_frustum(&vp, g.at, g.r + 1.0) {
+                    continue;
+                }
+                let m = Mat4::from_translation(g.at) * Mat4::from_axis_angle(Vec3::Y, g.turn * turn * 4.0 / g.r);
+                r.queue_draw(*mesh, m, [1.0; 4], 0.0, 0.25, false);
+            }
+            let balls = crate::machine::boulders_at(game.wake.seed, game.t);
+            let winding = balls.iter().any(|b| !b.rolling && b.s <= 0.0);
+            for (k, at) in self.screws.iter().enumerate() {
+                if !sphere_in_frustum(&vp, *at + Vec3::Y * 3.5, 4.5) {
+                    continue;
+                }
+                let spin = turn * if k % 2 == 0 { 2.5 } else { -2.5 } + if winding { vfx.time * 6.0 } else { 0.0 };
+                let m = Mat4::from_translation(*at) * Mat4::from_axis_angle(Vec3::Y, spin);
+                r.queue_draw(self.screw_mesh, m, [1.0; 4], 0.0, 0.2, false);
+            }
+            let pulse = 0.5 + 0.5 * (vfx.time * 8.0).sin();
+            for b in &balls {
+                if !sphere_in_frustum(&vp, b.pos, crate::machine::BOULDER_R + 1.0) {
+                    continue;
+                }
+                // it rolls: about the axis across its way, by s / R
+                let axis = Vec3::Y.cross(b.dir).normalize_or_zero();
+                let spin = if axis.length_squared() > 0.5 { Mat4::from_axis_angle(axis, b.s / crate::machine::BOULDER_R) } else { Mat4::IDENTITY };
+                // red-hot bands while it is winding up: the warning
+                let (tint, glow) = if b.rolling || b.s > 0.0 { ([1.0; 4], 0.0) } else { ([1.05 + 0.25 * pulse, 0.85, 0.75, 1.0], 0.18 * pulse * b.up) };
+                r.queue_draw(self.maze_ball, Mat4::from_translation(b.pos) * spin, tint, glow, 0.25, false);
+            }
+            // the locks' pads: flush plates, their rims lit while the lock
+            // is armed (brighter as the stone nears), swinging down on
+            // their far edge as it passes, the dark showing under them
+            let (k, _) = crate::maze::Wake::turn(game.t);
+            let running = crate::machine::pair_for(game.wake.seed, k);
+            for p in 0..crate::machine::pairs().len() {
+                for d in crate::machine::pads(p) {
+                    if !sphere_in_frustum(&vp, d.at, crate::machine::PAD_HALF * 1.5) {
+                        continue;
+                    }
+                    let ph = if running == Some(p) { crate::machine::pad_phase(game.wake.seed, game.t, p, d) } else { crate::machine::PadPhase::Shut };
+                    let open = ph.open();
+                    if open > 0.0 {
+                        r.queue_draw(self.pit, Mat4::from_translation(d.at + Vec3::Y * 0.02), [1.0; 4], 0.0, 0.25, false);
+                    }
+                    let hinge = d.at + d.out * crate::machine::PAD_HALF;
+                    let axis = d.out.cross(Vec3::Y).normalize_or_zero();
+                    let m = Mat4::from_translation(hinge) * Mat4::from_axis_angle(axis, open * 1.45) * Mat4::from_translation(d.at - hinge + Vec3::Y * 0.04);
+                    let (tint, glow) = match ph {
+                        crate::machine::PadPhase::Armed(f) => {
+                            let hot = 0.25 + 0.75 * f * f;
+                            ([1.0 + 0.5 * hot * pulse, 0.85, 0.7, 1.0], 0.3 * hot * pulse)
+                        }
+                        _ => ([1.0; 4], 0.0),
+                    };
+                    r.queue_draw(self.pad, m, tint, glow, 0.25, false);
+                }
+            }
+        }
+        // The Engineer's Quarry (`maze`): thorns rise along the walls of a waking
+        // section -- small and pulsing red while it stirs (the warning),
+        // full grown while it bites, sinking as it quiets
+        if !self.thorn_spots.is_empty() {
+            let moods: Vec<crate::maze::Mood> = (0..crate::maze::CLASSES).map(|c| game.wake.class_mood(c, game.t)).collect();
+            let pulse = 0.5 + 0.5 * (vfx.time * 7.0).sin();
+            for (k, (class, p, yaw)) in self.thorn_spots.iter().enumerate() {
+                let (scale, tint, glow) = match moods[*class as usize] {
+                    crate::maze::Mood::Calm => continue,
+                    crate::maze::Mood::Stirring(f) => (0.2 + 0.4 * f, [1.4 + 0.6 * pulse, 0.45, 0.4, 1.0], 0.25 + 0.35 * pulse),
+                    crate::maze::Mood::Hostile(f) => {
+                        let grow = (f / 0.04).min(1.0) * ((1.0 - f) / 0.08).min(1.0);
+                        (0.6 + 0.5 * grow, [1.0; 4], 0.0)
+                    }
+                };
+                if !sphere_in_frustum(&vp, *p, 2.5) {
+                    continue;
+                }
+                // (the clump is ~1.8 u; grown to ~3 u it reads against a
+                // 9.5 u wall)
+                let m = Mat4::from_translation(*p) * Mat4::from_axis_angle(Vec3::Y, *yaw) * Mat4::from_scale(Vec3::splat(scale * 1.7));
+                r.queue_draw(self.thorns[k % 3], m, tint, glow, 0.12, false);
+            }
+        }
         // Sproutkit's litter: his own body, small, hopping as it runs
         for k in &game.kitlings {
             if !sphere_in_frustum(&vp, k.pos, ACTOR_CULL_R) {
@@ -1029,7 +1254,49 @@ impl Scene {
             let m = Mat4::from_translation(k.pos + Vec3::Y * hop)
                 * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - yaw)
                 * Mat4::from_scale(Vec3::splat(crate::kit::KITLING_SCALE));
-            r.queue_draw(self.kitling[k.team as usize], m, [1.0; 4], 0.15, models::GOD_DRAW_VOXEL, false);
+            let mesh = if k.clay { self.clay_kit[k.team as usize] } else { self.kitling[k.team as usize] };
+            r.queue_draw(mesh, m, [1.0; 4], 0.15, models::GOD_DRAW_VOXEL, false);
+        }
+        // Claypaw's mudslides: the front, a heaving bank of mud across its
+        // width, surging as it runs
+        for w in &game.mudslides {
+            let side = Vec3::new(-w.dir.z, 0.0, w.dir.x);
+            let n = ((w.width / 2.2).ceil() as i32).max(2);
+            for k in 0..=n {
+                let u = k as f32 / n as f32 - 0.5;
+                let p = w.pos + side * (u * w.width);
+                let p = Vec3::new(p.x, crate::map::ground_y(p.x, p.z), p.z);
+                if !sphere_in_frustum(&vp, p, 3.0) {
+                    continue;
+                }
+                let heave = 0.8 + 0.35 * ((vfx.time * 9.0 + k as f32 * 1.7).sin());
+                let r0 = 1.9 * (0.6 + 0.4 * w.mul);
+                for (back, h) in [(0.0f32, heave), (-1.4, heave * 0.55), (-2.8, heave * 0.25)] {
+                    let q = p + w.dir * back + Vec3::Y * (h * 0.9);
+                    let m = Mat4::from_translation(q) * Mat4::from_axis_angle(Vec3::Y, k as f32 * 0.9) * Mat4::from_scale(Vec3::new(r0, 1.0 + h * 5.0, r0));
+                    r.queue_draw(self.puddle, m, [0.9, 0.8, 0.72, 1.0], 0.0, 0.1, false);
+                }
+            }
+        }
+        // Claypaw's mud: puddles down each slick's line, shrinking as it
+        // dries; a mudslide's darker, and sliding along its way
+        for s in &game.slicks {
+            let len = Vec3::new(s.b.x - s.a.x, 0.0, s.b.z - s.a.z).length();
+            let n = ((len / (s.r * 0.9)).ceil() as usize).max(1);
+            let fade = (s.left / s.secs.max(0.01)).clamp(0.0, 1.0);
+            let flow = if s.push.length_squared() > 0.0 { (vfx.time * 0.8).fract() } else { 0.0 };
+            for k in 0..=n {
+                let u = ((k as f32 + flow) / n as f32).min(1.0);
+                let p = s.a + (s.b - s.a) * u;
+                let p = Vec3::new(p.x, crate::map::ground_y(p.x, p.z) + 0.03, p.z);
+                if !sphere_in_frustum(&vp, p, s.r) {
+                    continue;
+                }
+                let r0 = s.r * (0.55 + 0.45 * fade) * (1.0 + 0.08 * ((k * 7) % 3) as f32);
+                let m = Mat4::from_translation(p) * Mat4::from_axis_angle(Vec3::Y, k as f32 * 1.3) * Mat4::from_scale(Vec3::new(r0, 1.0, r0));
+                let tint = if s.push.length_squared() > 0.0 { [0.8, 0.75, 0.7, 1.0] } else { [1.0; 4] };
+                r.queue_draw(self.puddle, m, tint, 0.0, 0.1, false);
+            }
         }
         // and his glitter-ball, turning over the dance floor
         for z in &game.zones {
@@ -1116,6 +1383,16 @@ fn jungle_spot(rng: &mut Rng, min_clear: f32) -> Option<(f32, f32)> {
     None
 }
 
+/// The middle band: between the side lanes, either side of the river line
+/// through the pits (`glades`' module doc has the picture).
+pub(crate) const MID_BAND: f32 = 44.0;
+/// Of the scatter that lands in the middle band, the share dropped.
+pub(crate) const MID_THIN: f32 = 0.5;
+
+pub(crate) fn in_mid_band(x: f32, z: f32) -> bool {
+    z.abs() < MID_BAND && x.abs() < 78.0 && x.hypot(z) >= crate::midjungle::HOLLOW_RADIUS
+}
+
 /// May scatter put something at `(x, z)`? Off the lanes, out of the river,
 /// out of the pits, off the authored centre and out of the tower clearings.
 fn jungle_ok(x: f32, z: f32, min_clear: f32) -> bool {
@@ -1126,6 +1403,7 @@ fn jungle_ok(x: f32, z: f32, min_clear: f32) -> bool {
         && consts::river_dist(x, z) > 9.5
         && !crate::bosses::in_pit(x, z)
         && !crate::midjungle::reserved(x, z)
+        && !crate::glades::reserved(x, z)
         && !consts::in_tower_clearing(x, z)
 }
 
@@ -1263,6 +1541,14 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
             let (pieces, blockers) = crate::skyworld::build();
             return batch(pieces, blockers);
         }
+        crate::map::MapId::Atlantis => {
+            let (pieces, blockers) = crate::atlantisworld::build();
+            return batch(pieces, blockers);
+        }
+        crate::map::MapId::Maze => {
+            let (pieces, blockers) = crate::mazeworld::build();
+            return batch(pieces, blockers);
+        }
         crate::map::MapId::Jungle => {}
     }
     const TAU: f32 = std::f32::consts::TAU;
@@ -1310,13 +1596,32 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
                 plant!(JungleTree; props::jungle_tree(a.scale, vi), x, z, 0.0, q, V_MED, 1.0);
                 blockers.push_jungle_roots(x, z, 0.0, vi);
             }
-            PropKind::StranglerFig => plant!(StranglerFig; props::strangler_fig(a.scale, vi), x, z, 0.0, q, V_MED, 0.8),
+            PropKind::StranglerFig => {
+                plant!(StranglerFig; props::strangler_fig(a.scale, vi), x, z, 0.0, q, V_MED, 0.8);
+                blockers.push_fig_roots(x, z, 0.0, vi, a.scale, q);
+            }
             PropKind::Palm => plant!(Palm; props::palm(a.scale, vi), x, z, 0.0, q, V_MED, 1.6),
             PropKind::Fern => plant!(Fern; props::fern(vi), x, z, 0.0, 0, V_SM, 2.6),
             PropKind::Bush => plant!(Bush; props::bush(vi), x, z, 0.0, 0, V_SM, 1.8),
             // A kind the layout uses and this match does not build would be
             // a prop that collides and cannot be seen.
             other => panic!("midjungle::layout places {other:?}, which build_world has no mesh arm for"),
+        }
+    }
+
+    // --- the glades: the Rings and the Steps, somewhere for a jungle fight
+    // to happen (`glades`). Before the groves and the scatter, which keep
+    // off them.
+    for (i, a) in crate::glades::layout().into_iter().enumerate() {
+        let (x, z, q, vi) = (a.x, a.z, a.quarter, 700 + i as i32);
+        match a.kind {
+            PropKind::Rock => put!(Rock; props::rock(a.scale), x, z, 0.0, q, V_MED),
+            PropKind::BoulderCluster => put!(BoulderCluster; props::boulder_cluster(a.scale, vi), x, z, 0.0, q, V_MED),
+            PropKind::RuinPillar => put!(RuinPillar; props::ruin_pillar(a.scale, vi), x, z, 0.0, q, V_MED),
+            PropKind::RuinWall => put!(RuinWall; props::ruin_wall(a.scale, vi), x, z, 0.0, q, V_MED),
+            PropKind::Fern => plant!(Fern; props::fern(vi), x, z, 0.0, 0, V_SM, 2.6),
+            PropKind::Bush => plant!(Bush; props::bush(vi), x, z, 0.0, 0, V_MED, 1.8),
+            other => panic!("glades::layout places {other:?}, which build_world has no mesh arm for"),
         }
     }
 
@@ -1343,7 +1648,10 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
                     plant!(JungleTree; props::jungle_tree(sc, v), x, z, 0.0, q, V_MED, 1.0);
                     blockers.push_jungle_roots(x, z, 0.0, v);
                 }
-                PropKind::StranglerFig => plant!(StranglerFig; props::strangler_fig(sc, v), x, z, 0.0, q, V_MED, 0.8),
+                PropKind::StranglerFig => {
+                    plant!(StranglerFig; props::strangler_fig(sc, v), x, z, 0.0, q, V_MED, 0.8);
+                    blockers.push_fig_roots(x, z, 0.0, v, sc, q);
+                }
                 PropKind::Bamboo => plant!(Bamboo; props::bamboo(sc, v), x, z, 0.0, q, V_MED, 2.2),
                 PropKind::Bush => plant!(Bush; props::bush(v), x, z, 0.0, 0, V_MED, 1.8),
                 PropKind::Fern => plant!(Fern; props::fern(v), x, z, 0.0, 0, V_SM, 2.6),
@@ -1355,10 +1663,20 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
 
     // Every scatter pass below goes through this: `jungle_spot`, minus the
     // grove beds.
+    //
+    // ...and thinned in the middle band. A plot of the blockers showed the
+    // band either side of mid (|z| < MID_BAND) as an even speckle of
+    // trunks, rocks and beds: everywhere a little in the way, nowhere a
+    // shape to fight round -- reported as clutter. Half of what lands there
+    // is dropped (not moved: moved, it would crowd the deep jungle instead),
+    // and the fights get authored shapes instead (`glades`).
     let jungle_spot = |rng: &mut Rng, min_clear: f32| -> Option<(f32, f32)> {
         for _ in 0..8 {
             let (x, z) = jungle_spot(rng, min_clear)?;
             if !rooms.iter().any(|&(gx, gz, r)| (x - gx).hypot(z - gz) < r) {
+                if in_mid_band(x, z) && rng.f32() < MID_THIN {
+                    return None;
+                }
                 return Some((x, z));
             }
         }
@@ -1381,7 +1699,9 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
     }
     for _ in 0..16 {
         if let Some((x, z)) = jungle_spot(&mut rng, 9.0) {
-            plant!(StranglerFig; props::strangler_fig(0.9 + rng.f32() * 0.25, v), x, z, 0.0, (v % 4) as u8, V_MED, 0.8);
+            let sc = 0.9 + rng.f32() * 0.25;
+            plant!(StranglerFig; props::strangler_fig(sc, v), x, z, 0.0, (v % 4) as u8, V_MED, 0.8);
+            blockers.push_fig_roots(x, z, 0.0, v, sc, (v % 4) as u8);
         }
         v += 1;
     }
@@ -1456,6 +1776,7 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
     for _ in 0..54 {
         if let Some((x, z)) = jungle_spot(&mut rng, 6.5) {
             plant!(VineCurtain; props::vine_curtain(v), x, z, 0.0, (v % 4) as u8, V_MED, 2.4);
+            blockers.push_curtain_poles(x, z, 0.0, (v % 4) as u8);
         }
         v += 1;
     }
@@ -1499,6 +1820,15 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
         let r = 30.0 + rng.f32() * (ARENA_RADIUS - 50.0);
         let (x, z) = (a.cos() * r, a.sin() * r);
         if consts::lane_clearance(x, z) < 17.0 || consts::river_dist(x, z) < 14.0 {
+            continue;
+        }
+        // a camp is ~9 u across: nowhere near the authored ground, a
+        // tower's, or a pit (none of which it was checked against)
+        let near = |f: &dyn Fn(f32, f32) -> bool| (0..8).any(|k| {
+            let a = k as f32 / 8.0 * TAU;
+            f(x + a.cos() * 9.0, z + a.sin() * 9.0)
+        }) || f(x, z);
+        if near(&|x, z| crate::midjungle::reserved(x, z) || crate::glades::reserved(x, z) || consts::in_tower_clearing(x, z) || crate::bosses::in_pit(x, z)) {
             continue;
         }
         if camps.iter().any(|(cx, cz)| ((cx - x).powi(2) + (cz - z).powi(2)).sqrt() < 34.0) {
@@ -1648,15 +1978,11 @@ fn batch(mut pieces: Vec<Piece>, mut blockers: Blockers) -> (Vec<(VoxelMesh, Vec
     // rebuild by 0).
     let mut cells: std::collections::BTreeMap<(i32, i32, u32), Vec<&Piece>> = std::collections::BTreeMap::new();
     for p in &pieces {
-        let cls = if p.vsize == V_SM {
-            0u32
-        } else if p.vsize == V_MED {
-            1
-        } else if p.vsize == V_BIG {
-            2
-        } else {
-            3
-        };
+        // one chunk per voxel size: a chunk is drawn at its FIRST piece's
+        // size, so two sizes sharing a chunk drew one of them wrong (every
+        // size outside the three named ones shared class 3)
+        let cls = p.vsize.to_bits();
+        let _ = (V_SM, V_MED, V_BIG);
         let key = ((p.pos.x / 34.0).floor() as i32, (p.pos.z / 34.0).floor() as i32, cls);
         cells.entry(key).or_default().push(p);
     }
@@ -1764,6 +2090,57 @@ mod plan_tests {
         }
         // And the root steps registered for the screen's trees do not push.
         assert!(b.steps().len() > 224, "the screen's jungle trees brought their roots: {}", b.steps().len());
+    }
+
+    /// The glades are what stands on their ground: every round prop inside
+    /// a Ring's clearing or along the Steps is one of theirs (the scatter
+    /// and the groves were kept off), and the middle band holds less
+    /// scatter than the same area of deep jungle (`MID_THIN`).
+    #[test]
+    fn scatter_leaves_the_glades_alone_and_thins_the_middle() {
+        use crate::blockers::Shape;
+        let (_, _, b) = build_world();
+        let glade = crate::glades::layout();
+        let mut inside = 0;
+        for bl in b.all() {
+            if let Shape::Circle { x, z, .. } = bl.shape {
+                // (the pit's own ring of boulders is where the Steps lead)
+                let pit_ring = crate::bosses::pit_positions().iter().any(|p| (p.x - x).hypot(p.z - z) < crate::bosses::PIT_RADIUS + 3.0);
+                if crate::glades::reserved(x, z) && !pit_ring {
+                    inside += 1;
+                    assert!(glade.iter().any(|p| (p.x - x).hypot(p.z - z) < 0.3), "a scattered prop at ({x:.1}, {z:.1}) on a glade's ground");
+                }
+            }
+        }
+        assert!(inside >= 20, "the glades' own props were found on their ground: {inside}");
+        // props per 1000 u^2, middle band against the jungle band beyond it
+        // (40..75 u from the centre line on each side, off the band), both
+        // outside anything authored
+        let density = |f: &dyn Fn(f32, f32) -> bool| {
+            let (mut n, mut area) = (0usize, 0usize);
+            let mut z = -160.0f32;
+            while z < 160.0 {
+                let mut x = -160.0f32;
+                while x < 160.0 {
+                    if f(x, z) && jungle_ok(x, z, 5.0) {
+                        area += 1;
+                    }
+                    x += 2.0;
+                }
+                z += 2.0;
+            }
+            for bl in b.all() {
+                if let Shape::Circle { x, z, .. } = bl.shape {
+                    if f(x, z) && jungle_ok(x, z, 5.0) {
+                        n += 1;
+                    }
+                }
+            }
+            n as f32 / (area as f32 * 4.0) * 1000.0
+        };
+        let mid = density(&|x, z| in_mid_band(x, z));
+        let deep = density(&|x, z| !in_mid_band(x, z) && x.hypot(z) < ARENA_RADIUS - 10.0 && x.hypot(z) > 60.0);
+        assert!(mid > 0.0 && mid < deep * 0.8, "middle {mid:.2} props / 1000 u^2 against {deep:.2} in the deep jungle");
     }
 
     /// The performance claim, measured on the REAL world rather than argued:
@@ -1935,3 +2312,4 @@ pub fn switch_world(r: &mut Renderer, old: Option<Scene>, m: crate::map::MapId) 
     }
     Scene::new(r)
 }
+

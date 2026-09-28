@@ -79,6 +79,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("select") {
         return run_select_shot();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("custom") {
+        return run_select_shot();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("aim") {
         return run_aim_shots();
     }
@@ -111,6 +114,30 @@ pub fn run() -> Result<(), String> {
     }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("sprout") {
         return run_sprout_shots();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("maze") {
+        return crate::mazeshots::run();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("atlantis") {
+        return crate::atlantisshots::run();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("flare") {
+        return run_flare_shots();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("glades") {
+        return run_glade_shots();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("hollow") {
+        return run_hollow_shots();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("brass") {
+        return run_brass_shots();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("ore") {
+        return run_ore_shots();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("hud") {
+        return run_hud_shots();
     }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("sky") {
         return crate::skyshots::run();
@@ -805,6 +832,31 @@ pub fn run_shop_shots() -> Result<(), String> {
         save_shot(&renderer.device, &renderer.queue, &target, name)?;
         println!("saved {name}");
     }
+    // A PinePhone held landscape: 720 x 360 logical, at 1280 x 640.
+    {
+        let (lw, lh) = (1280u32, 640u32);
+        let ltarget = mk(&renderer, lw, lh);
+        let lview = ltarget.create_view(&Default::default());
+        clear(&renderer.device, &renderer.queue, &lview);
+        let out = shop_frame(&egui_ctx, &mut game, &mut ui_state, lw, lh, lw as f32 / 720.0);
+        draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &lview, &egui_ctx, out, lw, lh);
+        save_shot(&renderer.device, &renderer.queue, &ltarget, "clawbound_shop_pinephone_landscape.png")?;
+        println!("saved clawbound_shop_pinephone_landscape.png");
+    }
+    // The Curio shelf, one of them in the study pane.
+    ui_state.shop_tab = crate::items::Cat::Curio;
+    ui_state.shop_study = crate::items::all().iter().find(|i| i.name == "Thrice-Pounce Claws").map(|i| i.id);
+    {
+        renderer.atmosphere = game.weather.atmosphere();
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.render_frame(&view, cam, 1.0);
+        let out = shop_frame(&egui_ctx, &mut game, &mut ui_state, W, H, 1.0);
+        draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &egui_ctx, out, W, H);
+        save_shot(&renderer.device, &renderer.queue, &target, "clawbound_shop_curios.png")?;
+        println!("saved clawbound_shop_curios.png");
+    }
+    ui_state.shop_tab = rec[0];
+    ui_state.shop_study = None;
     // Portrait phone: the shop alone on a cleared frame, on its Shelves
     // tab and then its Hoard tab.
     let (pw, ph) = (576u32, 1248u32); // width*4 must be a multiple of 256 for the readback
@@ -1336,6 +1388,11 @@ pub fn run_select_shot() -> Result<(), String> {
     let mut st = UiState::new();
     st.map_choice = crate::map::MapId::Sky;
     st.selected = crate::gods::ROSTER_LEN - 1; // the newest ancestor
+    // the rules as a launch would set them (CLAWBOUND_RULES / _GODS / _MIRROR)
+    st.rules = crate::launch::LaunchOptions::from_process().rules;
+    // CLAWBOUND_SHOTS=custom: the custom-game screen instead
+    let custom = std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("custom");
+    st.custom = custom;
     clear(&renderer.device, &renderer.queue, &view);
     let mut textures = egui::TexturesDelta::default();
     let mut out = None;
@@ -1346,15 +1403,23 @@ pub fn run_select_shot() -> Result<(), String> {
             time: Some(k as f64 * 0.016),
             ..Default::default()
         };
-        let o = ctx.run(raw, |c| ui::draw_select(c, &mut st, &mut locked));
+        let o = ctx.run(raw, |c| {
+            if custom {
+                let (mut next, mut back) = (false, false);
+                ui::draw_custom(c, &mut st, &mut next, &mut back);
+            } else {
+                ui::draw_select(c, &mut st, &mut locked);
+            }
+        });
         textures.append(o.textures_delta.clone());
         out = Some(o);
     }
     let mut out = out.expect("ran");
     out.textures_delta = textures;
     draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
-    save_shot(&renderer.device, &renderer.queue, &target, "select_map_picker.png")?;
-    println!("saved select_map_picker.png");
+    let name = if custom { "custom_game.png" } else { "select_map_picker.png" };
+    save_shot(&renderer.device, &renderer.queue, &target, name)?;
+    println!("saved {name}");
     Ok(())
 }
 
@@ -1975,7 +2040,7 @@ pub fn run_settings_shot() -> Result<(), String> {
             time: Some(k as f64 * 0.016),
             ..Default::default()
         };
-        let mut panel = ui::ControlsPanel { close: false, capture: None, clear: None, scheme: None, reset: false };
+        let mut panel = ui::ControlsPanel { in_match: true, leave: false, close: false, capture: None, clear: None, scheme: None, reset: false };
         let o = ctx.run(raw, |c| {
             ui::draw_fps(c, 60.0, 16.7);
             ui::draw_controls(c, &mut cfg, None, false, &mut panel);
@@ -2114,5 +2179,449 @@ pub fn run_quality_shots() -> Result<(), String> {
         save_shot(&renderer.device, &renderer.queue, &target, &name)?;
         println!("saved {name}: shadow map {} px", renderer.shadow_size);
     }
+    Ok(())
+}
+
+
+/// The HUD's level track and ability ranks (`ranks`): a cat at level 4 with
+/// the ultimate still locked, then the same cat just reaching 5 (the toast),
+/// then at 15 with every ability at its top.
+fn run_hud_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("hud"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    // CLAWBOUND_HUD_GOD=<id> puts another ancestor in the player's seat
+    // (Oremantle, 17, to see her WORN coat); the shots are then prefixed
+    // with the id
+    let who: u32 = std::env::var("CLAWBOUND_HUD_GOD").ok().and_then(|v| v.parse().ok()).filter(|&i: &u32| (i as usize) < crate::gods::ROSTER_LEN).unwrap_or(14);
+    let mut game = Game::new(who, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    game.blockers = scene.blockers.clone();
+    let mut vfx = Vfx::default();
+    for _ in 0..60 {
+        game.tick(1.0 / 60.0);
+    }
+    let p = game.gods[0].pos;
+    let cam = Camera { eye: p + Vec3::new(6.0, 9.0, -10.0), target: p + Vec3::Y * 1.2, fov_y: 0.95 };
+    let mut egui_renderer = egui_wgpu::Renderer::new(&renderer.device, wgpu::TextureFormat::Rgba8UnormSrgb, None, 1);
+    let ctx = egui::Context::default();
+    let mut st = UiState::new();
+    for (name, level, xp_frac, toast) in [("hud_level4.png", 4u32, 0.6f32, false), ("hud_level5_toast.png", 5, 0.05, true), ("hud_level15.png", 15, 0.0, false)] {
+        game.set_level(0, level);
+        game.gods[0].xp = crate::consts::xp_for_level(level) * xp_frac;
+        game.gods[0].cds = [0.0, 3.2, 0.0, 0.0];
+        if !toast {
+            st.level_seen = level;
+            st.level_toast_t = 0.0;
+        } else {
+            st.level_seen = level - 1;
+        }
+        renderer.clear_queues();
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        let vp = cam.view_proj(W as f32 / H as f32);
+        let mut textures = egui::TexturesDelta::default();
+        let mut out = None;
+        for k in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W as f32, H as f32))),
+                time: Some(1.0 + k as f64 * 0.016),
+                ..Default::default()
+            };
+            let o = ctx.run(raw, |c| ui::draw_hud(c, &game, 0, vp, W as f32, H as f32, &mut st, renderer.camera.eye));
+            textures.append(o.textures_delta.clone());
+            out = Some(o);
+        }
+        let mut out = out.expect("ran");
+        out.textures_delta = textures;
+        draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
+        let name = if who == 14 { name.to_string() } else { format!("hud_{who}_{}", &name[4..]) };
+        save_shot(&renderer.device, &renderer.queue, &target, &name)?;
+        println!("saved {name}");
+    }
+    Ok(())
+}
+
+
+/// The lens flare (`lensflare`, post.wgsl): a low sun in frame on a clear
+/// day, looked at from the lane at High and Ultra, and with the sun behind
+/// a trunk (the flare must go out), and the same view on Low (none).
+/// `CLAWBOUND_SHOTS=flare clawbound-battleground --screenshot`
+pub fn run_flare_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("flare"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let mut scene = Scene::new(&mut renderer);
+    let mut game = Game::new_teams(&[0], &[1]);
+    game.blockers = scene.blockers.clone();
+    let spot = Vec3::new(0.0, 0.0, -40.0);
+    game.gods[0].pos = spot + Vec3::new(0.8, 0.0, 3.0);
+    game.gods[1].respawn_t = 999.0;
+    game.gods[0].ai = None;
+    let mut vfx = Vfx::default();
+    for _ in 0..20 {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+        vfx.update(1.0 / 60.0, &[], &game);
+    }
+    let mut atm = game.weather.atmosphere();
+    atm.wetness = 0.0;
+    atm.rain = 0.0;
+    atm.cloud_cover = 0.05;
+    atm.night = 0.0;
+    atm.sun_dir = Vec3::new(0.35, 0.42, 1.0).normalize();
+    let eye = spot + Vec3::new(0.0, 2.2, -6.0);
+    let sun_x = atm.sun_dir.x;
+    let sun_z = atm.sun_dir.z;
+    let look = |yaw_off: f32, pitch: f32| {
+        let d = Vec3::new(sun_x + yaw_off, pitch, sun_z).normalize();
+        Camera { eye, target: eye + d * 20.0, fov_y: 1.0 }
+    };
+    let shots: [(&str, crate::quality::Quality, Camera); 4] = [
+        ("flare_high.png", crate::quality::Quality::High, look(-0.3, 0.3)),
+        ("flare_ultra_offaxis.png", crate::quality::Quality::Ultra, look(0.3, 0.2)),
+        ("flare_low.png", crate::quality::Quality::Low, look(-0.3, 0.3)),
+        // the sun low, behind the ruined pillar on the lane: no flare
+        ("flare_occluded.png", crate::quality::Quality::High, look(-0.35, 0.02)),
+    ];
+    for (name, q, cam) in shots {
+        let mut atm = atm;
+        if name == "flare_occluded.png" {
+            atm.sun_dir = Vec3::new(0.35, 0.16, 1.0).normalize();
+        }
+        renderer.quality = q;
+        renderer.set_shadow_size(q.shadow_size());
+        scene.ultra = q == crate::quality::Quality::Ultra && scene.ultra;
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = atm;
+        renderer.render_frame(&view, cam, 1.0);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+    }
+    // Caustics on a river bed (common_sea.wgsl): a high sun over the
+    // western river, looked down at, on High and on Low (none).
+    let rx = crate::consts::river_x(-1.0, 10.0);
+    let bed = Vec3::new(rx, 0.0, 10.0);
+    let mut atm2 = atm;
+    // the sun behind the camera: its glitter off the surface out of view
+    atm2.sun_dir = Vec3::new(-0.35, 0.85, -0.45).normalize();
+    for (name, q) in [("river_caustics_high.png", crate::quality::Quality::High), ("river_caustics_low.png", crate::quality::Quality::Low)] {
+        renderer.quality = q;
+        renderer.set_shadow_size(q.shadow_size());
+        let cam = Camera { eye: bed + Vec3::new(-5.0, 6.5, -7.0), target: bed, fov_y: 0.9 };
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = atm2;
+        renderer.render_frame(&view, cam, 3.0);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+    }
+    Ok(())
+}
+
+/// The jungle's glades (`glades`), from a cat's height and from above: a
+/// Ring, and the Steps up to a pit. `CLAWBOUND_SHOTS=glades`.
+pub fn run_glade_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("glades"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let mut scene = Scene::new(&mut renderer);
+    let mut game = Game::new_teams(&[0], &[1]);
+    game.blockers = scene.blockers.clone();
+    let (rx, rz) = crate::glades::RING;
+    game.gods[0].pos = Vec3::new(rx + 0.8, 1.4, rz + 1.2);
+    game.gods[1].respawn_t = 999.0;
+    game.gods[0].ai = None;
+    let mut vfx = Vfx::default();
+    for _ in 0..20 {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+        vfx.update(1.0 / 60.0, &[], &game);
+    }
+    let mut atm = game.weather.atmosphere();
+    atm.wetness = 0.0;
+    atm.rain = 0.0;
+    atm.cloud_cover = 0.2;
+    atm.night = 0.0;
+    atm.sun_dir = Vec3::new(0.3, 0.8, 0.4).normalize();
+    renderer.atmosphere = atm;
+    let pit = crate::bosses::pit_positions()[1];
+    let steps_mid = Vec3::new(pit.x * 0.62, 0.0, pit.z * 0.62);
+    let shots: [(&str, Camera); 3] = [
+        ("glade_ring_above.png", Camera { eye: Vec3::new(rx - 14.0, 26.0, rz - 16.0), target: Vec3::new(rx, 0.0, rz), fov_y: 0.9 }),
+        ("glade_ring_ground.png", Camera { eye: Vec3::new(rx - 13.0, 3.0, rz - 9.0), target: Vec3::new(rx + 2.0, 1.5, rz + 2.0), fov_y: 1.0 }),
+        ("glade_steps.png", Camera { eye: steps_mid + Vec3::new(-16.0, 16.0, -14.0), target: steps_mid + Vec3::new(6.0, 0.0, 0.0), fov_y: 1.0 }),
+    ];
+    renderer.quality = crate::quality::Quality::High;
+    renderer.set_shadow_size(crate::quality::Quality::High.shadow_size());
+    for (name, cam) in shots {
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = atm;
+        renderer.render_frame(&view, cam, 1.0);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+    }
+    Ok(())
+}
+
+/// Hollowstep (`stalker`): close up; his other stalking a foe across a
+/// clearing; every shadow risen; and the prey's own screen, afraid, with
+/// him close. `CLAWBOUND_SHOTS=hollow`.
+pub fn run_hollow_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("hollow"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let him = crate::gods::ROSTER.iter().position(|d| matches!(d.pelt, crate::gods::PeltKind::Hollow)).unwrap() as u32;
+    // the prey is the "player" (index 0), for the HUD shot
+    let mut game = Game::new_teams(&[0], &[him]);
+    game.blockers = scene.blockers.clone();
+    game.next_wave_t = 1e9;
+    game.set_level(1, 5);
+    for g in game.gods.iter_mut() {
+        g.ai = None;
+        g.mana = 9999.0;
+    }
+    // on mid lane between the towers: open ground to see them on
+    let at = Vec3::new(0.0, 0.0, -24.0);
+    game.gods[1].pos = at;
+    game.gods[1].yaw = std::f32::consts::FRAC_PI_2;
+    game.gods[0].pos = at + Vec3::new(0.0, 0.0, 30.0);
+    game.gods[0].yaw = -std::f32::consts::FRAC_PI_2;
+    let mut vfx = Vfx::default();
+    let step = |game: &mut Game, vfx: &mut Vfx, secs: f32| {
+        for _ in 0..(secs * 60.0) as usize {
+            game.tick(1.0 / 60.0);
+            let ev = std::mem::take(&mut game.events);
+            vfx.update(1.0 / 60.0, &ev, game);
+        }
+    };
+    let mut egui_renderer = egui_wgpu::Renderer::new(&renderer.device, wgpu::TextureFormat::Rgba8UnormSrgb, None, 1);
+    let ctx = egui::Context::default();
+    let mut st = UiState::new();
+    let mut shoot = |renderer: &mut Renderer, game: &Game, vfx: &mut Vfx, name: &str, cam: Camera, hud: bool| -> Result<(), String> {
+        renderer.clear_queues();
+        scene.draw(renderer, game, vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        if hud {
+            let vp = cam.view_proj(W as f32 / H as f32);
+            let mut textures = egui::TexturesDelta::default();
+            let mut out = None;
+            for k in 0..2 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W as f32, H as f32))),
+                    time: Some(1.0 + k as f64 * 0.016),
+                    ..Default::default()
+                };
+                let o = ctx.run(raw, |c| ui::draw_hud(c, game, 0, vp, W as f32, H as f32, &mut st, renderer.camera.eye));
+                textures.append(o.textures_delta.clone());
+                out = Some(o);
+            }
+            let mut out = out.expect("ran");
+            out.textures_delta = textures;
+            draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
+        }
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+        Ok(())
+    };
+    step(&mut game, &mut vfx, 0.3);
+    shoot(&mut renderer, &game, &mut vfx, "hollow_close.png", Camera { eye: at + Vec3::new(2.2, 1.5, 2.8), target: at + Vec3::Y * 1.2, fov_y: 0.8 }, false)?;
+    // his other, walking at the prey across the jungle
+    let k = game.main_other(1).expect("his other");
+    let prey = game.gods[0].pos;
+    game.others[k].pos = prey + Vec3::new(0.0, 0.0, -16.0);
+    game.gods[1].pos = prey + Vec3::new(0.0, 0.0, 40.0);
+    step(&mut game, &mut vfx, 1.5);
+    let o = game.others[k].pos;
+    shoot(&mut renderer, &game, &mut vfx, "hollow_other.png", Camera { eye: prey + Vec3::new(1.5, 2.2, 3.5), target: o + Vec3::Y * 1.0, fov_y: 0.9 }, false)?;
+    game.gods[1].pos = at;
+    // every shadow
+    game.gods[1].cds = [0.0; 4];
+    game.cast_queue.push((1, 3, at + Vec3::Z * 3.0));
+    step(&mut game, &mut vfx, 0.9);
+    shoot(&mut renderer, &game, &mut vfx, "hollow_every_shadow.png", Camera { eye: at + Vec3::new(-6.0, 3.5, -6.0), target: at + Vec3::new(0.0, 1.0, 1.0), fov_y: 0.9 }, false)?;
+    // afraid: the prey's own screen, him a few paces off
+    game.others.retain(|o| !o.echo);
+    game.gods[1].pos = prey + Vec3::new(0.0, 0.0, -5.0);
+    step(&mut game, &mut vfx, 0.02);
+    // on the beat
+    game.gods[0].beat_t = crate::stalker::beat_every(game.gods[0].fear);
+    let p = game.gods[0].pos;
+    shoot(&mut renderer, &game, &mut vfx, "hollow_afraid_hud.png", Camera { eye: p + Vec3::new(0.0, 5.0, 9.0), target: p + Vec3::new(0.0, 1.0, -4.0), fov_y: 0.95 }, true)?;
+    Ok(())
+}
+
+/// Oremantle (`sentinel`): beside her granddaughter Stonewhisper for size,
+/// then in each of her four coats on the lane, an enemy in the field.
+/// `CLAWBOUND_SHOTS=ore`.
+pub fn run_ore_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ore"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let id = |n: &str| crate::gods::ROSTER.iter().position(|d| d.name == n).unwrap() as u32;
+    let mut game = Game::new_teams(&[id("Oremantle"), id("Stonewhisper")], &[id("Goldenmane")]);
+    game.blockers = scene.blockers.clone();
+    game.next_wave_t = 1e9;
+    for i in 0..game.gods.len() {
+        game.set_level(i, 5);
+        game.gods[i].ai = None;
+        game.gods[i].mana = 9999.0;
+    }
+    let at = Vec3::new(0.0, 0.0, -24.0);
+    game.gods[0].pos = at;
+    game.gods[0].yaw = std::f32::consts::FRAC_PI_2;
+    game.gods[1].pos = at + Vec3::new(3.2, 0.0, 0.0);
+    game.gods[1].yaw = std::f32::consts::FRAC_PI_2;
+    game.gods[2].pos = at + Vec3::new(-40.0, 0.0, 0.0);
+    let mut vfx = Vfx::default();
+    let step = |game: &mut Game, vfx: &mut Vfx, secs: f32| {
+        for _ in 0..(secs * 60.0) as usize {
+            game.tick(1.0 / 60.0);
+            let ev = std::mem::take(&mut game.events);
+            vfx.update(1.0 / 60.0, &ev, game);
+        }
+    };
+    let mut shoot = |renderer: &mut Renderer, game: &Game, vfx: &mut Vfx, name: &str, cam: Camera| -> Result<(), String> {
+        renderer.clear_queues();
+        scene.draw(renderer, game, vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+        Ok(())
+    };
+    step(&mut game, &mut vfx, 0.5);
+    shoot(&mut renderer, &game, &mut vfx, "ore_size.png", Camera { eye: at + Vec3::new(1.6, 1.8, 7.5), target: at + Vec3::new(1.6, 1.2, 0.0), fov_y: 0.8 })?;
+    // the enemy steps into her field, her granddaughter out of shot
+    game.gods[1].pos = at + Vec3::new(20.0, 0.0, -6.0);
+    game.gods[2].pos = at + Vec3::new(-2.5, 0.0, 5.0);
+    game.gods[2].yaw = -std::f32::consts::FRAC_PI_2;
+    let cam = Camera { eye: at + Vec3::new(-9.0, 9.0, -9.0), target: at + Vec3::new(0.0, 0.5, 1.5), fov_y: 1.0 };
+    for m in [crate::gods::Material::Granite, crate::gods::Material::Rime, crate::gods::Material::Lodestone, crate::gods::Material::Magma] {
+        let k = game.coat_key(0, m).ok_or("coat locked")?;
+        game.gods[0].cds[k as usize] = 0.0;
+        game.cast_queue.push((0, k, at + Vec3::Z));
+        step(&mut game, &mut vfx, 1.0);
+        game.gods[2].hp = game.gods[2].max_hp;
+        shoot(&mut renderer, &game, &mut vfx, &format!("ore_{}.png", m.name()), cam)?;
+        step(&mut game, &mut vfx, 0.5);
+    }
+    Ok(())
+}
+
+/// Brasshowl (`lantern`): close up, and the lamp raised on the lane --
+/// Hollowstep and a friend of his running from it, shown up with a flame
+/// over them, Hollowstep's other torn out of the light.
+/// `CLAWBOUND_SHOTS=brass`.
+pub fn run_brass_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("brass"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let id = |n: &str| crate::gods::ROSTER.iter().position(|d| d.name == n).unwrap() as u32;
+    let mut game = Game::new_teams(&[id("Brasshowl")], &[id("Hollowstep"), 1]);
+    game.blockers = scene.blockers.clone();
+    game.next_wave_t = 1e9;
+    for i in 0..game.gods.len() {
+        game.set_level(i, 5);
+        game.gods[i].ai = None;
+        game.gods[i].mana = 9999.0;
+    }
+    let at = Vec3::new(0.0, 0.0, -24.0);
+    game.gods[0].pos = at;
+    game.gods[0].yaw = std::f32::consts::FRAC_PI_2;
+    game.gods[1].pos = at + Vec3::new(-2.0, 0.0, 6.0);
+    game.gods[2].pos = at + Vec3::new(3.0, 0.0, 7.0);
+    let mut vfx = Vfx::default();
+    let step = |game: &mut Game, vfx: &mut Vfx, secs: f32| {
+        for _ in 0..(secs * 60.0) as usize {
+            game.tick(1.0 / 60.0);
+            let ev = std::mem::take(&mut game.events);
+            vfx.update(1.0 / 60.0, &ev, game);
+        }
+    };
+    let mut shoot = |renderer: &mut Renderer, game: &Game, vfx: &mut Vfx, name: &str, cam: Camera| -> Result<(), String> {
+        renderer.clear_queues();
+        scene.draw(renderer, game, vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+        Ok(())
+    };
+    step(&mut game, &mut vfx, 0.3);
+    shoot(&mut renderer, &game, &mut vfx, "brass_close.png", Camera { eye: at + Vec3::new(2.0, 1.3, 2.6), target: at + Vec3::Y * 0.9, fov_y: 0.8 })?;
+    // Hollowstep's other beside him too
+    if let Some(k) = game.main_other(1) {
+        game.others[k].pos = at + Vec3::new(4.0, 0.0, 3.0);
+    }
+    game.cast_queue.push((0, 3, at + Vec3::Z));
+    step(&mut game, &mut vfx, 0.75);
+    shoot(&mut renderer, &game, &mut vfx, "brass_lamp.png", Camera { eye: at + Vec3::new(-8.0, 6.0, -8.0), target: at + Vec3::new(0.0, 1.0, 4.0), fov_y: 1.0 })?;
+    step(&mut game, &mut vfx, 0.9);
+    shoot(&mut renderer, &game, &mut vfx, "brass_fleeing.png", Camera { eye: at + Vec3::new(-10.0, 8.0, -6.0), target: at + Vec3::new(0.0, 1.0, 8.0), fov_y: 1.0 })?;
     Ok(())
 }

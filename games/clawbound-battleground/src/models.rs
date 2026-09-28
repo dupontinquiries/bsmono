@@ -39,6 +39,20 @@ pub fn god_palette(def: &GodDef, team: Team) -> [[f32; 3]; 4] {
 pub const GV: f32 = 0.05;
 /// Cube edge used when drawing ancestor meshes.
 pub const GOD_DRAW_VOXEL: f32 = 0.055;
+
+/// This ancestor's voxel spacing: GV, times the role's size. A Sentinel is
+/// the same grid built at a bigger unit, so her body, the rig cut from it,
+/// where her paws plant and her shadow all scale together -- scaling the
+/// drawn matrix instead would leave the paws planting where a small cat's
+/// would (`footfall` works from the rig's hips in world space).
+pub fn body_voxel(def: &GodDef) -> f32 {
+    GV * def.role.size()
+}
+
+/// The cube edge to draw (and smooth) this ancestor's meshes with.
+pub fn draw_voxel(def: &GodDef) -> f32 {
+    GOD_DRAW_VOXEL * def.role.size()
+}
 // Grid: 30 x 50 x 56, body centred at (CX, _, CZ). It was 30 x 42 x 48, which
 // silently clipped two things `Grid::set` drops without a word: the antlers
 // above y = 41 (Stillsmoke lost the top four voxels of each beam) and the
@@ -50,7 +64,7 @@ const CZ: i32 = 28;
 
 fn role_bulk(role: Role) -> i32 {
     match role {
-        Role::Guardian => 2,
+        Role::Guardian | Role::Sentinel => 2,
         Role::Warrior => 1,
         Role::Mage | Role::Hunter => 0,
         Role::Assassin => -1,
@@ -58,7 +72,7 @@ fn role_bulk(role: Role) -> i32 {
 }
 
 pub fn build_god(def: &GodDef, team: Team) -> VoxelMesh {
-    god_grid(def, team).mesh(GV, true)
+    god_grid(def, team).mesh(body_voxel(def), true)
 }
 
 /// An ancestor cut into posable parts, with the rig that poses them.
@@ -70,7 +84,8 @@ pub struct RiggedGod {
 pub fn build_god_rigged(def: &GodDef, team: Team) -> RiggedGod {
     let bulk = role_bulk(def.role);
     let plan = feline_cut_plan(bulk, matches!(def.pelt, PeltKind::Antlers));
-    RiggedGod { meshes: plan.cut(&god_grid(def, team), GV), rig: feline_rig(bulk) }
+    let gv = body_voxel(def);
+    RiggedGod { meshes: plan.cut(&god_grid(def, team), gv), rig: feline_rig_at(bulk, gv) }
 }
 
 /// Leg column geometry shared by the authoring, the cut and the rig, so the
@@ -114,21 +129,26 @@ pub fn feline_cut_plan(bulk: i32, antlers: bool) -> crate::rigged::CutPlan {
 }
 
 pub fn feline_rig(bulk: i32) -> crate::rigged::QuadRig {
+    feline_rig_at(bulk, GV)
+}
+
+/// The rig for a body built at voxel spacing `gv` (`body_voxel`).
+pub fn feline_rig_at(bulk: i32, gv: f32) -> crate::rigged::QuadRig {
     // voxel -> rig frame (X forward, Y up, Z right; model left is +X).
     const BODY_Y: f32 = 24.0;
-    let at = |x: f32, y: f32, z: f32| [(z - CZ as f32) * GV, (y - BODY_Y) * GV, -(x - CX as f32) * GV];
+    let at = |x: f32, y: f32, z: f32| [(z - CZ as f32) * gv, (y - BODY_Y) * gv, -(x - CX as f32) * gv];
     let cols = leg_columns(bulk);
     let leg = |i: usize| {
         let (x, z, lt) = cols[i];
         let top = LEG_TOP as f32 + 1.0;
-        (at(x as f32 + 0.5, top * 0.5, z as f32 + 0.5), [(lt as f32 + 1.5) * GV, top * 0.5 * GV, (lt as f32 + 0.5) * GV])
+        (at(x as f32 + 0.5, top * 0.5, z as f32 + 0.5), [(lt as f32 + 1.5) * gv, top * 0.5 * gv, (lt as f32 + 0.5) * gv])
     };
     crate::rigged::QuadRig::new(
-        glam::Vec3::new(0.0, BODY_Y * GV, 0.0),
-        [18.0 * GV, 7.5 * GV, (7.0 + bulk as f32) * GV],
+        glam::Vec3::new(0.0, BODY_Y * gv, 0.0),
+        [18.0 * gv, 7.5 * gv, (7.0 + bulk as f32) * gv],
         leg(0), leg(1), leg(2), leg(3),
-        (at(CX as f32, 32.5, CZ as f32 + 21.5), [5.5 * GV, 5.0 * GV, 5.0 * GV]),
-        (at(CX as f32, 27.0, CZ as f32 - 22.5), [4.0 * GV, 1.5 * GV, 1.5 * GV]),
+        (at(CX as f32, 32.5, CZ as f32 + 21.5), [5.5 * gv, 5.0 * gv, 5.0 * gv]),
+        (at(CX as f32, 27.0, CZ as f32 - 22.5), [4.0 * gv, 1.5 * gv, 1.5 * gv]),
     )
 }
 
@@ -142,7 +162,8 @@ fn god_grid(def: &GodDef, team: Team) -> Grid {
 
     let bulk = role_bulk(def.role);
     let bf = bulk as f32;
-    let crag = matches!(def.pelt, PeltKind::Crag);
+    // the thick mountain coat: Stonewhisper's, and her grandmother's
+    let crag = matches!(def.pelt, PeltKind::Crag | PeltKind::Mantle);
     let extra = if crag { 1.0 } else { 0.0 };
 
     let mut g = Grid::new(30, H as usize, NZ);
@@ -218,6 +239,14 @@ fn god_grid(def: &GodDef, team: Team) -> Grid {
     let (ear_h, ear_w, tuft): (i32, i32, bool) = match def.pelt {
         PeltKind::EarTufts => (5, 1, true),
         PeltKind::BigEars => (7, 2, false),
+        // long, lean ears (one notched, below)
+        PeltKind::Hollow => (5, 1, false),
+        // a sand cat's ears: broad and low, set wide
+        PeltKind::Lamp => (3, 2, false),
+        // a Pallas's cat's: small, round, set low and wide on a flat head
+        PeltKind::Hours => (2, 2, false),
+        // a fishing cat's: short and rounded
+        PeltKind::Clay => (2, 1, false),
         _ => (3, 1, false),
     };
     for sx in [-1i32, 1] {
@@ -297,6 +326,132 @@ fn god_grid(def: &GodDef, team: Team) -> Grid {
                 let r = 1.4 * (1.0 - t * 0.6);
                 g.ellipsoid(x, y, z, r, r, r * 1.3, solid(mix(accent, second, t)));
             }
+        }
+        PeltKind::Lamp => {
+            // a brass lantern hung at the breast from the collar: a small
+            // frame of brass round a bright flame, a ring on top; faint
+            // bars on the legs (a sand cat's)
+            let brass = solid([0.72, 0.52, 0.20]);
+            let lz = czf as i32 + 19;
+            g.filled_box(cx - 1, 20, lz, cx + 1, 23, lz + 2, brass);
+            g.filled_box(cx, 21, lz + 1, cx, 22, lz + 2, solid([1.0, 0.92, 0.55]));
+            g.set(cx, 24, lz + 1, brass);
+            g.set(cx, 25, lz + 1, brass);
+            paint_shell(&mut g, |_x, y, _z| (6..=12).contains(&y) && y % 3 == 0, solid(mix(pelt, dark, 0.35)));
+        }
+        PeltKind::Clay => {
+            // river clay: dark spots in rows down the flanks (a fishing
+            // cat's), the cracks of drying clay over the back, and a wet
+            // gleam of fresh slip at the shoulders and paws
+            paint_shell(&mut g, |x, y, z| {
+                if !(12..=28).contains(&y) {
+                    return false;
+                }
+                (z + 40).rem_euclid(4) == 0 && (y + x + 40).rem_euclid(4) == 1
+            }, solid(mix(pelt, dark, 0.55)));
+            paint_shell(&mut g, |x, y, z| {
+                if y < 26 {
+                    return false;
+                }
+                // a crack: a thin wandering line (where two hashes meet)
+                let h = ((x * 7 + z * 3) as u32).wrapping_mul(2654435761) >> 26;
+                (z + (h as i32 % 3) + 40).rem_euclid(7) == 0
+            }, solid(mix(dark, pelt, 0.2)));
+            let slip = solid(mix(pelt, [0.95, 0.85, 0.75], 0.35));
+            paint_shell(&mut g, |_x, y, z| (y <= 2) || ((29..=31).contains(&y) && (z - cz - 12).abs() <= 3), slip);
+        }
+        PeltKind::Hours => {
+            // a Pallas's cat: frosted tips all over the long smoky coat;
+            // thin dark bars on the brow and down the cheeks; dark rings
+            // round the tail; and on her back a small brass hourglass, its
+            // sand pale and bright
+            paint_shell(&mut g, |x, y, z| {
+                if y < 14 {
+                    return false;
+                }
+                let h = ((x * 13 + z * 29 + y * 5) as u32).wrapping_mul(2654435761) >> 24;
+                h > 200
+            }, solid(mix(pelt, [1.0, 1.0, 1.0], 0.45)));
+            paint_shell(&mut g, |_x, y, z| z < cz - 17 && y > 20 && (z + 40).rem_euclid(3) == 0, solid(dark));
+            for dx in [-2i32, 0, 2] {
+                g.set(cx + dx, hy as i32 + 3, hz as i32 + 3, solid(dark));
+            }
+            for sx in [-1i32, 1] {
+                for k in 0..2 {
+                    g.set(cx + sx * 4, hy as i32 - k, hz as i32 + 3 - k, solid(dark));
+                }
+            }
+            let brass = solid([0.72, 0.52, 0.20]);
+            let sand = solid([1.0, 0.90, 0.62]);
+            let mut top = 0;
+            for y in (0..H).rev() {
+                if g.get(cx, y, cz + 2).is_some() {
+                    top = y;
+                    break;
+                }
+            }
+            let (y0, z0) = (top + 1, cz + 2);
+            g.filled_box(cx - 2, y0, z0 - 2, cx + 2, y0, z0 + 2, brass);
+            g.filled_box(cx - 2, y0 + 6, z0 - 2, cx + 2, y0 + 6, z0 + 2, brass);
+            for (px, pz) in [(-2i32, -2i32), (2, -2), (-2, 2), (2, 2)] {
+                g.filled_box(cx + px, y0 + 1, z0 + pz, cx + px, y0 + 5, z0 + pz, brass);
+            }
+            g.filled_box(cx - 1, y0 + 1, z0 - 1, cx + 1, y0 + 2, z0 + 1, sand);
+            g.set(cx, y0 + 3, z0, sand);
+            g.set(cx, y0 + 4, z0, sand);
+            g.filled_box(cx - 1, y0 + 5, z0 - 1, cx + 1, y0 + 5, z0 + 1, sand);
+        }
+        PeltKind::Mantle => {
+            // the old snow leopard: open rosette rings over the whole
+            // coat, a mantle of rock over the shoulders, and a ridge of
+            // stone plates down the spine (what the mountain made her of)
+            let ring = solid(mix(dark, pelt, 0.35));
+            paint_shell(&mut g, |x, y, z| {
+                if y < 12 || (z - cz).abs() > 22 {
+                    return false;
+                }
+                // a ring: the rim of a cell, not its middle
+                let (u, v) = ((z + 40).rem_euclid(6), (x + y + 40).rem_euclid(6));
+                let rim = (u == 1 || u == 4) && (1..=4).contains(&v) || (v == 1 || v == 4) && (1..=4).contains(&u);
+                let h = ((x * 11 + z * 5 + y * 3) as u32).wrapping_mul(2654435761) >> 24;
+                rim && h > 70
+            }, ring);
+            let stone = solid([0.46, 0.45, 0.43]);
+            let stone_hi = solid([0.58, 0.57, 0.54]);
+            g.ellipsoid(cxf, 30.0, czf + 10.0, 8.5 + bf, 3.0, 6.5, stone);
+            g.ellipsoid(cxf, 31.5, czf + 10.0, 6.5 + bf, 1.6, 5.0, stone_hi);
+            for (k, z) in (cz - 14..=cz + 4).step_by(4).enumerate() {
+                let mut top = None;
+                for y in (0..H).rev() {
+                    if g.get(cx, y, z).is_some() {
+                        top = Some(y);
+                        break;
+                    }
+                }
+                if let Some(top) = top {
+                    let h = 2 + (k % 2) as i32;
+                    g.filled_box(cx - 1, top + 1, z - 1, cx + 1, top + h, z + 1, if k % 2 == 0 { stone } else { stone_hi });
+                }
+            }
+            // pale, heavy-lidded old eyes
+            for sx in [-1i32, 1] {
+                g.set(cx + sx * 2, hy as i32 + 2, hz as i32 + 5, solid(mix(pelt, dark, 0.4)));
+            }
+        }
+        PeltKind::Hollow => {
+            // a hood of dark fur over the brow and the eyes, falling back
+            // over the crown; two pale eyes looking out of it; the left
+            // ear notched; a thin dark line down the spine
+            let hood = solid(mix(dark, pelt, 0.12));
+            g.ellipsoid(cxf, hy + 2.2, hz + 0.5, 5.3 + bf * 0.5, 2.6, 5.2, hood);
+            g.ellipsoid(cxf, hy + 1.0, hz + 3.8, 3.8, 1.5, 1.8, hood);
+            for sx in [-1i32, 1] {
+                g.set(cx + sx * 2, hy as i32 + 1, hz as i32 + 5, solid([0.86, 0.93, 1.0]));
+                g.set(cx + sx * 2, hy as i32 + 1, hz as i32 + 6, solid([0.86, 0.93, 1.0]));
+            }
+            let ex = cx - (3 + bulk.max(0) / 2);
+            g.carve_sphere(ex as f32, hy + 6.5, hz - 0.5, 0.9);
+            paint_shell(&mut g, |x, y, _z| (x - cx).abs() <= 0 && y >= 27, solid(dark));
         }
         PeltKind::Kit => {
             // a kitten: the head rounder and bigger than any grown cat's
@@ -388,11 +543,11 @@ mod rig_tests {
     /// a hole that only shows in one pose.
     #[test]
     fn every_ancestor_cuts_into_ten_nonempty_parts_and_loses_nothing() {
-        assert_eq!(ROSTER.len(), 15);
+        assert_eq!(ROSTER.len(), 20);
         for def in ROSTER.iter() {
             let grid = god_grid(def, Team::Blue);
             let plan = feline_cut_plan(role_bulk(def.role), matches!(def.pelt, PeltKind::Antlers));
-            let parts = plan.cut(&grid, GV);
+            let parts = plan.cut(&grid, body_voxel(def));
             for (i, m) in parts.iter().enumerate() {
                 assert!(m.inst.len() >= 8, "{}: slot {i} has {} voxels", def.name, m.inst.len());
             }
@@ -439,6 +594,29 @@ mod rig_tests {
             let ph = crate::anim::Gait::Walk.leg_phases();
             assert_eq!(ph.len(), rig.parts().iter().filter(|p| p.role == creature_rig::Role::Leg).count());
         }
+    }
+
+    /// A Sentinel is built bigger, and it is the SAME cat bigger: her rig's
+    /// hips and her cut legs scale together (her paws plant under her), and
+    /// her mesh stands exactly `size` times as tall as the grid says.
+    #[test]
+    fn a_sentinel_is_built_bigger_all_through() {
+        let big = ROSTER.iter().find(|d| d.role == crate::gods::Role::Sentinel).expect("a Sentinel");
+        let s = big.role.size();
+        assert!(s > 1.2, "size {s}");
+        let r = build_god_rigged(big, Team::Blue);
+        let small = feline_rig(role_bulk(big.role));
+        for i in 0..4 {
+            let (h, h0) = (r.rig.hip(i), small.hip(i));
+            for a in 0..3 {
+                assert!((h[a] - h0[a] * s).abs() < 1e-4, "hip {i} axis {a}: {} vs {} x {s}", h[a], h0[a]);
+            }
+            assert!((r.rig.body_centre.y + r.rig.sole(i)).abs() < 1e-4, "sole {i} is not on the floor");
+        }
+        let top = |m: &VoxelMesh| m.inst.iter().map(|v| v.off_ao[1]).fold(f32::MIN, f32::max);
+        let other = ROSTER.iter().find(|d| d.pelt == PeltKind::Crag).unwrap();
+        let (tb, to) = (top(&build_god(big, Team::Blue)), top(&build_god(other, Team::Blue)));
+        assert!(tb > to * (s - 0.1), "her body tops out at {tb}, Stonewhisper's at {to}");
     }
 
     /// The grid used to clip the antlers at y = 41 and the tail at z = 0.

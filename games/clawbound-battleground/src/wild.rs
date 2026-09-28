@@ -49,6 +49,8 @@ pub fn heal_tree_positions() -> [Vec3; 6] {
     match crate::map::active() {
         crate::map::MapId::Pass => return crate::pass::heal_tree_positions(),
         crate::map::MapId::Sky => return crate::sky::heal_tree_positions(),
+        crate::map::MapId::Atlantis => return crate::atlantis::heal_tree_positions(),
+        crate::map::MapId::Maze => return crate::maze::heal_tree_positions(),
         crate::map::MapId::Jungle => {}
     }
     let mut rng = Rng::new(0x7EE5);
@@ -263,7 +265,7 @@ impl Game {
                     continue;
                 }
                 let hp0 = g.hp;
-                g.hp = (g.hp + g.max_hp * HEAL_TREE_HP_PER_S * rain_mul * dt).min(g.max_hp);
+                g.hp = (g.hp + g.max_hp * HEAL_TREE_HP_PER_S * rain_mul * dt * g.heal_mul).min(g.max_hp);
                 g.mana = (g.mana + g.max_mana * HEAL_TREE_MP_PER_S * rain_mul * dt).min(g.max_mana);
                 if g.hp > hp0 + 1e-3 {
                     resting += 1.0;
@@ -394,13 +396,15 @@ impl Game {
                 continue;
             }
             let p = self.wild.prey.remove(pi);
+            // a jungle kill: a kitten, if Claypaw's mudslide is running (`clay`)
+            self.clay_kill_credit(hi, crate::clay::KITS_PER_SMALL_KILL, p.pos);
             let gold = p.kind.gold() * self.map_events.gold_mul();
             let team = self.gods[hi].team;
             let name = self.god_name(hi);
             {
                 let g = &mut self.gods[hi];
                 g.gold += gold;
-                g.hp = (g.hp + g.max_hp * p.kind.heal_frac()).min(g.max_hp);
+                g.hp = (g.hp + g.max_hp * p.kind.heal_frac() * g.heal_mul).min(g.max_hp);
                 if p.kind == PreyKind::Glowfish {
                     g.blessing_t = BLESSING_SECS;
                 }

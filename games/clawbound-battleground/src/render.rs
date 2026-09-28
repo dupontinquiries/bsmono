@@ -56,6 +56,14 @@ pub struct FrameUniform {
     /// Tower range rings as the player should see them: x, z, range, state.
     /// terrain.wgsl. See `Game::tower_rings`.
     pub towers: [[f32; 4]; MAX_TOWER_RINGS],
+    /// The sea: x the whole map lies under it (Atlantis: every floor takes
+    /// caustics), y caustic strength (by quality), z the water surface's
+    /// height (river beds under it take caustics), w how far under the sea
+    /// the camera is. terrain.wgsl, voxel.wgsl.
+    pub sea: [f32; 4],
+    /// The ground's look by quality: x how far its fine detail carries
+    /// (u), y the strength of the dry sheen. terrain.wgsl.
+    pub look: [f32; 4],
 }
 
 #[repr(C)]
@@ -90,10 +98,11 @@ impl Camera {
 /// contact-hardening shadow (common_shadow.wgsl) and the ground's height
 /// field (common_surface.wgsl). tests/shaders.rs validates exactly these.
 pub mod shader_src {
-    pub const VOXEL: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/voxel.wgsl"));
-    pub const TERRAIN: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/common_surface.wgsl"), include_str!("../shaders/terrain.wgsl"));
+    pub const VOXEL: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/common_sea.wgsl"), include_str!("../shaders/voxel.wgsl"));
+    pub const TERRAIN: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/common_surface.wgsl"), include_str!("../shaders/common_sea.wgsl"), include_str!("../shaders/terrain.wgsl"));
     pub const SMOOTH: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/smooth.wgsl"));
     pub const POST: &str = concat!(include_str!("../shaders/common_surface.wgsl"), include_str!("../shaders/post.wgsl"));
+    pub const WATER: &str = concat!(include_str!("../shaders/common_sea.wgsl"), include_str!("../shaders/water.wgsl"));
 }
 
 /// A smooth mesh on the GPU (`smoothvox`): vertices and triangle indices.
@@ -312,6 +321,12 @@ pub struct Renderer {
     pub quality: crate::quality::Quality,
     /// The ultra post effects: wet ground as a mirror, sky-occluded god rays.
     pub ultra_post: bool,
+    /// How far the view is under the sea, 0..1 (the Atlantis map: set by
+    /// the scene each frame), and how strongly light ripples on the floors.
+    pub underwater: f32,
+    pub caustics: f32,
+    /// 1 on a map that lies wholly under the sea (Atlantis).
+    pub sea_map: f32,
     /// The fur's look (shells and density follow it: `set_fur_style`).
     pub fur_style: FurStyle,
     /// Fur shells per smooth draw, and strands per unit of model space.
@@ -481,7 +496,7 @@ impl Renderer {
         });
         let water_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("water"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/water.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_src::WATER.into()),
         });
         let sky_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sky.wgsl"),
@@ -877,7 +892,7 @@ impl Renderer {
             label: Some("post params"),
             // 3 vec4, view-proj, its inverse, the camera, and per blast a
             // world centre+radius and a strength+thickness
-            size: 64 + 64 * 2 + 16 + 32 * crate::groundfx::MAX_RINGS as u64,
+            size: 64 + 64 * 2 + 16 + 32 * crate::groundfx::MAX_RINGS as u64 + 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -947,6 +962,9 @@ impl Renderer {
             occluders: Vec::new(),
             quality: crate::quality::Quality::High,
             ultra_post: false,
+            underwater: 0.0,
+            caustics: 0.0,
+            sea_map: 0.0,
             fur_style: FurStyle::from_env(),
             fur_shells: FurStyle::from_env().shells_density().0,
             fur_density: FurStyle::from_env().shells_density().1,
@@ -1267,13 +1285,31 @@ impl Renderer {
         let lvp = crate::groundfx::fit_shadow(cam.target, sun, half, self.shadow_size);
 
         let fog_color = [atm.fog_color[0], atm.fog_color[1], atm.fog_color[2], 1.0];
+        // the Drowned Halls lie under the sea: caustics on every floor, and
+        // the view graded as seen through water (post.wgsl)
+        let drowned = crate::map::active() == crate::map::MapId::Atlantis;
+        self.sea_map = drowned as u32 as f32;
+        self.underwater = drowned as u32 as f32;
+        // caustics by the quality setting (Low: none; they are a per-pixel
+        // loop on every lit river bed and sea floor)
+        self.caustics = match self.quality {
+            crate::quality::Quality::Low => 0.0,
+            crate::quality::Quality::Medium => 0.45,
+            crate::quality::Quality::High => 0.75,
+            crate::quality::Quality::Ultra => 1.0,
+        };
         let frame = FrameUniform {
             view_proj: vp.to_cols_array_2d(),
             inv_view_proj: inv.to_cols_array_2d(),
             light_view_proj: lvp.to_cols_array_2d(),
             // w: the spirit sky (Starwell Glacier) -- no mountains on the
             // horizon, aurora, stars to the horizon (sky.wgsl)
-            sun_dir: [sun.x, sun.y, sun.z, if crate::map::active() == crate::map::MapId::Sky { 1.0 } else { 0.0 }],
+            // (2: the sea overhead, the Drowned Halls -- sky.wgsl)
+            sun_dir: [sun.x, sun.y, sun.z, match crate::map::active() {
+                crate::map::MapId::Sky => 1.0,
+                crate::map::MapId::Atlantis => 2.0,
+                _ => 0.0,
+            }],
             cam_pos: [cam.eye.x, cam.eye.y, cam.eye.z, 1.0],
             fog_color,
             params: [time, atm.fog_density, self.exposure, atm.night],
@@ -1286,6 +1322,8 @@ impl Renderer {
             blast_b: self.blast_b,
             cracks: self.cracks,
             towers: self.towers,
+            sea: [self.sea_map, self.caustics, crate::consts::WATER_LEVEL, self.underwater],
+            look: self.quality.ground_look(),
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 
@@ -1319,6 +1357,8 @@ impl Renderer {
             {
                 // project the sun (a far point along its direction) to screen uv
                 let sp = vp * (cam.eye + sun * 400.0).extend(1.0);
+                let sun_ndc = (sp.w > 0.0).then(|| [sp.x / sp.w, sp.y / sp.w]);
+                let flare = crate::lensflare::strength(sun_ndc, atm.cloud_cover, atm.night, self.underwater, self.quality);
                 let (sun_uv, ray) = if sp.w > 0.0 {
                     let n = sp.truncate() / sp.w;
                     let uv = [n.x * 0.5 + 0.5, 0.5 - n.y * 0.5];
@@ -1362,6 +1402,10 @@ impl Renderer {
                 for r in shell_b {
                     post_data.extend_from_slice(&r);
                 }
+                // the lens flare (lensflare.rs), in the sun's colour
+                post_data.extend_from_slice(&[flare, atm.sun_col[0], atm.sun_col[1], atm.sun_col[2]]);
+                // the sea (atlantis): how far under it the view is, caustics
+                post_data.extend_from_slice(&[self.underwater, self.caustics, 0.0, 0.0]);
                 bytemuck::cast_slice(&post_data)
             },
         );
@@ -1656,6 +1700,8 @@ impl Renderer {
             blast_b: self.blast_b,
             cracks: self.cracks,
             towers: self.towers,
+            sea: [0.0; 4],
+            look: [120.0, 1.0, 0.0, 0.0],
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 
@@ -1877,6 +1923,8 @@ pub fn terrain_height(x: f32, z: f32) -> f32 {
     match crate::map::active() {
         crate::map::MapId::Pass => return crate::pass::terrain_height(x, z),
         crate::map::MapId::Sky => return crate::sky::terrain_height(x, z),
+        crate::map::MapId::Atlantis => return crate::atlantis::terrain_height(x, z),
+        crate::map::MapId::Maze => return crate::maze::terrain_height(x, z),
         crate::map::MapId::Jungle => {}
     }
     use crate::consts::{river_dist, GROUND_HALF, RIVER_HALF_WIDTH, RIVER_DEPTH, ARENA_RADIUS, RIM_RADIUS};
@@ -2006,6 +2054,10 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
                 (color, mat) = pass_ground_color(x, z, h, slope, n1, n2, nm);
             } else if crate::map::active() == crate::map::MapId::Sky {
                 (color, mat) = sky_ground_color(x, z, h, slope, n1, n2, nm);
+            } else if crate::map::active() == crate::map::MapId::Atlantis {
+                (color, mat) = atlantis_ground_color(x, z, h, n1, n2, nm);
+            } else if crate::map::active() == crate::map::MapId::Maze {
+                (color, mat) = maze_ground_color(x, z, h, n1, n2, nm);
             } else if r > crate::consts::RIM_RADIUS + 3.0 && h > 14.0 {
                 // mountain rim: dark jungle rock with forest ledges
                 let rock = [0.24 + n1 * 0.05, 0.24 + n2 * 0.04, 0.22 + n1 * 0.03];
@@ -2092,6 +2144,13 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
                 }
                 color = g;
             }
+            // Cavity occlusion, baked: ground lower than its surroundings
+            // (a hollow, a stream bed, the foot of a cliff) sees less sky.
+            // The mean height a ring of 2.5 cells out, against this one.
+            let far = STEP * 2.5;
+            let ring = (terrain_height(x - far, z) + terrain_height(x + far, z) + terrain_height(x, z - far) + terrain_height(x, z + far) + hl + hr + hd + hu) / 8.0;
+            let ao = cavity_ao(h, ring);
+            let color = [color[0] * ao, color[1] * ao, color[2] * ao];
             verts.push(TerrainVert {
                 pos: [x, h, z],
                 normal: n.to_array(),
@@ -2216,7 +2275,7 @@ fn pass_ground_color(x: f32, z: f32, h: f32, slope: f32, n1: f32, n2: f32, nm: f
     let snowline = 44.0 + n1 * 10.0;
     let patchy = smoothstep(20.0, 30.0, h) * smoothstep(0.72, 0.88, nm) * (1.0 - smoothstep(0.1, 0.3, slope));
     let snow_t = smoothstep(snowline - 6.0, snowline + 4.0, h).max(patchy) * (1.0 - smoothstep(0.35, 0.6, slope) * 0.6);
-    (lerp(c, snow, snow_t), if snow_t > 0.5 { 6.0 } else { 4.0 })
+    (lerp(c, snow, snow_t), if snow_t > 0.5 { 7.0 } else { 4.0 })
 }
 
 /// Starwell Glacier ground. The lanes are old pale stone, almost marble,
@@ -2255,15 +2314,160 @@ fn sky_ground_color(x: f32, z: f32, h: f32, slope: f32, n1: f32, n2: f32, nm: f3
         let inner = smoothstep(-4.0, -12.0, d);
         let meadow_t = (smoothstep(0.52, 0.72, nm) * inner).clamp(0.0, 1.0);
         let c = lerp(snow, meadow, meadow_t);
-        return (c, if meadow_t > 0.5 { 0.0 } else { 6.0 });
+        return (c, if meadow_t > 0.5 { 0.0 } else { 7.0 });
     }
     if h > -2.0 {
         // the lip: blue glacier ice
-        return ([0.52 + n1 * 0.08, 0.76 + n2 * 0.06, 0.92 + n1 * 0.04], 6.0);
+        return ([0.52 + n1 * 0.08, 0.76 + n2 * 0.06, 0.92 + n1 * 0.04], 7.0);
     }
     // (past the edge: open sky, never drawn)
     let _ = slope;
     ([0.2, 0.24, 0.34], 5.0)
+}
+
+/// How much sky a point of ground at height `h` sees, from the mean height
+/// `ring` of the ground a few units round it: 1 on the level or a rise, down
+/// toward 0.62 in a deep hollow or at a wall's foot. Soft (a hollow a unit
+/// deep loses 13%), so the jungle's gentle ground barely changes and a
+/// canyon floor under its cliffs darkens.
+pub fn cavity_ao(h: f32, ring: f32) -> f32 {
+    let deep = (ring - h).max(0.0);
+    (1.0 - deep * 0.13 / (1.0 + deep * 0.12)).clamp(0.62, 1.0)
+}
+
+/// The Drowned Halls' ground: sea-marble floors with mosaics (a blue
+/// runner down the lane hall with gold borders; rings of the old palette in
+/// the Library; a medallion in each base), teal basalt walls laid in
+/// courses with a pale coping, and outside them the sea floor -- sand in
+/// dunes, dark rock.
+/// The Engineer's Quarry: worn flagstones with moss in the joints and grass at the
+/// wall's foot; the walls old grey stone; their crown a dark thorn hedge,
+/// berried; the Heart's floor a ring of pale stone; beyond the outer wall,
+/// the hills' rock and heather.
+fn maze_ground_color(x: f32, z: f32, h: f32, n1: f32, n2: f32, nm: f32) -> ([f32; 3], f32) {
+    use crate::maze as mz;
+    let lerp = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    let d = mz::floor().sdf(x, z);
+    // the wall's stone: its face rises inside one terrain cell and has no
+    // vertices of its own, so it is drawn in the colours of the floor's last
+    // cell and the wall's first -- both are the wall's stone, or the face
+    // came out hedge green (the Drowned Halls' basalt skirting, the same way)
+    let wall_stone = |x: f32, z: f32| {
+        let course = ((z * 0.37 + x * 0.21).sin() > 0.9) as i32 as f32;
+        lerp([0.36 + n1 * 0.06, 0.35 + n1 * 0.05, 0.32 + n2 * 0.05], [0.20, 0.19, 0.18], course * 0.6)
+    };
+    if d > -1.7 && d <= 2.6 && !(mz::beyond(x, z) && h > mz::WALL_H + 2.0) {
+        return (wall_stone(x, z), 5.0);
+    }
+    if d <= 0.2 {
+        // flagstones (the detail shader draws the joints: sampled here at
+        // the 1.6 u vertices, joint lines were moss on random vertices,
+        // smeared green over the whole floor), and broad moss patches
+        let stone = [0.46 + n1 * 0.06, 0.44 + n1 * 0.05, 0.40 + n2 * 0.05];
+        let moss = [0.24 + n2 * 0.05, 0.30 + n1 * 0.05, 0.16];
+        let c = lerp(stone, moss, smoothstep(0.6, 0.8, nm) * 0.45);
+        // the Heart: a ring of pale stone round a dark centre stone
+        let hr = Vec3::new(x, 0.0, z).length();
+        if hr < mz::HEART_R - 1.5 {
+            if hr < 2.5 {
+                return ([0.16, 0.14, 0.13], 4.0);
+            }
+            let ring = ((hr - 2.5) / 2.6).fract();
+            if ring < 0.1 {
+                return ([0.64, 0.60, 0.52], 4.0);
+            }
+        }
+        return (c, 4.0);
+    }
+    if mz::beyond(x, z) && h > mz::WALL_H + 2.0 {
+        // the hills round the maze
+        let heather = [0.22 + n1 * 0.05, 0.24 + n2 * 0.05, 0.15 + n1 * 0.04];
+        let rock = [0.34 + n1 * 0.05, 0.33 + n1 * 0.05, 0.31 + n2 * 0.04];
+        return (if n2 > 0.55 { rock } else { heather }, 5.0);
+    }
+    if h < mz::WALL_H - 0.05 {
+        return (wall_stone(x, z), 5.0);
+    }
+    // the crown: a thorn hedge, dark green and black, red berries here and
+    // there
+    let hedge = [0.07 + n1 * 0.04, 0.16 + n2 * 0.06, 0.07 + n1 * 0.02];
+    let thorn = [0.08, 0.07, 0.06];
+    let berry = (vnoise(x * 1.7, z.abs() * 1.7) > 0.86) as i32 as f32;
+    let c = lerp(hedge, thorn, (n2 > 0.6) as i32 as f32 * 0.5);
+    (lerp(c, [0.55, 0.08, 0.10], berry), 0.0)
+}
+
+fn atlantis_ground_color(x: f32, z: f32, h: f32, n1: f32, n2: f32, nm: f32) -> ([f32; 3], f32) {
+    use crate::atlantis as at;
+    let lerp = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    let d = at::floor().sdf(x, z);
+    // the floor's last grid cell before a wall is a basalt skirting: the
+    // wall's face spans a single cell, and is drawn in the colours of its
+    // two edges -- with marble at its foot it read pale as ice
+    if d > -1.7 && d <= 0.2 {
+        return ([0.06 + n1 * 0.03, 0.18 + n1 * 0.04, 0.22 + n2 * 0.04], 5.0);
+    }
+    if d <= 0.2 {
+        let marble = [0.60 + n1 * 0.06, 0.66 + n1 * 0.05, 0.64 + n2 * 0.05];
+        let gold = [0.70, 0.55, 0.22];
+        // flagstone joints, faint, every 2.4 u
+        let joint = (((x * 0.42).fract() < 0.07) || ((z * 0.42).fract() < 0.07)) as i32 as f32;
+        let floor = lerp(marble, [0.42, 0.48, 0.48], joint * 0.35);
+        // the Library: rings of the old palette round a pale medallion
+        let lr = Vec3::new(x - at::LIBRARY_X, 0.0, z).length();
+        if lr < at::LIBRARY_R - 1.5 {
+            let pal = [[0.10, 0.43, 0.54], [0.60, 0.48, 0.18], [0.42, 0.18, 0.35], [0.16, 0.54, 0.42], [0.14, 0.30, 0.53]];
+            if lr < 3.5 {
+                return ([0.91, 0.85, 0.60], 4.0);
+            }
+            let ring = ((lr - 3.5) / 3.2) as usize;
+            let within = ((lr - 3.5) / 3.2).fract();
+            if within < 0.12 || within > 0.88 {
+                return (gold, 4.0);
+            }
+            // every other ring a solid band; the rest the marble floor with
+            // tesserae scattered in the band's colour
+            let c = pal[ring % pal.len()];
+            if ring % 2 == 0 {
+                return (lerp(c, [c[0] * 1.2, c[1] * 1.2, c[2] * 1.2], n2 * 0.4), 4.0);
+            }
+            return (lerp(floor, c, (nm > 0.55) as i32 as f32 * 0.6), 4.0);
+        }
+        // a base's medallion
+        for team in [crate::consts::Team::Blue, crate::consts::Team::Red] {
+            let b = team.base_pos();
+            let br = Vec3::new(x - b.x, 0.0, z - b.z).length();
+            if br < 9.0 {
+                let tc = team.rgb();
+                let within = (br / 3.0).fract();
+                return if within < 0.14 { (gold, 4.0) } else { (lerp(floor, [tc[0] * 0.5, tc[1] * 0.5, tc[2] * 0.5], 0.45), 4.0) };
+            }
+        }
+        // the lane hall's runner: deep blue tiles with gold borders
+        let road = lane_road(x, z);
+        if road < 2.2 {
+            let tile = ((x * 0.8).floor() + (z * 0.8).floor()) as i32 % 2 == 0;
+            return (if tile { [0.13, 0.29, 0.50] } else { [0.16, 0.36, 0.58] }, 4.0);
+        }
+        if road < 2.8 {
+            return (gold, 4.0);
+        }
+        return (floor, 4.0);
+    }
+    if !at::on_seabed(x, z) {
+        // the walls, face and top alike: teal basalt. (The face rises within
+        // one grid cell, so it has no vertices of its own: it is drawn in
+        // the colours of the floor's edge and the wall's top. A pale coping
+        // up there washed the whole face out to glacier white.)
+        let course = ((z * 0.37 + x * 0.21).sin() > 0.93) as i32 as f32;
+        let c = [0.07 + n1 * 0.03, 0.21 + n1 * 0.05, 0.25 + n2 * 0.05];
+        return (lerp(c, [0.03, 0.09, 0.11], course * 0.6), 5.0);
+    }
+    // the sea floor: pale sand in the hollows, dark rock on the rises
+    let sand = [0.46 + n1 * 0.06, 0.44 + n1 * 0.05, 0.34 + n2 * 0.05];
+    let rock = [0.16 + n1 * 0.04, 0.20 + n2 * 0.04, 0.20 + n2 * 0.03];
+    let rocky = smoothstep(at::SEABED_Y + 0.8, at::SEABED_Y + 2.6, h);
+    (lerp(sand, rock, rocky), if rocky > 0.5 { 5.0 } else { 3.0 })
 }
 
 /// An island's underside at (x, z), `depth` below the floor: blue glacier
@@ -2378,6 +2582,11 @@ fn build_water() -> (Vec<WaterVert>, Vec<u32>) {
     match crate::map::active() {
         crate::map::MapId::Pass => return build_pass_water(),
         crate::map::MapId::Sky => return build_sky_water(),
+        // the halls are dry; the sea is the whole world, drawn by the
+        // renderer's sea grade, not a surface
+        crate::map::MapId::Atlantis => return (Vec::new(), Vec::new()),
+        // the maze is dry
+        crate::map::MapId::Maze => return (Vec::new(), Vec::new()),
         crate::map::MapId::Jungle => {}
     }
     use crate::consts::{river_x, GROUND_HALF, RIVER_HALF_WIDTH, WATER_LEVEL};
@@ -2518,5 +2727,23 @@ mod depth_tests {
         sort_far_to_near(&mut v);
         let order: Vec<char> = v.iter().filter(|e| e.1 != 'x').map(|e| e.1).collect();
         assert_eq!(order, vec!['f', 'm', 'n']);
+    }
+}
+
+#[cfg(test)]
+mod cavity_tests {
+    use super::cavity_ao;
+
+    /// Level ground and rises are untouched; hollows darken with depth,
+    /// softly, and never below the floor.
+    #[test]
+    fn hollows_see_less_sky_and_rises_see_it_all() {
+        assert_eq!(cavity_ao(0.0, 0.0), 1.0);
+        assert_eq!(cavity_ao(3.0, 1.0), 1.0, "a rise");
+        let one = cavity_ao(0.0, 1.0);
+        assert!((0.85..0.9).contains(&one), "a unit-deep hollow: {one}");
+        let deep = cavity_ao(0.0, 6.0);
+        assert!(deep < one && deep >= 0.62, "{deep}");
+        assert_eq!(cavity_ao(0.0, 1000.0), 0.62);
     }
 }

@@ -270,6 +270,81 @@ pub const PARTS: &[Part] = &[
         ],
     },
     Part {
+        who: "hollowstep",
+        voice: "Low, slow and close to the microphone: a stalker who never raises his voice because he never has to. Patient, almost gentle, with long silences left in. Breathe. Only the ultimate is loud.",
+        lines: &[
+            l("select", "I'm already there.", "quiet, certain, right at the mic", 2, SELECT),
+            l("cast1", "Behind you.", "a whisper at the ear", 2, "winds up Step Between"),
+            l("cast2", "Go on. Wait for them.", "patient, to someone beside you", 2, "winds up Send the Other"),
+            l("cast3", "Too slow.", "flat, a little disappointed", 3, "winds up The Long Reach"),
+            l("cast4", "Which one... is ME?", "from a whisper to a roar on 'me'", 5, "winds up Every Shadow"),
+            l("kill.1", "Found you.", "soft, almost tender", 2, KILL),
+            l("kill.2", "You ran. They always run.", "weary", 2, KILL),
+            l("death.1", "I'll... be... waiting...", "fading, not beaten", 1, DEATH),
+            l("death.2", "Check... the shadows...", "a last whisper, a threat", 1, DEATH),
+        ],
+    },
+    Part {
+        who: "brasshowl",
+        voice: "A small cat with an enormous voice: warm, loud, a caravan hand calling down the line at night. Big and round even when he is being kind. The ultimate is the biggest bellow you have.",
+        lines: &[
+            l("select", "Keep to the light!", "calling back down the road", 4, SELECT),
+            l("cast1", "Catch!", "a throw, cheerful", 3, "winds up Lamp Oil"),
+            l("cast2", "BACK!", "one bark, sharp", 4, "winds up Bark"),
+            l("cast3", "Sit by the fire.", "warm, looking after someone", 2, "winds up Watchfire"),
+            l("cast4", "SHADOWS!", "the biggest bellow you have", 5, "winds up SHADOWS!"),
+            l("kill.1", "Out you go.", "brisk", 3, KILL),
+            l("kill.2", "The road is clear.", "satisfied, to the caravan", 3, KILL),
+            l("death.1", "The lamp... is out...", "surprised, quiet", 2, DEATH),
+            l("death.2", "Keep... it... lit...", "a last instruction", 1, DEATH),
+        ],
+    },
+    Part {
+        who: "oremantle",
+        voice: "A Sentinel speaking the Geartooth tongue (`geartooth`) in the grandmother's voice the engineers gave her: low, slow and unbothered, every word set down like a stone. Clicks (! a pop, | a tsk) are sharp and dry, made with the tongue alone; the vowels are the tongue's own (a e i o u ä ö ü y). Only the ultimate rises -- from a rumble to a roar. Each direction gives the line's meaning in brackets.",
+        lines: &[
+            l("select", "Tharu hy.", "slow, settling in [the mountain is here]", 2, SELECT),
+            l("cast1", "|Ö, hy!", "firm, protective [kin, here -- behind me]", 3, "shifts to Granite"),
+            l("cast2", "Yla tam.", "quiet, breath misting [the water shuts -- cold now]", 2, "shifts to Rime"),
+            l("cast3", "Mi, hy.", "patient, drawing someone in [little one, here]", 2, "shifts to Lodestone"),
+            l("cast4", "Tharu-a !ÖN!", "from a rumble to a roar on the click [the mountain's HEART]", 5, "shifts to The Mountain's Heart"),
+            l("kill.1", "Luu.", "grandmotherly, almost kind [go down; rest]", 2, KILL),
+            l("kill.2", "Doru ol.", "flat, certain [stone, always]", 2, KILL),
+            l("death.1", "Tharu... !luu...", "surprised, slow [the mountain... went down...]", 1, DEATH),
+            l("death.2", "Doru... |kör...", "content, going home [the stone... will turn again...]", 1, DEATH),
+        ],
+    },
+    Part {
+        who: "hourwatch",
+        voice: "A night-watcher who has seen every ending already: dry, amused, unhurried, a little too calm. She talks as if she remembers what you are about to do. Mid voice, clipped consonants; the ultimate is the only line with wonder in it.",
+        lines: &[
+            l("select", "I have seen how this goes.", "dry, faintly amused", 2, SELECT),
+            l("cast1", "Again.", "calm, a correction", 2, "winds up Turn Back"),
+            l("cast2", "Not yet, you don't.", "tart, pointing", 3, "winds up Send Back"),
+            l("cast3", "Sooner.", "brisk, winding a spring", 3, "winds up Wind Forward"),
+            l("cast4", "Look back... I see ALL of you!", "hushed wonder, rising on 'all'", 5, "winds up The Long Look"),
+            l("kill.1", "I saw that coming.", "unsurprised", 2, KILL),
+            l("kill.2", "Right on time.", "satisfied, checking a clock", 2, KILL),
+            l("death.1", "I didn't see... this one...", "genuinely surprised", 1, DEATH),
+            l("death.2", "Out of... time...", "a last dry joke", 1, DEATH),
+        ],
+    },
+    Part {
+        who: "claypaw",
+        voice: "A cheerful, earthy maker with his paws always in something: warm, practical, a little rough, laughs easily. Wet consonants, a round open vowel. The ultimate is a whoop, the bank giving way.",
+        lines: &[
+            l("select", "Fresh from the riverbank!", "cheerful, rolling up his sleeves", 3, SELECT),
+            l("cast1", "Good as new.", "pressing a crack shut, satisfied", 2, "winds up Remold"),
+            l("cast2", "Wet and quick!", "a splash, bright", 3, "winds up Quicken"),
+            l("cast3", "Round we go!", "spinning, gleeful", 4, "winds up Spin"),
+            l("cast4", "Here comes the BANK!", "a whoop, rising on 'bank'", 5, "winds up Mudslide"),
+            l("kill.1", "Back to the mud.", "matter-of-fact", 2, KILL),
+            l("kill.2", "I'll make another.", "cheerful, already moving on", 2, KILL),
+            l("death.1", "Just... cracked...", "surprised, crumbling", 1, DEATH),
+            l("death.2", "I'll set... again...", "unbothered, going soft", 1, DEATH),
+        ],
+    },
+    Part {
         who: "narrator",
         voice: "The storyteller of the clans, over the first match's prologue: unhurried, weighty, a little in awe. Let each line breathe; the music leaves room between them. Record each as its own file.",
         lines: &[
@@ -359,7 +434,7 @@ mod tests {
                 assert_eq!(crate::cues::ancestor_key(&game, g), who);
             }
         }
-        assert_eq!(PARTS.len(), ROSTER.len() + 2, "13 ancestors, the narrator and the announcer");
+        assert_eq!(PARTS.len(), ROSTER.len() + 2, "every ancestor, the narrator and the announcer");
     }
 
     #[test]

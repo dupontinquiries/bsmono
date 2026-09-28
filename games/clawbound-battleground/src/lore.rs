@@ -50,7 +50,7 @@ pub struct Ancestor {
     pub instruments: &'static str,
 }
 
-pub const ANCESTORS: [Ancestor; 15] = [
+pub const ANCESTORS: [Ancestor; 20] = [
     Ancestor {
         name: "Goldenmane",
         species: "lion",
@@ -146,8 +146,8 @@ pub const ANCESTORS: [Ancestor; 15] = [
         species: "jaguar",
         age: "the green ages",
         land: "the drowned forest",
-        gender: Gender::Male,
-        story: "A jaguar of the flooded dark, who hunted under the water as easily as over it. The river does not chase, he says; it gathers, and so does he.",
+        gender: Gender::Female,
+        story: "A jaguar of the flooded dark, who hunted under the water as easily as over it. The river does not chase, she says; it gathers, and so does she.",
         instruments: "rainstick, panpipes, water percussion, slit drum; rain, rushing floodwater",
     },
     Ancestor {
@@ -185,6 +185,51 @@ pub const ANCESTORS: [Ancestor; 15] = [
         gender: Gender::Male,
         story: "The youngest of the ancestors, and the only one who never grew up. Every litter born in every clan is a little of him, so there is always more of him than anyone counted. He turns every fight into a game, and every game into a dance -- and what dances cannot fight. Where he naps, the first green of the year comes up through the snow.",
         instruments: "toy piano, music box, ukulele, kazoo, handclaps, a disco beat; birdsong, a spring brook",
+    },
+    Ancestor {
+        name: "Hollowstep",
+        species: "wildcat",
+        age: "the long nights",
+        land: "the fog moors",
+        gender: Gender::Male,
+        story: "Nobody on the moors ever saw Hollowstep arrive. His tread was heard on one side of the heath and he was found on the other, and the clans learned to count their own shadows before they slept. He never ran after anything in his life; he never had to. They say another of him is still out on the moor tonight, walking, and that you will hear it long before you see it.",
+        instruments: "bowed saw, low cello drones, a slow bass drum like a heartbeat, held breath; wind over heather, a curlew far off",
+    },
+    Ancestor {
+        name: "Brasshowl",
+        species: "sand cat",
+        age: "the caravan years",
+        land: "the salt roads",
+        gender: Gender::Male,
+        story: "The smallest of the ancestors, with the biggest voice. He walked ahead of the caravans on the salt roads at night with a brass lantern, and when something moved at the edge of its light he raised the lamp and bellowed, and whatever it was did not come in. It is said that Hollowstep has never once stood in Brasshowl's light, and that the two of them know exactly why.",
+        instruments: "frame drum, oud, a brass bell, clapping hands, a caravan's camel bells; desert wind, a crackling lamp",
+    },
+    Ancestor {
+        name: "Oremantle",
+        species: "a Sentinel -- a snow leopard of stone and ore, half as big again as any cat living, built by the Geartooth clan",
+        age: "the first winters",
+        land: "the roots of the high crags",
+        gender: Gender::Female,
+        story: "The first of the Sentinels, the great cats the Geartooth engineers built of stone and ore to keep their works when they were gone. They made her in the likeness of Stonewhisper's grandmother, who lay so long on the roots of the crags that they could quarry her shape from the mountain, and they gave her the grandmother's voice -- though she speaks with it only in their own tongue, clicks and all. Her coat turns on the machine's axles to show what the mountain is made of: granite in the thaw, rime in the long dark, lodestone where the iron veins run, and once, when the clans needed it, the molten heart itself. She never went to a fight in her life. She became what the fight was standing on.",
+        instruments: "the deepest mountain horns, stone chimes, a slow frame drum like footfalls, overtone throat-singing; wind in a cave mouth, rock settling",
+    },
+    Ancestor {
+        name: "Hourwatch",
+        species: "Pallas's cat",
+        age: "the long nights",
+        land: "the high steppe, where the sky is widest",
+        gender: Gender::Female,
+        story: "The Watcher. A Pallas's cat of the high steppe, who sat out whole nights on the rocks counting the stars round until she knew the sky's clock better than her own heartbeat -- and found that an hour, once you have watched enough of them, can be turned like any other thing. She turns her own back when it goes badly, her enemies' when they get ahead of themselves, and her friends' forward when they are waiting. When the clans need to know what is coming, she leaps into the stars and looks back at the whole field, and everything behind her is seen. Nobody has ever surprised her. She says.",
+        instruments: "a music box's comb, ticking clocks, a glass harmonica, a high drone of steppe throat-singing, a single temple bell; wind over grass at night",
+    },
+    Ancestor {
+        name: "Claypaw",
+        species: "fishing cat",
+        age: "the flood years",
+        land: "the banks of the great river",
+        gender: Gender::Male,
+        story: "The potter of the river mud. A fishing cat who waded the great river's banks so long that the clay took his shape and kept it -- and when the flood tore him apart he pressed himself back together out of the bank. He has been clay ever since: he cracks as he dries and remolds himself wet, nothing else mends him more than half, and every kitten he shapes out of the mud runs off to bite at whatever he is fighting. Where he spins, the ground turns to slip; where he is angry, the bank gives way. The clans that farm the flood plains leave a lump of wet clay on the doorstep for him.",
+        instruments: "clay pot drums (udu), a water drum, a potter's wheel's hum, low reed pipes; the river running, mud sucking at paws",
     },
 ];
 
@@ -239,6 +284,26 @@ mod tests {
         assert_eq!(of("Stillsmoke").unwrap().gender, Gender::Male, "canon: the ninth son");
     }
 
+    /// Each story speaks of its ancestor as the lore's gender does. (When
+    /// Riptail was recast as she, nothing here would have noticed a story
+    /// still saying "he says" -- the check above reads the game's text,
+    /// not the stories.)
+    #[test]
+    fn the_stories_agree() {
+        let male = ["he", "him", "his", "himself"];
+        let female = ["she", "her", "hers", "herself"];
+        let mut checked = 0;
+        for a in ANCESTORS.iter() {
+            let words: Vec<String> = a.story.split(|c: char| !c.is_alphabetic() && c != '\'').map(|w| w.to_ascii_lowercase()).collect();
+            let (right, wrong): (&[&str], &[&str]) = if a.gender == Gender::Male { (&male, &female) } else { (&female, &male) };
+            for w in &words {
+                assert!(!wrong.contains(&w.as_str()), "{}: the story says '{w}', the lore says {}", a.name, a.gender.pronouns());
+            }
+            checked += words.iter().any(|w| right.contains(&w.as_str())) as usize;
+        }
+        assert!(checked >= 10, "only {checked} stories use a pronoun at all");
+    }
+
     /// The voice notes the performer reads do not contradict the gender
     /// (no baritone for a female ancestor, no 'she' for a male).
     #[test]
@@ -263,6 +328,7 @@ mod tests {
     #[test]
     fn the_cast_is_balanced() {
         let f = ANCESTORS.iter().filter(|a| a.gender == Gender::Female).count();
-        assert!((6..=8).contains(&f) && (f as i32 - (ANCESTORS.len() - f) as i32).abs() <= 1, "{f} of {} female", ANCESTORS.len());
+        // as even as the count allows (it read 6..=8, which was that for 17)
+        assert!(f >= 6 && (f as i32 - (ANCESTORS.len() - f) as i32).abs() <= 1, "{f} of {} female", ANCESTORS.len());
     }
 }

@@ -1,6 +1,6 @@
 # Clawbound — Battleground · Rust + wgpu Microvoxel Edition
 
-A three-map arena for the **fifteen legendary ancestors of Clawbound**,
+A five-map arena for the **legendary ancestors of Clawbound**,
 built as a native Linux game in Rust + wgpu. No engine, no assets — every
 ancestor, minion, tower, Elder, projectile and ability effect is procedurally
 generated microvoxels: tens of thousands of instanced cubes with baked ambient
@@ -24,7 +24,47 @@ what else is known-but-unresolved.
   waves of four (five every third: 3 melee + 1–2 casters) that hold targets,
   answer a hit on their cats, and chase within a leash; 12 towers, two Elders
   gated behind tower kills.
-- **Three maps** — the jungle valley (5v5, three lanes), Twinfang Pass (15v15
+- **The Engineer's Quarry** (5v5, `--map quarry`; `src/maze.rs`): a great walled
+  labyrinth of fifteen rooms -- courtyards, colonnades, the round Heart with
+  its stone cat, the beasts' pits -- joined by short passages. Two lanes wind
+  room to room down the west and east sides through passages that never
+  shut; every other passage is a GATE, and every 40 s **the labyrinth
+  turns**: a fresh pattern of stone slabs rises and sinks (a gate glows red
+  for 5 s before it moves; a gate and its mirror move together; no room is
+  ever cut off). From 75 s, every 50 s two sections (a room and its mirror)
+  **wake**: they stir for 8 s, then the thorns close for 36 s -- a cat alone
+  there loses a twentieth of its health a second and is slowed, with one
+  friend close a fiftieth, with two or more nothing. Anywhere on the map, a
+  cat with two friends within 10 u takes 10% less from every blow. Bots
+  route round shut gates, walk out of waking rooms they are alone in, and
+  hold at the edge rather than walk into one alone. The labyrinth is a
+  MACHINE, built by the Geartooth clan of engineer-cats (`src/machine.rs`):
+  wooden gear trains turn on every wall top, spinning up as the gates move.
+  From each turn but the first it works one pair of tracks: Archimedes
+  screws wind a stone up out of a hopper in the western hills (or on the
+  wall by a base) for 4 s, it comes down a trestle chute, drops off the lip
+  into the labyrinth and rolls on at 15 u/s -- a cat in its way takes 18% of
+  its health, is thrown aside and slowed, once a run. The rooms a track runs
+  through are LOCKS for the turn: their other gates seal (never a lane's),
+  their pads -- stone trapdoors either side of the track, rims glowing while
+  armed -- swing open as the stone passes, and a cat standing on an open
+  pad falls to its death. Bots leave a lock the machine is working and step
+  off a track when a ball is due within 1.5 s. The machine knows its own: a
+  Sentinel is hurt by a stone but not thrown, and braces across a pad. The
+  Quarry has LINE OF SIGHT: a cat sees 55 u down open floor, not through a
+  wall or a shut gate; an enemy nobody on your team sees (and no tower of
+  yours reaches) is not drawn, not on the minimap, and not targeted by
+  bots. Carved TABLETS stand against the walls, one to a room: the
+  engineers' own tongue, **Geartooth** (`src/geartooth.rs`), with two clicks
+  (`!` a pop, `|` a tsk) and four vowels the clans lack (ä ö ü y); standing
+  at one, the HUD reads it -- the carving, its meaning, and the piece of
+  grammar it shows (verb last; many by doubling; a click before the verb
+  for past or future; not with -m; whose with -a). The Sentinels speak it:
+  Oremantle's lines are Geartooth, spoken by a formant synthesizer built
+  for its clicks and vowels (`dev/voice_script/geartooth_voice.py`).
+- **The Drowned Halls** (3v3, `--map atlantis`): one colonnaded hall and a
+  domed library on the sea floor.
+- **The first three maps** — the jungle valley (5v5, three lanes), Twinfang Pass (15v15
   mountain canyon), and **Starwell Glacier** (15v15): two wide lanes over
   glacier islands in a starlit sky, waves of 32 minions a side in each lane
   (64 when they meet), cloud ferries you leap onto to ride across the chasms (miss, and the
@@ -65,19 +105,67 @@ what else is known-but-unresolved.
   it keeps falling, the wind drifts it from the blown stretches into the lee,
   cats bound through drifts ploughing a trench and leave separate prints on
   powder, and blasts throw craters, fire melts it, frost lays more.
-- **15 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
+- **20 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
   Windclaw, Faryowl, Oldroar, Twofang, Suneye, Snowhush, Riptail, Stillsmoke,
   Stonewhisper, Cometail (the star-fallen caracal: Starshot, Meteor Pounce,
-  Flare, and the Falling Star ultimate) and Sproutkit (the ever-young kitten,
+  Flare, and the Falling Star ultimate), Sproutkit (the ever-young kitten,
   god of life and youth: **Litter** sends kitten doubles scampering at the
   nearest enemies to nip them into giggles; **Giggle Fit** sets everyone near
   laughing -- no attacks, no casts, and their paws wander; **First Spring**
   heals; the **Dance Party** ultimate hangs a glitter-ball over a fight, and
   every enemy under it dances -- no attacks or casts, a shuffle -- then drags
-  its paws for 6 s after the music stops; `src/kit.rs`) — across 5 roles (Warrior / Guardian / Mage / Hunter / Assassin).
+  its paws for 6 s after the music stops; `src/kit.rs`) and Hollowstep (the
+  stalker of the fog moors, who never runs: there is always **another of him**
+  somewhere else on the map, walking at the nearest enemy and stopping short to
+  watch; near him or it, an enemy's heart pounds -- faster the closer -- its
+  screen darkens and its legs go heavy, and his heavy tread carries; **Step
+  Between** trades places with his other, **Send the Other** glides it where he
+  points, **The Long Reach** is a cleave, and the **Every Shadow** ultimate
+  raises two hunting echoes beside him and two beside his other, any of which
+  he can step into; `src/stalker.rs`) and Brasshowl (the lamp-keeper of the
+  salt roads, a sand cat with an enormous voice, and Hollowstep's answer:
+  **Lamp Oil**, a **Bark** and a **Watchfire** shield, and the **SHADOWS!**
+  ultimate -- he raises the lamp and bellows, and every enemy in its light is
+  struck, runs from him unable to act, and is shown up (seen through cloud,
+  no stalking) for 6 s, while no shadow of Hollowstep's can stand in it;
+  `src/lantern.rs`) and Oremantle (the first **Sentinel** -- the Sentinels
+  are the Geartooth engineers' work, great cats of stone and ore, and she was
+  built in the likeness of Stonewhisper's grandmother: drawn and struck 1.4x the size of any other cat, the slowest
+  on the field, and she casts nothing -- each key shifts what her coat is made
+  of, and that material's field is always on around her: **Granite** spares
+  friends in it a share of every blow, **Rime** slows enemies, **Lodestone**
+  drags them in to arm's length, and the **Mountain's Heart** ultimate is
+  magma that burns everything near her for 7 s before she cools back to the
+  coat she wore; `src/sentinel.rs`) and Hourwatch (the Watcher, a Pallas's
+  cat of the high steppe who keeps the hours: **Turn Back** puts her where
+  she was 3 s ago with the health she had then, if it was more; **Send
+  Back** does it to the enemy she aims at, its wind-up lost; **Wind
+  Forward** winds nearby friends' cooldowns on 4 s; and **The Long Look**
+  ultimate leaps her into the stars for 2.6 s, out of reach, and shows up
+  every enemy on her own side of the line across the field where she is --
+  offside-style: the further forward she flies, the more is behind her --
+  for 6 s, and her too, for 4 s, where she lands; `src/hours.rs`) and
+  Claypaw (the potter of the river mud, a fishing cat made of clay: he
+  shapes a clay kitten every 6 s, up to 4, that runs off biting; his mana
+  comes only from his claws (14 a landed basic attack, +1 a level); any
+  healing but his own takes on him by half; and he dries, down to 70% of
+  his speed over 20 s. **Remold** presses 22% of his health back;
+  **Quicken** wets him again -- 20% faster, kittens every 2.5 s, for 6 s;
+  **Spin** is a spinning dash that leaves a MUD SLICK down its line, and
+  **Mudslide** (ultimate) is a wave of mud 16 u wide running 40 u down the
+  aim: it strikes every enemy in its front (280 + power) and carries every
+  cat in it, crushes through plants (15% weaker for each, to no less than
+  35%) and sloshes back off walls like water (60% as strong, up to three
+  times, able to strike again), leaving mud where it ran. Eight KILLABLE
+  kittens tumble out of it -- fighters that bite hard and soak tower shots
+  -- and for 6 s after, each god he kills shapes three more and each minion
+  or jungle beast one. Every mudslide kitten broken is 40 gold to whoever
+  breaks it: a push that works snowballs, and one that fails feeds them. On a slick, friend or foe keeps going the way it
+  was going, 30% faster, and turns slowly; `src/clay.rs`) — across 6 roles (Warrior / Guardian /
+  Mage / Hunter / Assassin / Sentinel).
   Each is a quadruped feline voxel body with a pelt signature (mane, stripes,
   rosettes, saber fangs, antlers, sun disc, ear tufts…) and its crest colour,
-  plus **4 mechanical abilities** (60 total) built from 17 archetype systems.
+  plus **4 mechanical abilities** (80 total) built from 30 archetype systems.
   Clawbound kits are a passive + two techniques + an ultimate; here the passive
   is reforged as a third short-cooldown technique (see `src/gods.rs`).
 - **Dynamic weather** (`src/weather.rs`) — Clear / Overcast / Rain / Storm /
@@ -364,6 +452,15 @@ src/
 ├── wild.rs        heal trees, prey (hare / stag / glowfish), the hunt, Riverblessing
 ├── lift.rs        Starwell's updrafts: pads, rides up to the Aerie and down
 ├── kit.rs         Sproutkit's litter (kitten doubles), giggles and dance party
+├── stalker.rs     Hollowstep's other, the terror radius, the step and every shadow
+├── lantern.rs     Brasshowl's lamp: the flight from it, the shown-up, no shadows in it
+├── sentinel.rs    the Sentinel role: coats instead of casts, the four fields, the bot's choice
+├── maze.rs        the Quarry: rooms and gates, the labyrinth turning, the waking, the thorns, the pack
+├── mazeworld.rs   the Quarry's dressing, gate slabs (collision + mesh), thorn spots, gear trains, screws, chutes, pads, boulder
+├── hours.rs       Hourwatch: every cat's trail; turning back, sending back, winding forward, the long look
+├── geartooth.rs   the Geartooth tongue: its lexicon, its grammar, the Quarry's tablets
+├── clay.rs        Claypaw: his kittens, his drying, his mana from claws, halved healing, the mud slicks
+├── machine.rs     the Quarry's machine: tracks from hopper to chute to floor, which pair runs each turn, the locks and their pads, the roll, the hit, the fall, the bots' dodge
 ├── bosses.rs      the Elder Boar + Storm Drake: pits, AI, rewards, TargetRef::Boss
 ├── disasters.rs   wildfire / tempest / earthquake / flood / tornado + map scars
 ├── audio.rs       acoustics_at(pos) → howl/reverb voicing; WindSynth DSP; cpal shell

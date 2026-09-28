@@ -69,6 +69,8 @@ impl Flavor {
             Role::Assassin => (160.0, 0.35),
             Role::Hunter => (220.0, 0.3),
             Role::Mage => (300.0, 0.15),
+            // the biggest cat: the lowest voice, and stone in it
+            Role::Sentinel => (55.0, 0.8),
         };
         let a = def.palette[3];
         let bright = (0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2]).clamp(0.0, 1.0);
@@ -411,6 +413,200 @@ pub fn ability(def: &GodDef, slot: usize) -> Vec<f32> {
             let sparkle = tones(0.9, &[b * 16.0, b * 20.2, b * 24.0], 0.005, 0.3, 1.2, 0.8);
             mix_at(&mut x, &sparkle, 0.12, 0.25);
         }
+        Archetype::Swap { .. } => {
+            // a breath drawn in backwards (a swelling hiss), cut off by a
+            // low, heavy arrival
+            let len = 0.32;
+            let mut w = whoosh(len, 900.0, 3800.0, 1.8, &mut n);
+            let m = w.len() as f32;
+            for (i, v) in w.iter_mut().enumerate() {
+                *v *= (i as f32 / m).powf(2.2) * 2.2;
+            }
+            mix_at(&mut x, &w, 0.0, 0.9);
+            let t = thud(0.4, b * 0.9, b * 0.28, fl.grit + 0.3, &mut n);
+            mix_at(&mut x, &t, len - 0.01, 1.0);
+        }
+        Archetype::Send { .. } => {
+            // a cold exhale going away from you, and a low note under it
+            let w = whoosh(0.7, 2400.0, 380.0, 1.2, &mut n);
+            mix_at(&mut x, &w, 0.0, 0.7);
+            let low = tones(0.7, &[b * 0.75, b * 0.8], 0.15, 0.4, 0.05, 0.3);
+            mix_at(&mut x, &low, 0.0, 0.5);
+        }
+        Archetype::Lantern { .. } => {
+            // the lamp going up: a brass chime (a bell's out-of-tune
+            // partials), a flare of flame rising, and a warm chord under it
+            let chime = tones(1.1, &[b * 8.0, b * 8.0 * 2.76, b * 8.0 * 5.40], 0.002, 0.5, 0.0, 0.0);
+            mix_at(&mut x, &chime, 0.0, 0.55);
+            let flare = whoosh(0.6, 500.0, 5200.0, 1.3, &mut n);
+            mix_at(&mut x, &flare, 0.02, 0.7);
+            let warm = tones(1.2, &[b * 2.0, b * 2.5, b * 3.0], 0.12, 0.7, 0.1, 0.2);
+            mix_at(&mut x, &warm, 0.1, 0.6);
+        }
+        // Hourwatch (`hours`): the clock
+        Archetype::Rewind { .. } => {
+            // her own hour turned back: a bell played backwards (swelling
+            // up out of nothing and stopping dead), ticks running backward
+            // under it, faster and faster
+            let mut bell = tones(0.8, &[b * 6.0, b * 6.0 * 2.4, b * 6.0 * 4.1], 0.002, 0.5, 0.0, 0.0);
+            bell.reverse();
+            mix_at(&mut x, &bell, 0.0, 0.7);
+            let mut at = 0.0;
+            let mut gap = 0.12;
+            // (the gaps shrink toward 0.6 s in all: stop at the last one
+            // longer than 20 ms, not at a time the ticks never reach)
+            while gap > 0.02 {
+                let tick = thud(0.03, 2600.0, 1800.0, 0.2, &mut n);
+                mix_at(&mut x, &tick, at, 0.35);
+                at += gap;
+                gap *= 0.8;
+            }
+        }
+        Archetype::SendBack { .. } => {
+            // someone else's hour: one hard tick, and a whoosh drawn
+            // backward (it swells toward the tick, then silence)
+            let mut w = whoosh(0.45, 600.0, 3800.0, 1.4, &mut n);
+            w.reverse();
+            mix_at(&mut x, &w, 0.0, 0.8);
+            let tick = thud(0.06, 1900.0, 1100.0, 0.3, &mut n);
+            mix_at(&mut x, &tick, 0.44, 0.9);
+            let low = tones(0.5, &[b * 2.0], 0.005, 0.3, 0.3, 0.0);
+            mix_at(&mut x, &low, 0.44, 0.5);
+        }
+        Archetype::WindForward { .. } => {
+            // a mainspring wound: a ratchet climbing in pitch, and a bright
+            // chord as it lets go
+            let mut at = 0.0;
+            let mut k = 0;
+            while at < 0.5 {
+                let tick = thud(0.025, 1400.0 + k as f32 * 180.0, 1000.0 + k as f32 * 150.0, 0.3, &mut n);
+                mix_at(&mut x, &tick, at, 0.45);
+                at += 0.05;
+                k += 1;
+            }
+            let chord = tones(0.7, &[b * 4.0, b * 5.04, b * 6.0], 0.01, 0.45, 0.05, 0.0);
+            mix_at(&mut x, &chord, 0.5, 0.6);
+        }
+        Archetype::LongLook { .. } => {
+            // up into the stars: a long rising shimmer, a high glassy bell
+            // at the top, and the sky's hush
+            let w = whoosh(0.9, 300.0, 7000.0, 2.0, &mut n);
+            mix_at(&mut x, &w, 0.0, 0.7);
+            let bell = tones(0.8, &[b * 12.0, b * 12.0 * 1.5, b * 12.0 * 2.01], 0.01, 0.6, 0.0, 0.3);
+            mix_at(&mut x, &bell, 0.35, 0.45);
+        }
+        // Claypaw (`clay`): wet clay
+        Archetype::Remold { .. } => {
+            // clay pressed and smoothed: squelches (low bandpassed bursts)
+            // and a wet slap
+            let len = 0.6;
+            let mut sq = vec![0.0; secs(len)];
+            let mut bp = Svf::default();
+            for (i, o) in sq.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let (_, b2, _) = bp.run(n.next(), 300.0 + 250.0 * (t * 9.0).sin().abs(), 2.5);
+                *o = b2 * (t * 9.0).sin().abs() * env(t, 0.02, 0.4);
+            }
+            mix_at(&mut x, &sq, 0.0, 0.9);
+            let slap = thud(0.12, b * 1.5, b * 0.8, 0.3, &mut n);
+            mix_at(&mut x, &slap, 0.42, 0.8);
+        }
+        Archetype::Quicken { .. } => {
+            // river water poured over: a splash's hiss, a trickle after
+            let w = whoosh(0.5, 3000.0, 900.0, 0.8, &mut n);
+            mix_at(&mut x, &w, 0.0, 0.8);
+            let drops = tones(0.5, &[b * 9.0, b * 11.0, b * 13.5], 0.003, 0.08, 0.0, 0.0);
+            mix_at(&mut x, &drops, 0.25, 0.4);
+        }
+        Archetype::Spin { .. } => {
+            // the wheel: a whirring swell and a wet spatter off it
+            let len = 0.5;
+            let mut wh = vec![0.0; secs(len)];
+            let mut bp = Svf::default();
+            for (i, o) in wh.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let (_, b2, _) = bp.run(n.next(), 500.0 + 1400.0 * (t / len), 3.0);
+                *o = b2 * (0.6 + 0.4 * (t * 40.0).sin()) * env(t, 0.1, 0.3);
+            }
+            mix_at(&mut x, &wh, 0.0, 0.9);
+            let spat = whoosh(0.25, 2500.0, 700.0, 1.0, &mut n);
+            mix_at(&mut x, &spat, 0.3, 0.5);
+        }
+        Archetype::Mudslide { .. } => {
+            // the bank giving way: a deep wet rumble swelling and a long
+            // sliding hiss over it
+            let r = thud(0.9, 60.0, 30.0, 0.8, &mut n);
+            mix_at(&mut x, &r, 0.0, 0.9);
+            let w = whoosh(1.0, 1800.0, 500.0, 0.7, &mut n);
+            mix_at(&mut x, &w, 0.1, 0.6);
+        }
+        Archetype::Field { material, .. } => {
+            use crate::gods::Material;
+            match material {
+                Material::Granite => {
+                    // stone grinding shut: a low thud, then a crunching roll
+                    let t = thud(0.4, 80.0, 34.0, 0.9, &mut n);
+                    mix_at(&mut x, &t, 0.0, 0.9);
+                    let len = 0.6;
+                    let mut gr = vec![0.0; secs(len)];
+                    let mut lp = Svf::default();
+                    for (i, o) in gr.iter_mut().enumerate() {
+                        let tt = i as f32 / RATE;
+                        let tick = if n.next() > 0.97 { n.next() * 2.5 } else { 0.0 };
+                        let (l, _, _) = lp.run(tick + n.next() * 0.3, 700.0, 1.2);
+                        *o = drive(l * 2.0, 0.6) * env(tt, 0.05, 0.4);
+                    }
+                    mix_at(&mut x, &gr, 0.05, 0.8);
+                }
+                Material::Rime => {
+                    // the air freezing: glassy partials, and ice cracking
+                    let glass = tones(0.9, &[b * 12.0, b * 12.0 * 1.5, b * 12.0 * 2.2], 0.02, 0.6, 0.3, 0.0);
+                    mix_at(&mut x, &glass, 0.0, 0.45);
+                    for k in 0..7 {
+                        let c = zap(0.05, 5200.0 - 400.0 * k as f32, 1900.0, fl, &mut n);
+                        mix_at(&mut x, &c, 0.04 + k as f32 * 0.07 + 0.02 * (k % 3) as f32, 0.45);
+                    }
+                    let w = whoosh(0.7, 3000.0, 7000.0, 1.6, &mut n);
+                    mix_at(&mut x, &w, 0.0, 0.35);
+                }
+                Material::Lodestone => {
+                    // a magnet waking: a low hum that beats, and a struck
+                    // iron ring over it
+                    let hum = tones(1.0, &[b, b * 1.01, b * 2.0], 0.15, 0.7, 0.0, 0.5);
+                    mix_at(&mut x, &hum, 0.0, 0.8);
+                    let ring = tones(0.8, &[b * 6.0, b * 6.0 * 2.4, b * 6.0 * 3.9], 0.003, 0.45, 0.05, 0.0);
+                    mix_at(&mut x, &ring, 0.08, 0.35);
+                }
+                Material::Magma => {
+                    // the mountain's heart: a rumble swelling up, a roar of
+                    // heat rising, and a low burning chord under it
+                    let len = 1.15;
+                    let mut rum = vec![0.0; secs(len)];
+                    let mut lp = Svf::default();
+                    for (i, o) in rum.iter_mut().enumerate() {
+                        let tt = i as f32 / RATE;
+                        let u = tt / len;
+                        let (l, _, _) = lp.run(n.next(), 90.0 + 60.0 * u, 0.9);
+                        *o = drive(l * 3.5, 0.8) * (u * 3.0).min(1.0) * (1.0 - u).powf(0.6);
+                    }
+                    mix_at(&mut x, &rum, 0.0, 1.0);
+                    let heat = whoosh(0.85, 300.0, 3800.0, 1.1, &mut n);
+                    mix_at(&mut x, &heat, 0.12, 0.7);
+                    let chord = tones(1.05, &[b * 1.0, b * 1.5, b * 2.25], 0.2, 0.7, 0.1, 0.3);
+                    mix_at(&mut x, &chord, 0.1, 0.55);
+                }
+            }
+        }
+        Archetype::Echoes { .. } => {
+            // a low cluster a semitone apart, trembling, and heavy steps
+            // coming from everywhere at once
+            let cl = tones(1.2, &[b * 0.5, b * 0.53, b * 0.75, b * 1.06], 0.3, 0.8, 0.05, 0.6);
+            mix_at(&mut x, &cl, 0.0, 0.8);
+            for k in 0..6 {
+                let st = thud(0.22, 85.0 - 6.0 * (k % 3) as f32, 38.0, 0.6, &mut n);
+                mix_at(&mut x, &st, 0.1 + k as f32 * 0.14 + 0.03 * (k % 2) as f32, 0.55);
+            }
+        }
     }
     let mut x = tail(x);
     if ab.ult {
@@ -428,7 +624,24 @@ pub fn ability(def: &GodDef, slot: usize) -> Vec<f32> {
 }
 
 /// The shared sounds, by bank key.
-pub const GENERIC: [&str; 6] = ["sfx/hit", "sfx/hit_big", "sfx/whiff", "sfx/levelup", "sfx/tower_down", "sfx/cast"];
+pub const GENERIC: [&str; 17] = [
+    "sfx/hit", "sfx/hit_big", "sfx/whiff", "sfx/levelup", "sfx/tower_down", "sfx/cast",
+    // Hollowstep's world (`stalker`): a pounding heart, his heavy tread,
+    // and the air closing where he left
+    "sfx/stalker/heart", "sfx/stalker/step", "sfx/stalker/swap",
+    // a Sentinel's footfall (`sentinel`): the ground takes her weight
+    "sfx/sentinel/tread",
+    // the Quarry's thorns raking a cat (`maze`)
+    "sfx/maze/thorns",
+    // the labyrinth turning: stone grinding on stone, far off
+    "sfx/maze/turn",
+    // a boulder let go down its track: the screws' ratchet, then the roll
+    "sfx/maze/boulder",
+    // a stone landing off its chute; a lock's pad swinging open
+    "sfx/maze/land", "sfx/maze/trapdoor",
+    // Claypaw's mudslide (`clay`): a plant crushed; a wall sloshed off
+    "sfx/clay/smush", "sfx/clay/slosh",
+];
 
 pub fn generic(key: &str) -> Vec<f32> {
     let mut n = Noise(0xC0FF_EE11 ^ (key.len() as u32).wrapping_mul(7919));
@@ -465,6 +678,167 @@ pub fn generic(key: &str) -> Vec<f32> {
             let t = thud(0.5, 90.0, 30.0, 0.9, &mut n);
             mix_at(&mut x, &t, 0.0, 1.0);
             x
+        }
+        "sfx/stalker/heart" => {
+            // lub-dub: two soft, deep thumps, the second a little lower
+            let mut x = vec![0.0; secs(0.5)];
+            let lub = thud(0.16, 70.0, 42.0, 0.05, &mut n);
+            mix_at(&mut x, &lub, 0.0, 1.0);
+            let dub = thud(0.2, 58.0, 36.0, 0.05, &mut n);
+            mix_at(&mut x, &dub, 0.2, 0.8);
+            x
+        }
+        "sfx/stalker/step" => {
+            // a heavy paw put down, and the grit it drags
+            let mut x = thud(0.3, 95.0, 38.0, 0.6, &mut n);
+            let len = 0.28;
+            let mut sc = vec![0.0; secs(len)];
+            let mut lp = Svf::default();
+            for (i, o) in sc.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let (l, _, _) = lp.run(n.next(), 900.0, 0.8);
+                *o = l * env(t, 0.02, 0.12) * 0.8;
+            }
+            mix_at(&mut x, &sc, 0.03, 0.6);
+            x
+        }
+        "sfx/sentinel/tread" => {
+            // a very heavy paw: a sub thump, the ground answering a beat
+            // later, and gravel shifting under it
+            let mut x = thud(0.45, 62.0, 26.0, 0.7, &mut n);
+            let answer = thud(0.35, 41.0, 24.0, 0.3, &mut n);
+            mix_at(&mut x, &answer, 0.06, 0.6);
+            let len = 0.4;
+            let mut gr = vec![0.0; secs(len)];
+            let mut bp = Svf::default();
+            for (i, o) in gr.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let tick = if n.next() > 0.985 { n.next() * 2.0 } else { 0.0 };
+                let (_, b, _) = bp.run(tick + n.next() * 0.15, 1800.0, 2.5);
+                *o = b * env(t, 0.01, 0.2);
+            }
+            mix_at(&mut x, &gr, 0.02, 0.5);
+            x
+        }
+        "sfx/maze/turn" => {
+            // slabs grinding in their slots: a low rumble that swells and
+            // settles, rough grit over it, and a deep knock as they seat
+            let len = 1.6;
+            let mut x = vec![0.0; secs(len)];
+            let (mut lp, mut bp) = (Svf::default(), Svf::default());
+            for (i, o) in x.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let u = t / len;
+                let (l, _, _) = lp.run(n.next(), 70.0 + 30.0 * (u * 9.0).sin().abs(), 0.9);
+                let (_, b, _) = bp.run(n.next(), 900.0, 1.5);
+                let swell = (u * 4.0).min(1.0) * (1.0 - u).powf(0.7);
+                *o = drive(l * 3.0, 0.7) * swell + b * 0.25 * swell;
+            }
+            let knock = thud(0.35, 55.0, 30.0, 0.6, &mut n);
+            mix_at(&mut x, &knock, len - 0.45, 0.9);
+            x
+        }
+        "sfx/maze/boulder" => {
+            // the last clicks of the screws' ratchet, then stone rolling on
+            // stone: a heavy low rumble with a bump each turn of the ball,
+            // passing (swell, then fade)
+            let len = 1.6;
+            let mut x = vec![0.0; secs(len)];
+            let mut lp = Svf::default();
+            for (i, o) in x.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let u = t / len;
+                let (l, _, _) = lp.run(n.next(), 55.0 + 25.0 * (t * 6.5).sin().abs(), 0.8);
+                let swell = ((t - 0.15) / 0.25).clamp(0.0, 1.0) * (1.0 - u).powf(1.3);
+                *o = drive(l * 3.5, 0.8) * swell;
+            }
+            for k in 0..4 {
+                let click = thud(0.05, 900.0, 600.0, 0.4, &mut n);
+                mix_at(&mut x, &click, k as f32 * 0.06, 0.35);
+            }
+            let mut b = 0.3;
+            while b < len - 0.3 {
+                let bump = thud(0.18, 48.0, 30.0, 0.5, &mut n);
+                mix_at(&mut x, &bump, b, 0.5 * (1.0 - b / len));
+                b += 0.36;
+            }
+            x
+        }
+        "sfx/clay/smush" => {
+            // wood and stems giving way under mud: splintering crackles
+            // over a wet crunch
+            let mut x = thud(0.25, 180.0, 90.0, 0.9, &mut n);
+            let len = 0.35;
+            let mut cr = vec![0.0; secs(len)];
+            let mut bp = Svf::default();
+            for (i, o) in cr.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let snap = if n.next() > 0.985 { n.next() * 3.0 } else { 0.0 };
+                let (_, b2, _) = bp.run(snap, 2200.0, 2.0);
+                *o = b2 * env(t, 0.005, 0.25);
+            }
+            mix_at(&mut x, &cr, 0.0, 0.7);
+            x
+        }
+        "sfx/clay/slosh" => {
+            // a wave of mud hitting stone and falling back: a heavy slap,
+            // then a sucking, sliding hiss
+            let mut x = thud(0.3, 110.0, 50.0, 0.6, &mut n);
+            let w = whoosh(0.7, 2000.0, 400.0, 0.7, &mut n);
+            mix_at(&mut x, &w, 0.05, 0.7);
+            x
+        }
+        "sfx/maze/land" => {
+            // a stone hitting the flags from a wall's height: a deep thud,
+            // a crack of grit over it, a short rumble after
+            let mut x = thud(0.6, 70.0, 28.0, 0.9, &mut n);
+            let crack = thud(0.08, 1400.0, 500.0, 0.8, &mut n);
+            mix_at(&mut x, &crack, 0.0, 0.5);
+            x
+        }
+        "sfx/maze/trapdoor" => {
+            // a latch let go (a bright clack), then stone dragging on its
+            // hinge and a hollow knock as it hangs
+            let len = 0.9;
+            let mut x = vec![0.0; secs(len)];
+            let mut bp = Svf::default();
+            for (i, o) in x.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let (_, b, _) = bp.run(n.next(), 420.0 + 300.0 * (1.0 - t / len), 1.2);
+                *o = b * 0.6 * env(t, 0.05, 0.5);
+            }
+            let clack = thud(0.06, 1800.0, 900.0, 0.5, &mut n);
+            mix_at(&mut x, &clack, 0.0, 0.8);
+            let knock = thud(0.3, 110.0, 60.0, 0.4, &mut n);
+            mix_at(&mut x, &knock, 0.5, 0.7);
+            x
+        }
+        "sfx/maze/thorns" => {
+            // a rake of thorns: dry crackles through a bright band, over a
+            // short scrape
+            let len = 0.45;
+            let mut x = vec![0.0; secs(len)];
+            let (mut bp, mut hp) = (Svf::default(), Svf::default());
+            for (i, o) in x.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let crack = if n.next() > 0.992 { n.next() * 3.0 } else { 0.0 };
+                let (_, b, _) = bp.run(crack, 3200.0, 3.0);
+                let (_, _, h) = hp.run(n.next(), 2400.0, 0.7);
+                *o = b * env(t, 0.005, 0.3) + h * 0.35 * env(t, 0.02, 0.12);
+            }
+            x
+        }
+        "sfx/stalker/swap" => {
+            // the air closing where he stood: a short suck, then nothing
+            let len = 0.25;
+            let mut w = whoosh(len, 4200.0, 700.0, 1.5, &mut n);
+            let m = w.len() as f32;
+            for (i, v) in w.iter_mut().enumerate() {
+                *v *= (1.0 - i as f32 / m).powf(0.5);
+            }
+            let t = thud(0.18, 60.0, 30.0, 0.2, &mut n);
+            mix_at(&mut w, &t, 0.05, 0.8);
+            w
         }
         _ => {
             let fl = Flavor { base: 180.0, bright: 0.6, grit: 0.3, seed: 1 };

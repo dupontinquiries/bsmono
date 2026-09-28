@@ -60,6 +60,14 @@ impl Game {
         self.projectiles_tick(dt);
         self.zones_tick(dt);
         self.kit_tick(dt);
+        self.stalker_tick(dt);
+        self.lantern_tick(dt);
+        self.sentinel_tick(dt);
+        // after sentinel_tick: that resets `ward`, this multiplies into it
+        self.maze_tick(dt);
+        self.machine_tick(dt);
+        self.hours_tick(dt);
+        self.clay_tick(dt);
 
         // 6b. sky + map events (weather.rs / map_events.rs)
         self.atmosphere_tick(dt);
@@ -85,7 +93,7 @@ impl Game {
         let scale = 1.0 + (self.t / 60.0).min(15.0) * 0.07;
         let hp = MINION_HP * scale * self.lane_surge(team, lane);
         // melee in ranks (four abreast, eight for a big wave), casters behind
-        let (melee, casters) = crate::map::active().wave(self.waves);
+        let (melee, casters) = self.rules.wave(crate::map::active().wave(self.waves));
         let rank = |k: usize, n: usize, back: f32| -> [f32; 2] {
             // eight abreast for a big wave (the sky's 32 u lanes), else four
             let per = if n > 8 { 8 } else { n.min(4).max(1) };
@@ -134,6 +142,7 @@ impl Game {
                 lane_off: o[1] * if melee + casters > 5 { 1.6 } else { 1.0 },
                 giggle_t: 0.0,
                 dance_t: 0.0,
+                clay: None,
             });
         }
     }
@@ -279,6 +288,10 @@ impl Game {
                     Seen { foe: f, class, dist: d }
                 });
                 foe = pick(cur, &seen);
+                // a mudslide kitten: cats first, no leash (`clay::kit_foe`)
+                if m.clay.is_some() {
+                    foe = self.kit_foe(m, foe);
+                }
             }
             if foe.is_some() && left_at.is_none() {
                 left_at = Some(m.pos);
@@ -306,6 +319,8 @@ impl Game {
         // moved since last tick (riders are carried by that), and which pier
         // it is docked at.
         let ferries = self.ferries.clone();
+        // Claypaw's mud (`clay`): on a slick a cat slides
+        let slicks = self.slicks.clone();
         let clouds: Vec<(Vec3, Vec3, Option<u8>)> = ferries
             .iter()
             .map(|f| {
@@ -391,6 +406,8 @@ impl Game {
             let speed = self.move_speed(i) * self.gods[i].casting.map_or(1.0, |c| c.move_mul);
             self.gods[i].face_hold = (self.gods[i].face_hold - dt).max(0.0);
             let dir = crate::kit::confused(self.gods[i].move_dir, self.gods[i].giggle_t, self.t, i);
+            // fleeing the lamp (`lantern`): straight away, at a run
+            let dir = self.flee_dir(i, dir);
             let yaw_cur = self.gods[i].yaw;
             let g = &mut self.gods[i];
             g.leap_cd = (g.leap_cd - dt).max(0.0);
@@ -420,22 +437,43 @@ impl Game {
                     g.leap_cd = crate::leap::LEAP_COOLDOWN * if now - g.last_dmg_t < crate::brawl::WINDED_SECS { crate::brawl::WINDED_COOLDOWN } else { 1.0 };
                 }
             } else if let Some(d) = &mut g.dash {
+                let a0 = (d.t / d.dur).min(1.0);
                 d.t += dt;
                 let a = (d.t / d.dur).min(1.0);
+                // Step along the line from where the cat IS, not set to where
+                // the line says it should be: the resolve below shoves it off
+                // a trunk it dashes into, and setting the position from the
+                // line every tick threw that shove away -- the dash went
+                // straight through the tree. Moved by the step, a dash into
+                // bark slides round it.
+                let step = d.to - d.from;
+                let (x, z) = (g.pos.x + step.x * (a - a0), g.pos.z + step.z * (a - a0));
                 // over the ground the whole way: a straight line up a ramp
                 // went INTO the slope, then snapped up at the end
-                let p = d.from.lerp(d.to, a);
-                let gy = crate::map::ground_y(p.x, p.z);
-                g.pos = Vec3::new(p.x, p.y.max(gy), p.z) + Vec3::Y * (a * (1.0 - a) * 4.0 * d.arc);
+                let line_y = d.from.y + step.y * a;
+                let gy = crate::map::ground_y(x, z);
+                g.pos = Vec3::new(x, line_y.max(gy), z) + Vec3::Y * (a * (1.0 - a) * 4.0 * d.arc);
                 if a >= 1.0 {
-                    let gy = crate::map::ground_y(d.to.x, d.to.z);
-                    g.pos = Vec3::new(d.to.x, d.to.y.max(gy), d.to.z);
-                    dash_ends.push((i, g.team, d.from, d.to, d.dmg, d.blast));
+                    let gy = crate::map::ground_y(x, z);
+                    g.pos = Vec3::new(x, (d.from.y + step.y).max(gy), z);
+                    // the strike runs to where the dash really ended
+                    dash_ends.push((i, g.team, d.from, g.pos, d.dmg, d.blast));
                     g.dash = None;
                 }
                 g.walk_anim += dt * 12.0;
+            } else if let Some(s) = slicks.iter().rev().find(|s| g.perch.is_none() && s.covers(g.pos)) {
+                // on a slick: it keeps going the way it went, faster, and
+                // turns slowly; a mudslide carries it too
+                let want = if dir.length_squared() > 0.0001 { dir.normalize() } else { Vec3::ZERO };
+                g.slide = crate::clay::slide_step(g.slide, want, speed, dt);
+                g.pos += (g.slide + s.push) * dt;
+                if g.slide.length_squared() > 0.5 && g.face_hold <= 0.0 {
+                    g.yaw = g.slide.z.atan2(g.slide.x);
+                }
+                g.walk_anim += dt * 6.0;
             } else if dir.length_squared() > 0.0001 {
                 let on_ridge = g.perch.is_some() && g.perch_narrow;
+                g.slide = dir.normalize() * speed;
                 g.pos += dir.normalize() * speed * if on_ridge { crate::leap::NARROW_SPEED } else { 1.0 } * dt;
                 // Facing: toward the move, within a cone round where the
                 // player looks (`face_ref`, the camera's forward): strafing
@@ -455,6 +493,7 @@ impl Game {
                 }
                 g.walk_anim += dt * 9.0;
             } else {
+                g.slide = Vec3::ZERO;
                 g.walk_anim += dt * 1.5;
             }
             // Prop collision. Runs AFTER the move and BEFORE the arena clamp:
@@ -583,6 +622,7 @@ impl Game {
             self.dash_strikes(gi, team, from, to, dmg, blast);
         }
         // separation
+        let mut shoved = vec![false; self.gods.len()];
         for a in 0..self.gods.len() {
             for b in (a + 1)..self.gods.len() {
                 let (pa, pb) = (self.gods[a].pos, self.gods[b].pos);
@@ -592,7 +632,21 @@ impl Game {
                     let push = d.normalize() * (1.1 - dist) * 0.5;
                     self.gods[a].pos -= push;
                     self.gods[b].pos += push;
+                    shoved[a] = true;
+                    shoved[b] = true;
                 }
+            }
+        }
+        // ...and back out of anything the shove put them into: two cats
+        // meeting beside a trunk pushed one into the bark, where it stayed
+        // until its next step (on the ground only -- a cat in the air is
+        // resolved at its feet above). A dash is on the ground: shoved
+        // mid-dash into a trunk, a cat was left 0.14 u inside the bark (it
+        // showed when bots began to move a reaction late, `reaction`, and
+        // one was still standing in the dash's way)
+        for (gi, g) in self.gods.iter_mut().enumerate() {
+            if shoved[gi] && g.leap.is_none() && g.perch.is_none() && g.fall.is_none() {
+                g.pos = self.blockers.resolve(g.pos, GOD_RADIUS);
             }
         }
     }
@@ -611,6 +665,13 @@ impl Game {
                     // casters stand a little inside their reach
                     let want = if m.caster { reach * 0.85 } else { reach - 0.3 };
                     (flat(p - m.pos) > want).then_some(p)
+                }
+                // a mudslide kitten with nothing to bite: round its potter,
+                // or down a lane (`clay::kit_idle_goal`); on the way the mud
+                // threw it only if there is no lane at all
+                None if self.minions[mi].clay.is_some() => {
+                    let m = &self.minions[mi];
+                    self.kit_idle_goal(m).or(Some(m.pos + m.clay.unwrap().heading * 4.0))
                 }
                 None => {
                     let m = &mut self.minions[mi];
@@ -641,7 +702,8 @@ impl Game {
                     let d = Vec3::new(target.x - m.pos.x, 0.0, target.z - m.pos.z);
                     if d.length_squared() > 0.001 {
                         let shuffle = if m.dance_t > 0.0 { crate::kit::DANCE_MOVE } else { 1.0 };
-                        let step = (7.4 * shuffle * dt).min(d.length());
+                        let pace = if m.clay.is_some() { crate::clay::SLIDE_KIT_SPEED } else { 7.4 };
+                        let step = (pace * shuffle * dt).min(d.length());
                         m.pos += d.normalize() * step;
                         m.yaw = d.z.atan2(d.x);
                         m.walk_anim += dt * 10.0;
@@ -702,7 +764,8 @@ impl Game {
                 let e = &self.gods[j];
                 // a cat hidden in cloud cannot be locked onto
                 if e.team != g.team && e.respawn_t <= 0.0 && self.sees(g.team, j) {
-                    let d = e.pos.distance(g.pos);
+                    // a bigger cat is reached sooner (`Role::extra_reach`)
+                    let d = e.pos.distance(g.pos) - self.def(j).role.extra_reach();
                     if d < bd {
                         bd = d;
                         target = Some(TargetRef::God(j));
@@ -754,7 +817,8 @@ impl Game {
             }
             // fire!
             let interval = self.auto_interval(i);
-            let dmg = self.auto_damage(i);
+            // the Thrice-Pounce Claws count this blow (curios.rs)
+            let dmg = self.auto_damage(i) + self.pounce_bonus(i);
             let (pen_pct, pen_flat) = (self.gods[i].pen_pct, self.gods[i].pen_flat);
             let team = self.gods[i].team;
             let from = self.gods[i].pos + Vec3::Y * 1.4;
@@ -779,14 +843,14 @@ impl Game {
                         }
                     }
                     let extra = profile.map(|m| self.cleave_targets(i, main, def.auto_range * 1.15, m)).unwrap_or_default();
-                    self.siphon_off = true;
+                    self.basic_attack = true;
                     self.deal_damage(main, dmg, magic, Some(i), pen_pct, pen_flat);
                     // the sweep or cleave catches those beside it
                     let splash = profile.map_or(0.0, |m| m.splash);
                     for t in extra {
                         self.deal_damage(t, dmg * splash, magic, Some(i), pen_pct, pen_flat);
                     }
-                    self.siphon_off = false;
+                    self.basic_attack = false;
                 }
                 AutoKind::Ranged => {
                     let to = self.target_pos(target.unwrap());
@@ -804,6 +868,7 @@ impl Game {
                         pen_pct,
                         pen_flat,
                         color: team.rgb(),
+                        auto: true,
                     });
                 }
             }
@@ -871,9 +936,15 @@ impl Game {
             }
             m.atk_timer = MINION_ATK_CD;
             m.atk_anim = 1.0;
-            let mut dmg = if m.caster { MINION_CASTER_DMG } else { MINION_DMG };
-            dmg *= 1.0 + (self.t / 60.0).min(15.0) * 0.08;
-            dmg *= surge;
+            // a mudslide kitten (`clay`) bites as hard as it was made to,
+            // and its bites are its maker's
+            let clay = m.clay;
+            let mut dmg = if let Some(c) = clay { c.dmg } else if m.caster { MINION_CASTER_DMG } else { MINION_DMG };
+            if clay.is_none() {
+                dmg *= 1.0 + (self.t / 60.0).min(15.0) * 0.08;
+                dmg *= surge;
+            }
+            let src = clay.map(|c| c.owner);
             // structures take bonus minion damage so lanes actually fall
             if matches!(target.unwrap(), TargetRef::Tower(_) | TargetRef::Titan(_)) {
                 dmg *= 2.4 * crate::map::active().minion_structure_mul();
@@ -883,18 +954,18 @@ impl Game {
                     if m.caster {
                         self.spawn_minion_bolt(mi, TargetRef::God(gi));
                     } else {
-                        self.deal_damage(TargetRef::God(gi), dmg, false, None, 0.0, 0.0);
+                        self.deal_damage(TargetRef::God(gi), dmg, false, src, 0.0, 0.0);
                     }
                 }
                 TargetRef::Minion(oi) => {
                     if m.caster {
                         self.spawn_minion_bolt(mi, TargetRef::Minion(oi));
                     } else {
-                        self.deal_damage(TargetRef::Minion(oi), dmg, false, None, 0.0, 0.0);
+                        self.deal_damage(TargetRef::Minion(oi), dmg, false, src, 0.0, 0.0);
                     }
                 }
-                TargetRef::Tower(ti) => self.deal_damage(TargetRef::Tower(ti), dmg, false, None, 0.0, 0.0),
-                TargetRef::Titan(team) => self.deal_damage(TargetRef::Titan(team), dmg, false, None, 0.0, 0.0),
+                TargetRef::Tower(ti) => self.deal_damage(TargetRef::Tower(ti), dmg, false, src, 0.0, 0.0),
+                TargetRef::Titan(team) => self.deal_damage(TargetRef::Titan(team), dmg, false, src, 0.0, 0.0),
                 TargetRef::Boss(_) => {} // minions never fight the beasts
             }
         }
@@ -920,6 +991,7 @@ impl Game {
             pen_pct: 0.0,
             pen_flat: 0.0,
             color: team.rgb(),
+            auto: false,
         });
     }
 
@@ -1016,6 +1088,7 @@ impl Game {
                 pen_pct: 0.0,
                 pen_flat: 0.0,
                 color: tw.team.rgb(),
+                auto: false,
             });
         }
     }
@@ -1155,7 +1228,7 @@ impl Game {
                 let g = &self.gods[gi];
                 if g.team != p.team && g.respawn_t <= 0.0 {
                     // The body, not a ball over the feet: see `hitbox`.
-                    if crate::hitbox::cat(g.pos, g.yaw, g.sneak && g.hush_t <= 0.0).hit_by_moving_sphere(p.pos - p.vel * dt, p.pos, p.radius + 0.2) {
+                    if crate::hitbox::cat_sized(g.pos, g.yaw, g.sneak && g.hush_t <= 0.0, self.def(gi).role.size()).hit_by_moving_sphere(p.pos - p.vel * dt, p.pos, p.radius + 0.2) {
                         hit = Some(TargetRef::God(gi));
                         break;
                     }
@@ -1205,12 +1278,14 @@ impl Game {
                 }
             }
             if let Some(h) = hit {
-                let (pdmg, ppen, ppf, powner, ppos, pcolor) = {
+                let (pdmg, ppen, ppf, powner, ppos, pcolor, pauto) = {
                     let p = &self.projectiles[pi];
-                    (p.dmg, p.pen_pct, p.pen_flat, p.owner, p.pos, p.color)
+                    (p.dmg, p.pen_pct, p.pen_flat, p.owner, p.pos, p.color, p.auto)
                 };
                 let owner = if powner == usize::MAX { None } else { Some(powner) };
+                self.basic_attack = pauto;
                 self.deal_damage(h, pdmg, false, owner, ppen, ppf);
+                self.basic_attack = false;
                 self.events.push(Event::Explosion { pos: ppos, radius: 0.9, color: pcolor });
                 dead[pi] = true;
             }
@@ -1227,7 +1302,7 @@ impl Game {
         let mut hits: Vec<TargetRef> = Vec::new();
         for gi in 0..self.gods.len() {
             let g = &self.gods[gi];
-            if g.team != team && g.respawn_t <= 0.0 && (g.pos.y - center.y).abs() < crate::brawl::AOE_REACH_Y && crate::hitbox::cat(g.pos, g.yaw, false).in_disc(center, radius + 0.2) {
+            if g.team != team && g.respawn_t <= 0.0 && (g.pos.y - center.y).abs() < crate::brawl::AOE_REACH_Y && crate::hitbox::cat_sized(g.pos, g.yaw, false, self.def(gi).role.size()).in_disc(center, radius + 0.2) {
                 hits.push(TargetRef::God(gi));
             }
         }
@@ -1377,6 +1452,12 @@ impl Game {
             let was_dead = self.gods[i].respawn_t > 0.0;
             let last_dmg = self.gods[i].last_dmg_t;
             let now = self.t;
+            // out of the fight: after 6 s, 1.2% a second -- or the Moonmilk
+            // Flask's quicker, deeper mending (curios.rs)
+            let (mend_after, mend_pct) = self.mending(i);
+            if !was_dead {
+                self.curios_tick(i, dt);
+            }
 
             {
                 let g = &mut self.gods[i];
@@ -1420,13 +1501,15 @@ impl Game {
                     }
                 } else {
                     // regen
-                    g.mana = (g.mana + (2.6 + 0.5 * g.level as f32) * dt).min(g.max_mana);
-                    if now - last_dmg > 6.0 {
-                        g.hp = (g.hp + g.max_hp * 0.012 * dt).min(g.max_hp);
+                    // (Claypaw's mana comes only from his claws: `clay`)
+                    let regen = if crate::clay::is_clay(crate::gods::god(g.def_id)) { 0.0 } else { 1.0 };
+                    g.mana = (g.mana + (2.6 + 0.5 * g.level as f32) * dt * regen).min(g.max_mana);
+                    if now - last_dmg > mend_after {
+                        g.hp = (g.hp + g.max_hp * mend_pct * dt * g.heal_mul).min(g.max_hp);
                     }
                     let f = g.team.fountain();
                     if g.pos.distance(f) < FOUNTAIN_RADIUS {
-                        g.hp = (g.hp + g.max_hp * FOUNTAIN_REGEN * dt * 4.0).min(g.max_hp);
+                        g.hp = (g.hp + g.max_hp * FOUNTAIN_REGEN * dt * 4.0 * g.heal_mul).min(g.max_hp);
                         g.mana = (g.mana + g.max_mana * FOUNTAIN_REGEN * dt * 4.0).min(g.max_mana);
                     }
                 }

@@ -42,7 +42,7 @@ pub const KINDS: [(&str, PropKind); 10] = [
 pub fn mirror(x: f32, z: f32) -> (f32, f32) {
     match crate::map::active() {
         crate::map::MapId::Jungle => (-x, -z),
-        crate::map::MapId::Pass | crate::map::MapId::Sky => (x, -z),
+        crate::map::MapId::Pass | crate::map::MapId::Sky | crate::map::MapId::Atlantis | crate::map::MapId::Maze => (x, -z),
     }
 }
 
@@ -61,6 +61,8 @@ pub fn tools() -> String {
             crate::map::MapId::Jungle => "through the origin",
             crate::map::MapId::Pass => "across z = 0; the ground is a canyon floor and everything else is cliff",
             crate::map::MapId::Sky => "across z = 0; the ground is islands in the sky and everything else is a fall",
+            crate::map::MapId::Atlantis => "across z = 0; the ground is the floor of walled halls under the sea",
+            crate::map::MapId::Maze => "across z = 0; the ground is a labyrinth's corridors and everything else is wall",
         },
         KINDS.iter().map(|k| k.0).collect::<Vec<_>>().join(", "),
         consts::ARENA_RADIUS * 2.0

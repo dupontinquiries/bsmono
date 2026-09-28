@@ -13,6 +13,8 @@ struct PostParams {
     cam: vec4<f32>,                 // xyz: the camera
     blast_a: array<vec4<f32>, 8>,   // blast fronts in the world: centre xyz, radius
     blast_b: array<vec4<f32>, 8>,   // strength, shell thickness
+    flare: vec4<f32>,               // x strength (lensflare::strength), yzw the sun's colour
+    sea: vec4<f32>,                 // x underwater (0..1), y caustic strength, zw free
 };
 @group(0) @binding(2) var<uniform> pp: PostParams;
 // The scene's depth (MSAA; sample 0 is plenty for a refraction mask).
@@ -143,6 +145,73 @@ fn hash21(p: vec2<f32>) -> f32 {
     return fract(q.x * q.y);
 }
 
+// --- the lens flare (lensflare.rs states the placement and strength; the
+// test there pins them). Everything is in screen uv with x scaled by the
+// aspect, so discs are round. `open` is how much of the sun the scene
+// leaves uncovered.
+fn flare_disc(p: vec2<f32>, c: vec2<f32>, r: f32, soft: f32) -> f32 {
+    let d = length(p - c);
+    // a soft disc with a faint brighter rim: an aperture ghost
+    let body = smoothstep(r, r * (1.0 - soft), d);
+    let rim = smoothstep(r * 0.08, 0.0, abs(d - r * 0.92)) * 0.35;
+    return body * 0.65 + rim;
+}
+
+fn lens_flare(uv: vec2<f32>, sun: vec2<f32>, aspect: f32, t: f32) -> vec3<f32> {
+    let a = vec2(aspect, 1.0);
+    let p = uv * a;
+    let s = sun * a;
+    let d = p - s;
+    let r = length(d);
+    var col = vec3(0.0);
+    // glare: a tight hot core and a broad warm veil
+    col = col + vec3(1.0, 0.92, 0.78) * (exp(-r * r * 900.0) * 1.6 + exp(-r * r * 22.0) * 0.12);
+    // starburst: twelve spikes of uneven length from the aperture blades,
+    // turning slowly with the time so they shimmer, not rotate
+    let ang = atan2(d.y, d.x);
+    let spikes = pow(abs(cos(ang * 6.0 + 0.3)), 90.0) + 0.6 * pow(abs(cos(ang * 6.0 + 0.3 + 1.5708 / 6.0 * 3.0)), 140.0);
+    let jag = 0.6 + 0.4 * sin(ang * 37.0 + t * 0.7) * sin(ang * 23.0 - t * 0.4);
+    col = col + vec3(1.0, 0.95, 0.85) * spikes * jag * exp(-r * 7.0) * 0.55;
+    // anamorphic streak: a long thin blue-white line through the sun
+    col = col + vec3(0.55, 0.72, 1.0) * exp(-abs(d.y) * 420.0) * exp(-abs(d.x) * 2.2) * 0.45;
+    // ghosts: reflections between the lens elements, strung on the line
+    // from the sun through the centre of the frame, each a little off in
+    // colour (the red, green and blue images are different sizes)
+    let axis = (vec2(0.5) - sun) * a;
+    let c0 = vec2(0.5) * a;
+    var ks = array<f32, 6>(0.45, 0.72, 1.18, 1.55, 1.95, 2.4);
+    var rs = array<f32, 6>(0.035, 0.08, 0.05, 0.13, 0.025, 0.2);
+    var tint = array<vec3<f32>, 6>(vec3(1.0, 0.7, 0.4), vec3(0.45, 0.8, 1.0), vec3(0.9, 0.5, 1.0), vec3(0.4, 1.0, 0.7), vec3(1.0, 0.9, 0.5), vec3(0.5, 0.6, 1.0));
+    for (var i = 0; i < 6; i = i + 1) {
+        let c = s + axis * ks[i];
+        let g = vec3(flare_disc(p, c, rs[i] * 1.04, 0.5), flare_disc(p, c, rs[i], 0.5), flare_disc(p, c, rs[i] * 0.96, 0.5));
+        col = col + g * tint[i] * 0.13;
+    }
+    // the halo: a faint rainbow ring about the frame's centre, brightest on
+    // the side the sun is
+    let hc = p - c0;
+    let hr = length(hc);
+    let ring = smoothstep(0.03, 0.0, abs(hr - 0.42));
+    let side = max(dot(normalize(hc + vec2(1e-4)), normalize(-axis + vec2(1e-4))), 0.0);
+    let rainbow = 0.5 + 0.5 * cos(vec3(0.0, 2.094, 4.188) + (hr - 0.42) * 90.0);
+    col = col + rainbow * ring * side * side * 0.07;
+    return col;
+}
+
+// A little dust on the lens: the flare lights it, nothing else does.
+fn lens_dirt(uv: vec2<f32>) -> f32 {
+    var d = 0.0;
+    for (var i = 0; i < 3; i = i + 1) {
+        let sc = 7.0 + f32(i) * 9.0;
+        let cell = floor(uv * sc);
+        let f = fract(uv * sc) - 0.5;
+        let h = hash21(cell + f32(i) * 17.0);
+        let off = vec2(hash21(cell + 3.1), hash21(cell + 7.7)) - 0.5;
+        d = d + step(0.72, h) * smoothstep(0.32, 0.0, length(f - off * 0.5)) * (0.4 + 0.6 * h);
+    }
+    return d;
+}
+
 fn bright(c: vec3<f32>) -> vec3<f32> {
     // soft knee around 1.0 in linear HDR — crystals, VFX, the sun disc, wet glints
     let l = dot(c, vec3(0.2126, 0.7152, 0.0722));
@@ -218,6 +287,14 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         let wob = sin(in.uv.y * 95.0 - t * 6.5 + sin(in.uv.x * 40.0 + t * 2.0) * 1.7);
         bend = bend + vec2(wob * 0.0022, 0.0) * heat * smoothstep(0.0, 0.5, 1.0 - in.uv.y + 0.2);
     }
+    // under the sea (the Drowned Halls): the whole view sways a little, as
+    // seen through moving water
+    let sea = pp.sea.x;
+    if (sea > 0.001) {
+        let tt = pp.a.z;
+        // (gentle: at 0.0011 the colonnade's columns wavered like reeds)
+        bend = bend + vec2(sin(in.uv.y * 9.0 + tt * 0.9) + 0.5 * sin(in.uv.y * 5.0 - tt * 0.5), cos(in.uv.x * 8.0 + tt * 0.8)) * 0.0005 * sea;
+    }
     let uv0 = clamp(in.uv + bend, vec2(0.001), vec2(0.999));
     var col = textureSample(hdr, samp, uv0).rgb;
     if (pp.d.y > 0.5 && pp.d.x > 0.02) {
@@ -280,6 +357,42 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         }
         let fade = smoothstep(1.4, 0.2, distance(in.uv, sun_uv));
         col = col + acc / 22.0 * ray_s * fade * vec3(1.0, 0.9, 0.75);
+    }
+
+    // --- the lens flare: only where the sun is uncovered (the depth buffer
+    // at the far plane round its disc: a leaf, a peak, a cat in front of it
+    // puts it out), in its colour
+    let fl = pp.flare.x;
+    if (fl > 0.001) {
+        let sun_uv = pp.c.xy;
+        var open = 0.0;
+        for (var j = 0; j < 9; j = j + 1) {
+            let o = vec2(f32(j % 3) - 1.0, f32(j / 3) - 1.0) * 0.006;
+            let suv = sun_uv + o;
+            if (all(suv >= vec2(0.0)) && all(suv <= vec2(1.0))) {
+                let px = vec2<i32>(clamp(suv * dims, vec2(0.0), dims - vec2(1.0)));
+                open = open + select(0.0, 1.0, textureLoad(scene_depth, px, 0) >= 0.99999);
+            } else {
+                // just off the frame: the flare fades out with the sun
+                open = open + 0.5;
+            }
+        }
+        open = open / 9.0;
+        if (open > 0.001) {
+            let f = lens_flare(in.uv, sun_uv, aspect, pp.a.z) * pp.flare.yzw * fl * open;
+            col = col + f * (1.0 + lens_dirt(in.uv) * 1.5);
+        }
+    }
+
+    // --- under the sea: light falls in slanting shafts from the surface
+    // (brightest at the top of the frame, drifting), and the view is graded
+    // blue-green, its reds drunk by the water
+    if (sea > 0.001) {
+        let tt = pp.a.z;
+        let slant = in.uv.x + in.uv.y * 0.35;
+        let shafts = pow(max(surf_noise(vec2(slant * 7.0 + tt * 0.05, tt * 0.02)) - 0.45, 0.0) * 1.8, 2.0) + 0.5 * pow(max(surf_noise(vec2(slant * 17.0 - tt * 0.08, 3.0)) - 0.55, 0.0) * 2.2, 2.0);
+        col = col + vec3(0.25, 0.55, 0.55) * shafts * smoothstep(0.95, 0.0, in.uv.y) * 0.35 * sea;
+        col = col * mix(vec3(1.0), vec3(0.78, 1.0, 1.04), sea);
     }
 
     // --- lightning: a full-frame flash on top of the lit scene

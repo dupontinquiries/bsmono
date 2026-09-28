@@ -60,7 +60,12 @@ pub fn card(p: &Part) -> String {
     let accent = legible(accent);
     let w = 1000;
     let voice = wrap(p.voice, 78);
-    let head = 250 + voice.len() as i32 * 26 + if about.is_some() { 30 } else { 0 };
+    // a long title or lore line wraps too (Sproutkit's and Oremantle's
+    // titles ran off the card's edge)
+    let titles = wrap(&title, 70);
+    let abouts = about.as_deref().map(|a| wrap(a, 90)).unwrap_or_default();
+    let extra = (titles.len() as i32 - 1).max(0) * 30;
+    let head = 250 + extra + voice.len() as i32 * 26 + abouts.len() as i32 * 24 + if abouts.is_empty() { 0 } else { 6 };
     // the narrator's sentences wrap onto two lines: taller rows
     let wraps = p.lines.iter().any(|l| l.text.len() > 46);
     let row = if wraps { 142 } else { 112 };
@@ -76,12 +81,17 @@ pub fn card(p: &Part) -> String {
     s += &format!(r#"<rect width="{w}" height="{head}" fill="url(#hd)"/>"#);
     s += &format!(r#"<rect y="{}" width="{w}" height="6" fill="{}"/>"#, head - 6, hex(accent, 1.0));
     s += &format!(r##"<text x="48" y="92" font-size="64" font-weight="bold" fill="#fbf6ea">{}</text>"##, esc(&name));
-    s += &format!(r##"<text x="50" y="132" font-size="24" fill="#e8dcc0">{}</text>"##, esc(&title));
-    s += &format!(r##"<text x="50" y="176" font-size="22" font-style="italic" fill="{}">{}</text>"##, hex(accent, 1.0), esc(&motto));
-    let mut vy = 218;
-    if let Some(a) = &about {
+    for (i, t) in titles.iter().enumerate() {
+        s += &format!(r##"<text x="50" y="{}" font-size="24" fill="#e8dcc0">{}</text>"##, 132 + i as i32 * 30, esc(t));
+    }
+    s += &format!(r##"<text x="50" y="{}" font-size="22" font-style="italic" fill="{}">{}</text>"##, 176 + extra, hex(accent, 1.0), esc(&motto));
+    let mut vy = 218 + extra;
+    for a in &abouts {
         s += &format!(r##"<text x="50" y="{vy}" font-size="18" font-weight="bold" fill="#f3ead4">{}</text>"##, esc(a));
-        vy += 30;
+        vy += 24;
+    }
+    if !abouts.is_empty() {
+        vy += 6;
     }
     for (i, l) in voice.iter().enumerate() {
         s += &format!(r##"<text x="50" y="{}" font-size="19" fill="#d8d2c4">{}</text>"##, vy + i as i32 * 26, esc(l));

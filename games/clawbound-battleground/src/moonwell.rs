@@ -226,7 +226,7 @@ impl crate::sim::Game {
             let grant = grants(self.bosses.claim_t[ti], self.bosses.claim_id[ti], g.boon_claim, g.boon.is_some());
             let boon = if grant { Some(draw(&mut self.rng)) } else { None };
             let g = &mut self.gods[i];
-            g.hp = (g.hp + g.max_hp * heal * dt).min(g.max_hp);
+            g.hp = (g.hp + g.max_hp * heal * dt * g.heal_mul).min(g.max_hp);
             if let Some(b) = boon {
                 g.boon = Some((b, BOON_SECS));
                 g.boon_claim = self.bosses.claim_id[ti];

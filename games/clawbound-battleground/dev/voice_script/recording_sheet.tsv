@@ -134,6 +134,51 @@ voice/sproutkit/kill.1.opus	sproutkit	Tag, you're out!	teasing	3	takes down an e
 voice/sproutkit/kill.2.opus	sproutkit	Nap time!	a yawn in it	2	takes down an enemy ancestor
 voice/sproutkit/death.1.opus	sproutkit	Not... fair...	a pout	2	falls
 voice/sproutkit/death.2.opus	sproutkit	I'll grow... back...	sleepy, sure of it	1	falls
+voice/hollowstep/select.opus	hollowstep	I'm already there.	quiet, certain, right at the mic	2	locked in on the select screen
+voice/hollowstep/cast1.opus	hollowstep	Behind you.	a whisper at the ear	2	winds up Step Between
+voice/hollowstep/cast2.opus	hollowstep	Go on. Wait for them.	patient, to someone beside you	2	winds up Send the Other
+voice/hollowstep/cast3.opus	hollowstep	Too slow.	flat, a little disappointed	3	winds up The Long Reach
+voice/hollowstep/cast4.opus	hollowstep	Which one... is ME?	from a whisper to a roar on 'me'	5	winds up Every Shadow
+voice/hollowstep/kill.1.opus	hollowstep	Found you.	soft, almost tender	2	takes down an enemy ancestor
+voice/hollowstep/kill.2.opus	hollowstep	You ran. They always run.	weary	2	takes down an enemy ancestor
+voice/hollowstep/death.1.opus	hollowstep	I'll... be... waiting...	fading, not beaten	1	falls
+voice/hollowstep/death.2.opus	hollowstep	Check... the shadows...	a last whisper, a threat	1	falls
+voice/brasshowl/select.opus	brasshowl	Keep to the light!	calling back down the road	4	locked in on the select screen
+voice/brasshowl/cast1.opus	brasshowl	Catch!	a throw, cheerful	3	winds up Lamp Oil
+voice/brasshowl/cast2.opus	brasshowl	BACK!	one bark, sharp	4	winds up Bark
+voice/brasshowl/cast3.opus	brasshowl	Sit by the fire.	warm, looking after someone	2	winds up Watchfire
+voice/brasshowl/cast4.opus	brasshowl	SHADOWS!	the biggest bellow you have	5	winds up SHADOWS!
+voice/brasshowl/kill.1.opus	brasshowl	Out you go.	brisk	3	takes down an enemy ancestor
+voice/brasshowl/kill.2.opus	brasshowl	The road is clear.	satisfied, to the caravan	3	takes down an enemy ancestor
+voice/brasshowl/death.1.opus	brasshowl	The lamp... is out...	surprised, quiet	2	falls
+voice/brasshowl/death.2.opus	brasshowl	Keep... it... lit...	a last instruction	1	falls
+voice/oremantle/select.opus	oremantle	Tharu hy.	slow, settling in [the mountain is here]	2	locked in on the select screen
+voice/oremantle/cast1.opus	oremantle	|Ö, hy!	firm, protective [kin, here -- behind me]	3	shifts to Granite
+voice/oremantle/cast2.opus	oremantle	Yla tam.	quiet, breath misting [the water shuts -- cold now]	2	shifts to Rime
+voice/oremantle/cast3.opus	oremantle	Mi, hy.	patient, drawing someone in [little one, here]	2	shifts to Lodestone
+voice/oremantle/cast4.opus	oremantle	Tharu-a !ÖN!	from a rumble to a roar on the click [the mountain's HEART]	5	shifts to The Mountain's Heart
+voice/oremantle/kill.1.opus	oremantle	Luu.	grandmotherly, almost kind [go down; rest]	2	takes down an enemy ancestor
+voice/oremantle/kill.2.opus	oremantle	Doru ol.	flat, certain [stone, always]	2	takes down an enemy ancestor
+voice/oremantle/death.1.opus	oremantle	Tharu... !luu...	surprised, slow [the mountain... went down...]	1	falls
+voice/oremantle/death.2.opus	oremantle	Doru... |kör...	content, going home [the stone... will turn again...]	1	falls
+voice/hourwatch/select.opus	hourwatch	I have seen how this goes.	dry, faintly amused	2	locked in on the select screen
+voice/hourwatch/cast1.opus	hourwatch	Again.	calm, a correction	2	winds up Turn Back
+voice/hourwatch/cast2.opus	hourwatch	Not yet, you don't.	tart, pointing	3	winds up Send Back
+voice/hourwatch/cast3.opus	hourwatch	Sooner.	brisk, winding a spring	3	winds up Wind Forward
+voice/hourwatch/cast4.opus	hourwatch	Look back... I see ALL of you!	hushed wonder, rising on 'all'	5	winds up The Long Look
+voice/hourwatch/kill.1.opus	hourwatch	I saw that coming.	unsurprised	2	takes down an enemy ancestor
+voice/hourwatch/kill.2.opus	hourwatch	Right on time.	satisfied, checking a clock	2	takes down an enemy ancestor
+voice/hourwatch/death.1.opus	hourwatch	I didn't see... this one...	genuinely surprised	1	falls
+voice/hourwatch/death.2.opus	hourwatch	Out of... time...	a last dry joke	1	falls
+voice/claypaw/select.opus	claypaw	Fresh from the riverbank!	cheerful, rolling up his sleeves	3	locked in on the select screen
+voice/claypaw/cast1.opus	claypaw	Good as new.	pressing a crack shut, satisfied	2	winds up Remold
+voice/claypaw/cast2.opus	claypaw	Wet and quick!	a splash, bright	3	winds up Quicken
+voice/claypaw/cast3.opus	claypaw	Round we go!	spinning, gleeful	4	winds up Spin
+voice/claypaw/cast4.opus	claypaw	Here comes the BANK!	a whoop, rising on 'bank'	5	winds up Mudslide
+voice/claypaw/kill.1.opus	claypaw	Back to the mud.	matter-of-fact	2	takes down an enemy ancestor
+voice/claypaw/kill.2.opus	claypaw	I'll make another.	cheerful, already moving on	2	takes down an enemy ancestor
+voice/claypaw/death.1.opus	claypaw	Just... cracked...	surprised, crumbling	1	falls
+voice/claypaw/death.2.opus	claypaw	I'll set... again...	unbothered, going soft	1	falls
 narrator/prologue1.opus	narrator	Before any word was written, the world belonged to the clans.	hushed, as if starting an old story	2	the prologue opens, line 1 of 8 (first match of a session)
 narrator/prologue2.opus	narrator	No hand raised a wall. No fire burned but the lightning's.	slow, each sentence its own image	2	the prologue, line 2 of 8
 narrator/prologue3.opus	narrator	From the frozen long-ago to the endless dunes, the great cats kept it.	growing, sweeping	3	the prologue, line 3 of 8

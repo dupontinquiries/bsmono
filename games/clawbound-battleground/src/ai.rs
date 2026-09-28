@@ -357,10 +357,36 @@ pub fn think(game: &mut Game, gi: usize) {
         }
     }
 
+    // The Engineer's Quarry: alone (or one of two) in ground that is waking, get
+    // out of it -- to a friend close enough to reach, else to calm ground
+    // (`maze::bot_goal`). Not mid-fight: the stance decides that.
+    let mut escaping = false;
+    if state == AiState::Push && goal.is_none() {
+        if let Some(p) = crate::maze::bot_goal(game, gi) {
+            escaping = true;
+            let me = &game.gods[gi];
+            move_dir = Vec3::new(p.x - me.pos.x, 0.0, p.z - me.pos.z).normalize_or_zero();
+            goal = Some(p);
+        }
+    }
+
+    // A boulder coming (the Quarry's machine): step off its track, in
+    // any state -- a duel is not worth being rolled over (`machine::dodge`)
+    if let Some(p) = crate::machine::dodge(game, gi) {
+        escaping = true;
+        let me = &game.gods[gi];
+        move_dir = Vec3::new(p.x - me.pos.x, 0.0, p.z - me.pos.z).normalize_or_zero();
+        if state == AiState::Push {
+            goal = Some(p);
+        }
+    }
+
     // the hunt: hurt, with no enemy ancestor in sight and prey close by,
     // an ancestor breaks off to chase it (a mouthful of health + gold). If a
     // dash is off cooldown and the animal is in range, pounce with it.
-    if hp_frac < 0.6 && state != AiState::Fight {
+    // (not while getting out of the thorns or off a track: a hurt bot
+    // chasing prey round a biting room stayed in it 24 s -- seed 5)
+    if hp_frac < 0.6 && state != AiState::Fight && !escaping {
         let enemy_near = (0..game.gods.len()).any(|j| game.gods[j].team != team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(g.pos) < 16.0);
         if !enemy_near {
             let mut best: Option<(f32, Vec3)> = None;
@@ -442,7 +468,7 @@ pub fn think(game: &mut Game, gi: usize) {
         let close = (0..game.gods.len()).any(|j| game.gods[j].team != team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(g.pos) < 7.0);
         if close {
             for slot in 0..4usize {
-                let ab = &def.abilities[slot];
+                let Some(ab) = game.ability(gi, slot as u32) else { continue };
                 if let Archetype::Dash { dist, .. } | Archetype::Blink { dist, .. } = ab.arch {
                     if game.gods[gi].cds[slot] <= 0.0 && game.gods[gi].mana >= ab.cost && !ab.ult {
                         let f = team.fountain();
@@ -477,7 +503,8 @@ pub fn think(game: &mut Game, gi: usize) {
             let reached = m.route_wp.is_some_and(|w| Vec3::new(w.x - pos.x, 0.0, w.z - pos.z).length() < 1.5);
             if !(now - m.route_t < crate::steer::ROUTE_EVERY) || reached {
                 let tgt = game.ai_move_target(gi);
-                let wp = f.next_waypoint(pos, tgt, 0.5);
+                // (not through a shut gate: the Quarry -- `route_open`)
+                let wp = f.next_waypoint_with(game.route_from(pos), tgt, 0.5, &|s| game.route_open(s));
                 let m = &mut game.steer_mem[gi];
                 m.route_wp = wp;
                 m.route_t = now;
@@ -508,6 +535,16 @@ pub fn think(game: &mut Game, gi: usize) {
         d
     };
 
+    // What the brain decided goes to the body a reaction time late
+    // (`reaction`): it moves and casts on what it saw, not what is.
+    let (move_dir, casts) = {
+        let delay = crate::reaction::delay_for(game.rules.bot_reaction, gi);
+        let intent = crate::reaction::Intent { state: new_state, target, off_lane: goal.is_some() };
+        let b = game.gods[gi].ai.as_mut().unwrap();
+        crate::reaction::through(&mut b.pending, &mut b.body, t, delay, crate::reaction::Act { due: 0.0, move_dir, cast: cast_req, intent })
+    };
+    let move_dir = move_dir.unwrap_or(game.gods[gi].move_dir);
+
     // write back
     {
         let g = &mut game.gods[gi];
@@ -534,10 +571,9 @@ pub fn think(game: &mut Game, gi: usize) {
     if let Some(c) = new_call {
         game.calls[team as usize] = Some(c);
     }
-    if let Some((slot, aim)) = cast_req {
+    for (slot, aim) in casts {
         game.cast_queue.push((gi, slot, aim));
     }
-    let _ = t;
 }
 
 /// Choose an ability cast for the current target based on archetype heuristics.
@@ -551,7 +587,11 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
     let is_god_target = matches!(target, TargetRef::God(_));
     let mut best: Option<(u32, f32)> = None; // (slot, priority)
 
-    for (slot, ab) in def.abilities.iter().enumerate() {
+    let _ = def;
+    for slot in 0..4usize {
+        // the ability as the bot's level ranks it; a locked one is not there
+        let Some(ab) = game.ability(gi, slot as u32) else { continue };
+        let ab = &ab;
         if g.cds[slot] > 0.0 || g.mana < ab.cost {
             continue;
         }
@@ -571,6 +611,22 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             Archetype::Litter { .. } => crate::kit::SEEK * 1.6,
             Archetype::Giggle { radius, .. } => radius * 0.85,
             Archetype::DanceParty { radius, .. } => crate::kit::PARTY_RANGE + radius * 0.5,
+            Archetype::Swap { .. } => f32::INFINITY,
+            // sent from where he stands, clamped to its range: prey further
+            // off is still worth sending it toward
+            Archetype::Send { .. } => f32::INFINITY,
+            Archetype::Echoes { .. } => 12.0,
+            Archetype::Lantern { radius, .. } => radius * 0.8,
+            // a coat is worn wherever she is (`sentinel::coat_for` decides)
+            Archetype::Field { .. } => f32::INFINITY,
+            // Hourwatch (`hours`)
+            Archetype::Rewind { .. } | Archetype::WindForward { .. } => f32::INFINITY,
+            Archetype::SendBack { range, .. } => range,
+            Archetype::LongLook { range, .. } => range,
+            // Claypaw (`clay`)
+            Archetype::Remold { .. } | Archetype::Quicken { .. } => f32::INFINITY,
+            Archetype::Spin { dist: dd, .. } => dd + 2.0,
+            Archetype::Mudslide { len, .. } => len * 0.7,
         };
         let pri = match ab.arch {
             Archetype::Nova { .. } => {
@@ -608,6 +664,63 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             }
             Archetype::DanceParty { .. } => {
                 if is_god_target && dist < range { 0.95 } else { 0.0 }
+            }
+            // Hollowstep (`stalker`): step in when his other is closer to
+            // the prey than he is and the prey is far; send the other at
+            // prey he cannot reach; every shadow on a fight
+            Archetype::Swap { .. } => {
+                // his other is well closer to the prey than he is
+                let other = game.main_other(gi).map(|k| game.others[k].pos.distance(tpos)).unwrap_or(f32::MAX);
+                if is_god_target && other + 5.0 < dist && other < 12.0 { 0.9 } else { 0.0 }
+            }
+            Archetype::Send { .. } => {
+                // his other is far from the prey (and not already on its way)
+                let far = game.main_other(gi).is_some_and(|k| game.others[k].goal.is_none() && game.others[k].pos.distance(tpos) > dist + 6.0);
+                if is_god_target && far { 0.6 } else { 0.0 }
+            }
+            Archetype::Echoes { .. } => {
+                if engage && is_god_target && dist < range { 0.93 } else { 0.0 }
+            }
+            // the lamp on a cat in its light, or on a shadow of
+            // Hollowstep's standing in it
+            Archetype::Lantern { radius, .. } => {
+                let shadow = game.others.iter().any(|o| o.team != g.team && o.pos.distance(g.pos) < radius * 0.8);
+                if (is_god_target && dist < range) || shadow { 0.95 } else { 0.0 }
+            }
+            Archetype::Field { .. } => {
+                if game.coat_for(gi) == Some(slot as u32) { 0.9 } else { 0.0 }
+            }
+            // Hourwatch (`hours`): turn back a bad few seconds (a quarter of
+            // her health lost in them); send back an enemy in reach; wind
+            // on friends waiting on their keys; look long on a fight ahead
+            Archetype::Rewind { secs } => {
+                let then = crate::hours::past(&g.trail, game.t, secs).map_or(0.0, |m| m.hp);
+                if then - g.hp > g.max_hp * 0.25 { 0.97 } else { 0.0 }
+            }
+            Archetype::SendBack { .. } => {
+                if is_god_target && dist < range { 0.75 } else { 0.0 }
+            }
+            Archetype::WindForward { radius, .. } => {
+                let waiting = game.gods.iter().enumerate().any(|(j, o)| j != gi && o.team == g.team && o.respawn_t <= 0.0 && o.pos.distance(g.pos) < radius && o.cds.iter().sum::<f32>() > 10.0);
+                if waiting { 0.6 } else { 0.0 }
+            }
+            Archetype::LongLook { .. } => {
+                if is_god_target && dist > 10.0 && dist < range { 0.5 } else { 0.0 }
+            }
+            // Claypaw (`clay`): remold when cracked (half his health gone);
+            // quicken when he has dried (or to chase); spin in on a cat
+            // (or through a fight); the mudslide on a fight in front of him
+            Archetype::Remold { .. } => {
+                if g.hp / g.max_hp < 0.5 { 0.96 } else { 0.0 }
+            }
+            Archetype::Quicken { .. } => {
+                if g.clay_wet < 0.4 || (engage && is_god_target && dist > 6.0) { 0.55 } else { 0.0 }
+            }
+            Archetype::Spin { .. } => {
+                if is_god_target && dist < range { 0.7 } else { 0.0 }
+            }
+            Archetype::Mudslide { .. } => {
+                if is_god_target && dist < range { 0.9 } else { 0.0 }
             }
             Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } => {
                 let hurt = g.hp / g.max_hp;

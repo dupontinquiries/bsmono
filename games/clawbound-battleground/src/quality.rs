@@ -104,7 +104,10 @@ impl Quality {
     /// phone screen is most of the way to invisible.
     pub fn shadow_size(self) -> u32 {
         match self {
-            Quality::High | Quality::Ultra => 2048,
+            // Ultra: four times the texels -- crisp shadows from every leaf
+            // and paw at the fitted box's full reach
+            Quality::Ultra => 4096,
+            Quality::High => 2048,
             Quality::Medium => 1024,
             Quality::Low => 1024,
         }
@@ -139,6 +142,18 @@ impl Quality {
     /// Low draws water flat. It is the one visual cut a player might notice as
     /// a CHANGE rather than as "lower settings", so it is worth naming: the
     /// water is still there, still the right colour, still drowns you.
+    /// The ground's look (render.rs FrameUniform `look`): how far its fine
+    /// detail carries, and its dry sheen. Ultra carries detail to 220 u
+    /// (High 120, where it always stopped); Low has no sheen.
+    pub fn ground_look(self) -> [f32; 4] {
+        match self {
+            Quality::Ultra => [220.0, 1.2, 0.0, 0.0],
+            Quality::High => [120.0, 1.0, 0.0, 0.0],
+            Quality::Medium => [90.0, 0.8, 0.0, 0.0],
+            Quality::Low => [60.0, 0.0, 0.0, 0.0],
+        }
+    }
+
     pub fn fancy_water(self) -> bool {
         !matches!(self, Quality::Low)
     }
@@ -282,7 +297,10 @@ mod tests {
     #[test]
     fn ultra_is_high_plus_the_preview() {
         let (u, h) = (Quality::Ultra, Quality::High);
-        assert_eq!(u.shadow_size(), h.shadow_size());
+        // (and more: four times High's shadow texels, detail carried
+        // further -- `ground_look`)
+        assert_eq!(u.shadow_size(), h.shadow_size() * 2);
+        assert!(u.ground_look()[0] > h.ground_look()[0] && u.ground_look()[1] >= h.ground_look()[1]);
         assert_eq!(u.bloom_scale(), h.bloom_scale());
         assert_eq!(u.particle_scale(), h.particle_scale());
         assert!(u.smooth_characters());

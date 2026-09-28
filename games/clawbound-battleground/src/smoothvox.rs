@@ -453,7 +453,7 @@ mod tests {
                     if m.inst.is_empty() {
                         continue;
                     }
-                    let s = smooth(m, crate::models::GOD_DRAW_VOXEL, 2);
+                    let s = smooth(m, crate::models::draw_voxel(def), 2);
                     assert!(s.tris() > 8, "{} part {k}: {} triangles", def.name, s.tris());
                     let mut count: HashMap<(u32, u32), u32> = HashMap::new();
                     for t in s.indices.chunks_exact(3) {

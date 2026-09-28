@@ -36,6 +36,27 @@ pub fn cast_timing(ab: &crate::gods::AbilityDef) -> (f32, f32) {
         Archetype::Litter { .. } => (0.12, 0.8),
         Archetype::Giggle { .. } => (0.2, 0.6),
         Archetype::DanceParty { .. } => (0.4, 0.0),
+        // the step is a held breath; the other goes at a gesture; the echoes
+        // take a moment to rise
+        Archetype::Swap { .. } => (0.12, 0.0),
+        Archetype::Send { .. } => (0.1, 0.8),
+        Archetype::Echoes { .. } => (0.35, 0.0),
+        // the lamp goes up with the breath for the bellow
+        Archetype::Lantern { .. } => (0.4, 0.0),
+        // a coat is not cast, it is worn: the shift is at once, and she
+        // keeps walking (`sentinel`)
+        Archetype::Field { .. } => (0.0, 1.0),
+        // Hourwatch (`hours`): turning her own hour back is at once (it is
+        // an escape); pointing at someone else's takes a moment; winding
+        // her friends' on is a gesture; the leap is a crouch
+        Archetype::Rewind { .. } | Archetype::WindForward { .. } => (0.0, 1.0),
+        Archetype::SendBack { .. } => (0.2, 0.6),
+        Archetype::LongLook { .. } => (0.3, 0.3),
+        // Claypaw (`clay`): remolding and wetting are at once (he keeps
+        // moving); the spin is a dash's; the bank gives way after a heave
+        Archetype::Remold { .. } | Archetype::Quicken { .. } => (0.0, 1.0),
+        Archetype::Spin { .. } => (0.08, 1.0),
+        Archetype::Mudslide { .. } => (0.35, 0.0),
     };
     if ab.ult && w > 0.0 {
         ((w * 1.5).max(0.45), 0.0)
@@ -59,6 +80,12 @@ impl Game {
     /// and either fires it (no wind-up) or starts the wind-up; `cast` fires
     /// it when the wind-up ends (`tick_casting`). Cooldown and mana are spent
     /// when it FIRES, so an interrupted cast costs nothing.
+    /// Slot `slot` of cat `gi` as its level ranks it; None while locked.
+    pub fn ability(&self, gi: usize, slot: u32) -> Option<crate::gods::AbilityDef> {
+        let ab = self.def(gi).abilities[slot.min(3) as usize];
+        crate::ranks::ranked(ab, crate::ranks::rank(slot, self.gods[gi].level))
+    }
+
     pub fn begin_cast(&mut self, gi: usize, slot: u32, aim: Vec3) {
         if self.over.is_some() || self.gods[gi].respawn_t > 0.0 || self.gods[gi].casting.is_some() || self.gods[gi].skyfall.is_some() {
             return;
@@ -67,7 +94,8 @@ impl Game {
         if !self.kit_free(gi) {
             return;
         }
-        let ab = self.def(gi).abilities[slot as usize];
+        // locked until its level (`ranks`)
+        let Some(ab) = self.ability(gi, slot) else { return };
         let g = &self.gods[gi];
         if g.cds[slot as usize] > 0.0 || g.mana < ab.cost {
             return;
@@ -116,14 +144,14 @@ impl Game {
         if self.over.is_some() || self.gods[gi].respawn_t > 0.0 {
             return;
         }
-        let def = self.def(gi);
-        let ab = def.abilities[slot as usize];
+        // the ability at the rank the cat's level gives it (`ranks`)
+        let Some(ab) = self.ability(gi, slot) else { return };
         let g = &self.gods[gi];
         if g.cds[slot as usize] > 0.0 || g.mana < ab.cost {
             return;
         }
         // cooldown with CDR
-        let cd = ab.cooldown * (1.0 - g.cdr);
+        let cd = ab.cooldown * (1.0 - g.cdr) * self.rules.cd_mul;
         let (from, power, pen_pct, pen_flat) = (g.pos, g.power, g.pen_pct, g.pen_flat);
         let team = g.team;
         let pos_y = from + Vec3::Y * 1.3;
@@ -178,6 +206,7 @@ impl Game {
                     pen_pct,
                     pen_flat,
                     color: ab.color,
+                    auto: false,
                 });
                 self.events.push(Event::BeamFx { from: pos_y, dir, length: 1.2, width: 0.4, color: ab.color, dur: 0.12 });
             }
@@ -200,6 +229,7 @@ impl Game {
                         pen_pct,
                         pen_flat,
                         color: ab.color,
+                        auto: false,
                     });
                 }
             }
@@ -218,6 +248,7 @@ impl Game {
                     pen_pct,
                     pen_flat,
                     color: ab.color,
+                    auto: false,
                 });
                 self.events.push(Event::RingTelegraph { pos: clamped, radius, delay: 0.75, color: ab.color });
             }
@@ -231,7 +262,7 @@ impl Game {
                 for j in 0..self.gods.len() {
                     let e = &self.gods[j];
                     if e.team != team && e.respawn_t <= 0.0 {
-                        if crate::hitbox::cat(e.pos, e.yaw, false).hit_by_beam(pos_y, end, width + 0.2) {
+                        if crate::hitbox::cat_sized(e.pos, e.yaw, false, self.def(j).role.size()).hit_by_beam(pos_y, end, width + 0.2) {
                             hits.push(TargetRef::God(j));
                         }
                     }
@@ -334,6 +365,59 @@ impl Game {
                 self.events.push(Event::StormFx { pos: at, radius, color: ab.color, dur: duration });
                 self.dance_party(gi, at, radius, duration, slow, slow_secs, ab.color);
             }
+            Archetype::Swap { radius, dmg, slow, secs } => {
+                let d = if dmg > 0.0 { dmg_scale(dmg, ab.power_scale) } else { 0.0 };
+                self.step_between(gi, aim_flat, radius, d, slow, secs);
+            }
+            Archetype::Send { range, speed } => {
+                let to = Vec3::new(from.x, 0.0, from.z) + dir * dist.min(range);
+                self.send_other(gi, to, speed);
+            }
+            Archetype::Echoes { each, life, dmg } => {
+                let d = dmg_scale(dmg, ab.power_scale);
+                self.every_shadow(gi, each, life, d);
+            }
+            Archetype::Lantern { radius, dmg, flee, reveal } => {
+                let d = dmg_scale(dmg, ab.power_scale);
+                self.raise_the_lamp(gi, radius, d, flee, reveal);
+            }
+            Archetype::Field { .. } => {
+                self.shift_coat(gi, slot);
+            }
+            Archetype::Rewind { secs } => {
+                self.turn_back(gi, secs);
+            }
+            Archetype::SendBack { range, dmg, secs } => {
+                let d = dmg_scale(dmg, ab.power_scale);
+                self.send_back(gi, aim_flat, range, d, secs);
+            }
+            Archetype::WindForward { radius, secs } => {
+                self.wind_forward(gi, radius, secs);
+            }
+            Archetype::Remold { heal } => {
+                self.remold(gi, heal);
+            }
+            Archetype::Quicken { secs } => {
+                self.quicken(gi, secs);
+            }
+            Archetype::Spin { dist: dd, dmg, radius, secs } => {
+                let d = dmg_scale(dmg, ab.power_scale);
+                let dest = clamp_arena(from + dir * dd);
+                let dest = crate::map::onto_floor(dest, crate::consts::GOD_RADIUS);
+                self.events.push(Event::DashFx { pos: from + Vec3::Y * 1.0, dir, color: ab.color });
+                self.gods[gi].dash = Some(DashState { from, to: dest, t: 0.0, dur: 0.32, dmg: d, arc: 0.2, blast: None });
+                self.lay_slick(from, dest, radius, secs, Vec3::ZERO);
+            }
+            Archetype::Mudslide { len, width, speed, dmg, kits } => {
+                let d = dmg_scale(dmg, ab.power_scale);
+                self.mudslide(gi, dir, len, width, speed, d, kits);
+            }
+            Archetype::LongLook { range, flight, reveal, exposed } => {
+                let dest = clamp_arena(from + dir * dist.min(range));
+                let dest = crate::map::onto_floor(dest, crate::consts::GOD_RADIUS);
+                let dest = Vec3::new(dest.x, crate::map::ground_y(dest.x, dest.z), dest.z);
+                self.long_look(gi, dest, flight, reveal, exposed);
+            }
             Archetype::Blink { dist: dd, dmg } => {
                 let d = if dmg > 0.0 { dmg_scale(dmg, ab.power_scale) } else { 0.0 };
                 let dest = clamp_arena(from + dir * dd);
@@ -386,11 +470,11 @@ impl Game {
             Archetype::Heal { amount, radius } => {
                 let d = amount + power * ab.power_scale * 0.5;
                 self.events.push(Event::HealFx { pos: from, radius });
-                self.gods[gi].hp = (self.gods[gi].hp + d).min(self.gods[gi].max_hp);
+                self.gods[gi].hp = (self.gods[gi].hp + d * self.gods[gi].heal_mul).min(self.gods[gi].max_hp);
                 for j in 0..self.gods.len() {
                     let e = &self.gods[j];
                     if e.team == team && j != gi && e.pos.distance(from) < radius {
-                        self.gods[j].hp = (self.gods[j].hp + d * 0.5).min(self.gods[j].max_hp);
+                        self.gods[j].hp = (self.gods[j].hp + d * 0.5 * self.gods[j].heal_mul).min(self.gods[j].max_hp);
                     }
                 }
             }
@@ -467,7 +551,7 @@ impl Game {
         let mut out = Vec::new();
         for gi in 0..self.gods.len() {
             let g = &self.gods[gi];
-            if g.team != team && g.respawn_t <= 0.0 && crate::hitbox::cat(g.pos, g.yaw, false).in_disc(center, radius + 0.2) {
+            if g.team != team && g.respawn_t <= 0.0 && crate::hitbox::cat_sized(g.pos, g.yaw, false, self.def(gi).role.size()).in_disc(center, radius + 0.2) {
                 out.push(TargetRef::God(gi));
             }
         }

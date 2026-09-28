@@ -25,6 +25,8 @@ pub fn arena_radius() -> f32 {
         crate::map::MapId::Jungle => ARENA_RADIUS,
         crate::map::MapId::Pass => crate::pass::ARENA_RADIUS,
         crate::map::MapId::Sky => crate::sky::ARENA_RADIUS,
+        crate::map::MapId::Atlantis => crate::atlantis::ARENA_RADIUS,
+        crate::map::MapId::Maze => crate::maze::ARENA_RADIUS,
     }
 }
 
@@ -34,6 +36,8 @@ pub fn ground_half() -> f32 {
         crate::map::MapId::Jungle => GROUND_HALF,
         crate::map::MapId::Pass => crate::pass::GROUND_HALF,
         crate::map::MapId::Sky => crate::sky::GROUND_HALF,
+        crate::map::MapId::Atlantis => crate::atlantis::GROUND_HALF,
+        crate::map::MapId::Maze => crate::maze::GROUND_HALF,
     }
 }
 
@@ -93,6 +97,8 @@ pub fn river_dist(x: f32, z: f32) -> f32 {
     match crate::map::active() {
         crate::map::MapId::Pass => return crate::pass::river_dist(x, z),
         crate::map::MapId::Sky => return crate::sky::river_dist(x, z),
+        crate::map::MapId::Atlantis => return crate::atlantis::river_dist(x, z),
+        crate::map::MapId::Maze => return crate::maze::river_dist(x, z),
         crate::map::MapId::Jungle => {}
     }
     (x - river_x(-1.0, z)).abs().min((x - river_x(1.0, z)).abs())
@@ -109,6 +115,11 @@ pub fn water_depth(x: f32, z: f32) -> f32 {
     // over the sky map's void the "terrain" is the cloud sea, thirty units
     // down: that is not water. Only the Moonwell is.
     if crate::map::active() == crate::map::MapId::Sky && !crate::sky::in_pool(x, z) {
+        return 0.0;
+    }
+    // the Drowned Halls are dry inside; the sea floor beyond the walls is
+    // not walked
+    if matches!(crate::map::active(), crate::map::MapId::Atlantis | crate::map::MapId::Maze) {
         return 0.0;
     }
     (WATER_LEVEL - crate::render::terrain_height(x, z)).max(0.0)
@@ -151,6 +162,8 @@ impl Team {
         match crate::map::active() {
             crate::map::MapId::Pass => return crate::pass::fountain(self),
             crate::map::MapId::Sky => return crate::sky::fountain(self),
+            crate::map::MapId::Atlantis => return crate::atlantis::fountain(self),
+            crate::map::MapId::Maze => return crate::maze::fountain(self),
             crate::map::MapId::Jungle => {}
         }
         match self {
@@ -162,6 +175,8 @@ impl Team {
         match crate::map::active() {
             crate::map::MapId::Pass => return crate::pass::titan_pos(self),
             crate::map::MapId::Sky => return crate::sky::titan_pos(self),
+            crate::map::MapId::Atlantis => return crate::atlantis::titan_pos(self),
+            crate::map::MapId::Maze => return crate::maze::titan_pos(self),
             crate::map::MapId::Jungle => {}
         }
         match self {
@@ -173,6 +188,8 @@ impl Team {
         match crate::map::active() {
             crate::map::MapId::Pass => return crate::pass::base_pos(self),
             crate::map::MapId::Sky => return crate::sky::base_pos(self),
+            crate::map::MapId::Atlantis => return crate::atlantis::base_pos(self),
+            crate::map::MapId::Maze => return crate::maze::base_pos(self),
             crate::map::MapId::Jungle => {}
         }
         match self {
@@ -238,6 +255,8 @@ impl Lane {
         match crate::map::active() {
             crate::map::MapId::Pass => return crate::pass::lane_polyline(self),
             crate::map::MapId::Sky => return crate::sky::lane_polyline(self),
+            crate::map::MapId::Atlantis => return crate::atlantis::lane_polyline(self),
+            crate::map::MapId::Maze => return crate::maze::lane_polyline(self),
             crate::map::MapId::Jungle => {}
         }
         match self {
@@ -309,7 +328,9 @@ fn push_sampled(out: &mut Vec<Vec3>, from: Vec3, to: Vec3, step: f32) {
 pub fn lane_path(lane: Lane, team: Team) -> &'static [Vec3] {
     use std::sync::OnceLock;
     // One cache per map: the paths are the map's.
-    static PATHS: [OnceLock<Vec<Vec<Vec3>>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    // (sized by MapId::ALL: a fixed 4 here would index out of bounds on a
+    // fifth map at run time, which no compiler error flags)
+    static PATHS: [OnceLock<Vec<Vec<Vec3>>>; crate::map::MapId::ALL.len()] = [const { OnceLock::new() }; crate::map::MapId::ALL.len()];
     let all = PATHS[crate::map::active() as usize].get_or_init(|| {
         let mut v = Vec::new();
         for lane in LANES {
@@ -332,6 +353,8 @@ pub fn tower_pos(lane: Lane, team: Team, inner: bool) -> Vec3 {
     match crate::map::active() {
         crate::map::MapId::Pass => return crate::pass::tower_pos(lane, team, inner),
         crate::map::MapId::Sky => return crate::sky::tower_pos(lane, team, inner),
+        crate::map::MapId::Atlantis => return crate::atlantis::tower_pos(lane, team, inner),
+        crate::map::MapId::Maze => return crate::maze::tower_pos(lane, team, inner),
         crate::map::MapId::Jungle => {}
     }
     use Lane::*;
@@ -375,7 +398,8 @@ pub const XP_MELEE: f32 = 43.0;
 pub const XP_CASTER: f32 = 56.0;
 pub const XP_GOD: f32 = 340.0;
 pub const XP_SHARE_RADIUS: f32 = 14.0;
-pub const MAX_LEVEL: u32 = 20;
+/// Levels run 1 to 15 (`ranks`: every level ranks up an ability).
+pub const MAX_LEVEL: u32 = crate::ranks::MAX;
 
 pub const MINION_HP: f32 = 320.0;
 pub const MINION_HP_SCALE: f32 = 1.0; // per minute factor
@@ -385,8 +409,11 @@ pub const MINION_RANGE_MELEE: f32 = 2.2;
 pub const MINION_RANGE_CASTER: f32 = 9.0;
 pub const MINION_ATK_CD: f32 = 1.4;
 
-pub const TOWER_HP: f32 = 1450.0;
-pub const TOWER_DMG: f32 = 168.0;
+/// Towers: 25% tougher and 25% harder-hitting than the 1450 / 168 they had
+/// (a lane held a while longer, a dive under one paid for).
+pub const TOWER_BUFF: f32 = 1.25;
+pub const TOWER_HP: f32 = 1450.0 * TOWER_BUFF;
+pub const TOWER_DMG: f32 = 168.0 * TOWER_BUFF;
 /// Was 16. Measured against what it has to answer: ranged autos reach 14.4
 /// (1.6 u inside the old line), lobs 20, beams 22-32, and at 12.4 u/s a cat
 /// crossed the old 32 u zone in 2.6 s -- two shots. At 24 the zone is 48 u
@@ -416,8 +443,11 @@ pub fn in_tower_clearing(x: f32, z: f32) -> bool {
 pub const TOWER_ATK_CD: f32 = 1.1;
 pub const TOWER_RAMP: f32 = 1.25;
 
-pub const TITAN_HP: f32 = 4600.0;
-pub const TITAN_DMG: f32 = 260.0;
+/// The Elders (titans): 75% more health and damage than the 4600 / 260
+/// they had -- the last stand should be one.
+pub const TITAN_BUFF: f32 = 1.75;
+pub const TITAN_HP: f32 = 4600.0 * TITAN_BUFF;
+pub const TITAN_DMG: f32 = 260.0 * TITAN_BUFF;
 pub const TITAN_RANGE: f32 = 6.5;
 pub const TITAN_ATK_CD: f32 = 1.0;
 /// The Elder's ground (`Game::titan_zone`): it may step this far from its

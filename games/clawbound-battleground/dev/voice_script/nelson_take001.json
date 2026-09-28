@@ -1,0 +1,64 @@
+{
+ "session": "nelson-hollowstep.opus",
+ "clean": true,
+ "rnnoise": "sh.rnnn",
+ "source": "nelson-hollowstep",
+ "layers_db": -6.0,
+ "takes": [
+  [
+   "hollowstep",
+   "select",
+   19.8,
+   22.5
+  ],
+  [
+   "hollowstep",
+   "cast1",
+   22.6,
+   24.8
+  ],
+  [
+   "hollowstep",
+   "cast2",
+   24.8,
+   27.85
+  ],
+  [
+   "hollowstep",
+   "cast3",
+   27.9,
+   30.3
+  ],
+  [
+   "hollowstep",
+   "cast4",
+   30.3,
+   33.3
+  ],
+  [
+   "hollowstep",
+   "kill.1",
+   33.35,
+   35.4
+  ],
+  [
+   "hollowstep",
+   "kill.2",
+   35.4,
+   38.6
+  ],
+  [
+   "hollowstep",
+   "death.1",
+   38.6,
+   41.35
+  ],
+  [
+   "hollowstep",
+   "death.2",
+   41.35,
+   44.6
+  ]
+ ],
+ "note": "Nelson's session: Hollowstep, one take of each line, mostly whispered as directed. Neither file is in the repo: put the session and the RNNoise model (GregorR/rnnoise-models somnolent-hogwash sh.rnnn) beside this manifest. Windows from silero VAD + Parakeet word timestamps; each window runs from just before the line to just before the next. layers_db -6: the breathed double and the octave shadow at half their stand-in level, over a performance that already whispers."
+}

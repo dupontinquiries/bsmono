@@ -166,6 +166,8 @@ pub fn pit_positions() -> [Vec3; 2] {
     match crate::map::active() {
         crate::map::MapId::Pass => return crate::pass::pit_positions(),
         crate::map::MapId::Sky => return crate::sky::pit_positions(),
+        crate::map::MapId::Atlantis => return crate::atlantis::pit_positions(),
+        crate::map::MapId::Maze => return crate::maze::pit_positions(),
         crate::map::MapId::Jungle => {}
     }
     let mut rng = Rng::new(0xB0A2);
@@ -471,6 +473,10 @@ impl Game {
                 b.kills += 1;
             }
             self.events.push(Event::BossDown { kind, pos, team });
+            // a jungle kill: a kitten, if Claypaw's mudslide is running (`clay`)
+            if let Some(s) = source {
+                self.clay_kill_credit(s, crate::clay::KITS_PER_SMALL_KILL, pos);
+            }
             if let Some(team) = team {
                 let ti = team as usize;
                 match kind {

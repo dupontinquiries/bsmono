@@ -4,14 +4,14 @@ use clawbound::items;
 use clawbound::sim::{Game, Team};
 
 #[test]
-fn catalog_has_exactly_102_items() {
-    // 100 across the stat categories, and the two Siphon items (brawl)
+fn catalog_has_exactly_110_items() {
+    // 100 across the stat categories, the two Siphon items (brawl), 8 Curios
     let cat = items::all();
-    assert_eq!(cat.len(), 102, "item catalog must have exactly 102 items");
+    assert_eq!(cat.len(), 110, "item catalog must have exactly 110 items");
     let mut ids: Vec<u16> = cat.iter().map(|i| i.id).collect();
     ids.sort();
     ids.dedup();
-    assert_eq!(ids.len(), 102, "item ids must be unique");
+    assert_eq!(ids.len(), 110, "item ids must be unique");
     for it in cat {
         assert!(it.cost > 0.0, "item {} must cost something", it.name);
         assert!(it.tier >= 1 && it.tier <= 3);
@@ -20,7 +20,7 @@ fn catalog_has_exactly_102_items() {
 
 #[test]
 fn catalog_categories_match_user_spec() {
-    // All 8 requested categories must exist with items
+    // All 9 shelves must exist with items
     let cat = items::all();
     for c in items::CATS {
         let n = cat.iter().filter(|it| it.cat == c).count();
@@ -39,9 +39,63 @@ fn stacking_items_declare_rules() {
     }
 }
 
+/// The shop charges 85% of the list price, to 5 gold: the cheapest
+/// Sapling (listed at 500) is 425, and every price is a round number.
+#[test]
+fn the_shop_charges_fifteen_percent_less() {
+    assert_eq!(items::PRICE_CUT, 0.85);
+    assert_eq!(items::price(500.0), 425.0);
+    assert_eq!(items::price(3300.0), 2805.0);
+    let cleaver = items::all().iter().find(|i| i.name == "Wooden Cleaver").unwrap();
+    assert_eq!(cleaver.cost, 425.0);
+    for it in items::all() {
+        assert_eq!(it.cost % 5.0, 0.0, "{} costs {}", it.name, it.cost);
+    }
+    let dearest = items::all().iter().map(|i| i.cost).fold(0.0, f32::max);
+    assert!((2700.0..=2850.0).contains(&dearest), "dearest item {dearest}");
+}
+
+/// Every trophy's growth reaches the stat it names, up to its most.
+/// (Every one sat on the Stacking shelf, which the stat match skipped, so
+/// none ever grew anything; and the per-minute ones never counted.)
+#[test]
+fn trophies_grow_the_stat_they_name_up_to_their_most() {
+    for it in items::all().iter().filter(|i| i.stack.is_some()) {
+        let st = it.stack.unwrap();
+        let mut g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        g.gods[0].gold = 1e6;
+        assert!(g.buy_item(0, it.id));
+        let before = Game::item_stats(&g.gods[0]);
+        if st.kind == items::StackKind::Time {
+            // two intervals held
+            for _ in 0..((st.interval * 2.0 + 1.0) * 10.0) as usize {
+                g.curios_tick(0, 0.1);
+            }
+        } else {
+            g.add_stacks(0, st.kind, 2.0);
+        }
+        let grew = |a: &items::Stats, b: &items::Stats| match st.grows {
+            items::Grow::Strength => b.strength - a.strength,
+            items::Grow::Intelligence => b.intelligence - a.intelligence,
+            items::Grow::Power => b.power - a.power,
+            items::Grow::Protection => b.protection - a.protection,
+            items::Grow::Health => b.health - a.health,
+        };
+        let two = grew(&before, &Game::item_stats(&g.gods[0]));
+        assert!((two - 2.0 * st.per).abs() < 1e-3, "{}: two stacks grew {two}, not {}", it.name, 2.0 * st.per);
+        // and it reached the cat: recalc ran
+        if st.grows == items::Grow::Health {
+            assert!(g.gods[0].max_hp > 0.0);
+        }
+        g.add_stacks(0, st.kind, 10_000.0);
+        let full = grew(&before, &Game::item_stats(&g.gods[0]));
+        assert!((full - st.max).abs() < 1e-3, "{}: full at {full}, not {}", it.name, st.max);
+    }
+}
+
 #[test]
 fn roster_is_14_ancestors_with_4_abilities_each() {
-    assert_eq!(ROSTER.len(), 15);
+    assert_eq!(ROSTER.len(), 20);
     let roles: std::collections::HashSet<_> = ROSTER.iter().map(|g| g.role).collect();
     assert!(roles.len() >= 4, "roster should span multiple roles");
     for g in &ROSTER {
@@ -126,6 +180,20 @@ fn damage_mitigation_order_pen_then_flat() {
     assert!((game.gods[enemy].hp - expected).abs() < 0.01);
 }
 
+/// The buffs asked for: towers +25% health and damage, Elders +75%, and
+/// the game builds them at those numbers.
+#[test]
+fn towers_and_elders_are_buffed() {
+    assert_eq!(TOWER_HP, 1450.0 * 1.25);
+    assert_eq!(TOWER_DMG, 168.0 * 1.25);
+    assert_eq!(TITAN_HP, 4600.0 * 1.75);
+    assert_eq!(TITAN_DMG, 260.0 * 1.75);
+    let g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    let mul = clawbound::map::active().structure_hp_mul();
+    assert!(g.towers.iter().all(|t| (t.max_hp - 1812.5 * mul).abs() < 1e-2));
+    assert!((g.titans[0].hp - 8050.0 * mul).abs() < 1e-2);
+}
+
 #[test]
 fn titan_shielded_until_towers_fall() {
     let game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
@@ -144,6 +212,86 @@ fn xp_curve_monotonic() {
     }
 }
 
+
+/// A dash into a tree trunk goes round it, not through it: the dash used to
+/// set the cat's position from its line every tick, throwing away the
+/// shove the trunk gave it, so a cat dashed straight through the bark.
+///
+/// The dash alone (every other cat parked far off): head on (0.3 u off the
+/// trunk's centre line) and glancing (1.6 u off), it never enters the bark
+/// and slides round the trunk and on. (This test used to claim the head-on
+/// dash STOPPED at the bark. That held only because a teammate standing at
+/// the base was in the dash's way; when bots began to move a reaction late
+/// (`reaction`) that teammate moved differently and the claim fell. Alone,
+/// a head-on dash slides round, as a glancing one does.)
+#[test]
+fn a_dash_into_a_trunk_goes_round_it() {
+    for off in [0.3f32, 1.6] {
+        let (closest, r, end, tree) = dash_at_trunk(off, None);
+        assert!(closest >= r - 0.05, "off {off}: the dash went {closest:.2} u from the trunk's centre; the bark is at {r:.2}");
+        assert!(end > tree + r * 0.5, "off {off}: ended at x {end:.2}, short of round the tree at {tree:.2}");
+    }
+}
+
+/// A dash shoved by the cats around it still never ends up in the bark:
+/// the push-out after cats shove each other skipped a dashing cat, and at
+/// the base with the whole team about (bots moving at a normal match's
+/// reaction, `reaction`) one was left 0.14 u inside a trunk.
+#[test]
+fn a_dash_shoved_by_a_cat_does_not_go_into_the_bark() {
+    let mut worst = (f32::MAX, 0.0, 0.0, 0.0);
+    let mut tried = 0;
+    for off in [-0.8f32, -0.3, 0.3, 0.8, 1.6] {
+        for sx in 0..9 {
+            for sz in 0..9 {
+                let stand = glam::Vec3::new(1.0 + sx as f32 * 0.5, 0.0, off - 2.0 + sz as f32 * 0.5);
+                let (closest, r, _, _) = dash_at_trunk(off, Some(stand));
+                tried += 1;
+                if closest - r < worst.0 {
+                    worst = (closest - r, off, stand.x, stand.z);
+                }
+            }
+        }
+    }
+    eprintln!("SWEEP {tried} scenes, worst: {:.3} u into the bark (off {}, a cat at {:.1},{:.1})", -worst.0, worst.1, worst.2, worst.3);
+    assert!(worst.0 >= -0.05, "off {}, a cat standing at ({:.1}, {:.1}): the dash went {:.2} u into the bark", worst.1, worst.2, worst.3, -worst.0);
+}
+
+/// Dash cat 0 9 u along +x past a trunk `off` from its line, 4 u out, with
+/// every other cat parked far off -- or, `crowd`, left where the match put
+/// them, the bots thinking. Returns (closest approach to the trunk's
+/// centre, the bark's radius for a cat, where the dash ended in x, the
+/// tree's x).
+fn dash_at_trunk(off: f32, stand: Option<glam::Vec3>) -> (f32, f32, f32, f32) {
+    use clawbound::blockers::{Blockers, PropKind};
+    use clawbound::sim::DashState;
+    use glam::Vec3;
+    let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    let from = game.gods[0].pos;
+    let to = from + Vec3::new(9.0, 0.0, 0.0);
+    let r = PropKind::JungleTree.footprint().radius + clawbound::consts::GOD_RADIUS;
+    let tree = from + Vec3::new(4.0, 0.0, off);
+    let mut b = Blockers::new(200.0, 6.0);
+    b.push_prop(PropKind::JungleTree, tree.x, tree.z, 0.0, 1.0);
+    game.blockers = std::sync::Arc::new(b);
+    for k in 1..game.gods.len() {
+        game.gods[k].ai = None;
+        game.gods[k].pos = Vec3::new(300.0 + k as f32 * 5.0, 0.0, 300.0);
+    }
+    if let Some(s) = stand {
+        game.gods[1].pos = from + s;
+    }
+    game.gods[0].pos = from;
+    game.gods[0].dash = Some(DashState { from, to, t: 0.0, dur: 0.4, dmg: 0.0, arc: 0.35, blast: None });
+    let mut closest = f32::MAX;
+    for _ in 0..40 {
+        game.tick(1.0 / 60.0);
+        let p = game.gods[0].pos;
+        closest = closest.min(Vec3::new(p.x - tree.x, 0.0, p.z - tree.z).length());
+    }
+    assert!(game.gods[0].dash.is_none(), "off {off}: the dash ended");
+    (closest, r, game.gods[0].pos.x, tree.x)
+}
 
 /// The leap, through the real sim loop: press toward a rock, end up standing
 /// on it; press again toward the next, and the chain skips the cooldown;
@@ -494,9 +642,12 @@ fn a_thicket_slows_a_cat_and_does_not_stop_it() {
 fn a_bot_steers_off_a_line_that_runs_into_a_trunk() {
     use clawbound::blockers::{Blocker, Blockers, Cover, Shape};
     use glam::Vec3;
+    // (what the brain decides, read the tick it decides it: no reaction
+    // delay between it and the body, `reaction`)
     let fresh = || {
         let mut g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
         g.blockers = std::sync::Arc::new(Blockers::new(200.0, 6.0));
+        g.rules.bot_reaction = 0.0;
         g
     };
     let bot = 1;
@@ -686,6 +837,7 @@ fn firing_range_every_ability_goes_where_it_is_aimed_and_turns_the_cat() {
     for (god, def) in ROSTER.iter().enumerate() {
         for slot in 0..4u32 {
             let mut game = Game::new_teams(&[god as u32], &[(god as u32 + 1) % 13]);
+            game.set_level(0, 5); // every ability unlocked (`ranks`)
             game.gods[1].respawn_t = 999.0; // an empty range
             game.gods[0].ai = None;
             let start = Vec3::new(0.0, 0.0, -40.0);
@@ -738,6 +890,9 @@ fn firing_range_every_ability_goes_where_it_is_aimed_and_turns_the_cat() {
                             dirs.push(flat(pos));
                         }
                     }
+                    // Claypaw's mud (`clay`): the way its slick runs
+                    Event::SlickFx { a, b, .. } => dirs.push(Vec3::new(b.x - a.x, 0.0, b.z - a.z).normalize_or_zero()),
+                    Event::MudslideFx { dir, .. } => dirs.push(Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero()),
                     _ => {}
                 }
             }
@@ -747,7 +902,17 @@ fn firing_range_every_ability_goes_where_it_is_aimed_and_turns_the_cat() {
             if matches!(ab.arch, Archetype::Blink { .. }) {
                 dirs.push(flat(game.gods[0].pos));
             }
-            let directional = !matches!(ab.arch, Archetype::Nova { .. } | Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } | Archetype::Giggle { .. });
+            // Hollowstep's other, sent: where it glides
+            if matches!(ab.arch, Archetype::Send { .. }) {
+                if let Some((goal, _)) = game.main_other(0).and_then(|k| game.others[k].goal) {
+                    dirs.push(flat(goal));
+                }
+            }
+            // the step goes to wherever his other is, and the echoes rise
+            // round him: neither goes along the aim
+            // (Hourwatch's hours go where the cat WAS, or to friends round
+            // her, or -- sent back -- to an enemy, and this range is empty)
+            let directional = !matches!(ab.arch, Archetype::Nova { .. } | Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } | Archetype::Giggle { .. } | Archetype::Swap { .. } | Archetype::Echoes { .. } | Archetype::Lantern { .. } | Archetype::Field { .. } | Archetype::Rewind { .. } | Archetype::WindForward { .. } | Archetype::SendBack { .. } | Archetype::Remold { .. } | Archetype::Quicken { .. });
             if directional {
                 assert!(!dirs.is_empty(), "{} slot {slot} ({:?}): no directional effect found", def.name, ab.arch);
                 for d in &dirs {
@@ -875,7 +1040,7 @@ fn the_audio_engine_voices_a_cast_end_to_end() {
                 }
                 if let Some(id) = bank.first(&cue.keys) {
                     played.push(cue.keys.clone());
-                    h.play(Play { clip: id, bus: cue.bus, gain, pan, priority: cue.priority, looped: false, speaker: cue.speaker.map(|x| x as u16) });
+                    h.play(Play { handle: 0, clip: id, bus: cue.bus, gain, pan, priority: cue.priority, looped: false, speaker: cue.speaker.map(|x| x as u16) });
                 }
             }
         }
@@ -1791,6 +1956,7 @@ mod cometail {
     fn the_falling_star_vaults_high_and_lands_where_aimed_in_a_blast() {
         let c = cometail();
         let mut g = Game::new_teams(&[c], &[0, 1]);
+        g.set_level(0, 5); // the kit unlocked (`ranks`)
         quiet(&mut g);
         g.gods[0].pos = Vec3::ZERO;
         g.gods[0].mana = 9999.0;
@@ -1817,6 +1983,7 @@ mod cometail {
     fn a_dash_hurts_what_it_passes_through() {
         let c = cometail();
         let mut g = Game::new_teams(&[c], &[0]);
+        g.set_level(0, 5); // the kit unlocked (`ranks`)
         quiet(&mut g);
         g.gods[0].pos = Vec3::ZERO;
         g.gods[0].mana = 9999.0;
@@ -2287,6 +2454,8 @@ mod sproutkit {
     fn game(red: &[u32]) -> Game {
         let mut g = Game::new_teams(&[kit()], red);
         quiet(&mut g);
+        // every ability unlocked (`ranks`); the ultimate at rank 1
+        g.set_level(0, 5);
         g.gods[0].pos = Vec3::ZERO;
         g.gods[0].mana = 9999.0;
         g
@@ -2427,6 +2596,7 @@ mod sproutkit {
     fn minions_dance_too() {
         let mut g = Game::new_teams(&[kit()], &[0]);
         quiet(&mut g);
+        g.set_level(0, 5); // the ultimate unlocked (`ranks`)
         g.gods[1].pos = Vec3::new(80.0, 0.0, 80.0);
         g.next_wave_t = 0.0;
         g.tick(1.0 / 60.0);
@@ -2480,6 +2650,10 @@ mod sproutkit {
         for c in g.gods.iter_mut() {
             c.ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
         }
+        // the kit unlocked from the start (`ranks`): this is about using it
+        for i in 0..g.gods.len() {
+            g.set_level(i, 5);
+        }
         let mut used = [false; 4];
         for _ in 0..(240 * 30) {
             g.tick(1.0 / 30.0);
@@ -2490,5 +2664,1197 @@ mod sproutkit {
             }
         }
         assert!(used[0] && used[1] && used[3], "litter, giggles and the party in four minutes: {used:?}");
+    }
+}
+
+/// Levels 1-15 (`ranks`): a fresh cat casts its first ability only; the
+/// ultimate opens at 5; the level carries through to stronger stats, and a
+/// ranked ability hits harder than rank 1.
+#[test]
+fn levels_unlock_the_kit_and_rank_it_up() {
+    use clawbound::gods::ROSTER;
+    use glam::Vec3;
+    assert_eq!(MAX_LEVEL, 15);
+    let mut g = Game::new_teams(&[0], &[1]);
+    g.gods[1].respawn_t = 999.0;
+    for c in g.gods.iter_mut() {
+        c.ai = None;
+        c.mana = 1e5;
+    }
+    assert_eq!(g.gods[0].level, 1);
+    let fired = |g: &mut Game, slot: u32| {
+        let p = g.gods[0].pos;
+        g.cast_queue.push((0, slot, p + Vec3::Z * 6.0));
+        let mut f = false;
+        for _ in 0..90 {
+            g.tick(1.0 / 60.0);
+            for e in g.events.drain(..) {
+                if let clawbound::sim::Event::Cast { god: 0, slot: s, .. } = e {
+                    f |= s == slot;
+                }
+            }
+        }
+        g.gods[0].cds = [0.0; 4];
+        g.gods[0].mana = 1e5;
+        f
+    };
+    assert!(fired(&mut g, 0), "level 1: the first ability");
+    assert!(!fired(&mut g, 1) && !fired(&mut g, 3), "level 1: the rest locked");
+    g.set_level(0, 4);
+    assert!(fired(&mut g, 1) && fired(&mut g, 2) && !fired(&mut g, 3), "level 4: all but the ultimate");
+    g.set_level(0, 5);
+    assert!(fired(&mut g, 3), "level 5: the ultimate");
+    // stats climb with the level, at LEVEL_GROWTH a level
+    let def = &ROSTER[0];
+    g.set_level(0, 15);
+    let want = def.hp + def.hp_growth * 14.0 * clawbound::gods::LEVEL_GROWTH;
+    assert!((g.gods[0].max_hp - want).abs() < 1e-2, "{} vs {want}", g.gods[0].max_hp);
+    // ranked: the cooldown the cat pays is shorter at 15 than at 1
+    let one = clawbound::ranks::ranked(def.abilities[0], 1).unwrap();
+    let top = g.ability(0, 0).unwrap();
+    assert!(top.cooldown < one.cooldown);
+}
+
+/// The Drowned Halls: 3 a side, one lane with two towers a side; bots stay
+/// on the halls' floor (never in a wall or out on the sea floor), leave
+/// their bases, and over eight minutes the lane moves -- a tower falls; and
+/// across two matches someone takes the Library by its passages.
+///
+/// Two matches, not one: the Library is a side room, and whether a given
+/// lineup's bots go in is the lineup's business. Seed 9 fielded a lineup
+/// that did until the roster grew to 16; its new lineup (Hollowstep among
+/// them) and seed 9's old red side with Stonewhisper in his place both
+/// kept to the lane, as did 4 of 6 seeds sampled. Seed 9 still runs,
+/// Hollowstep and all, for the walls: his step lands him wherever his
+/// other stood.
+#[test]
+fn the_drowned_halls_play_three_a_side_in_one_lane() {
+    use clawbound::map::{self, MapId};
+    map::with(MapId::Atlantis, || {
+        assert_eq!(MapId::Atlantis.team_size(), 3);
+        assert_eq!(map::lanes(), &[clawbound::consts::Lane::Mid]);
+        let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+        let mut library = false;
+        // (3 was the second seed until the roster reached 18: its new
+        // lineup keeps to the lane, as 4 of 9 seeds sampled then did,
+        // Oremantle in none of them. Seed 1 fields her -- her lodestone
+        // moves enemy cats, so the walls are checked against her pull too
+        // -- and its bots go in; with Stonewhisper in her place they did
+        // not.)
+        for seed in [9u64, 1] {
+            let (b, r) = map::team_picks(4, &mut clawbound::sim::Rng::new(seed));
+            let mut game = Game::new_teams(&b, &r);
+            assert_eq!(game.gods.len(), 6);
+            assert_eq!(game.towers.len(), 4, "two towers a side in the one lane");
+            game.blockers = blockers.clone();
+            // the player's cat plays too
+            game.gods[0].ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+            let f = map::floor().unwrap();
+            let mut left_base = [false; 6];
+            for _ in 0..(8 * 60 * 30) {
+                game.tick(1.0 / 30.0);
+                game.events.clear();
+                for (i, g) in game.gods.iter().enumerate() {
+                    if g.respawn_t <= 0.0 {
+                        assert!(f.sdf(g.pos.x, g.pos.z) <= 0.05, "seed {seed}: cat {i} in the wall at {} (sdf {})", g.pos, f.sdf(g.pos.x, g.pos.z));
+                        library |= glam::Vec3::new(g.pos.x - clawbound::atlantis::LIBRARY_X, 0.0, g.pos.z).length() < clawbound::atlantis::LIBRARY_R;
+                        left_base[i] |= (g.pos - g.team.base_pos()).length() > 30.0;
+                    }
+                }
+                for m in &game.minions {
+                    assert!(f.sdf(m.pos.x, m.pos.z) <= 0.3, "seed {seed}: a minion in the wall at {}", m.pos);
+                }
+                if game.over.is_some() {
+                    break;
+                }
+            }
+            assert!(left_base.iter().all(|x| *x), "seed {seed}: every cat leaves its base: {left_base:?}");
+            let standing: usize = game.tower_alive.iter().sum();
+            assert!(standing < 4 || game.over.is_some(), "seed {seed}: no tower fell in eight minutes");
+        }
+        assert!(library, "nobody went into the Library in two eight-minute matches");
+    });
+}
+
+/// Hollowstep (`stalker`): the other of him, the terror radius, the step,
+/// the sending, and every shadow.
+mod hollowstep {
+    use clawbound::gods::{Archetype, ROSTER};
+    use clawbound::sim::{Event, Game};
+    use clawbound::stalker::*;
+    use glam::Vec3;
+
+    fn quiet(g: &mut Game) {
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+            c.move_dir = Vec3::ZERO;
+            c.attack_held = false;
+        }
+        g.minions.clear();
+        g.next_wave_t = 1e9;
+    }
+    fn run(g: &mut Game, secs: f32) {
+        for _ in 0..(secs * 60.0) as usize {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+        }
+    }
+    fn him() -> u32 {
+        ROSTER.iter().position(|d| d.name == "Hollowstep").expect("Hollowstep is on the roster") as u32
+    }
+    fn slot(f: impl Fn(&Archetype) -> bool) -> u32 {
+        (0..4).find(|&s| f(&ROSTER[him() as usize].abilities[s].arch)).unwrap() as u32
+    }
+    /// Hollowstep (0) against `red`, everyone still, far from anything.
+    fn game(red: &[u32]) -> Game {
+        let mut g = Game::new_teams(&[him()], red);
+        quiet(&mut g);
+        g.set_level(0, 5);
+        // in the jungle west of mid, a tower's range from every tower (and
+        // so his other, through the centre, in the jungle east of it)
+        g.gods[0].pos = Vec3::new(-38.0, 0.0, -8.0);
+        g.gods[0].mana = 9999.0;
+        for i in 1..g.gods.len() {
+            g.gods[i].pos = Vec3::new(-120.0 + i as f32 * 3.0, 0.0, -20.0);
+        }
+        g
+    }
+    fn other(g: &Game) -> Vec3 {
+        g.others[g.main_other(0).expect("his other")].pos
+    }
+
+    /// There is always another of him, somewhere else: it rises with him on
+    /// the far side of the map's centre, goes when he falls, rises again
+    /// when he does -- and nobody else has one.
+    #[test]
+    fn there_is_always_another_of_him_somewhere_else() {
+        let mut g = game(&[0]);
+        run(&mut g, 0.1);
+        assert_eq!(g.others.len(), 1, "one other, and only his");
+        let d = other(&g).distance(g.gods[0].pos);
+        assert!(d > 50.0, "somewhere else: {d:.1} u from him");
+        g.gods[0].hp = 0.0;
+        g.gods[0].respawn_t = 3.0;
+        run(&mut g, 0.1);
+        assert!(g.others.is_empty(), "gone while he is dead");
+        g.gods[0].respawn_t = 0.0;
+        g.gods[0].hp = g.gods[0].max_hp;
+        run(&mut g, 0.1);
+        assert_eq!(g.others.len(), 1, "back with him");
+    }
+
+    /// Left alone it walks at the nearest enemy -- slower than a cat, with
+    /// a heavy footfall every stride -- and stops short of it, watching.
+    #[test]
+    fn it_walks_at_the_prey_and_stops_short_watching() {
+        let mut g = game(&[0]);
+        run(&mut g, 0.1);
+        let start = other(&g);
+        g.gods[1].pos = start + Vec3::new(20.0, 0.0, 0.0);
+        let mut steps = 0;
+        for _ in 0..60 {
+            g.tick(1.0 / 60.0);
+            steps += g.events.iter().filter(|e| matches!(e, Event::HeavyStep { .. })).count();
+            g.events.clear();
+        }
+        let walked = other(&g).distance(start);
+        assert!((WALK * 0.8..=WALK * 1.05).contains(&walked), "a walk, not a run: {walked:.2} u in a second");
+        assert!(steps >= 1, "it is heard coming");
+        run(&mut g, 8.0);
+        let d = other(&g).distance(g.gods[1].pos);
+        assert!((LURK - 0.3..=LURK + 0.3).contains(&d), "it stops {d:.2} u off, not {LURK}");
+    }
+
+    /// Near him or near his other, an enemy's heart pounds -- faster the
+    /// closer -- and its legs go heavy; an ally's does not, nor anyone's
+    /// out of reach.
+    #[test]
+    fn the_terror_radius_is_round_him_and_round_his_other() {
+        let mut g = game(&[0, 1]);
+        g.gods.truncate(3);
+        run(&mut g, 0.1);
+        let beats = |g: &mut Game, i: usize, at: Vec3| {
+            g.gods[i].pos = at;
+            g.gods[i].beat_t = 0.0;
+            let mut n = 0;
+            for _ in 0..(4 * 60) {
+                g.tick(1.0 / 60.0);
+                n += g.events.iter().filter(|e| matches!(e, Event::Heartbeat { god, .. } if *god == i)).count();
+                g.events.clear();
+            }
+            n
+        };
+        let me = g.gods[0].pos;
+        let near = beats(&mut g, 1, me + Vec3::new(3.0, 0.0, 0.0));
+        let fear_near = g.gods[1].fear;
+        let edge = beats(&mut g, 1, me + Vec3::new(TERROR_R - 3.0, 0.0, 0.0));
+        let out = beats(&mut g, 1, me + Vec3::new(TERROR_R + 6.0, 0.0, 0.0));
+        let beside_it = other(&g) + Vec3::new(0.0, 0.0, 5.0);
+        let by_other = beats(&mut g, 2, beside_it);
+        assert!(fear_near > 0.99, "at his side the fear is whole: {fear_near}");
+        // 4 s at a beat every 0.42 s close, ~1 s at the rim
+        assert!((9..=10).contains(&near) && (3..=5).contains(&edge), "the heart races near him: {near} beats in 4 s close, {edge} at the edge");
+        assert_eq!(out, 0, "out of reach: calm");
+        assert!(by_other >= 5, "his other frightens as well as he does: {by_other}");
+        // the legs
+        g.gods[1].pos = me + Vec3::new(2.0, 0.0, 0.0);
+        g.tick(1.0 / 60.0);
+        let afraid = g.move_speed(1);
+        g.gods[1].pos = me + Vec3::new(TERROR_R + 6.0, 0.0, 0.0);
+        g.tick(1.0 / 60.0);
+        let calm = g.move_speed(1);
+        assert!((afraid / calm - (1.0 - FEAR_SLOW)).abs() < 0.01, "afraid legs: {afraid:.2} against {calm:.2}");
+        // an ally beside him is not afraid
+        let mut g = Game::new_teams(&[him(), 0], &[1]);
+        quiet(&mut g);
+        g.gods[1].pos = g.gods[0].pos + Vec3::new(2.0, 0.0, 0.0);
+        run(&mut g, 0.5);
+        assert_eq!(g.gods[1].fear, 0.0, "his own side does not fear him");
+    }
+
+    /// Step Between: he and his other trade places exactly, and whoever
+    /// waited by it is struck and stumbles.
+    #[test]
+    fn stepping_between_trades_places_and_staggers_the_prey() {
+        let mut g = game(&[0]);
+        run(&mut g, 0.1);
+        let (me, it) = (g.gods[0].pos, other(&g));
+        g.gods[1].pos = it + Vec3::new(2.0, 0.0, 0.0);
+        let h = g.gods[1].hp;
+        g.cast_queue.push((0, slot(|a| matches!(a, Archetype::Swap { .. })), it));
+        let mut fx = false;
+        for _ in 0..30 {
+            g.tick(1.0 / 60.0);
+            fx |= g.events.iter().any(|e| matches!(e, Event::SwapFx { .. }));
+            g.events.clear();
+        }
+        assert!(fx, "the step was taken");
+        assert!(g.gods[0].pos.distance(Vec3::new(it.x, g.gods[0].pos.y, it.z)) < 1.2, "he is where it was: {} vs {it}", g.gods[0].pos);
+        assert!(other(&g).distance(Vec3::new(me.x, other(&g).y, me.z)) < 1.5, "it is where he was");
+        assert!(g.gods[1].hp < h - 40.0, "struck: {h} -> {}", g.gods[1].hp);
+        assert!(g.gods[1].slow > 0.3, "and stumbling: slow {}", g.gods[1].slow);
+    }
+
+    /// Send the Other: it glides to the aim (no further than the range),
+    /// silently, waits, then goes hunting again.
+    #[test]
+    fn the_other_goes_where_it_is_sent_and_waits() {
+        let mut g = game(&[0]);
+        run(&mut g, 0.1);
+        let s = slot(|a| matches!(a, Archetype::Send { .. }));
+        let Archetype::Send { range, speed } = ROSTER[him() as usize].abilities[s as usize].arch else { unreachable!() };
+        let me = g.gods[0].pos;
+        let aim = me + Vec3::new(0.0, 0.0, 100.0);
+        g.cast_queue.push((0, s, aim));
+        let mut steps = 0;
+        let mut t = 0.0;
+        let want = me + Vec3::new(0.0, 0.0, range);
+        while t < 12.0 {
+            g.tick(1.0 / 60.0);
+            t += 1.0 / 60.0;
+            steps += g.events.iter().filter(|e| matches!(e, Event::HeavyStep { .. })).count();
+            g.events.clear();
+            if g.others[g.main_other(0).unwrap()].goal.is_none() && t > 1.0 {
+                break;
+            }
+        }
+        let at = other(&g);
+        assert!(Vec3::new(at.x - want.x, 0.0, at.z - want.z).length() < 1.5, "clamped to its range: at {at}, wanted {want}");
+        assert!(t < 120.0 / speed + 2.0, "it glides: {t:.1} s");
+        assert_eq!(steps, 0, "a glide is silent");
+        // it waits there...
+        g.gods[1].pos = at + Vec3::new(15.0, 0.0, 0.0);
+        run(&mut g, HOLD_SECS * 0.8);
+        assert!(other(&g).distance(at) < 0.2, "it waits where it was sent");
+        // ...then hunts
+        run(&mut g, HOLD_SECS * 0.6 + 1.0);
+        assert!(other(&g).distance(at) > 1.0, "and then it hunts again");
+    }
+
+    /// Every Shadow: two echoes rise beside him and two beside his other;
+    /// they strike what they reach and fade on time; while they stand, the
+    /// step goes to whichever of him is nearest the aim, and comes back
+    /// fast.
+    #[test]
+    fn every_shadow_is_four_more_of_him_to_step_into() {
+        let mut g = game(&[0]);
+        run(&mut g, 0.1);
+        let s = slot(|a| matches!(a, Archetype::Echoes { .. }));
+        let Archetype::Echoes { each, life, .. } = ROSTER[him() as usize].abilities[s as usize].arch else { unreachable!() };
+        let me = g.gods[0].pos;
+        g.gods[1].pos = me + Vec3::new(0.0, 0.0, 3.0);
+        let h = g.gods[1].hp;
+        g.cast_queue.push((0, s, me + Vec3::Z));
+        run(&mut g, 0.8);
+        let echoes: Vec<Vec3> = g.others.iter().filter(|o| o.echo).map(|o| o.pos).collect();
+        assert_eq!(echoes.len() as u32, each * 2, "two beside him, two beside his other");
+        let it = other(&g);
+        assert_eq!(echoes.iter().filter(|e| e.distance(it) < 6.0).count() as u32, each, "{each} with his other");
+        run(&mut g, 2.0);
+        assert!(g.gods[1].hp < h - 50.0, "the echoes by him struck: {h} -> {}", g.gods[1].hp);
+        // step into the echo nearest a spot beside his other
+        let far_echo = g.others.iter().filter(|o| o.echo).map(|o| o.pos).max_by(|a, b| a.distance(me).total_cmp(&b.distance(me))).unwrap();
+        g.gods[0].cds[0] = 0.0;
+        let it_was = other(&g);
+        g.cast_queue.push((0, slot(|a| matches!(a, Archetype::Swap { .. })), far_echo));
+        run(&mut g, 0.3);
+        let flat = |a: Vec3, b: Vec3| Vec3::new(a.x - b.x, 0.0, a.z - b.z).length();
+        assert!(flat(g.gods[0].pos, far_echo) < 0.6 && flat(far_echo, it_was) > 1.0, "he stepped into the echo he aimed at ({:.2} u off it), not his other", flat(g.gods[0].pos, far_echo));
+        assert!(g.gods[0].cds[0] <= ULT_STEP_CD, "and the step comes back fast: {}", g.gods[0].cds[0]);
+        run(&mut g, life);
+        assert!(g.others.iter().all(|o| !o.echo), "the echoes are gone after {life} s");
+        assert_eq!(g.others.len(), 1, "his other stays");
+    }
+
+    /// A bot Hollowstep uses the whole kit in a real match.
+    #[test]
+    fn a_bot_hollowstep_uses_his_kit() {
+        let mut g = Game::new_teams(&[0, him()], &[1, 2]);
+        for c in g.gods.iter_mut() {
+            c.ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+        }
+        for i in 0..g.gods.len() {
+            g.set_level(i, 5);
+        }
+        let mut used = [0u32; 4];
+        for _ in 0..(240 * 30) {
+            g.tick(1.0 / 30.0);
+            for e in g.events.drain(..) {
+                if let Event::Cast { god: 1, slot, .. } = e {
+                    used[slot as usize] += 1;
+                }
+            }
+        }
+        assert!(used.iter().all(|&n| n > 0), "the step, the sending, the reach and every shadow in four minutes: {used:?}");
+    }
+}
+
+/// Brasshowl (`lantern`): the lamp raised -- the struck flee, cannot act,
+/// are shown up and cannot stalk; Hollowstep's shadows cannot stand in it.
+mod brasshowl {
+    use clawbound::gods::{Archetype, ROSTER};
+    use clawbound::sim::{Event, Game};
+    use glam::Vec3;
+
+    fn quiet(g: &mut Game) {
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+            c.move_dir = Vec3::ZERO;
+            c.attack_held = false;
+        }
+        g.minions.clear();
+        g.next_wave_t = 1e9;
+    }
+    fn run(g: &mut Game, secs: f32) {
+        for _ in 0..(secs * 60.0) as usize {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+        }
+    }
+    fn id(name: &str) -> u32 {
+        ROSTER.iter().position(|d| d.name == name).unwrap() as u32
+    }
+    fn lamp() -> (u32, f32, f32, f32) {
+        let d = &ROSTER[id("Brasshowl") as usize];
+        let s = (0..4).find(|&s| matches!(d.abilities[s].arch, Archetype::Lantern { .. })).unwrap();
+        let Archetype::Lantern { radius, flee, reveal, .. } = d.abilities[s].arch else { unreachable!() };
+        (s as u32, radius, flee, reveal)
+    }
+    fn game(red: &[u32]) -> Game {
+        let mut g = Game::new_teams(&[id("Brasshowl")], red);
+        quiet(&mut g);
+        g.set_level(0, 5);
+        g.gods[0].pos = Vec3::new(-38.0, 0.0, -8.0);
+        g.gods[0].mana = 9999.0;
+        for i in 1..g.gods.len() {
+            g.gods[i].pos = Vec3::new(-120.0 + i as f32 * 3.0, 0.0, -20.0);
+        }
+        g
+    }
+
+    /// SHADOWS!: a cat in the light is struck, runs straight away from him
+    /// (whatever it is steered to do), cannot attack or cast while it runs,
+    /// and is shown up -- it cannot stalk -- for longer than it runs. One
+    /// out of the light is untouched.
+    #[test]
+    fn the_lamp_sends_them_running_and_shows_them_up() {
+        let (slot, radius, flee, reveal) = lamp();
+        let mut g = game(&[0, 1]);
+        let me = g.gods[0].pos;
+        g.gods[1].pos = me + Vec3::new(4.0, 0.0, 0.0);
+        g.gods[2].pos = me + Vec3::new(0.0, 0.0, radius + 6.0);
+        g.gods[1].sneak = true;
+        g.gods[2].sneak = true;
+        run(&mut g, 2.0);
+        assert!(g.stalking(1), "stalking before the lamp");
+        let h = g.gods[1].hp;
+        // it tries to come at him
+        g.gods[1].move_dir = Vec3::new(-1.0, 0.0, 0.0);
+        g.cast_queue.push((0, slot, me));
+        let mut lit = false;
+        // the ultimate's wind-up is 0.6 s
+        for _ in 0..50 {
+            g.tick(1.0 / 60.0);
+            lit |= g.events.iter().any(|e| matches!(e, Event::LanternFx { .. }));
+            g.events.clear();
+        }
+        assert!(lit, "the lamp went up");
+        assert!(g.gods[1].hp < h - 60.0, "struck: {h} -> {}", g.gods[1].hp);
+        assert!(g.gods[1].flee_t > 0.0 && g.gods[1].revealed_t > flee, "running, and shown up for longer");
+        assert!(!g.kit_free(1), "a fleeing cat cannot act");
+        let x0 = g.gods[1].pos.x;
+        run(&mut g, 0.8);
+        assert!(g.gods[1].pos.x > x0 + 3.0, "it ran away from him though it was steered at him: {x0:.1} -> {:.1}", g.gods[1].pos.x);
+        assert!(!g.stalking(1), "shown up: no stalking");
+        assert!(g.stalking(2), "out of the light: still stalking");
+        assert_eq!(g.gods[2].flee_t, 0.0);
+        run(&mut g, flee);
+        assert!(g.kit_free(1), "the running wears off");
+        // past the break a hit puts on stalking, and still shown up: it is
+        // the light that stops the stalk, not the blow
+        assert!(0.8 + flee > clawbound::consts::STALK_BREAK_SECS + 0.3, "the blow's own break on stalking is over by now");
+        assert!(g.gods[1].revealed_t > 0.0, "still shown up");
+        assert!(!g.stalking(1), "shown up, long after the blow: still no stalking");
+        run(&mut g, reveal);
+        assert!(g.stalking(1), "and so does the showing up");
+    }
+
+    /// No shadow stands in the light: Hollowstep's echoes in it are gone,
+    /// and his other is driven to the far side of the map from him.
+    #[test]
+    fn no_shadow_stands_in_the_light() {
+        let (slot, radius, ..) = lamp();
+        let mut g = game(&[id("Hollowstep")]);
+        run(&mut g, 0.1);
+        let me = g.gods[0].pos;
+        // Hollowstep beside the lamp, his other and his echoes too
+        g.gods[1].pos = me + Vec3::new(-(radius + 30.0), 0.0, 0.0);
+        let k = g.main_other(1).expect("his other");
+        g.others[k].pos = me + Vec3::new(3.0, 0.0, 0.0);
+        g.gods[1].cds = [0.0; 4];
+        g.gods[1].mana = 9999.0;
+        g.set_level(1, 5);
+        g.every_shadow(1, 2, 8.0, 10.0);
+        assert!(g.others.iter().filter(|o| o.echo).count() >= 2);
+        let echoes_near = g.others.iter().filter(|o| o.echo && o.pos.distance(me) < radius).count();
+        assert!(echoes_near >= 2, "echoes stand in the light: {echoes_near}");
+        g.cast_queue.push((0, slot, me));
+        let mut driven = 0;
+        for _ in 0..50 {
+            g.tick(1.0 / 60.0);
+            driven += g.events.iter().filter(|e| matches!(e, Event::ShadowDriven { .. })).count();
+            g.events.clear();
+        }
+        assert!(driven >= 3, "his other and its echoes torn out of the light: {driven}");
+        assert!(g.others.iter().all(|o| o.pos.distance(me) > radius), "nothing of his in the light");
+        let back = g.main_other(1).map(|k| g.others[k].pos).expect("his other rises again, elsewhere");
+        let him = g.gods[1].pos;
+        assert!(back.distance(him) > 30.0, "far from him: {:.1}", back.distance(him));
+    }
+
+    /// A bot Brasshowl uses his kit, the lamp included.
+    #[test]
+    fn a_bot_brasshowl_raises_the_lamp() {
+        let mut g = Game::new_teams(&[0, id("Brasshowl")], &[1, 2]);
+        for c in g.gods.iter_mut() {
+            c.ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+        }
+        for i in 0..g.gods.len() {
+            g.set_level(i, 5);
+        }
+        let mut used = [0u32; 4];
+        for _ in 0..(240 * 30) {
+            g.tick(1.0 / 30.0);
+            for e in g.events.drain(..) {
+                if let Event::Cast { god: 1, slot, .. } = e {
+                    used[slot as usize] += 1;
+                }
+            }
+        }
+        assert!(used[0] > 0 && used[1] > 0 && used[3] > 0, "oil, bark and the lamp in four minutes: {used:?}");
+    }
+}
+
+mod hourwatch {
+    use clawbound::gods::ROSTER;
+    use clawbound::map::{self, MapId};
+    use clawbound::sim::{Event, Game};
+    use glam::Vec3;
+
+    fn id() -> u32 {
+        ROSTER.iter().position(|d| d.name == "Hourwatch").unwrap() as u32
+    }
+
+    /// A bot Hourwatch in a real match uses her kit: sends back, winds
+    /// forward, and looks long, in four minutes.
+    #[test]
+    fn a_bot_hourwatch_keeps_the_hours() {
+        let mut g = Game::new_teams(&[0, id(), 3], &[1, 2, 4]);
+        for c in g.gods.iter_mut() {
+            c.ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+        }
+        for i in 0..g.gods.len() {
+            g.set_level(i, 6);
+        }
+        let mut used = [0u32; 4];
+        for _ in 0..(240 * 30) {
+            g.tick(1.0 / 30.0);
+            for e in g.events.drain(..) {
+                if let Event::Cast { god: 1, slot, .. } = e {
+                    used[slot as usize] += 1;
+                }
+            }
+        }
+        assert!(used[1] > 0 && used[2] > 0 && used[3] > 0, "send back, wind forward and the long look in four minutes: {used:?}");
+    }
+
+    /// On the Quarry, where walls hide: an enemy behind a wall is not seen
+    /// by her team -- until she looks long from in front of it.
+    #[test]
+    fn the_long_look_sees_through_the_quarry_walls() {
+        map::with(MapId::Maze, || {
+            let mut g = Game::new_teams(&[id()], &[1]);
+            g.blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+            for c in g.gods.iter_mut() {
+                c.ai = None;
+            }
+            g.minions.clear();
+            g.next_wave_t = 1e9;
+            let blue = g.gods[0].team;
+            let fwd = clawbound::hours::forward(blue);
+            // her in the Heart; the enemy two rooms back toward her base
+            // (behind her), in the middle column's back room
+            g.gods[0].pos = Vec3::new(0.0, 0.0, 0.0);
+            g.gods[1].pos = clawbound::maze::room_pos((1, if fwd.z > 0.0 { -2 } else { 2 })) + Vec3::new(8.0, 0.0, 0.0);
+            g.gods[0].mana = 9999.0;
+            g.set_level(0, 6);
+            for _ in 0..30 {
+                g.tick(1.0 / 60.0);
+            }
+            assert!(!g.sees(blue, 1), "seen through the walls before the look");
+            let slot = 3;
+            let aim = g.gods[0].pos + fwd * 20.0;
+            g.cast_queue.push((0, slot, aim));
+            let mut seen = false;
+            for _ in 0..60 {
+                g.tick(1.0 / 60.0);
+                seen |= g.sees(blue, 1);
+            }
+            assert!(seen, "the long look did not show the one behind her");
+        });
+    }
+}
+
+mod claypaw {
+    use clawbound::gods::ROSTER;
+    use clawbound::sim::{Event, Game};
+    use glam::Vec3;
+
+    fn id() -> u32 {
+        ROSTER.iter().position(|d| d.name == "Claypaw").unwrap() as u32
+    }
+
+    /// A bot Claypaw in a real match: shapes kittens, spins, quickens and
+    /// brings the bank down, in four minutes -- and his mana comes (it
+    /// never refills by itself), so his kit keeps going.
+    #[test]
+    fn a_bot_claypaw_works_his_clay() {
+        let mut g = Game::new_teams(&[0, id(), 3], &[1, 2, 4]);
+        for c in g.gods.iter_mut() {
+            c.ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+        }
+        for i in 0..g.gods.len() {
+            g.set_level(i, 6);
+        }
+        let mut used = [0u32; 4];
+        let mut shaped = 0;
+        for _ in 0..(240 * 30) {
+            g.tick(1.0 / 30.0);
+            for e in g.events.drain(..) {
+                match e {
+                    Event::Cast { god: 1, slot, .. } => used[slot as usize] += 1,
+                    Event::ClayShaped { n, .. } => shaped += n,
+                    _ => {}
+                }
+            }
+        }
+        assert!(shaped >= 10, "only {shaped} kittens in four minutes");
+        assert!(used[2] > 0 && used[3] > 0 && used[0] + used[1] > 0, "his kit in four minutes: {used:?}");
+    }
+
+    /// In a real game: his basic attacks on a cat in reach bring his mana
+    /// (none comes by itself); and his Spin lays mud down the aim.
+    #[test]
+    fn his_claws_bring_mana_and_his_spin_lays_mud() {
+        let mut g = Game::new_teams(&[id()], &[1]);
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+        }
+        g.minions.clear();
+        g.next_wave_t = 1e9;
+        let at = Vec3::new(0.0, 0.0, -40.0);
+        g.gods[0].pos = at;
+        g.gods[1].pos = at + Vec3::X * 2.5;
+        g.gods[1].max_hp = 1e6;
+        g.gods[1].hp = 1e6;
+        g.gods[0].mana = 0.0;
+        for _ in 0..(3 * 60) {
+            g.gods[0].attack_held = true;
+            g.tick(1.0 / 60.0);
+        }
+        assert!(g.gods[1].hp < 1e6, "no blow landed");
+        assert!(g.gods[0].mana >= clawbound::clay::MANA_PER_HIT, "his claws brought {} mana", g.gods[0].mana);
+        // the spin, aimed north: mud down the aim
+        g.gods[0].mana = 999.0;
+        g.gods[0].attack_held = false;
+        g.gods[1].pos = at + Vec3::new(0.0, 0.0, -60.0);
+        g.set_level(0, 5);
+        g.cast_queue.push((0, 2, at + Vec3::Z * 10.0));
+        for _ in 0..20 {
+            g.tick(1.0 / 60.0);
+        }
+        let s = g.slicks.first().expect("no mud after the spin");
+        let d = Vec3::new(s.b.x - s.a.x, 0.0, s.b.z - s.a.z).normalize_or_zero();
+        assert!(d.dot(Vec3::Z) > 0.95, "the mud runs {d}, the spin went north");
+    }
+
+    /// A real slick, in the real mover: a cat walking onto it keeps going
+    /// faster than it walks; told to turn round on it, it is still carried
+    /// on a while; a mudslide carries a cat standing still on it along.
+    #[test]
+    fn the_mud_carries_friend_and_foe() {
+        let mut g = Game::new_teams(&[0], &[1]);
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+        }
+        g.minions.clear();
+        g.next_wave_t = 1e9;
+        let at = Vec3::new(0.0, 0.0, -40.0);
+        g.gods[0].pos = at;
+        g.gods[1].pos = at + Vec3::new(0.0, 0.0, 8.0);
+        g.lay_slick(at - Vec3::X * 30.0, at + Vec3::X * 30.0, 12.0, 30.0, Vec3::ZERO);
+        let walk = g.move_speed(0);
+        for _ in 0..90 {
+            g.gods[0].move_dir = Vec3::X;
+            g.tick(1.0 / 60.0);
+        }
+        let x0 = g.gods[0].pos.x;
+        g.gods[0].move_dir = Vec3::X;
+        g.tick(1.0 / 60.0);
+        let v = (g.gods[0].pos.x - x0) * 60.0;
+        assert!(v > walk * 1.15, "on the slick at {v:.1}, walking {walk:.1}");
+        for _ in 0..6 {
+            g.gods[0].move_dir = -Vec3::X;
+            g.tick(1.0 / 60.0);
+        }
+        assert!(g.gods[0].pos.x > x0, "turned round on the mud at once");
+        // a mudslide: the other one, standing still, is carried along
+        let z0 = g.gods[1].pos.z;
+        g.slicks.clear();
+        g.lay_slick(at + Vec3::new(-20.0, 0.0, 8.0), at + Vec3::new(20.0, 0.0, 8.0), 5.0, 10.0, Vec3::Z * 7.0);
+        for _ in 0..60 {
+            g.gods[1].move_dir = Vec3::ZERO;
+            g.tick(1.0 / 60.0);
+        }
+        assert!(g.gods[1].pos.z - z0 > 4.0, "a mudslide carried it {:.1}", g.gods[1].pos.z - z0);
+    }
+}
+
+mod oremantle {
+    use clawbound::gods::{Material, Role, ROSTER};
+    use clawbound::sim::{Event, Game};
+
+    fn id() -> u32 {
+        ROSTER.iter().position(|d| d.role == Role::Sentinel).unwrap() as u32
+    }
+
+    /// A claw reaches a bigger cat sooner: a melee cat just out of reach of
+    /// an ordinary cat's middle strikes her from there, and does not strike
+    /// the ordinary cat.
+    #[test]
+    fn a_claw_reaches_her_sooner() {
+        let claw = ROSTER.iter().position(|d| d.name == "Goldenmane").unwrap() as u32;
+        let range = ROSTER[claw as usize].auto_range;
+        let extra = Role::Sentinel.extra_reach();
+        assert!(extra > 0.2, "extra reach {extra}");
+        let struck = |target: u32| {
+            let mut g = Game::new_teams(&[claw], &[target]);
+            for c in g.gods.iter_mut() {
+                c.ai = None;
+                c.move_dir = glam::Vec3::ZERO;
+            }
+            g.minions.clear();
+            g.next_wave_t = 1e9;
+            let at = glam::Vec3::new(-38.0, 0.0, -8.0);
+            g.gods[0].pos = at;
+            g.gods[1].pos = at + glam::Vec3::X * (range + extra * 0.6);
+            g.gods[0].attack_held = true;
+            let hp = g.gods[1].hp;
+            for _ in 0..40 {
+                g.tick(1.0 / 60.0);
+            }
+            g.gods[1].hp < hp
+        };
+        assert!(struck(id()), "the claw did not reach her");
+        assert!(!struck(12), "the claw reached an ordinary cat from as far");
+    }
+
+    /// Lodestone never draws a cat off the floor: on the Drowned Halls
+    /// (whose walls are the floor's edge), cats placed across a wall from
+    /// her are drawn up to it and no further. The scan asserts it found
+    /// pairs with a wall between them, or it proves nothing.
+    #[test]
+    fn lodestone_never_draws_a_cat_through_a_wall() {
+        use clawbound::map::{self, MapId};
+        map::with(MapId::Atlantis, || {
+            let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+            let f = map::floor().expect("the Drowned Halls have a floor");
+            let mut rng = clawbound::sim::Rng::new(5);
+            let mut rand = |lo: f32, hi: f32| lo + (hi - lo) * ((rng.next_u() % 10_000) as f32 / 10_000.0);
+            let (mut tried, mut walled) = (0, 0);
+            // keep only pairs with the floor's edge between them: the halls
+            // are open enough that 1 in 400 random pairs had one
+            while walled < 30 && tried < 200_000 {
+                let her = glam::Vec3::new(rand(-110.0, 110.0), 0.0, rand(-110.0, 110.0));
+                let a = rand(0.0, std::f32::consts::TAU);
+                let d = rand(3.5, 7.5);
+                let foe = her + glam::Vec3::new(a.cos() * d, 0.0, a.sin() * d);
+                if !f.fits(her.x, her.z, 0.6) || !f.fits(foe.x, foe.z, 0.6) {
+                    continue;
+                }
+                tried += 1;
+                let wall = (1..20).any(|k| {
+                    let p = foe + (her - foe) * (k as f32 / 20.0);
+                    f.sdf(p.x, p.z) > 0.0
+                });
+                if !wall {
+                    continue;
+                }
+                walled += 1;
+                let mut g = Game::new_teams(&[id()], &[0]);
+                g.blockers = blockers.clone();
+                g.set_level(0, 3);
+                g.gods[0].pos = her;
+                g.gods[1].pos = foe;
+                g.sentinel_tick(1.0 / 60.0);
+                let k = g.coat_key(0, Material::Lodestone).unwrap();
+                g.shift_coat(0, k);
+                for _ in 0..240 {
+                    g.sentinel_tick(1.0 / 60.0);
+                    let p = g.gods[1].pos;
+                    assert!(f.sdf(p.x, p.z) <= 0.05, "drawn into the wall at {p} (sdf {}), from {foe} toward {her}", f.sdf(p.x, p.z));
+                }
+            }
+            assert!(walled >= 30, "only {walled} pairs with a wall between them in {tried} tries: the test proves nothing");
+        });
+    }
+
+    /// A bot Oremantle, in a real match, wears more than one coat, puts on
+    /// the Mountain's Heart, and is struck by what comes at her.
+    #[test]
+    fn a_bot_oremantle_shifts_her_coats() {
+        let mut g = Game::new_teams(&[0, id()], &[1, 2]);
+        for c in g.gods.iter_mut() {
+            c.ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+        }
+        for i in 0..g.gods.len() {
+            g.set_level(i, 5);
+        }
+        let mut worn = std::collections::HashSet::new();
+        let (mut shifts, mut hit) = (0u32, 0.0f32);
+        let mut hp = g.gods[1].hp;
+        for _ in 0..(240 * 30) {
+            g.tick(1.0 / 30.0);
+            for e in g.events.drain(..) {
+                if let Event::CoatShift { god: 1, material, .. } = e {
+                    worn.insert(material);
+                    shifts += 1;
+                }
+            }
+            let now = g.gods[1].hp;
+            if now < hp {
+                hit += hp - now;
+            }
+            hp = now;
+        }
+        assert!(worn.len() >= 3 && worn.contains(&Material::Magma), "coats worn in four minutes: {worn:?} ({shifts} shifts)");
+        // a shift has a 3 s cooldown: she cannot have flapped faster
+        assert!(shifts < 240 / 3 + 4, "{shifts} shifts in four minutes");
+        assert!(hit > 0.0, "nothing ever struck her");
+    }
+}
+
+mod quarry {
+    use clawbound::map::{self, MapId};
+    use clawbound::maze::{self as mz, Mood};
+    use clawbound::sim::{Event, Game};
+
+    /// Eight minutes of bots on the Quarry, one seed: nobody in a wall,
+    /// every cat out of its base, the thorns biting, and no cat left alone
+    /// in biting ground for long (the bots walk out of it: `maze::bot_goal`).
+    pub fn play(seed: u64, secs: f32) -> (f32, usize, [usize; 2], u32, f32, u32, usize, usize) {
+        map::with(MapId::Maze, || {
+            let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+            let (b, r) = map::team_picks(4, &mut clawbound::sim::Rng::new(seed));
+            let mut game = Game::new_teams(&b, &r);
+            assert_eq!(game.gods.len(), 10);
+            game.blockers = blockers;
+            game.gods[0].ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Top, 0.9));
+            let f = map::floor().unwrap();
+            let mut left_base = vec![false; game.gods.len()];
+            let mut alone_for = vec![0.0f32; game.gods.len()];
+            let (mut worst, mut bites, mut alone_total) = (0.0f32, 0usize, 0.0f32);
+            let (mut boulder_hits, mut falls) = (0usize, 0usize);
+            // stuck: wanting to move (a move direction), alive, not
+            // fighting, yet not 1.5 u from where it was 5 s ago
+            let mut anchor: Vec<(glam::Vec3, f32)> = game.gods.iter().map(|g| (g.pos, 0.0)).collect();
+            let mut stuck = 0u32;
+            let dt = 1.0 / 30.0;
+            for _ in 0..(secs / dt) as usize {
+                game.tick(dt);
+                bites += game.events.iter().filter(|e| matches!(e, Event::ThornBite { .. })).count();
+                boulder_hits += game.events.iter().filter(|e| matches!(e, Event::BoulderHit { .. })).count();
+                falls += game.events.iter().filter(|e| matches!(e, Event::CatFell { .. })).count();
+                game.events.clear();
+                for i in 0..game.gods.len() {
+                    let g = &game.gods[i];
+                    if g.respawn_t > 0.0 {
+                        alone_for[i] = 0.0;
+                        continue;
+                    }
+                    assert!(f.sdf(g.pos.x, g.pos.z) <= 0.05, "seed {seed}: cat {i} in the wall at {}", g.pos);
+                    left_base[i] |= (g.pos - g.team.base_pos()).length() > 40.0;
+                    // (waiting at an uncovered enemy tower's edge for minions
+                    // is the tower discipline, not stuck: seed 9 stood at
+                    // exactly TOWER_RANGE + 1 from blue's inner Top tower)
+                    let at_tower = game.towers.iter().any(|tw| tw.team != g.team && tw.hp > 0.0 && tw.pos.distance(g.pos) < clawbound::consts::TOWER_RANGE + 3.0);
+                    let wants = !at_tower && g.move_dir.length_squared() > 0.01 && !matches!(g.ai.as_ref().map(|b| b.state), Some(clawbound::sim::AiState::Fight));
+                    if !wants || (g.pos - anchor[i].0).length() > 1.5 {
+                        anchor[i] = (g.pos, game.t);
+                    } else if game.t - anchor[i].1 > 5.0 {
+                        stuck += 1;
+                        eprintln!("seed {seed}: cat {i} stuck at {} since {:.0}s (t {:.0})", g.pos, anchor[i].1, game.t);
+                        anchor[i] = (g.pos, game.t);
+                    }
+                    let biting = matches!(game.wake.mood_at(g.pos.x, g.pos.z, game.t), Mood::Hostile(_));
+                    let fighting = matches!(g.ai.as_ref().map(|b| b.state), Some(clawbound::sim::AiState::Fight));
+                    if biting && game.pack(i) == 0 && !fighting {
+                        alone_for[i] += dt;
+                        alone_total += dt;
+                        worst = worst.max(alone_for[i]);
+                    } else {
+                        alone_for[i] = 0.0;
+                    }
+                }
+                if game.over.is_some() {
+                    break;
+                }
+            }
+            assert!(left_base.iter().all(|x| *x), "seed {seed}: every cat leaves its base: {left_base:?}");
+            (worst, bites, game.tower_alive, game.gods.iter().map(|g| g.kills).sum(), alone_total, stuck, boulder_hits, falls)
+        })
+    }
+
+    #[test]
+    fn eight_minutes_in_the_quarry() {
+        let t0 = std::time::Instant::now();
+        for seed in [5u64, 9] {
+            let (worst, bites, towers, kills, alone, stuck, hits, falls) = play(seed, 8.0 * 60.0);
+            eprintln!("quarry seed {seed}: worst alone-in-thorns {worst:.1}s, total {alone:.1}s, {bites} bites, towers {towers:?}, {kills} kills, {stuck} stuck, {hits} boulder hits, {falls} fell through pads, in {:.1}s", t0.elapsed().as_secs_f32());
+            assert!(bites > 0, "seed {seed}: the thorns never bit");
+            assert_eq!(stuck, 0, "seed {seed}: a bot stood stuck (against a shut gate?)");
+            // measured with the bots' rule: 9.1 s worst (seed 5); without
+            // it, 9.1 s worst but 849 bites to 318 -- the rule is what keeps
+            // a lone bot from walking its lane into biting ground
+            assert!(worst < 15.0, "seed {seed}: a cat alone in the thorns for {worst:.1} s");
+            // the bots' rule (walk out of waking ground; hold at its edge) is
+            // what keeps the bites down: 318 and 358 with it; 849 (seed 5)
+            // with no rule at all
+            assert!(bites < 600, "seed {seed}: {bites} thorn bites: bots are walking into the thorns");
+            // the bots leave a lock the machine is working (`maze::bot_goal`):
+            // 4 and 2 falls through its pads with that rule, 10 and 6
+            // without (seeds 5 and 9)
+            assert!(falls <= 6, "seed {seed}: {falls} bots fell through the pads: they are not leaving the locks");
+            assert!(towers.iter().sum::<usize>() < 8, "seed {seed}: no tower fell in eight minutes");
+        }
+        let _ = mz::CYCLE;
+    }
+}
+
+/// The god limit (`picks`) at its loosest: no limit, every bot playing the
+/// player's ancestor. Nothing in the sim may assume one cat per line.
+mod god_limit {
+    use clawbound::consts::Lane;
+    use clawbound::map::{self, MapId};
+    use clawbound::picks::{Fill, GodLimit};
+    use clawbound::sim::{AiBrain, Event, Game, Rng};
+
+    /// Every ancestor, ten of it in one 5v5 on the jungle from level 3,
+    /// for 90 s of bots: nothing panics, every cat stays finite, and the
+    /// mirrored kits are used (casts from both sides).
+    #[test]
+    fn every_ancestor_can_mirror_itself() {
+        map::with(MapId::Jungle, || {
+            let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+            for id in 0..clawbound::gods::ROSTER_LEN as u32 {
+                let (b, r) = map::team_picks_under(GodLimit::Open, Fill::Mirror, id, &mut Rng::new(7));
+                assert!(b.iter().chain(&r).all(|&x| x == id) && b.len() == 5 && r.len() == 5);
+                let mut g = Game::new_teams(&b, &r);
+                g.blockers = blockers.clone();
+                g.gods[0].ai = Some(AiBrain::new(Lane::Mid, 0.9));
+                // level 3: the whole basic kit unlocked, so "the kit is
+                // used" means the kit and not only its first ability (at
+                // level 1 Oremantle has only one, unusable at arm's length,
+                // and a side of her that fought close never cast)
+                g.apply_rules(clawbound::rules::MatchRules { start_level: 3, ..Default::default() });
+                let mut casts = [0u32; 2];
+                for _ in 0..(90 * 30) {
+                    g.tick(1.0 / 30.0);
+                    for e in &g.events {
+                        if let Event::Cast { god, .. } = *e {
+                            casts[(god >= 5) as usize] += 1;
+                        }
+                    }
+                    g.events.clear();
+                }
+                for (i, c) in g.gods.iter().enumerate() {
+                    assert!(c.pos.is_finite() && c.hp.is_finite(), "{}: cat {i} went non-finite", clawbound::gods::god(id).name);
+                }
+                eprintln!("{:>14}: casts {casts:?}, deaths {}", clawbound::gods::god(id).name, g.gods.iter().map(|c| c.deaths).sum::<u32>());
+                assert!(casts[0] > 0 && casts[1] > 0, "{}: a side never cast in 90 s: {casts:?}", clawbound::gods::god(id).name);
+            }
+        });
+    }
+
+    /// Fifteen Claypaws a side on the Pass for two minutes: no cat in the
+    /// rock, the potters shape, and the clay kittens on the field at once
+    /// stay bounded.
+    #[test]
+    fn fifteen_claypaws_a_side_on_the_pass() {
+        map::with(MapId::Pass, || {
+            let claypaw = clawbound::gods::ROSTER.iter().find(|d| d.name == "Claypaw").unwrap().id;
+            let (b, r) = map::team_picks_under(GodLimit::Open, Fill::Mirror, claypaw, &mut Rng::new(3));
+            let mut g = Game::new_teams(&b, &r);
+            assert_eq!(g.gods.len(), 30);
+            g.blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+            g.gods[0].ai = Some(AiBrain::new(Lane::Mid, 0.9));
+            let f = map::floor().unwrap();
+            let (mut most_kits, mut shaped) = (0usize, 0u32);
+            for _ in 0..(120 * 30) {
+                g.tick(1.0 / 30.0);
+                shaped += g.events.iter().filter(|e| matches!(e, Event::ClayShaped { .. })).count() as u32;
+                g.events.clear();
+                for (i, c) in g.gods.iter().enumerate() {
+                    if c.respawn_t <= 0.0 {
+                        assert!(f.sdf(c.pos.x, c.pos.z) <= 0.05, "cat {i} in the rock at {}", c.pos);
+                    }
+                }
+                most_kits = most_kits.max(g.minions.iter().filter(|m| m.clay.is_some()).count());
+            }
+            eprintln!("kittens at most {most_kits}, shaped {shaped}");
+            assert!(shaped > 30, "the potters barely shaped: {shaped}");
+            // (measured 99 at most: none would mean the kittens never came)
+            assert!((1..=400).contains(&most_kits), "{most_kits} kittens at once");
+        });
+    }
+}
+
+/// Claypaw's mudslide kittens think for themselves (`clay::kit_foe`,
+/// `clay::kit_idle_goal`): they hunt cats past a lane minion's notice and
+/// past its leash, go for the one their potter is fighting, keep to him
+/// with nothing to bite, and march a lane when he is gone.
+mod mud_kittens {
+    use clawbound::map::{self, MapId};
+    use clawbound::sim::Game;
+    use glam::Vec3;
+
+    fn claypaw() -> u32 {
+        clawbound::gods::ROSTER.iter().find(|d| d.name == "Claypaw").unwrap().id
+    }
+
+    /// Claypaw (0) against two cats (1, 2), nobody driven, no towers to
+    /// distract, the enemies parked far off unless a test places them.
+    fn quiet() -> Game {
+        let mut g = Game::new_teams(&[claypaw()], &[0, 1]);
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+        }
+        for t in g.towers.iter_mut() {
+            t.hp = 0.0;
+        }
+        g.gods[1].pos = Vec3::new(400.0, 0.0, 400.0);
+        g.gods[2].pos = Vec3::new(-400.0, 0.0, 400.0);
+        g
+    }
+
+    fn run(g: &mut Game, secs: f32, mut each: impl FnMut(&mut Game)) {
+        for _ in 0..(secs * 30.0) as usize {
+            each(g);
+            g.tick(1.0 / 30.0);
+            g.events.clear();
+            // only the kittens: no lane waves wander in
+            g.minions.retain(|m| m.clay.is_some());
+        }
+    }
+
+    fn kits(g: &Game) -> Vec<Vec3> {
+        g.minions.iter().filter(|m| m.clay.is_some()).map(|m| m.pos).collect()
+    }
+
+    /// A cat 12 u BEHIND the mud (a lane minion notices at 7), walking
+    /// away: the kittens turn, catch it and bite, and follow it well past
+    /// a lane minion's 9 u leash.
+    #[test]
+    fn they_hunt_a_cat_behind_them_and_past_the_leash() {
+        let mut g = quiet();
+        let at = Vec3::new(10.0, 0.0, -20.0);
+        g.gods[0].pos = at + Vec3::new(0.0, 0.0, -40.0); // the potter out of it
+        g.gods[1].pos = at - Vec3::X * 12.0;
+        let hp0 = g.gods[1].hp;
+        g.slide_kittens(0, at, 6, Vec3::X);
+        run(&mut g, 4.0, |g| g.gods[1].pos -= Vec3::X * (2.5 / 30.0));
+        assert!(g.gods[1].hp < hp0 - 50.0, "the kittens never bit: {} of {hp0}", g.gods[1].hp);
+        let far = kits(&g).iter().map(|k| (*k - at).length()).fold(0.0f32, f32::max);
+        assert!(far > 15.0, "no kitten followed past the leash: furthest {far:.1} u");
+    }
+
+    /// Two cats, the nearer one untouched, the other just hit by the
+    /// potter: the kittens go for his.
+    #[test]
+    fn they_go_for_the_cat_their_potter_is_fighting() {
+        let mut g = quiet();
+        let at = Vec3::new(10.0, 0.0, -20.0);
+        g.gods[0].pos = at + Vec3::new(-6.0, 0.0, 0.0);
+        g.gods[1].pos = at + Vec3::new(0.0, 0.0, 7.0);
+        g.gods[2].pos = at + Vec3::new(0.0, 0.0, -10.0);
+        g.slide_kittens(0, at, 6, Vec3::X);
+        run(&mut g, 1.2, |g| {
+            let t = g.t;
+            g.gods[2].recent_damagers = vec![(0, t)];
+        });
+        let (a, b) = (g.gods[1].pos, g.gods[2].pos);
+        let to_b = kits(&g).iter().filter(|k| (**k - b).length() < (**k - a).length()).count();
+        assert!(to_b >= 5, "only {to_b} of 6 went for the potter's cat");
+    }
+
+    /// Nothing to bite: they keep round the potter as he walks, not off
+    /// the way the mud threw them.
+    #[test]
+    fn with_nothing_to_bite_they_keep_to_their_potter() {
+        let mut g = quiet();
+        let at = Vec3::new(10.0, 0.0, -20.0);
+        g.gods[0].pos = at;
+        g.slide_kittens(0, at + Vec3::X * 2.0, 6, Vec3::X);
+        run(&mut g, 6.0, |g| g.gods[0].pos += Vec3::Z * (5.0 / 30.0));
+        let o = g.gods[0].pos;
+        let far = kits(&g).iter().map(|k| (*k - o).length()).fold(0.0f32, f32::max);
+        assert!(!kits(&g).is_empty() && far < 6.0, "a kitten strayed {far:.1} u from its potter");
+    }
+
+    /// The potter dead: they march the nearest lane, not on into the wild.
+    #[test]
+    fn without_their_potter_they_take_a_lane() {
+        let mut g = quiet();
+        g.gods[0].respawn_t = 100.0;
+        let lanes: Vec<Vec3> = map::lanes().iter().flat_map(|&l| clawbound::consts::lane_path(l, g.gods[0].team).to_vec()).collect();
+        let off = |p: Vec3| lanes.iter().map(|w| Vec3::new(w.x - p.x, 0.0, w.z - p.z).length()).fold(f32::MAX, f32::min);
+        // a spot well off any lane, thrown further off
+        let at = (0..400).map(|k| Vec3::new(-90.0 + (k % 20) as f32 * 9.0, 0.0, -90.0 + (k / 20) as f32 * 9.0)).find(|p| (18.0..30.0).contains(&off(*p))).expect("an off-lane spot");
+        let away = lanes.iter().min_by(|a, b| (**a - at).length().total_cmp(&(**b - at).length())).map(|w| Vec3::new(at.x - w.x, 0.0, at.z - w.z).normalize()).unwrap();
+        g.slide_kittens(0, at, 4, away);
+        let start = off(at);
+        run(&mut g, 6.0, |_| {});
+        let worst = kits(&g).iter().map(|k| off(*k)).fold(0.0f32, f32::max);
+        assert!(worst < 5.0, "a kitten is still {worst:.1} u off the lanes (started {start:.1})");
+    }
+
+    /// On the Pass, thrown at a cliff with the scene's own collision:
+    /// no kitten ever stands in the rock.
+    #[test]
+    fn on_the_pass_they_stay_out_of_the_rock() {
+        map::with(MapId::Pass, || {
+            let mut g = quiet();
+            g.blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+            g.gods[0].respawn_t = 100.0;
+            let f = map::floor().unwrap();
+            let path = clawbound::consts::lane_path(map::lanes()[0], g.gods[0].team);
+            // a lane point with rock close beside it, and the way to it
+            let (at, dir) = path
+                .iter()
+                .flat_map(|p| (0..16).map(move |k| (*p, Vec3::new((k as f32 * 0.3927).cos(), 0.0, (k as f32 * 0.3927).sin()))))
+                .find(|(p, d)| f.sdf(p.x, p.z) < -2.0 && f.sdf(p.x + d.x * 9.0, p.z + d.z * 9.0) > 1.0)
+                .expect("rock beside a lane");
+            g.slide_kittens(0, at, 6, dir);
+            run(&mut g, 8.0, |g| {
+                for m in &g.minions {
+                    assert!(f.sdf(m.pos.x, m.pos.z) <= 0.3, "a kitten in the rock at {} (sdf {:.2})", m.pos, f.sdf(m.pos.x, m.pos.z));
+                }
+            });
+        });
+    }
+}
+
+/// Bots act a reaction time after they see (`reaction`): the same scene --
+/// an enemy cat appears in reach of a bot with its kit ready -- answered at
+/// the match's reaction setting, not in the tick it happens.
+mod reaction {
+    use clawbound::rules::MatchRules;
+    use clawbound::sim::{Event, Game};
+    use glam::Vec3;
+
+    /// Seconds from the enemy appearing to the bot's first cast, and to the
+    /// bot first moving toward it.
+    fn answer(reaction: Option<f32>) -> (f32, f32) {
+        let mut g = Game::new_teams(&[0, 3], &[1]);
+        // None: a normal match's rules (only the level raised, for a kit)
+        let d = MatchRules::default();
+        g.apply_rules(MatchRules { bot_reaction: reaction.unwrap_or(d.bot_reaction), start_level: 6, ..d });
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+        }
+        let bot = 1;
+        g.gods[bot].ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+        let home = Vec3::new(20.0, 0.0, 0.0);
+        g.gods[bot].pos = home;
+        g.gods[2].pos = Vec3::new(300.0, 0.0, 300.0);
+        g.gods[0].pos = Vec3::new(-300.0, 0.0, 300.0);
+        g.minions.clear();
+        // settle with nobody near
+        for _ in 0..60 {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+            g.minions.clear();
+            g.gods[bot].pos = home;
+        }
+        // the enemy is there
+        g.gods[2].pos = home + Vec3::new(0.0, 0.0, 9.0);
+        let t0 = g.t;
+        let (mut cast, mut turn) = (None, None);
+        for _ in 0..120 {
+            g.gods[2].pos = home + Vec3::new(0.0, 0.0, 9.0);
+            g.tick(1.0 / 60.0);
+            if cast.is_none() && g.events.iter().any(|e| matches!(*e, Event::Cast { god, .. } | Event::CastStart { god, .. } if god == bot)) {
+                cast = Some(g.t - t0);
+            }
+            if turn.is_none() && g.gods[bot].move_dir.z > 0.3 {
+                turn = Some(g.t - t0);
+            }
+            g.events.clear();
+            g.minions.clear();
+        }
+        (cast.expect("the bot never cast"), turn.expect("the bot never moved to it"))
+    }
+
+    #[test]
+    fn a_bot_answers_a_reaction_time_late() {
+        let (cast0, turn0) = answer(Some(0.0));
+        let (cast2, turn2) = answer(Some(0.2));
+        // a normal match plays the pro's reaction, not the instant bot
+        assert_eq!(answer(None), (cast2, turn2), "a normal match's bots are not the 0.2 s bots");
+        let d = clawbound::reaction::delay_for(0.2, 1);
+        eprintln!("instant: cast {cast0:.3} turn {turn0:.3}; 0.2 s: cast {cast2:.3} turn {turn2:.3} (this bot's delay {d:.3})");
+        assert!(cast0 < 0.1 && turn0 < 0.1, "the instant bot is not instant: {cast0} {turn0}");
+        assert!((cast2 - cast0 - d).abs() < 0.035, "the cast came {:.3} s later, not {d:.3}", cast2 - cast0);
+        assert!((turn2 - turn0 - d).abs() < 0.035, "the move came {:.3} s later, not {d:.3}", turn2 - turn0);
     }
 }

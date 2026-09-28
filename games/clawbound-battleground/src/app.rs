@@ -26,6 +26,8 @@ use crate::vfx::Vfx;
 enum Screen {
     Menu,
     Select,
+    /// The custom-game rules, before choosing an ancestor.
+    Custom,
     Playing,
     /// Browsing or hosting on the local network.
     Lan,
@@ -90,6 +92,8 @@ struct AppState {
     /// This tick's events, for the audio cues.
     audio_events: Vec<crate::sim::Event>,
     voice_gate: crate::cues::VoiceGate,
+    /// Sounds that follow what made them, while they play (`emitters`).
+    emitters: crate::emitters::Emitters,
     /// Whether this match's music has been started.
     music_on: bool,
     /// The game-state announcer (`announcer`).
@@ -146,6 +150,10 @@ pub fn run(opts: crate::launch::LaunchOptions) {
                             Ok(mut s) => {
                                 eprintln!("RESUMED: init ok — surface configured");
                                 s.launch = opts.clone();
+                                s.ui.rules = opts.rules;
+                                if let Some(e) = &opts.rules_error {
+                                    eprintln!("[clawbound] --rules: {e}");
+                                }
                                 if let Some(role) = &opts.handoff {
                                     let id = opts.player_id.clone().unwrap_or_else(|| format!("cat-{:x}", std::process::id()));
                                     let name = opts.player_name.clone().unwrap_or_else(|| "Cat".into());
@@ -433,6 +441,7 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         bank: None,
         audio_events: Vec::new(),
         voice_gate: Default::default(),
+        emitters: Default::default(),
         music_on: false,
         announcer: Default::default(),
         space_tick: 0,
@@ -764,7 +773,7 @@ fn ground_point_from_screen(s: &AppState, p: Vec2) -> Option<Vec3> {
     let player = &g.gods[0];
     let dir = cam_dir(s.cam_yaw, s.cam_pitch);
     let target = player.pos + Vec3::Y * 1.5;
-    let cam = Camera { eye: target - dir * s.cam_dist, target, fov_y: 0.95 };
+    let cam = Camera { eye: target - dir * crate::map::camera_boom(target, dir, s.cam_dist), target, fov_y: 0.95 };
     let aspect = s.renderer.width as f32 / s.renderer.height.max(1) as f32;
     let vp = cam.view_proj(aspect);
     let inv = vp.inverse();
@@ -794,7 +803,7 @@ fn cam_dir(yaw: f32, pitch: f32) -> Vec3 {
 fn compute_aim(s: &AppState) -> Vec3 {
     let player = &s.game.as_ref().unwrap().gods[0];
     let dir = cam_dir(s.cam_yaw, s.cam_pitch);
-    let eye = player.pos + Vec3::Y * 1.5 - dir * s.cam_dist;
+    let eye = player.pos + Vec3::Y * 1.5 - dir * crate::map::camera_boom(player.pos + Vec3::Y * 1.5, dir, s.cam_dist);
     // the camera ray against the REAL surface (the pass has a shelf and
     // slopes; the plane y = 0 put the aim somewhere else), clamped to 30 u
     // and set down on the ground there
@@ -873,26 +882,25 @@ fn start_game(s: &mut AppState) {
         .map(|d| d.as_secs())
         .unwrap_or(42);
     let mut rng = crate::sim::Rng::new(0xBEEF ^ seed);
+    // The match rules (`rules`, the god limit among them) -- a normal
+    // match's in a LAN match, for the same reason as the map: nothing
+    // carries the setup between peers yet.
+    let rules = if s.lan.is_some() { crate::rules::MatchRules::default() } else { s.ui.rules };
+    let (blue, red) = crate::map::team_picks_under(rules.gods, rules.fill(), s.ui.selected as u32, &mut rng);
     if crate::map::active() != crate::map::MapId::Jungle {
-        let (blue, red) = crate::map::team_picks(s.ui.selected as u32, &mut rng);
         let mut game = Game::new_teams(&blue, &red);
+        game.apply_rules(rules);
         open_playbook(s, &mut game, &mut rng);
         s.game = Some(game);
         finish_start(s);
         return;
     }
-    let mut pool: Vec<u32> = (0..crate::gods::ROSTER_LEN as u32).filter(|&i| i != s.ui.selected as u32).collect();
-    let mut allies = [0u32; 4];
-    let mut enemies = [0u32; 5];
-    for a in allies.iter_mut() {
-        let k = (rng.next_u() % pool.len() as u64) as usize;
-        *a = pool.remove(k);
-    }
-    for e in enemies.iter_mut() {
-        let k = (rng.next_u() % pool.len() as u64) as usize;
-        *e = pool.remove(k.min(pool.len() - 1));
-    }
+    // (the jungle's constructor takes fixed arrays; the deal is the same
+    // draw the jungle made here by hand before the god limit)
+    let allies: [u32; 4] = blue[1..5].try_into().expect("the jungle is 5 a side");
+    let enemies: [u32; 5] = red[..5].try_into().expect("the jungle is 5 a side");
     let mut game = Game::new(s.ui.selected as u32, allies, enemies);
+    game.apply_rules(rules);
     open_playbook(s, &mut game, &mut rng);
     s.game = Some(game);
     finish_start(s);
@@ -948,7 +956,7 @@ fn finish_start(s: &mut AppState) {
     s.ui.announce = None;
     s.ui.shop_open = false;
     s.cam_yaw = std::f32::consts::PI;
-    s.cam_pitch = 0.38;
+    s.cam_pitch = crate::map::active().cam_pitch();
     s.walk_to = None;
     // The opening: every cat held out of the world until the intro brings
     // it in, and the intro ends on exactly the camera play starts with.
@@ -960,7 +968,7 @@ fn finish_start(s: &mut AppState) {
         let p0 = g.gods[0].pos;
         let dir = cam_dir(s.cam_yaw, s.cam_pitch);
         let target = p0 + Vec3::Y * 1.5;
-        let play = crate::intro::Shot { eye: target - dir * s.cam_dist, target, fov_y: 0.95 };
+        let play = crate::intro::Shot { eye: target - dir * crate::map::camera_boom(target, dir, s.cam_dist), target, fov_y: 0.95 };
         // the session's first match opens with the narrated prologue
         s.intro = Some(if s.intros_played == 0 { crate::intro::Intro::full(&teams, p0, play) } else { crate::intro::Intro::new(&teams, p0, play) });
         s.intros_played += 1;
@@ -1095,12 +1103,12 @@ fn render(s: &mut AppState) {
                     if before == 0.0 {
                         let key = if it.is_full() { "music/intro_full" } else { "music/intro" };
                         if let Some(id) = bank.pick(key) {
-                            s.intro_music = amb.mixer.play(Play { clip: id, bus: Bus::Music, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: None });
+                            s.intro_music = amb.mixer.play(Play { handle: 0, clip: id, bus: Bus::Music, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: None });
                         }
                     }
                     for key in it.narration_due(before, it.t) {
                         if let Some(id) = bank.pick(&format!("narrator/{key}")) {
-                            amb.mixer.play(Play { clip: id, bus: Bus::Voice, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: Some(u16::MAX - 1) });
+                            amb.mixer.play(Play { handle: 0, clip: id, bus: Bus::Voice, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: Some(u16::MAX - 1) });
                         }
                     }
                     if s.skip_intro {
@@ -1115,7 +1123,7 @@ fn render(s: &mut AppState) {
                     #[cfg(feature = "audio")]
                     if let (Some(amb), Some(bank)) = (s.ambience.as_mut(), s.bank.as_mut()) {
                         if let Some(id) = bank.pick("music/fanfare") {
-                            played = amb.mixer.play(crate::mixer::Play { clip: id, bus: crate::mixer::Bus::Music, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: None });
+                            played = amb.mixer.play(crate::mixer::Play { handle: 0, clip: id, bus: crate::mixer::Bus::Music, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: None });
                         }
                     }
                     if !played {
@@ -1188,7 +1196,7 @@ fn render(s: &mut AppState) {
 
     // camera
     let cam = match s.screen {
-        Screen::Menu | Screen::Select | Screen::Lan => {
+        Screen::Menu | Screen::Select | Screen::Custom | Screen::Lan => {
             let t = s.last_frame.elapsed().as_secs_f32() * 0.05;
             let r = 55.0;
             Camera {
@@ -1225,7 +1233,9 @@ fn render(s: &mut AppState) {
                     Camera { eye: shot.eye, target: shot.target, fov_y: shot.fov_y }
                 }
                 None => Camera {
-                    eye: target - dir * s.cam_dist + jolt * 0.5,
+                    // the boom comes in over the cat rather than sit in a
+                    // wall (`map::camera_boom`: the Quarry's corridors)
+                    eye: target - dir * crate::map::camera_boom(target, dir, s.cam_dist) + jolt * 0.5,
                     target,
                     fov_y: 0.95,
                 },
@@ -1312,7 +1322,7 @@ fn render(s: &mut AppState) {
                 // the map's music waits for the intro (and its score) to end
                 if !s.music_on && s.intro.is_none() {
                     if let Some(id) = bank.pick(&format!("music/{}", crate::map::active().key())) {
-                        amb.mixer.play(Play { clip: id, bus: Bus::Music, gain: 0.8, pan: 0.0, priority: 9, looped: true, speaker: None });
+                        amb.mixer.play(Play { handle: 0, clip: id, bus: Bus::Music, gain: 0.8, pan: 0.0, priority: 9, looped: true, speaker: None });
                     }
                     s.music_on = true;
                 }
@@ -1336,7 +1346,7 @@ fn render(s: &mut AppState) {
                     let key = format!("announcer/{}", call.key);
                     let secs = match bank.pick(&key) {
                         Some(id) => {
-                            amb.mixer.play(Play { clip: id, bus: Bus::Voice, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: Some(u16::MAX) });
+                            amb.mixer.play(Play { handle: 0, clip: id, bus: Bus::Voice, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: Some(u16::MAX) });
                             bank.secs(id, amb.sample_rate)
                         }
                         None => 1.2, // unrecorded: keep the pacing anyway
@@ -1344,15 +1354,26 @@ fn render(s: &mut AppState) {
                     s.announcer.playing(g.t, secs);
                 }
                 for ev in s.audio_events.drain(..) {
+                    // what its sounds follow while they play, if they do
+                    let follow = crate::emitters::follow_for(&ev, g);
                     for cue in crate::cues::cues_for(&ev, g) {
                         let Some((gain, pan)) = crate::cues::place(&cue, ear, right) else { continue };
                         if !s.voice_gate.allow(&cue, g.t) {
                             continue;
                         }
                         if let Some(id) = bank.first(&cue.keys) {
-                            amb.mixer.play(Play { clip: id, bus: cue.bus, gain, pan, priority: cue.priority, looped: false, speaker: cue.speaker.map(|x| x as u16) });
+                            let handle = match (follow, cue.pos) {
+                                (Some(f), Some(at)) => s.emitters.start(f, cue.gain, cue.bus, cue.speaker, at, g.t, bank.secs(id, amb.sample_rate)),
+                                _ => 0,
+                            };
+                            amb.mixer.play(Play { handle, clip: id, bus: cue.bus, gain, pan, priority: cue.priority, looped: false, speaker: cue.speaker.map(|x| x as u16) });
                         }
                     }
+                }
+                // and every following sound moved to where its source is now,
+                // as heard from where the ear is now
+                for (handle, gain, pan) in s.emitters.places(g, ear, right) {
+                    amb.mixer.send(Cmd::Place { handle, gain, pan });
                 }
             }
             _ => {
@@ -1421,6 +1442,7 @@ fn render(s: &mut AppState) {
     // egui frame
     let raw_input = s.egui_winit.take_egui_input(s.window);
     let mut play = false;
+    let (mut custom, mut custom_next, mut custom_back) = (false, false, false);
     let mut quit = false;
     let mut open_lan = false;
     let mut spectate = false;
@@ -1429,7 +1451,7 @@ fn render(s: &mut AppState) {
     let mut again = false;
     let mut menu = false;
     let mut open_controls = false;
-    let mut panel = ui::ControlsPanel { close: false, capture: None, clear: None, scheme: None, reset: false };
+    let mut panel = ui::ControlsPanel { in_match: s.screen == Screen::Playing && s.game.is_some() && s.spectator.is_none(), leave: false, close: false, capture: None, clear: None, scheme: None, reset: false };
     let (show_fps, frame_s) = (s.cfg.settings.show_fps, s.frame_s);
     // where the camera is: bars fade with distance and behind terrain
     let cam_eye = s.renderer.camera.eye;
@@ -1439,10 +1461,11 @@ fn render(s: &mut AppState) {
         }
         match s.screen {
             Screen::Menu => {
-                ui::draw_menu(ctx, &mut play, &mut quit, &mut open_lan, &mut spectate);
+                ui::draw_menu(ctx, &mut play, &mut custom, &mut quit, &mut open_lan, &mut spectate);
                 ui::draw_controls_button(ctx, &mut open_controls);
             }
             Screen::Select => ui::draw_select(ctx, &mut s.ui, &mut locked_in),
+            Screen::Custom => ui::draw_custom(ctx, &mut s.ui, &mut custom_next, &mut custom_back),
             Screen::Lan => {
                 if let Some(l) = s.lan.as_mut() {
                     l.tick(Instant::now());
@@ -1483,6 +1506,19 @@ fn render(s: &mut AppState) {
     });
     if open_controls {
         s.controls_open = true;
+    }
+    if panel.leave {
+        // leave the match: the same way out as the end screen's "Main
+        // Menu", and the cursor let go
+        s.controls_open = false;
+        s.capturing = None;
+        s.ui.shop_open = false;
+        s.ui.sell_armed = None;
+        s.targeting.slot = None;
+        s.intro = None;
+        s.game = None;
+        s.screen = Screen::Menu;
+        set_locked(s, false);
     }
     if panel.close {
         s.controls_open = false;
@@ -1564,7 +1600,22 @@ fn render(s: &mut AppState) {
         start_spectate(s);
     }
     if play {
+        // PLAY is a normal match (the launch flags' rules, if any, stand)
+        if s.ui.custom {
+            s.ui.rules = s.launch.rules;
+            s.ui.custom = false;
+        }
         s.screen = Screen::Select;
+    }
+    if custom {
+        s.ui.custom = true;
+        s.screen = Screen::Custom;
+    }
+    if custom_next {
+        s.screen = Screen::Select;
+    }
+    if custom_back {
+        s.screen = Screen::Menu;
     }
     if quit {
         s.exiting = true;
@@ -1577,7 +1628,7 @@ fn render(s: &mut AppState) {
                 let def = &crate::gods::ROSTER[(s.ui.selected as usize).min(crate::gods::ROSTER.len() - 1)];
                 let who = def.name.to_ascii_lowercase().replace([' ', '\''], "");
                 if let Some(id) = bank.pick(&format!("voice/{who}/select")) {
-                    amb.mixer.play(crate::mixer::Play { clip: id, bus: crate::mixer::Bus::Voice, gain: 1.0, pan: 0.0, priority: 9, looped: false, speaker: None });
+                    amb.mixer.play(crate::mixer::Play { handle: 0, clip: id, bus: crate::mixer::Bus::Voice, gain: 1.0, pan: 0.0, priority: 9, looped: false, speaker: None });
                 }
             }
         }

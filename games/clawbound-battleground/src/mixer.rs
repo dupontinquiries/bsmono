@@ -50,6 +50,10 @@ pub struct Play {
     pub looped: bool,
     /// A voice line's speaker (a god index): one line per speaker at a time.
     pub speaker: Option<u16>,
+    /// A name the game can move it by while it plays ([`Cmd::Place`]): a
+    /// sound that follows what made it -- a rolling stone, a talking cat.
+    /// 0: none (fire and forget).
+    pub handle: u32,
 }
 
 pub enum Cmd {
@@ -60,6 +64,10 @@ pub enum Cmd {
     BusGain(Bus, f32),
     /// The space the listener is in: the reverb and echo (`reverb`).
     Space(crate::reverb::Space),
+    /// Move a playing sound (by its `Play::handle`): its new gain and pan.
+    /// The voice glides there over the next block (no zipper); a handle no
+    /// longer playing is ignored.
+    Place { handle: u32, gain: f32, pan: f32 },
 }
 
 /// How much of each bus feeds the space (reverb and echo): sound effects
@@ -77,11 +85,14 @@ struct Voice {
     pos: usize,
     p: Play,
     age: u64,
+    /// The gain and pan it is AT (it glides to `p`'s over each block).
+    cur_gain: f32,
+    cur_pan: f32,
 }
 
 impl Voice {
     fn idle() -> Voice {
-        Voice { clip: None, channels: 1, pos: 0, p: Play { clip: 0, bus: Bus::Sfx, gain: 0.0, pan: 0.0, priority: 0, looped: false, speaker: None }, age: 0 }
+        Voice { clip: None, channels: 1, pos: 0, p: Play { handle: 0, clip: 0, bus: Bus::Sfx, gain: 0.0, pan: 0.0, priority: 0, looped: false, speaker: None }, age: 0, cur_gain: 0.0, cur_pan: 0.0 }
     }
 }
 
@@ -173,7 +184,7 @@ impl Mixer {
                         i
                     }
                 };
-                self.voices[slot] = Voice { clip: Some(pcm), channels: ch, pos: 0, p, age: self.clock };
+                self.voices[slot] = Voice { clip: Some(pcm), channels: ch, pos: 0, p, age: self.clock, cur_gain: p.gain, cur_pan: p.pan };
             }
             Cmd::StopBus(b) => {
                 for v in self.voices.iter_mut() {
@@ -184,6 +195,16 @@ impl Mixer {
             }
             Cmd::BusGain(b, g) => self.bus_gain[b as usize] = g.clamp(0.0, 2.0),
             Cmd::Space(sp) => self.space.target = sp,
+            Cmd::Place { handle, gain, pan } => {
+                if handle != 0 {
+                    for v in self.voices.iter_mut() {
+                        if v.clip.is_some() && v.p.handle == handle {
+                            v.p.gain = gain;
+                            v.p.pan = pan;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -227,9 +248,18 @@ impl Mixer {
             let ch = v.channels as usize;
             let len = pcm.len() / ch;
             let duck = if v.p.bus == Bus::Voice { 1.0 } else { self.duck };
-            let g = v.p.gain * self.bus_gain[v.p.bus as usize] * duck;
-            let a = (v.p.pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
-            let (gl, gr) = (a.cos() * g, a.sin() * g);
+            let bus = self.bus_gain[v.p.bus as usize] * duck;
+            // glide from where it was to where it is told to be, across this
+            // block (a moved sound; a still one has from == to)
+            let gains = |gain: f32, pan: f32| {
+                let a = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
+                (a.cos() * gain * bus, a.sin() * gain * bus)
+            };
+            let (gl0, gr0) = gains(v.cur_gain, v.cur_pan);
+            let (gl1, gr1) = gains(v.p.gain, v.p.pan);
+            v.cur_gain = v.p.gain;
+            v.cur_pan = v.p.pan;
+            let inv = 1.0 / frames.max(1) as f32;
             // the space's share of this voice (the announcer and narrator
             // -- speakers at the top of the range -- stay dry)
             let offstage = v.p.bus == Bus::Voice && v.p.speaker.is_some_and(|s| s >= u16::MAX - 1);
@@ -246,6 +276,8 @@ impl Mixer {
                 }
                 let (l, r) = if ch == 2 { (pcm[v.pos * 2], pcm[v.pos * 2 + 1]) } else { (pcm[v.pos], pcm[v.pos]) };
                 v.pos += 1;
+                let u = f as f32 * inv;
+                let (gl, gr) = (gl0 + (gl1 - gl0) * u, gr0 + (gr1 - gr0) * u);
                 send[f * 2] += l * gl * sk;
                 send[f * 2 + 1] += r * gr * sk;
                 let o = &mut out[f * channels..f * channels + channels];
@@ -275,7 +307,7 @@ mod tests {
         (0..n).map(|_| v).collect::<Vec<f32>>().into()
     }
     fn play(clip: u32, bus: Bus) -> Play {
-        Play { clip, bus, gain: 1.0, pan: 0.0, priority: 1, looped: false, speaker: None }
+        Play { handle: 0, clip, bus, gain: 1.0, pan: 0.0, priority: 1, looped: false, speaker: None }
     }
 
     /// A clip plays from the first sample of the next block, at its gain,
@@ -425,4 +457,47 @@ mod tests {
         assert!(fx > 1e-3, "no tail on an effect: {fx}");
         assert!(announcer < 1e-9, "the announcer echoed: {announcer}");
     }
+
+    /// A playing sound moves when told (`Cmd::Place` by its handle): from
+    /// the left to the right, gliding across the block (the first frame
+    /// still where it was, the last where it is going); a place for a
+    /// handle not playing touches nothing.
+    #[test]
+    fn a_placed_sound_glides_to_its_new_place() {
+        let (mut h, mut m) = new();
+        h.send(Cmd::Load { id: 0, pcm: tone(48_000, 0.5), channels: 1 });
+        h.send(Cmd::BusGain(Bus::Sfx, 1.0));
+        h.play(Play { pan: -1.0, handle: 7, ..play(0, Bus::Sfx) });
+        let mut out = vec![0.0f32; 2 * 512];
+        m.render_add(&mut out, 2);
+        assert!(out[2 * 500] > 0.3 && out[2 * 500 + 1].abs() < 1e-4, "not hard left at first");
+        h.send(Cmd::Place { handle: 99, gain: 1.0, pan: 1.0 });
+        let mut out = vec![0.0f32; 2 * 512];
+        m.render_add(&mut out, 2);
+        assert!(out[2 * 500 + 1].abs() < 1e-4, "a stranger's handle moved it");
+        // handle 0 is "no handle": every fire-and-forget sound has it, and a
+        // place for 0 must move none of them (a fresh mixer: the handled
+        // voice above would otherwise sound on the right)
+        {
+            let (mut h0, mut m0) = new();
+            h0.send(Cmd::Load { id: 0, pcm: tone(48_000, 0.5), channels: 1 });
+            h0.send(Cmd::BusGain(Bus::Sfx, 1.0));
+            h0.play(Play { pan: -1.0, ..play(0, Bus::Sfx) });
+            h0.send(Cmd::Place { handle: 0, gain: 1.0, pan: 1.0 });
+            let mut out = vec![0.0f32; 2 * 512];
+            m0.render_add(&mut out, 2);
+            assert!(out[2 * 500] > 0.3, "the unhandled sound is not playing");
+            assert!(out[2 * 500 + 1].abs() < 1e-4, "a place for handle 0 moved the unhandled");
+        }
+        h.send(Cmd::Place { handle: 7, gain: 1.0, pan: 1.0 });
+        let mut out = vec![0.0f32; 2 * 512];
+        m.render_add(&mut out, 2);
+        let (l0, r0) = (out[0], out[1]);
+        let (l1, r1) = (out[2 * 511], out[2 * 511 + 1]);
+        assert!(l0 > 0.3 && r0 < 0.01, "jumped: first frame {l0} {r0}");
+        assert!(l1 < 0.01 && r1 > 0.3, "did not arrive: last frame {l1} {r1}");
+        let mid = out[2 * 256 + 1];
+        assert!(mid > 0.05 && mid < r1, "no glide between: {mid}");
+    }
+
 }

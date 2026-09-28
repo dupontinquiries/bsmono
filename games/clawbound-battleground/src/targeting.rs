@@ -117,8 +117,27 @@ pub fn guide_for(ab: &AbilityDef, from: Vec3, aim: Vec3) -> Guide {
         Archetype::DanceParty { radius, .. } => Guide::Circle { at: at(crate::kit::PARTY_RANGE), radius },
         Archetype::Litter { speed, life, .. } => Guide::Fan { from, dir, len: (speed * life).min(crate::kit::SEEK * 2.0), half: crate::kit::FAN_DEG.to_radians() },
         Archetype::Giggle { radius, .. } => Guide::Around { at: from, radius },
+        // the step goes to whichever of him is nearest the aim; the guide
+        // shows the ring he staggers where he lands, at the aim
+        Archetype::Swap { radius, .. } => Guide::Circle { at: from + dir * dist, radius },
+        Archetype::Send { range, .. } => Guide::Circle { at: at(range), radius: 1.2 },
+        Archetype::Echoes { .. } => Guide::Around { at: from, radius: crate::stalker::ECHO_HUNT },
+        Archetype::Lantern { radius, .. } => Guide::Around { at: from, radius },
+        // a coat is worn, not aimed: the guide is the field it will be
+        Archetype::Field { radius, .. } => Guide::Around { at: from, radius },
         Archetype::Nova { radius, .. } | Archetype::Heal { radius, .. } => Guide::Around { at: from, radius },
         Archetype::Shield { .. } | Archetype::Buff { .. } => Guide::Around { at: from, radius: 1.6 },
+        // Hourwatch (`hours`): her own hour, round her; the enemy by the aim
+        // (5 u of it); her friends in reach; where she will come down
+        Archetype::Rewind { .. } => Guide::Around { at: from, radius: 1.6 },
+        Archetype::SendBack { range, .. } => Guide::Circle { at: at(range), radius: 5.0 },
+        Archetype::WindForward { radius, .. } => Guide::Around { at: from, radius },
+        Archetype::LongLook { range, .. } => Guide::Circle { at: at(range), radius: 2.0 },
+        // Claypaw (`clay`): his own clay, round him; the spin's line; the
+        // mudslide's run
+        Archetype::Remold { .. } | Archetype::Quicken { .. } => Guide::Around { at: from, radius: 1.6 },
+        Archetype::Spin { dist, .. } => Guide::Line { from, dir, len: dist },
+        Archetype::Mudslide { len, .. } => Guide::Line { from, dir, len },
     }
 }
 
@@ -209,6 +228,10 @@ mod tests {
                             Archetype::Pull { radius, .. } => radius,
                             Archetype::Meteor { range, .. } => range,
                             Archetype::DanceParty { .. } => crate::kit::PARTY_RANGE,
+                            Archetype::Send { range, .. } => range.min((aim - from).length()),
+                            // the stagger ring is drawn at the aim itself
+                            Archetype::Swap { .. } => (aim - from).length(),
+                            Archetype::SendBack { range, .. } | Archetype::LongLook { range, .. } => range.min((aim - from).length()),
                             _ => unreachable!(),
                         };
                         let v = at - from;

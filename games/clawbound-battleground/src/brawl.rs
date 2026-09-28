@@ -53,6 +53,8 @@ pub fn melee_for(def: &GodDef) -> Option<Melee> {
         Role::Guardian => Melee { arc: 150f32.to_radians(), targets: 3, splash: 0.6, backstab: 1.0 },
         Role::Warrior => Melee { arc: 100f32.to_radians(), targets: 2, splash: 0.75, backstab: 1.1 },
         Role::Assassin => Melee { arc: 50f32.to_radians(), targets: 1, splash: 0.0, backstab: 1.35 },
+        // the biggest cat sweeps nearly all the way round her
+        Role::Sentinel => Melee { arc: 200f32.to_radians(), targets: 3, splash: 0.7, backstab: 1.0 },
         _ => Melee { arc: 80f32.to_radians(), targets: 1, splash: 0.0, backstab: 1.15 },
     })
 }
@@ -127,6 +129,7 @@ impl Game {
         // with each cat's real footing (the shelf, wall tops), and re-doing
         // it here for everyone, footing-blind, broke the climbing lane
         let mut pushed = vec![false; n];
+        let mut tackles = Vec::new();
         for i in 0..n {
             for j in (i + 1)..n {
                 let (a, b) = (&self.gods[i], &self.gods[j]);
@@ -146,7 +149,15 @@ impl Game {
                 if enemies {
                     for (dasher, other, sign) in [(i, j, 1.0f32), (j, i, -1.0)] {
                         if self.gods[dasher].dash.is_some() && self.gods[other].dash.is_none() {
-                            self.gods[dasher].dash = None;
+                            // the dash ends HERE, and strikes what it ran
+                            // into: dropped without a strike, a dash that met
+                            // a body dealt nothing -- which only went
+                            // unnoticed while the dash was teleported along
+                            // its line past whatever it touched
+                            if let Some(d) = self.gods[dasher].dash.take() {
+                                let (team, at) = (self.gods[dasher].team, self.gods[dasher].pos);
+                                tackles.push((dasher, team, d.from, at, d.dmg, d.blast));
+                            }
                             let knock = nrm * sign * TACKLE_KNOCK;
                             self.gods[other].pos += knock;
                             pushed[other] = true;
@@ -159,6 +170,9 @@ impl Game {
                 pushed[i] = true;
                 pushed[j] = true;
             }
+        }
+        for (gi, team, from, to, dmg, blast) in tackles {
+            self.dash_strikes(gi, team, from, to, dmg, blast);
         }
         // the walls, then the arena's rim -- the rim has the LAST word (as in
         // movement: a prop pushing outward must not eject a cat; the walls

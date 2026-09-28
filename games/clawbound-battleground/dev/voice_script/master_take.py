@@ -6,7 +6,9 @@ clean them, give each ancestor its own vocal chain, level and encode them.
 
 The second form takes a manifest ({"session", "clean", "takes"}) in place
 of a recorded session and the TAKES table below -- synth_session.py writes
-one for the stand-in voices; "clean": false skips the noise clean-up.
+one for the stand-in voices; "clean": false skips the noise clean-up. A
+manifest for a real session names its RNNoise model as "rnnoise"
+(wendy_take001.json is one).
 
 SESSION is the performer's take (anything ffmpeg reads). RNNOISE_MODEL is an
 RNNoise model for ffmpeg's arnndn (used: GregorR/rnnoise-models,
@@ -20,14 +22,18 @@ TAKES holds, per line, the window of the session the chosen take lies in
 recogniser (sherpa-onnx, NVIDIA parakeet-tdt-0.6b-v2) over silero-VAD
 segments; the last clean take of each line in Kessler's first pass through
 each ancestor was chosen. Needs ffmpeg with rubberband and arnndn, numpy,
-soundfile, pyloudnorm.
+soundfile, pyloudnorm (and noisereduce, for a take read very quietly).
 """
 import subprocess, numpy as np, soundfile as sf, pyloudnorm as pyln, os, csv, json, sys, tempfile
 SR = 48000
 MANIFEST = None
 if sys.argv[1].endswith('.json'):
     MANIFEST = json.load(open(sys.argv[1]))
-    SESSION, RNN, ROOT = MANIFEST['session'], None, os.path.abspath(sys.argv[2])
+    # a real session names its RNNoise model; a synthesised one has none
+    # paths in a manifest are relative to it, unless absolute
+    here = os.path.dirname(os.path.abspath(sys.argv[1]))
+    at = lambda p: p if p is None or os.path.isabs(p) else os.path.join(here, p)
+    SESSION, RNN, ROOT = at(MANIFEST['session']), at(MANIFEST.get('rnnoise')), os.path.abspath(sys.argv[2])
     ONLY = sys.argv[3:]
 else:
     SESSION, RNN, ROOT = (os.path.abspath(a) for a in sys.argv[1:4])
@@ -99,51 +105,56 @@ CHAINS = {
                "aecho=0.8:0.35:24|47:0.06|0.035",
  # -- the stand-in voices (synth_session.py) --
  # a tiger in the reeds: low, close, dark; a small dead room
- 'duskstripe': "rubberband=pitch=0.89:formant=preserved,"
+ 'duskstripe': "rubberband=pitch=0.89:formant=preserved:pitchq=quality,"
                "equalizer=f=160:t=q:w=1:g=3,equalizer=f=3000:t=q:w=1.2:g=1.5,lowpass=f=9000,"
                "acompressor=threshold=-26dB:ratio=3:attack=8:release=150:makeup=2,"
                "aecho=0.8:0.4:18|31:0.10|0.06",
  # a leopard of the rivers: easy, a ripple of chorus, a wet open room
- 'rainspots':  "rubberband=pitch=0.97:formant=preserved,"
+ 'rainspots':  ""
                "equalizer=f=220:t=q:w=1:g=1.5,treble=g=2:f=7000,"
                "chorus=0.7:0.9:35|48:0.3|0.25:0.35|0.6:2.2|1.6,"
                "acompressor=threshold=-24dB:ratio=3:attack=8:release=120:makeup=2,"
                "aecho=0.8:0.5:60|110:0.18|0.10",
  # the moonless woods: hushed, dark, a long soft night-forest tail
- 'nightpelt':  "rubberband=pitch=0.92:formant=preserved,"
+ 'nightpelt':  "rubberband=pitch=0.92:formant=preserved:pitchq=quality,"
                "equalizer=f=250:t=q:w=1:g=2,lowpass=f=6500,"
                "acompressor=threshold=-28dB:ratio=3:attack=10:release=200:makeup=3,"
                "aecho=0.8:0.6:120|230|370:0.22|0.15|0.09",
  # a singer across the grasslands: bright, ringing, a big open hall
- 'faryowl':    "rubberband=pitch=1.0:formant=preserved,"
+ 'faryowl':    ""
                "equalizer=f=2500:t=q:w=1.2:g=3,treble=g=3:f=8000,"
                "acompressor=threshold=-22dB:ratio=2.5:attack=10:release=150:makeup=2,"
                "aecho=0.8:0.6:80|160|300:0.24|0.16|0.10",
  # radiant, ceremonial: warm and golden, a temple
- 'suneye':     "rubberband=pitch=0.95:formant=preserved,"
+ 'suneye':     "rubberband=pitch=0.95:formant=preserved:pitchq=quality,"
                "equalizer=f=300:t=q:w=1:g=2,equalizer=f=4000:t=q:w=1:g=2,"
                "acompressor=threshold=-24dB:ratio=3:attack=10:release=150:makeup=2,"
                "aecho=0.8:0.6:70|140|260:0.26|0.18|0.12",
  # a lynx in the snow: cold, clear, a crisp small plate
- 'snowhush':   "rubberband=pitch=1.0:formant=preserved,"
+ 'snowhush':   ""
                "highpass=f=130,equalizer=f=350:t=q:w=1:g=-2,equalizer=f=6000:t=q:w=1:g=3,"
                "acompressor=threshold=-24dB:ratio=3:attack=6:release=100:makeup=2,"
                "aecho=0.8:0.45:30|55:0.14|0.08",
  # a grey ghost of the crags: dry up close, and the mountain answering
- # a quarter-second later
- 'stonewhisper': "rubberband=pitch=0.94:formant=preserved,"
+ # a quarter-second later (quietly: louder, the recogniser heard the
+ # echoed last syllable as a word of its own -- "Crumble... things")
+ 'stonewhisper': "rubberband=pitch=0.94:formant=preserved:pitchq=quality,"
                "highpass=f=120,equalizer=f=2200:t=q:w=1:g=2,"
                "acompressor=threshold=-26dB:ratio=3:attack=8:release=120:makeup=2,"
-               "aecho=0.8:0.7:260|520:0.14|0.06",
- # a jaguar of the drowned forest: heavy, down with the formants, wet
- # and murky
- 'riptail':    "rubberband=pitch=0.9:formant=shifted,"
-               "equalizer=f=120:t=q:w=1:g=3,lowpass=f=5000,"
-               "flanger=delay=2:depth=3:regen=-20:width=60:speed=0.3,"
-               "acompressor=threshold=-26dB:ratio=4:attack=12:release=200:makeup=2,"
-               "aecho=0.8:0.5:45|90:0.18|0.10",
+               "aecho=0.8:0.7:260|520:0.07|0.03",
+ # a jaguar of the drowned forest -- she: heavy, a little lower with her
+ # formants kept (shifted with them, as when the part was a he, a woman's
+ # reading came out a man's). Water: a slow, wide chorus -- three voices
+ # 40-70 ms behind, drifting at a fifth of a hertz, so she flows rather
+ # than warbles (the flanger that was here combed her into metal) -- and
+ # a soft wet room after it
+ 'riptail':    "rubberband=pitch=0.94:formant=preserved:pitchq=quality,"
+               "equalizer=f=120:t=q:w=1:g=3,equalizer=f=3200:t=q:w=1.5:g=-1.5,lowpass=f=6500,"
+               "chorus=0.65:0.9:40|55|70:0.38|0.32|0.26:0.13|0.19|0.24:1.4|1.8|2.2,"
+               "acompressor=threshold=-26dB:ratio=3:attack=15:release=220:makeup=2,"
+               "aecho=0.8:0.55:60|110|170:0.16|0.10|0.06",
  # the storm-dragon's ninth son: serene and deep, a mountain valley
- 'stillsmoke': "rubberband=pitch=0.93:formant=preserved,"
+ 'stillsmoke': "rubberband=pitch=0.93:formant=preserved:pitchq=quality,"
                "equalizer=f=140:t=q:w=1:g=3,"
                "acompressor=threshold=-24dB:ratio=3:attack=10:release=180:makeup=2,"
                "aecho=0.8:0.6:110|240|420:0.24|0.16|0.10",
@@ -154,8 +165,39 @@ CHAINS = {
                "chorus=0.7:0.9:18|29:0.25|0.2:0.6|0.9:1.5|1.8,"
                "acompressor=threshold=-24dB:ratio=3:attack=5:release=90:makeup=2,"
                "aecho=0.8:0.35:28|52:0.10|0.06",
+ # the stalker of the fog moors: down with the formants (a bigger, older
+ # throat), dark, very close and dry -- a small dead room, no hall: he is
+ # right beside you
+ 'hollowstep': "rubberband=pitch=0.9:formant=shifted:pitchq=quality,"
+               "equalizer=f=140:t=q:w=1:g=3,equalizer=f=3000:t=q:w=1.4:g=-2,lowpass=f=7000,"
+               "acompressor=threshold=-28dB:ratio=3:attack=10:release=180:makeup=3,"
+               "aecho=0.8:0.35:14|27:0.10|0.05",
+ # the lamp-keeper of the salt roads: a big warm voice out in the open
+ # desert night -- warmth low down, a little presence, a long slap back
+ # off the dunes; no pitch shift (the voice is already the size it is)
+ 'brasshowl':  "equalizer=f=180:t=q:w=1:g=2,equalizer=f=2600:t=q:w=1.2:g=1.5,"
+               "acompressor=threshold=-22dB:ratio=3:attack=8:release=160:makeup=2,"
+               "aecho=0.8:0.5:130|260:0.16|0.08",
+ # the mountain's grandmother: old, huge and slow -- down in pitch with the
+ # formants kept (a big chest, not a chipmunk in reverse), a low shelf of
+ # weight, and a cave's long answer
+ 'oremantle':  "rubberband=pitch=0.87:formant=preserved:pitchq=quality,"
+               "highpass=f=70,lowshelf=f=160:g=3,equalizer=f=2400:t=q:w=1:g=1,"
+               "acompressor=threshold=-24dB:ratio=3:attack=10:release=200:makeup=2,"
+               "aecho=0.8:0.5:150|300:0.06|0.03",
+ # the Watcher of the high steppe: dry and close, clear consonants, and far
+ # behind her the steppe at night answering late and faint (a long, thin
+ # echo): the only room she is in is the whole sky
+ 'hourwatch':  "highpass=f=90,equalizer=f=220:t=q:w=1:g=1,equalizer=f=3600:t=q:w=1.2:g=2,"
+               "acompressor=threshold=-24dB:ratio=3:attack=8:release=150:makeup=2,"
+               "aecho=0.8:0.45:340|680:0.09|0.04",
+ # the potter of the river mud: warm and close, a little body low down,
+ # and the river bank's short wet slap
+ 'claypaw':    "highpass=f=80,equalizer=f=250:t=q:w=1:g=2,equalizer=f=2800:t=q:w=1.2:g=1,"
+               "acompressor=threshold=-24dB:ratio=3:attack=8:release=150:makeup=2,"
+               "aecho=0.8:0.4:45|90:0.12|0.06",
  # a young daredevil: bright and quick, a short slap
- 'cometail':   "rubberband=pitch=1.04:tempo=1.03:formant=preserved,"
+ 'cometail':   "rubberband=pitch=1.04:tempo=1.03:formant=preserved:pitchq=quality,"
                "highpass=f=120,treble=g=4:f=6000,"
                "aexciter=level_in=1:level_out=1:amount=1.2:drive=5:blend=0:freq=4500,"
                "acompressor=threshold=-24dB:ratio=3:attack=5:release=90:makeup=2,"
@@ -174,7 +216,70 @@ def viper(y):
     i0 = np.floor(idx).astype(int); i1 = np.minimum(i0 + 1, len(y) - 1); fr = idx - i0
     return ((y[i0] * (1 - fr) + y[i1] * fr) * trem).astype(np.float32)
 
-POST = {'twofang': viper}
+def baby(name):
+    """A clip of the real baby (baby_clips.py), with the same small room as
+    Sproutkit's chain (28 and 52 ms echoes) so it sits beside his words."""
+    x, sr = sf.read(os.path.join(HERE, 'baby', name + '.opus'), dtype='float32')
+    assert sr == SR, (name, sr)
+    y = np.concatenate([x, np.zeros(int(0.06 * SR), np.float32)])
+    for ms, g in ((28, 0.10), (52, 0.06)):
+        d = int(ms * SR / 1000)
+        y[d:d + len(x)] += g * x
+    return y
+
+
+# Which baby goes with which line, and how: 'before' / 'after' the words
+# (a 60 ms gap; a negative gap overlaps), or 'under' them from `at` s in.
+# Levels are the clip's peak against the line's.
+SPROUT_BABY = {
+    'select': [('ah.5', 'before', 0.06, 0.8)],
+    'cast1':  [('ah.3', 'after', -0.08, 0.8)],
+    'cast2':  [('babble.1', 'under', 0.15, 0.7)],
+    'cast3':  [('coo.2', 'after', 0.06, 0.7)],
+    'cast4':  [('squeal.1', 'after', -0.05, 1.0)],
+    'kill.1': [('babble.2', 'after', 0.06, 0.75)],
+    'kill.2': [('coo.1', 'after', 0.08, 0.6)],
+    'death.1': [('fall.2', 'after', 0.08, 0.6)],
+    'death.2': [('fall.1', 'after', 0.10, 0.55)],
+}
+
+
+def sproutkit_post(y, key):
+    """The baby, mixed in AFTER the chain: the words are pitched up into a
+    kitten, the baby is already small and stays as it was recorded."""
+    peak = float(np.abs(y).max())
+    for name, how, t, level in SPROUT_BABY.get(key, []):
+        b = baby(name)
+        b *= peak * level / (np.abs(b).max() + 1e-9)
+        # the words' own extent (the chain's padded tail is silence)
+        e = B.envelope(y, 10)
+        on = np.where(e > e.max() * 0.03)[0]
+        st, en = (on[0], on[-1]) if len(on) else (0, len(y))
+        if how == 'before':
+            y = np.concatenate([b, np.zeros(int(t * SR), np.float32), y[st:]])
+        elif how == 'after':
+            at = en + int(t * SR)
+            out = np.zeros(max(len(y), at + len(b)), np.float32)
+            out[:len(y)] += y
+            out[at:at + len(b)] += b
+            y = out
+        else:
+            at = st + int(t * SR)
+            out = np.zeros(max(len(y), at + len(b)), np.float32)
+            out[:len(y)] += y
+            out[at:at + len(b)] += b
+            y = out
+    return y.astype(np.float32)
+
+
+def hollowstep_post(y, key):
+    # the phantom (phantom.py): a reversed echo swelling into the words,
+    # detuned doubles a sixth-tone either side, a faint tritone under
+    import phantom
+    return phantom.post(y, key)
+
+
+POST = {'twofang': lambda y, key: viper(y), 'sproutkit': sproutkit_post, 'hollowstep': hollowstep_post}
 
 # The god and the beast under each voice, laid in BEFORE the chain so the
 # chain's pitch, EQ, compression and room glue them to the voice (beast.py).
@@ -245,66 +350,71 @@ def _breath(c, lo, hi, level, seed):
 
 def duskstripe_layers(c, key):
     # a tiger: breath close to the ear, and a low chuffing growl under it
-    return c + _breath(c, 1500, 7000, -13, 21) + _growl(c, 58, 0.2, 0.4, 22, -9, base=0.4)
+    return c + _breath(c, 1500, 7000, -18, 21) + _growl(c, 58, 0.2, 0.4, 22, -14, base=0.3)
 
 
 def rainspots_layers(c, key):
     # a leopard: the sawing rasp leopards call with (a slow, very uneven
     # pulse) under the words, and a bright ripple -- water -- above
-    return c + _growl(c, 34, 0.35, 0.6, 23, -10, base=0.5, rise=0.6) + _breath(c, 3500, 9000, -17, 24)
+    return c + _growl(c, 34, 0.35, 0.6, 23, -15, base=0.4, rise=0.6) + _breath(c, 3500, 9000, -21, 24)
 
 
 def nightpelt_layers(c, key):
     # the dark: a whispered double (the voice on breath) nearly as loud as
     # the voice, and a shadow an octave under it
-    return c + _breath(c, 700, 8000, -8, 25) + B.at(-15, B.octave(c, 0.5), c)
+    return c + _breath(c, 700, 8000, -14, 25) + B.at(-19, B.octave(c, 0.5), c)
 
 
 def faryowl_layers(c, key):
     # a singer: a fifth and an octave above her, ringing -- and on the
     # shouts, a caterwaul (the octave-up double swells)
-    fifth = B.at(-13, B.octave(c, 1.5), c)
-    up = B.at(-16, B.octave(c, 2.0), c) * (0.5 + 1.2 * B.loud_gate(c, 10))
+    fifth = B.at(-18, B.octave(c, 1.5), c)
+    up = B.at(-21, B.octave(c, 2.0), c) * (0.5 + 1.2 * B.loud_gate(c, 10))
     return c + fifth + up
 
 
 def suneye_layers(c, key):
     # a priestess of the sun: a choir -- an octave under, a fifth over, an
     # octave over -- and a warm purr beneath
-    choir = B.at(-11, B.octave(c, 0.5), c) + B.at(-14, B.octave(c, 1.5), c) + B.at(-17, B.octave(c, 2.0), c)
+    choir = B.at(-16, B.octave(c, 0.5), c) + B.at(-20, B.octave(c, 1.5), c) + B.at(-23, B.octave(c, 2.0), c)
     return c + choir + B.at(-16, B.lowpass(B.cross(c, B.growl_carrier(len(c), f0=27, jitter=0.1, double=0.2, seed=26)), 500), c)
 
 
 def snowhush_layers(c, key):
     # a lynx: cold air on the words, a faint ice-bright octave above, and a
     # hiss rising on the loud ones
-    hiss = _breath(c, 3000, 10000, -12, 27) * (0.4 + 1.0 * B.loud_gate(c, 10))
+    hiss = _breath(c, 3000, 10000, -17, 27) * (0.4 + 1.0 * B.loud_gate(c, 10))
     return c + hiss + B.at(-18, B.octave(c, 2.0), c)
+
+
+def oremantle_layers(c, key):
+    # the mountain under her voice: an octave of stone beneath, faint
+    return c + B.at(-19, B.octave(c, 0.5), c)
 
 
 def stonewhisper_layers(c, key):
     # a ghost of the crags: half whisper, half voice, and a stone-deep
     # shadow
-    return c + _breath(c, 900, 7000, -9, 28) + B.at(-14, B.octave(c, 0.5), c)
+    return c + _breath(c, 900, 7000, -20, 28) + B.at(-22, B.octave(c, 0.5), c)
 
 
 def riptail_layers(c, key):
     # a jaguar in the flood: an octave-down double, a wet low growl, and
     # a roar on the shouts
-    return c + B.at(-8, B.octave(c, 0.5), c) + _growl(c, 48, 0.25, 0.45, 29, -7, below=12, base=0.4, rise=1.3)
+    return c + B.at(-13, B.octave(c, 0.5), c) + _growl(c, 48, 0.25, 0.45, 29, -12, below=12, base=0.3, rise=1.3)
 
 
 def stillsmoke_layers(c, key):
     # a dragon's son: an octave-down double, and thunder under the loud
     # words (the voice on noise, kept below 300 Hz)
     thunder = B.lowpass(B.cross(c, B.noise(len(c), seed=30)), 300)
-    return c + B.at(-9, B.octave(c, 0.5), c) + B.at(-4, thunder, c) * B.loud_gate(c, 10) ** 2
+    return c + B.at(-14, B.octave(c, 0.5), c) + B.at(-8, thunder, c) * B.loud_gate(c, 10) ** 2
 
 
 def cometail_layers(c, key):
     # a comet: a sparkle a fifth up, and a streak (a falling whoosh) after
     # the casts and the select call
-    y = c + B.at(-15, B.octave(c, 1.5), c)
+    y = c + B.at(-20, B.octave(c, 1.5), c)
     if key.startswith('cast') or key == 'select':
         n = int(0.35 * SR)
         t = np.arange(n) / SR
@@ -321,24 +431,26 @@ def cometail_layers(c, key):
     return y.astype(np.float32)
 
 
+def hollowstep_layers(c, key):
+    # a stalker: the words breathed as much as spoken (a whispered double
+    # under the voice), and a shadow an octave down that swells only on the
+    # ultimate's roar
+    shadow = B.at(-15, B.octave(c, 0.5), c) * (0.4 + 1.2 * B.loud_gate(c, 10) ** 2)
+    return (c + _breath(c, 900, 7500, -11, 33) + shadow).astype(np.float32)
+
+
 def sproutkit_layers(c, key):
-    # a kitten: a soft purr under every word, a mew before the select call
-    # and the litter, and a giggle after the kills and the giggle fit
+    # a kitten: a soft purr under every word (the real baby's squeals, coos
+    # and babble go in after the chain: sproutkit_post)
     purr = B.lowpass(B.cross(c, B.growl_carrier(len(c), f0=26, jitter=0.08, double=0.25, seed=32)), 700)
-    y = c + B.at(-15, purr, c)
-    peak = float(np.abs(c).max())
-    gap = np.zeros(int(0.04 * SR), np.float32)
-    if key in ('select', 'cast1'):
-        y = np.concatenate([B.chirp(0.2, 700, 1100, seed=5) * peak * 0.45, gap, y])
-    if key.startswith('kill') or key == 'cast2':
-        y = np.concatenate([y, gap, B.giggle(seed=6) * peak * 0.5])
-    return y.astype(np.float32)
+    return (c + B.at(-15, purr, c)).astype(np.float32)
 
 
 PRE = {'sproutkit': sproutkit_layers, 'goldenmane': goldenmane_layers, 'oldroar': oldroar_layers, 'twofang': twofang_layers, 'windclaw': windclaw_layers,
        'duskstripe': duskstripe_layers, 'rainspots': rainspots_layers, 'nightpelt': nightpelt_layers, 'faryowl': faryowl_layers,
-       'suneye': suneye_layers, 'snowhush': snowhush_layers, 'stonewhisper': stonewhisper_layers, 'riptail': riptail_layers,
-       'stillsmoke': stillsmoke_layers, 'cometail': cometail_layers}
+       'suneye': suneye_layers, 'snowhush': snowhush_layers, 'stonewhisper': stonewhisper_layers, 'oremantle': oremantle_layers, 'riptail': riptail_layers,
+       'stillsmoke': stillsmoke_layers, 'cometail': cometail_layers,
+       'hollowstep': hollowstep_layers}
 sheet = {}
 for row in csv.DictReader(open(os.path.join(HERE, 'recording_sheet.tsv')), delimiter='\t'):
     sheet[row['file']] = row
@@ -373,6 +485,32 @@ def trim(x, pre=0.06, post=0.18, floor_db=-38, start_db=None):
     y = x[a:b].copy(); fi, fo = int(0.01*SR), int(0.06*SR)
     y[:fi] *= np.linspace(0,1,fi); y[-fo:] *= np.linspace(1,0,fo)
     return y
+def quiet_take(c, core, near):
+    """A take read far under the others (Riptail's whispered "Gathered.":
+    its words at -58 dBFS where the rest are -25 to -45) comes up by ~30 dB
+    at levelling, and the room's hiss comes up with it -- under the words,
+    where RNNoise lets it through. Such a take is cleaned first, before
+    RNNoise, by spectral gating (noisereduce, stationary) against the room:
+    the quietest fifth of the 20 ms frames within a few seconds of the take
+    (`near`), which is the session's own hiss and nothing of the voice.
+    Gating with time and frequency smoothing, not bare subtraction: a bare
+    2.5x subtraction was tried first and left the hiss nearly where it was
+    and holes in the whisper. `core` is the take's own window, for its
+    level. A take read at the usual level is returned untouched."""
+    h = int(0.02 * SR)
+    e = np.array([np.sqrt(np.mean(core[i:i + h] ** 2)) + 1e-9 for i in range(0, len(core) - h, h)])
+    db = 20 * np.log10(e)
+    if np.percentile(db, 95) > -50.0:
+        return c
+    import noisereduce as nr
+    fr = [near[i:i + h] for i in range(0, len(near) - h, h)]
+    en = np.array([np.sqrt(np.mean(f ** 2)) for f in fr])
+    room = np.concatenate([f for f, v in zip(fr, en) if v <= np.percentile(en, 20)])
+    print(f'  (a quiet take, words at {np.percentile(db, 95):.0f} dBFS: gated against {len(room) / SR:.1f} s of room first)', flush=True)
+    return nr.reduce_noise(y=c, sr=SR, y_noise=room, stationary=True, prop_decrease=0.92,
+                           n_std_thresh_stationary=1.3, time_mask_smooth_ms=80, freq_mask_smooth_hz=400).astype(np.float32)
+
+
 full, _ = sf.read(TAKE, dtype='float32')
 report = []
 for who, key, s, e in TAKES:
@@ -380,20 +518,38 @@ for who, key, s, e in TAKES:
     rel = f'voice/{who}/{key}.opus'
     energy = int(sheet[rel]['energy'])
     raw = full[int((s-0.5)*SR):int((e+0.5)*SR)]
-    sf.write('tmp_raw.wav', raw, SR)
+    gated = quiet_take(raw, full[int(s*SR):int(e*SR)], full[max(0, int((s-4)*SR)):int((e+4)*SR)])
+    quiet = gated is not raw
+    sf.write('tmp_raw.wav', gated, SR)
+    # a quiet take, after its gating and RNNoise: brought up to a working
+    # level and gated once more (a soft gate, -24 dB of range, not a
+    # mute), so the pauses the levelling will lift are room, not hiss
     ff('tmp_raw.wav', 'tmp_clean.wav', CLEAN)
     c, _ = sf.read('tmp_clean.wav', dtype='float32')
+    if quiet:
+        sf.write('tmp_quiet.wav', c * (0.5 / (float(np.abs(c).max()) + 1e-9)), SR)
+        ff('tmp_quiet.wav', 'tmp_clean.wav', 'agate=threshold=0.02:range=0.063:ratio=3:attack=8:release=160')
+        c, _ = sf.read('tmp_clean.wav', dtype='float32')
     c = c[int(0.5*SR):len(c)-int(0.5*SR)]
     c = trim(c)
     if who in PRE:
-        c = PRE[who](c, key).astype(np.float32)
+        # the animal under the voice. A manifest can turn it down
+        # ("layers_db"): the layers were set against synthesised stand-ins,
+        # and a performer's own reading carries the character they supplied
+        layered = PRE[who](c, key).astype(np.float32)
+        g = 10 ** ((MANIFEST or {}).get('layers_db', 0.0) / 20)
+        n = min(len(layered), len(c))
+        extra = layered.copy()
+        extra[:n] -= c[:n]
+        c = np.concatenate([c, np.zeros(len(layered) - len(c), np.float32)]) if len(layered) > len(c) else c
+        c = (c[:len(layered)] + g * extra).astype(np.float32)
         c /= max(1.0, float(np.abs(c).max()) / 0.9)
     sf.write('tmp_cut.wav', c, SR)
     # the chain, then room for the tail to ring out
     ff('tmp_cut.wav', 'tmp_fx.wav', "apad=pad_dur=0.5," + CHAINS[who])
     y, _ = sf.read('tmp_fx.wav', dtype='float32')
     if who in POST:
-        y = POST[who](y)
+        y = POST[who](y, key)
     y = trim(y, pre=0.09, post=0.25, floor_db=-45, start_db=-36)
     # level: -18 LUFS at energy 3, 1.5 LU a step up or down the sheet's scale
     target = -18.0 + 1.5*(energy-3)

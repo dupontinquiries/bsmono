@@ -104,6 +104,10 @@ pub struct Vfx {
     pub beams: Vec<Beam>,
     pub rings: Vec<Ring>,
     pub time: f32,
+    /// How far the Quarry's machinery has turned (radians of a unit
+    /// wheel): its drive (`machine::drive`) integrated, so the gears spin
+    /// up and settle rather than jump.
+    pub machine_turn: f32,
     /// ambient jungle life (seeded lazily on first update)
     fireflies: Vec<(Vec3, f32)>,
     leaves: Vec<Particle>,
@@ -352,6 +356,14 @@ impl Vfx {
                 Event::StarfallFx { at, radius } => add(*at + Vec3::Y * 3.0, [0.88, 0.94, 1.0], radius * 4.0, 0.6, 18.0),
                 Event::HealFx { pos, radius } => add(*pos + Vec3::Y, [0.45, 1.0, 0.55], radius * 1.5, 0.6, 2.0),
                 Event::GiggleFx { pos, radius } => add(*pos + Vec3::Y, [1.0, 0.55, 0.8], radius * 1.5, 0.5, 3.0),
+                // the lamp raised: warm light out to its reach, held a moment
+                Event::LanternFx { pos, radius } => add(*pos + Vec3::Y * 2.0, [1.0, 0.72, 0.35], radius * 1.3, 1.2, 5.0),
+                // a Sentinel's coat changes: magma lights the ground round
+                // her; the cold coats hardly glow
+                Event::CoatShift { pos, material, radius, .. } => {
+                    let (c, k) = coat_light(*material);
+                    add(*pos + Vec3::Y * 2.0, c, radius * 1.4, 0.8, k);
+                }
                 Event::ShieldFx { pos, dur, color } => add(*pos + Vec3::Y, *color, 4.0, dur.min(1.5), 1.5),
                 Event::BeamFx { from, dir, length, color, dur, .. } => add(*from + *dir * (length * 0.5) + Vec3::Y, *color, length * 0.6 + 2.0, dur.min(2.0), 3.0),
                 _ => {}
@@ -984,6 +996,18 @@ impl Vfx {
             }
         }
         self.time += dt;
+        // a running mudslide throws mud off its front
+        for w in &game.mudslides {
+            let side = Vec3::new(-w.dir.z, 0.0, w.dir.x);
+            for k in 0..3 {
+                let u = ((self.time * 13.7 + k as f32 * 0.37).fract()) - 0.5;
+                let p = w.pos + side * (u * w.width) + Vec3::Y * 1.0;
+                self.dust.push(Particle { pos: p, vel: w.dir * (w.speed * 0.8) + side * (u * 3.0) + Vec3::Y * 3.5, life: 0.6, max_life: 0.6, size: 0.2, color: [0.42, 0.29, 0.18], alpha: 1.0, gravity: 14.0, drag: 0.5 });
+            }
+        }
+        if crate::map::active() == crate::map::MapId::Maze {
+            self.machine_turn += dt * 1.6 * crate::machine::drive(game.wake.seed, game.t);
+        }
         let atm = game.weather.atmosphere();
         self.ground.tick(dt, atm.rain, atm.wetness);
         if !self.seeded {
@@ -1263,6 +1287,164 @@ impl Vfx {
                         let r = *radius * ((k as f32 * 0.618).fract());
                         let c = if k % 3 == 0 { [1.4, 1.2, 0.5] } else { [1.4, 0.7, 1.1] };
                         self.particles.push(Particle { pos: *pos + Vec3::new(a.cos() * r, 0.8, a.sin() * r), vel: Vec3::new(a.cos(), 4.0 + (k % 4) as f32, a.sin()), life: 0.8, max_life: 0.8, size: 0.22, color: c, alpha: 0.9, gravity: 5.0, drag: 1.0 });
+                    }
+                }
+                Event::SwapFx { from, to } => {
+                    // Hollowstep steps between: where he was, the fog closes
+                    // in on the empty spot; where he is, it is thrown off him
+                    for (at, inward) in [(*from, true), (*to, false)] {
+                        for k in 0..26 {
+                            let a = k as f32 * 2.399;
+                            let r = 1.6 + (k % 5) as f32 * 0.35;
+                            let d = Vec3::new(a.cos(), 0.0, a.sin());
+                            let (p, v) = if inward { (at + d * r + Vec3::Y * 0.4, -d * 2.4) } else { (at + d * 0.4 + Vec3::Y * 0.5, d * 3.2 + Vec3::Y * 0.3) };
+                            self.particles.push(Particle { pos: p, vel: v, life: 1.3, max_life: 1.3, size: 0.42, color: [0.30, 0.31, 0.36], alpha: 0.5, gravity: 0.0, drag: 1.2 });
+                        }
+                    }
+                }
+                Event::LanternFx { pos, radius } => {
+                    // the lamp goes up: a ring of warm light thrown out to
+                    // its reach, and sparks from the wick
+                    self.rings.push(Ring { pos: *pos + Vec3::Y * 0.05, r0: 0.5, r1: *radius, until: 0.5, dur: 0.5, color: [1.4, 1.0, 0.45], thick: 0.3 });
+                    for k in 0..40 {
+                        let a = k as f32 * 2.399;
+                        self.particles.push(Particle { pos: *pos + Vec3::new(a.cos() * 0.3, 1.6, a.sin() * 0.3), vel: Vec3::new(a.cos() * 1.2, 2.5 + (k % 5) as f32 * 0.5, a.sin() * 1.2), life: 1.4, max_life: 1.4, size: 0.09, color: [1.6, 1.1, 0.4], alpha: 1.0, gravity: -0.5, drag: 0.6 });
+                    }
+                }
+                Event::CoatShift { pos, material, radius, .. } => {
+                    // the shift runs out over the ground to the field's edge,
+                    // and what she is now comes off her coat: grit, frost,
+                    // iron filings drawn inward, embers
+                    let c = material.edge();
+                    self.rings.push(Ring { pos: *pos + Vec3::Y * 0.05, r0: 1.0, r1: *radius, until: 0.45, dur: 0.45, color: c, thick: 0.25 });
+                    use crate::gods::Material;
+                    for k in 0..36 {
+                        let a = k as f32 * 2.399;
+                        let d = Vec3::new(a.cos(), 0.0, a.sin());
+                        let h = 0.4 + (k % 6) as f32 * 0.35;
+                        let (p, v, size, col, grav) = match material {
+                            Material::Granite => (*pos + d * 1.2 + Vec3::Y * h, d * 2.5 + Vec3::Y * 1.5, 0.16, [0.55, 0.53, 0.50], 9.0),
+                            Material::Rime => (*pos + d * 1.4 + Vec3::Y * h, d * 1.2 + Vec3::Y * 0.6, 0.08, [1.3, 1.5, 1.8], -0.2),
+                            Material::Lodestone => (*pos + d * (*radius * 0.8) + Vec3::Y * 0.5, -d * (*radius * 0.9), 0.07, [0.35, 0.35, 0.45], 0.0),
+                            Material::Magma => (*pos + d * 1.0 + Vec3::Y * h, d * 1.8 + Vec3::Y * 3.0, 0.12, [2.0, 0.8, 0.25], 2.0),
+                        };
+                        self.particles.push(Particle { pos: p, vel: v, life: 1.0, max_life: 1.0, size, color: col, alpha: 1.0, gravity: grav, drag: 1.0 });
+                    }
+                }
+                // Hourwatch (`hours`): a line of pale gold motes from where a
+                // cat was sent to where it is now, fading back along it;
+                // her friends' hours wound on, a clock's ring; up into the
+                // stars and down again
+                Event::TimeTurned { from, to, back, .. } => {
+                    let col = if *back { [1.6, 1.35, 0.7] } else { [1.1, 0.95, 1.7] };
+                    for k in 0..40 {
+                        let u = k as f32 / 39.0;
+                        let p = *from + (*to - *from) * u + Vec3::Y * (0.6 + (k % 5) as f32 * 0.3);
+                        self.particles.push(Particle { pos: p, vel: Vec3::Y * 0.4, life: 0.4 + 0.8 * u, max_life: 1.2, size: 0.14, color: col, alpha: 0.9, gravity: -0.2, drag: 1.0 });
+                    }
+                    self.rings.push(Ring { pos: *to + Vec3::Y * 0.05, r0: 2.4, r1: 0.4, until: 0.5, dur: 0.5, color: [col[0] * 0.6, col[1] * 0.6, col[2] * 0.6], thick: 0.2 });
+                }
+                Event::WindFx { pos, radius } => {
+                    self.rings.push(Ring { pos: *pos + Vec3::Y * 0.05, r0: 0.8, r1: *radius, until: 0.6, dur: 0.6, color: [1.4, 1.2, 0.55], thick: 0.3 });
+                    for k in 0..12 {
+                        let a = k as f32 * std::f32::consts::TAU / 12.0;
+                        let d = Vec3::new(a.cos(), 0.0, a.sin());
+                        self.particles.push(Particle { pos: *pos + d * (*radius * 0.9) + Vec3::Y * 0.3, vel: Vec3::Y * 1.5, life: 0.7, max_life: 0.7, size: 0.2, color: [1.6, 1.3, 0.6], alpha: 1.0, gravity: 0.0, drag: 1.0 });
+                    }
+                }
+                Event::LookUp { pos, .. } => {
+                    for k in 0..48 {
+                        let a = k as f32 * 2.399;
+                        self.particles.push(Particle { pos: *pos + Vec3::new(a.cos() * 0.8, 0.5, a.sin() * 0.8), vel: Vec3::new(a.cos() * 1.5, 10.0 + (k % 6) as f32 * 2.5, a.sin() * 1.5), life: 1.4, max_life: 1.4, size: 0.12, color: [1.3, 1.4, 2.0], alpha: 1.0, gravity: 0.0, drag: 0.3 });
+                    }
+                }
+                Event::LookLand { pos, .. } => {
+                    self.rings.push(Ring { pos: *pos + Vec3::Y * 0.05, r0: 0.5, r1: 7.0, until: 0.7, dur: 0.7, color: [0.9, 1.0, 1.6], thick: 0.3 });
+                }
+                // Claypaw (`clay`): kittens shaped in a puff of clay dust;
+                // clay pressed and slip flicked off; mud flung along a slick
+                Event::ClayShaped { pos, .. } | Event::ClayRemold { pos } => {
+                    for k in 0..14 {
+                        let a = k as f32 * 2.399;
+                        self.dust.push(Particle { pos: *pos + Vec3::new(a.cos() * 0.6, 0.5 + (k % 3) as f32 * 0.3, a.sin() * 0.6), vel: Vec3::new(a.cos() * 1.8, 1.2, a.sin() * 1.8), life: 0.6, max_life: 0.6, size: 0.14, color: [0.62, 0.42, 0.30], alpha: 0.9, gravity: 6.0, drag: 1.2 });
+                    }
+                }
+                // the mudslide: a plant crushed (leaves and splinters thrown
+                // up), a wall sloshed off (mud flung high and back)
+                Event::Smush { pos } => {
+                    for k in 0..14 {
+                        let a = k as f32 * 2.399;
+                        let col = if k % 3 == 0 { [0.35, 0.25, 0.15] } else { [0.25, 0.45, 0.18] };
+                        self.dust.push(Particle { pos: *pos + Vec3::new(a.cos() * 1.5, 0.8 + (k % 4) as f32 * 0.4, a.sin() * 1.5), vel: Vec3::new(a.cos() * 3.0, 4.0 + (k % 3) as f32, a.sin() * 3.0), life: 0.9, max_life: 0.9, size: 0.17, color: col, alpha: 1.0, gravity: 9.0, drag: 1.0 });
+                    }
+                }
+                Event::MudslideFx { pos, dir } => {
+                    for k in 0..30 {
+                        let a = k as f32 * 2.399;
+                        let d = (*dir + Vec3::new(a.cos(), 0.0, a.sin()) * 0.6).normalize_or_zero();
+                        self.dust.push(Particle { pos: *pos + Vec3::Y * 0.5, vel: d * (5.0 + (k % 5) as f32) + Vec3::Y * 4.0, life: 0.9, max_life: 0.9, size: 0.25, color: [0.40, 0.27, 0.17], alpha: 1.0, gravity: 12.0, drag: 0.5 });
+                    }
+                }
+                Event::Slosh { pos } => {
+                    for k in 0..36 {
+                        let a = k as f32 * 2.399;
+                        let d = Vec3::new(a.cos(), 0.0, a.sin());
+                        self.dust.push(Particle { pos: *pos + d * 1.0 + Vec3::Y * 0.6, vel: d * (4.0 + (k % 4) as f32) + Vec3::Y * (5.0 + (k % 5) as f32), life: 1.0, max_life: 1.0, size: 0.22, color: [0.40, 0.27, 0.17], alpha: 1.0, gravity: 14.0, drag: 0.4 });
+                    }
+                }
+                Event::SlickFx { a, b, .. } => {
+                    for k in 0..24 {
+                        let u = k as f32 / 23.0;
+                        let p = *a + (*b - *a) * u;
+                        let s = if k % 2 == 0 { 1.0 } else { -1.0 };
+                        let side = Vec3::new(-(b.z - a.z), 0.0, b.x - a.x).normalize_or_zero() * s;
+                        self.dust.push(Particle { pos: p + Vec3::Y * 0.3, vel: side * 3.0 + Vec3::Y * 2.5, life: 0.6, max_life: 0.6, size: 0.16, color: [0.40, 0.27, 0.17], alpha: 1.0, gravity: 14.0, drag: 0.5 });
+                    }
+                }
+                Event::BoulderLand { pos } | Event::CatFell { pos } => {
+                    // a ring of dust off the flags
+                    for k in 0..32 {
+                        let a = k as f32 * std::f32::consts::TAU / 32.0;
+                        let d = Vec3::new(a.cos(), 0.0, a.sin());
+                        self.dust.push(Particle { pos: Vec3::new(pos.x, 0.3, pos.z) + d * 1.5, vel: d * 6.0 + Vec3::Y * 1.2, life: 1.0, max_life: 1.0, size: 0.3, color: [0.55, 0.51, 0.45], alpha: 0.7, gravity: 1.0, drag: 2.0 });
+                    }
+                }
+                Event::PadDrop { pos } => {
+                    // grit off the pad's edges as it swings
+                    for k in 0..10 {
+                        let a = k as f32 * 2.399;
+                        self.dust.push(Particle { pos: *pos + Vec3::new(a.cos() * 2.3, 0.2, a.sin() * 2.3), vel: Vec3::new(a.cos(), 0.8, a.sin()), life: 0.6, max_life: 0.6, size: 0.18, color: [0.50, 0.47, 0.42], alpha: 0.7, gravity: 4.0, drag: 1.5 });
+                    }
+                }
+                Event::BoulderHit { pos } => {
+                    // a cat thrown aside: stone grit and dust off the ball
+                    for k in 0..28 {
+                        let a = k as f32 * 2.399;
+                        let d = Vec3::new(a.cos(), 0.0, a.sin());
+                        self.dust.push(Particle { pos: *pos + d * 0.8 + Vec3::Y * (0.3 + (k % 4) as f32 * 0.3), vel: d * (2.5 + (k % 3) as f32) + Vec3::Y * 2.0, life: 0.9, max_life: 0.9, size: 0.22, color: [0.50, 0.46, 0.40], alpha: 0.8, gravity: 5.0, drag: 1.6 });
+                    }
+                }
+                Event::ThornBite { pos, alone } => {
+                    // thorns rake: dark splinters and a few red flecks
+                    let n = if *alone { 12 } else { 6 };
+                    for k in 0..n {
+                        let a = k as f32 * 2.399;
+                        let col = if k % 4 == 0 { [0.7, 0.08, 0.1] } else { [0.12, 0.10, 0.07] };
+                        self.particles.push(Particle { pos: *pos + Vec3::new(a.cos() * 0.5, 0.4 + (k % 3) as f32 * 0.4, a.sin() * 0.5), vel: Vec3::new(a.cos() * 2.0, 1.5, a.sin() * 2.0), life: 0.5, max_life: 0.5, size: 0.08, color: col, alpha: 1.0, gravity: 6.0, drag: 1.5 });
+                    }
+                }
+                Event::ShadowDriven { pos } => {
+                    // a shadow torn to rags in the light
+                    for k in 0..24 {
+                        let a = k as f32 * 2.399;
+                        self.particles.push(Particle { pos: *pos + Vec3::Y * (0.4 + (k % 4) as f32 * 0.35), vel: Vec3::new(a.cos() * 4.0, 1.0, a.sin() * 4.0), life: 0.7, max_life: 0.7, size: 0.3, color: [0.12, 0.12, 0.15], alpha: 0.7, gravity: 0.0, drag: 2.0 });
+                    }
+                }
+                Event::EchoRise { pos, .. } => {
+                    // an echo stands up out of the ground fog
+                    for k in 0..16 {
+                        let a = k as f32 * 2.399;
+                        self.particles.push(Particle { pos: *pos + Vec3::new(a.cos() * 0.8, 0.2, a.sin() * 0.8), vel: Vec3::new(a.cos() * 0.6, 1.4 + (k % 3) as f32 * 0.4, a.sin() * 0.6), life: 1.1, max_life: 1.1, size: 0.36, color: [0.20, 0.21, 0.26], alpha: 0.55, gravity: -0.4, drag: 1.0 });
                     }
                 }
                 Event::KitlingPop { pos } => {
@@ -2235,6 +2417,18 @@ fn rnd_jitter(seed: f32) -> f32 {
     (x - x.floor()) * 2.0 - 1.0
 }
 
+
+/// A coat's light: its colour, and how bright (`sentinel`).
+fn coat_light(m: crate::gods::Material) -> ([f32; 3], f32) {
+    use crate::gods::Material;
+    match m {
+        Material::Granite => ([0.8, 0.78, 0.72], 1.0),
+        Material::Rime => ([0.6, 0.85, 1.0], 2.0),
+        Material::Lodestone => ([0.55, 0.55, 0.8], 1.2),
+        Material::Magma => ([1.0, 0.45, 0.15], 6.0),
+    }
+}
+
 #[cfg(test)]
 mod glow_tests {
     use super::*;
@@ -2364,6 +2558,7 @@ mod lightning_tests {
     #[test]
     fn storms_strike_with_lightning() {
         let mut game = Game::new_teams(&[11], &[0]); // Stillsmoke
+        game.set_level(0, 5); // every ability unlocked (`ranks`)
         game.gods[1].respawn_t = 999.0;
         game.gods[0].ai = None;
         game.gods[0].mana = 10_000.0;

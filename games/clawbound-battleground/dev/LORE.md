@@ -56,6 +56,17 @@ bring down; stones to break first.
   the elder dawn. Fifteen a side: for matters that concern every clan at
   once. The high path climbs a shelf around the western fang; the caves along
   the side paths are the dens of the vole-beasts that keep the camps.
+- **The Engineer's Quarry**: the works of the **Geartooth clan**, the engineer-cats
+  of the old hills, who learned to cut wood and stone with their teeth and
+  set the rivers to turn it. They built the labyrinth as a machine for
+  moving the mountain: gear trains across the wall tops, stone gates that
+  rise and sink in their slots, Archimedes screws that lift quarried stone
+  from the cisterns in the hills, chutes on trestles that bring it down,
+  and tracks it rolls along through the rooms. A room the stone passes
+  through is a LOCK while it runs: the machine seals its gates and opens the
+  trapdoors in its floor behind the stone, down to the old workings. The
+  Geartooth are long gone; the machine is not, and it does not know that
+  cats walk its locks now. The thorns grew over it after them. Five a side.
 
 ## The ancestors
 
@@ -77,11 +88,16 @@ voice note contradicts its ancestor. Seven are female, six male.
 | Twofang | sabre-tooth (smilodon) | the elder dawn | the tar-pit plains of the far west | he |
 | Suneye | sand cat | the golden ages | the endless dunes and the sun temples | she |
 | Snowhush | lynx | the long winters | the white silence of the northern taiga | she |
-| Riptail | jaguar | the green ages | the drowned forest | he |
+| Riptail | jaguar | the green ages | the drowned forest | she |
 | Stillsmoke | dragon-cat, son of the storm-dragon | the age of storms | the far-east thunder mountains | he |
 | Stonewhisper | snow leopard | the long winters | the high crags | she |
 | Cometail | caracal | the elder dawn | the glacier-sky above the cloud sea | he |
 | Sproutkit | a kitten, of every clan | every spring | wherever something is being born | he |
+| Hollowstep | wildcat | the long nights | the fog moors | he |
+| Brasshowl | sand cat | the caravan years | the salt roads | he |
+| Oremantle | a Sentinel: a snow leopard of stone and ore, built by the Geartooth clan | the first winters | the roots of the high crags | she |
+| Hourwatch | Pallas's cat | the long nights | the high steppe, where the sky is widest | she |
+| Claypaw | fishing cat | the flood years | the banks of the great river | he |
 
 **Goldenmane.** First of the lion-clan to lead a pride that was not his by
 birth. He taught that a cat alone is a whisker and a pride is a storm, and
@@ -124,8 +140,8 @@ chose. She picked the ground, let the snow fall, and waited; her clan keeps
 the silence still.
 
 **Riptail.** A jaguar of the flooded dark, who hunted under the water as
-easily as over it. The river does not chase, he says; it gathers, and so
-does he.
+easily as over it. The river does not chase, she says; it gathers, and so
+does she.
 
 **Stillsmoke.** Ninth son of the storm-dragon: antlered, scaled,
 sabre-fanged, and happiest sitting still in incense smoke. He sits so long
@@ -148,6 +164,73 @@ grew up. Every litter born in every clan is a little of him, so there is
 always more of him than anyone counted. He turns every fight into a game,
 and every game into a dance -- and what dances cannot fight. Where he naps,
 the first green of the year comes up through the snow.
+
+**Hollowstep.** Nobody on the moors ever saw Hollowstep arrive. His tread
+was heard on one side of the heath and he was found on the other, and the
+clans learned to count their own shadows before they slept. He never ran
+after anything in his life; he never had to. They say another of him is
+still out on the moor tonight, walking, and that you will hear it long
+before you see it.
+
+**Brasshowl.** The smallest of the ancestors, with the biggest voice. He
+walked ahead of the caravans on the salt roads at night with a brass
+lantern, and when something moved at the edge of its light he raised the
+lamp and bellowed, and whatever it was did not come in. It is said that
+Hollowstep has never once stood in Brasshowl's light, and that the two of
+them know exactly why.
+
+**Oremantle.** The first of the **Sentinels**, the great cats the Geartooth
+engineers built of stone and ore to keep their works when they were gone.
+They built her in the likeness of Stonewhisper's grandmother, of the old
+snow leopards that were half as big again as any cat since, who lay so long
+on the roots of the crags that the engineers could quarry her shape from the
+mountain itself; and they gave her the grandmother's voice -- though she speaks
+with it only in their own tongue, clicks and all. Her coat is
+plates on the machine's axles, and turned, it shows what the mountain is
+made of: granite in the thaw, rime in the long dark, lodestone where the
+iron veins run, and once, when the clans needed it, the molten heart
+itself. She never went to a fight in her life. She became what the fight
+was standing on. The Geartooth machines know her as their own.
+
+**Hourwatch.** The Watcher. A Pallas's cat of the high steppe, who sat out
+whole nights on the rocks counting the stars round until she knew the sky's
+clock better than her own heartbeat -- and found that an hour, once you
+have watched enough of them, can be turned like any other thing. She turns
+her own back when it goes badly, her enemies' when they get ahead of
+themselves, and her friends' forward when they are waiting. When the clans
+need to know what is coming, she leaps into the stars and looks back at the
+whole field, and everything behind her is seen. Nobody has ever surprised
+her. She says.
+
+**Claypaw.** The potter of the river mud. A fishing cat who waded the great
+river's banks so long that the clay took his shape and kept it -- and when
+the flood tore him apart he pressed himself back together out of the bank.
+He has been clay ever since: he cracks as he dries and remolds himself
+wet, nothing else mends him more than half, and every kitten he shapes out
+of the mud runs off to bite at whatever he is fighting. Where he spins,
+the ground turns to slip; where he is angry, the bank gives way. The clans
+that farm the flood plains leave a lump of wet clay on the doorstep for him.
+
+## Geartooth, the engineers' tongue
+
+The Geartooth clan spoke a tongue of their own, and the Sentinels they
+built still speak it. They carved it on the Quarry's walls, one tablet to a
+room, as if to teach whoever came after -- and read in order from either
+base, the tablets do. (The full lexicon and grammar are in
+`src/geartooth.rs`; the tablets' texts, their readings and what each
+teaches are `geartooth::TABLETS`.)
+
+Its sounds: nine vowels -- a e i o u, and ä ö ü y, which no clan has -- and
+two clicks made with the tongue alone: `!`, a pop, the sound of a gear
+tooth dropping into place, and `|`, a tsk, a ratchet's catch. Its grammar:
+the verb comes last; many is said by doubling the first syllable (`!ük` a
+gear, `!ü!ük` gears); a click before a verb says when (`!kör` turned,
+`|kör` will turn); not is `-m` (`|ö` kin, `|öm` a stranger); whose is `-a`
+(`tharu-a !ön`, the mountain's heart -- Oremantle's cry).
+
+Oremantle speaks only Geartooth: *Tharu hy* (the mountain is here), *|Ö,
+hy!* (kin, here), *Yla tam* (the water shuts), *Mi, hy* (little one,
+here), *Tharu-a !ÖN!*, *Luu* (go down), *Doru ol* (stone, always).
 
 ## The music of the clans
 
@@ -173,6 +256,11 @@ side.
 | Stonewhisper | long mountain horns, singing bowls, damaru, low chant | high wind, falling scree |
 | Cometail | glass harmonica, crystal bowls, frame drum, overtone singing | the hiss of a meteor, ice cracking in the cold |
 | Sproutkit | toy piano, music box, ukulele, kazoo, handclaps, a disco beat | birdsong, a spring brook |
+| Hollowstep | bowed saw, low cello drones, a slow bass drum like a heartbeat, held breath | wind over heather, a curlew far off |
+| Brasshowl | frame drum, oud, a brass bell, clapping hands, a caravan's camel bells | desert wind, a crackling lamp |
+| Oremantle | the deepest mountain horns, stone chimes, a slow frame drum like footfalls, overtone throat-singing | wind in a cave mouth, rock settling |
+| Hourwatch | a music box's comb, ticking clocks, a glass harmonica, steppe throat-singing, a single temple bell | wind over grass at night |
+| Claypaw | clay pot drums (udu), a water drum, a potter's wheel's hum, low reed pipes | the river running, mud sucking at paws |
 
 **Frostfang** colours: long horns, hardanger fiddle and nyckelharpa, kulning,
 bone flute, singing bowls, wind over ice. **Emberclaw** colours: kora,

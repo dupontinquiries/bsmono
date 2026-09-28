@@ -13,6 +13,7 @@
 //! |------------------|-------------------------------------------------------------|-------|
 //! | wind-up          | `voice/<ancestor>/cast<N>`, `voice/<ancestor>/cast`         | voice |
 //! | cast fires       | `sfx/cast/<ancestor>/<N>`, `sfx/cast/<archetype>`, `sfx/cast` | sfx |
+//! | ...and its crowd | `sfx/swarm/<ancestor>/<N>/b<k>`, each round the caster      | sfx   |
 //! | attack, nothing  | `sfx/whiff`                                                 | sfx   |
 //! | hit              | `sfx/hit_big` (big), `sfx/hit`                              | sfx   |
 //! | kill             | `voice/<killer>/kill`; `voice/<victim>/death`               | voice |
@@ -64,7 +65,29 @@ pub fn cues_for(ev: &Event, game: &Game) -> Vec<Cue> {
         Event::Cast { god, slot, .. } => {
             let a = ancestor_key(game, *god);
             let arch = archetype_key(&game.def(*god).abilities[*slot as usize].arch);
-            vec![Cue { keys: vec![format!("sfx/cast/{a}/{}", slot + 1), format!("sfx/cast/{arch}"), "sfx/cast".into()], bus: Bus::Sfx, gain: 0.9, pos: god_pos(*god), speaker: None, priority: 5 }]
+            let mut v = vec![Cue { keys: vec![format!("sfx/cast/{a}/{}", slot + 1), format!("sfx/cast/{arch}"), "sfx/cast".into()], bus: Bus::Sfx, gain: 0.9, pos: god_pos(*god), speaker: None, priority: 5 }];
+            // An ability with no wind-up never sends a CastStart, which is
+            // where the line is spoken: speak it here instead. (Every
+            // Blink, Buff and Shield was silent -- Brasshowl's "Sit by the
+            // fire." among them -- and every Sentinel coat would be.)
+            if crate::abilities::cast_timing(&game.def(*god).abilities[*slot as usize]).0 <= 0.0 {
+                v.push(Cue { keys: vec![format!("voice/{a}/cast{}", slot + 1), format!("voice/{a}/cast")], bus: Bus::Voice, gain: 1.0, pos: god_pos(*god), speaker: Some(*god), priority: 6 });
+            }
+            if let Some(at) = god_pos(*god) {
+                // the ring turned to a new angle each cast (from the clock:
+                // replays agree), so a swarm -- Sproutkit's babies,
+                // Hollowstep's phantoms -- is somewhere new round him every
+                // time
+                // (a hash of the clock's bits: the sine-of-time trick came
+                // back to the same angle whenever casts fell ~7 pi / 12.99 s
+                // apart, which the test's spacing happened to be)
+                let h = game.t.to_bits().wrapping_mul(2_654_435_761) >> 8;
+                let turn = (h & 0xFFFF) as f32 / 65536.0 * std::f32::consts::TAU;
+                for k in 0..SWARM_MAX {
+                    v.push(Cue { keys: vec![format!("sfx/swarm/{a}/{}/b{k}", slot + 1)], bus: Bus::Sfx, gain: SWARM_GAIN, pos: Some(swarm_spot(at, *slot, k, turn)), speaker: None, priority: 2 });
+                }
+            }
+            v
         }
         Event::Whiff { god } => vec![Cue { keys: vec!["sfx/whiff".into()], bus: Bus::Sfx, gain: 0.6, pos: god_pos(*god), speaker: None, priority: 2 }],
         Event::Damage { pos, big, .. } => {
@@ -83,8 +106,58 @@ pub fn cues_for(ev: &Event, game: &Game) -> Vec<Cue> {
         }
         Event::TowerDown { pos, .. } => vec![Cue { keys: vec!["sfx/tower_down".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 6 }],
         Event::LevelUp { pos } => vec![Cue { keys: vec!["sfx/levelup".into()], bus: Bus::Sfx, gain: 0.7, pos: Some(*pos), speaker: None, priority: 3 }],
+        // the big beasts (dev/voice_script/beast_sfx.py, grown from a real
+        // snore): a boss wakes growling where it rises, groans where it
+        // falls, and a titan whose guard is down snorts -- heard map-wide,
+        // like the announcer's line it comes with
+        Event::BossSpawn { pos, .. } => vec![Cue { keys: vec!["sfx/beast/wake".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 6 }],
+        Event::BossDown { pos, .. } => vec![Cue { keys: vec!["sfx/beast/fall".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 6 }],
+        Event::TitanVulnerable { .. } => vec![Cue { keys: vec!["sfx/beast/snort".into()], bus: Bus::Sfx, gain: 0.8, pos: None, speaker: None, priority: 5 }],
+        // Hollowstep (`stalker`): his tread, loud and carrying, from him
+        // and from every other of him; the air closing where he stepped
+        // from; and a cat's own heart, pounding at it, harder the closer
+        // he is (heard near the cat: loud to whoever IS that cat)
+        Event::HeavyStep { pos } => vec![Cue { keys: vec!["sfx/stalker/step".into()], bus: Bus::Sfx, gain: 0.95, pos: Some(*pos), speaker: None, priority: 3 }],
+        Event::SwapFx { from, .. } => vec![Cue { keys: vec!["sfx/stalker/swap".into()], bus: Bus::Sfx, gain: 0.9, pos: Some(*from), speaker: None, priority: 4 }],
+        // a shadow torn out of Brasshowl's light: the air closing on it
+        Event::ShadowDriven { pos } => vec![Cue { keys: vec!["sfx/stalker/swap".into()], bus: Bus::Sfx, gain: 0.8, pos: Some(*pos), speaker: None, priority: 3 }],
+        // a Sentinel (`sentinel`): the ground taking her weight
+        // the Quarry's thorns: louder when it is the heavy bite (alone)
+        Event::ThornBite { pos, alone } => vec![Cue { keys: vec!["sfx/maze/thorns".into()], bus: Bus::Sfx, gain: if *alone { 0.85 } else { 0.55 }, pos: Some(*pos), speaker: None, priority: 3 }],
+        // the Quarry's machine (`machine`): a boulder let go, and a cat
+        // it runs down
+        Event::BoulderRoll { pos } => vec![Cue { keys: vec!["sfx/maze/boulder".into()], bus: Bus::Sfx, gain: 0.95, pos: Some(*pos), speaker: None, priority: 4 }],
+        Event::Smush { pos } => vec![Cue { keys: vec!["sfx/clay/smush".into()], bus: Bus::Sfx, gain: 0.8, pos: Some(*pos), speaker: None, priority: 3 }],
+        Event::Slosh { pos } => vec![Cue { keys: vec!["sfx/clay/slosh".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 4 }],
+        Event::BoulderLand { pos } => vec![Cue { keys: vec!["sfx/maze/land".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 4 }],
+        Event::PadDrop { pos } => vec![Cue { keys: vec!["sfx/maze/trapdoor".into()], bus: Bus::Sfx, gain: 0.7, pos: Some(*pos), speaker: None, priority: 2 }],
+        Event::CatFell { pos } => vec![Cue { keys: vec!["sfx/hit_big".into()], bus: Bus::Sfx, gain: 0.9, pos: Some(*pos), speaker: None, priority: 5 }],
+        Event::BoulderHit { pos } => vec![Cue { keys: vec!["sfx/hit_big".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 5 }],
+        // the labyrinth turning: heard everywhere
+        Event::LabyrinthTurns => vec![Cue { keys: vec!["sfx/maze/turn".into()], bus: Bus::Sfx, gain: 0.8, pos: None, speaker: None, priority: 5 }],
+        Event::Tread { pos } => vec![Cue { keys: vec!["sfx/sentinel/tread".into()], bus: Bus::Sfx, gain: 0.85, pos: Some(*pos), speaker: None, priority: 2 }],
+        Event::Heartbeat { god, fear } => vec![Cue { keys: vec!["sfx/stalker/heart".into()], bus: Bus::Sfx, gain: 0.45 + 0.55 * fear, pos: god_pos(*god), speaker: None, priority: 4 }],
         _ => Vec::new(),
     }
+}
+
+/// The most voices in an ancestor's swarm (`sfx/swarm/<ancestor>/<N>/b<k>`,
+/// k < SWARM_MAX): a crowd that answers an ability -- Sproutkit's babies.
+/// Each is placed at its own spot round the caster ([`swarm_spot`]), so the
+/// ordinary panning spreads the crowd around him. A missing key is silence,
+/// so an ancestor with no swarm files has none.
+pub const SWARM_MAX: usize = 8;
+/// How far round the caster the swarm stands.
+pub const SWARM_RING: f32 = 3.0;
+/// One swarm voice's gain (a crowd of them, under the cast sound).
+pub const SWARM_GAIN: f32 = 0.5;
+
+/// Where swarm voice `k` of ability `slot` stands round `at`: on a ring,
+/// a golden angle apart (so any first few are spread round, not bunched),
+/// turned a little per ability and by `turn` (radians) per cast.
+pub fn swarm_spot(at: Vec3, slot: u32, k: usize, turn: f32) -> Vec3 {
+    let a = k as f32 * 2.399_963 + slot as f32 * 0.7 + turn;
+    at + Vec3::new(a.cos(), 0.0, a.sin()) * SWARM_RING
 }
 
 /// Voice lines further than this from the listener are not spoken.
@@ -155,6 +228,81 @@ mod tests {
         assert!(c[0].keys[1].starts_with("sfx/cast/") && c[0].keys[2] == "sfx/cast");
     }
 
+    /// Every cast is spoken exactly once: an ability with a wind-up on its
+    /// CastStart, one without (a shield, a coat) on its Cast. Brasshowl's
+    /// Watchfire (a Shield, instant) was never heard.
+    #[test]
+    fn every_cast_is_spoken_once() {
+        let g = Game::new_teams(&[16], &[0]);
+        let voiced = |c: &[Cue]| c.iter().filter(|c| c.bus == Bus::Voice).count();
+        let brass = crate::gods::god(16);
+        for slot in 0..4u32 {
+            let instant = crate::abilities::cast_timing(&brass.abilities[slot as usize]).0 <= 0.0;
+            let at_start = voiced(&cues_for(&Event::CastStart { god: 0, slot, aim: Vec3::ZERO, dur: 0.3 }, &g));
+            let at_cast = voiced(&cues_for(&Event::Cast { god: 0, slot, aim: Vec3::ZERO }, &g));
+            // an instant ability never sends a CastStart
+            let heard = if instant { at_cast } else { at_start + at_cast };
+            assert_eq!(heard, 1, "{} (instant: {instant}) is spoken {heard} times", brass.abilities[slot as usize].name);
+        }
+        assert!(brass.abilities.iter().any(|a| crate::abilities::cast_timing(a).0 <= 0.0), "no instant ability to test");
+    }
+
+    /// The swarm's ring turns cast to cast: Hollowstep's phantoms (and
+    /// Sproutkit's babies) speak from somewhere new round him each time.
+    #[test]
+    fn a_swarm_stands_somewhere_new_each_cast() {
+        let mut g = game();
+        let at = g.gods[0].pos;
+        let spot = |g: &Game| {
+            let c = cues_for(&Event::Cast { god: 0, slot: 0, aim: Vec3::ZERO }, g);
+            c.iter().find(|c| c.keys[0].ends_with("/b0")).unwrap().pos.unwrap() - at
+        };
+        let mut seen = Vec::new();
+        for k in 0..6 {
+            g.t = 3.0 + k as f32 * 1.7;
+            seen.push(spot(&g));
+        }
+        let distinct = (0..seen.len()).filter(|&i| (0..i).all(|j| seen[i].distance(seen[j]) > 0.5)).count();
+        assert!(distinct >= 5, "the first phantom stood in only {distinct} different places over 6 casts: {seen:?}");
+    }
+
+    /// A cast asks for its swarm: SWARM_MAX voices, each its own key, each
+    /// on the ring round the caster, spread all round -- a listener at the
+    /// caster hears them on both sides and in front and behind.
+    #[test]
+    fn a_cast_brings_its_swarm_round_the_caster() {
+        let g = game();
+        let a = ancestor_key(&g, 0);
+        let at = g.gods[0].pos;
+        let c = cues_for(&Event::Cast { god: 0, slot: 3, aim: Vec3::ZERO }, &g);
+        let swarm: Vec<&Cue> = c.iter().filter(|c| c.keys[0].starts_with("sfx/swarm/")).collect();
+        assert_eq!(swarm.len(), SWARM_MAX);
+        let keys: std::collections::HashSet<_> = swarm.iter().map(|c| c.keys[0].clone()).collect();
+        assert_eq!(keys.len(), SWARM_MAX, "one voice per key");
+        assert!(keys.contains(&format!("sfx/swarm/{a}/4/b0")));
+        let (mut left, mut right, mut ahead, mut behind) = (0, 0, 0, 0);
+        for s in &swarm {
+            assert_eq!(s.bus, Bus::Sfx);
+            assert!(s.priority < c[0].priority, "the crowd gives way before the cast sound");
+            let p = s.pos.unwrap();
+            let r = Vec3::new(p.x - at.x, 0.0, p.z - at.z).length();
+            assert!((r - SWARM_RING).abs() < 1e-3, "on the ring: {r}");
+            let (_, pan) = place(s, at, Vec3::X).unwrap();
+            left += (pan < -0.3) as i32;
+            right += (pan > 0.3) as i32;
+            ahead += (p.z - at.z > 0.5) as i32;
+            behind += (p.z - at.z < -0.5) as i32;
+        }
+        assert!(left >= 2 && right >= 2 && ahead >= 2 && behind >= 2, "all round: {left} {right} {ahead} {behind}");
+        // the first three already spread (golden angle): no two within 60 deg
+        for i in 0..3 {
+            for j in 0..i {
+                let (a, b) = (swarm_spot(at, 3, i, 0.0) - at, swarm_spot(at, 3, j, 0.0) - at);
+                assert!(a.normalize().dot(b.normalize()) < 0.5, "voices {i} and {j} bunched");
+            }
+        }
+    }
+
     #[test]
     fn a_kill_is_the_killer_and_the_victim() {
         let g = game();
@@ -167,6 +315,30 @@ mod tests {
 
     /// Left is left: a sound to the listener's right pans right; far away is
     /// quieter; a far voice line is not spoken; the announcer is everywhere.
+    #[test]
+    fn the_big_beasts_are_heard_waking_falling_and_snorting() {
+        use crate::bosses::BossKind;
+        let g = game();
+        let p = Vec3::new(3.0, 0.0, -4.0);
+        let kind = BossKind::Boar;
+        let one = |ev: Event| {
+            let c = cues_for(&ev, &g);
+            assert_eq!(c.len(), 1, "{ev:?}");
+            c.into_iter().next().unwrap()
+        };
+        let w = one(Event::BossSpawn { kind, pos: p });
+        assert_eq!((w.keys[0].as_str(), w.pos), ("sfx/beast/wake", Some(p)));
+        let f = one(Event::BossDown { kind, pos: p, team: None });
+        assert_eq!((f.keys[0].as_str(), f.pos), ("sfx/beast/fall", Some(p)));
+        let s = one(Event::TitanVulnerable { team: g.gods[0].team });
+        assert_eq!((s.keys[0].as_str(), s.pos), ("sfx/beast/snort", None));
+        // and the files are there to be played
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/audio");
+        for k in [&w, &f, &s] {
+            assert!(dir.join(format!("{}.opus", k.keys[0])).is_file(), "{}", k.keys[0]);
+        }
+    }
+
     #[test]
     fn placement_pans_fades_and_limits_voices() {
         let cue = Cue { keys: vec![], bus: Bus::Sfx, gain: 1.0, pos: Some(Vec3::new(10.0, 0.0, 0.0)), speaker: None, priority: 1 };
