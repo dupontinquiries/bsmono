@@ -79,6 +79,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("select") {
         return run_select_shot();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("custom") {
+        return run_select_shot();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("aim") {
         return run_aim_shots();
     }
@@ -1374,10 +1377,11 @@ pub fn run_select_shot() -> Result<(), String> {
     let mut st = UiState::new();
     st.map_choice = crate::map::MapId::Sky;
     st.selected = crate::gods::ROSTER_LEN - 1; // the newest ancestor
-    // the god limit as a launch would set it (CLAWBOUND_GODS / _MIRROR)
-    let o = crate::launch::LaunchOptions::from_process();
-    st.god_limit = o.gods.unwrap_or_default();
-    st.mirror = o.mirror;
+    // the rules as a launch would set them (CLAWBOUND_RULES / _GODS / _MIRROR)
+    st.rules = crate::launch::LaunchOptions::from_process().rules;
+    // CLAWBOUND_SHOTS=custom: the custom-game screen instead
+    let custom = std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("custom");
+    st.custom = custom;
     clear(&renderer.device, &renderer.queue, &view);
     let mut textures = egui::TexturesDelta::default();
     let mut out = None;
@@ -1388,15 +1392,23 @@ pub fn run_select_shot() -> Result<(), String> {
             time: Some(k as f64 * 0.016),
             ..Default::default()
         };
-        let o = ctx.run(raw, |c| ui::draw_select(c, &mut st, &mut locked));
+        let o = ctx.run(raw, |c| {
+            if custom {
+                let (mut next, mut back) = (false, false);
+                ui::draw_custom(c, &mut st, &mut next, &mut back);
+            } else {
+                ui::draw_select(c, &mut st, &mut locked);
+            }
+        });
         textures.append(o.textures_delta.clone());
         out = Some(o);
     }
     let mut out = out.expect("ran");
     out.textures_delta = textures;
     draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
-    save_shot(&renderer.device, &renderer.queue, &target, "select_map_picker.png")?;
-    println!("saved select_map_picker.png");
+    let name = if custom { "custom_game.png" } else { "select_map_picker.png" };
+    save_shot(&renderer.device, &renderer.queue, &target, name)?;
+    println!("saved {name}");
     Ok(())
 }
 

@@ -15,7 +15,7 @@ pub enum HandoffRole {
     Join,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct LaunchOptions {
     /// `--quick-match`: skip the menu and character select, pick a random
     /// ancestor, straight into a 5v5.
@@ -39,12 +39,13 @@ pub struct LaunchOptions {
     /// `--map <jungle|pass|starwell|atlantis>` (or `CLAWBOUND_MAP`): which map to play. Chosen
     /// at launch because the terrain mesh is built with the renderer.
     pub map: crate::map::MapId,
-    /// `--gods <lobby|team|open>` (or `CLAWBOUND_GODS`): the god limit
-    /// (`picks`); the select screen's choice otherwise.
-    pub gods: Option<crate::picks::GodLimit>,
-    /// `--mirror` (or `CLAWBOUND_MIRROR=1`): under no limit, every bot
-    /// plays the player's ancestor. Implies `--gods open`.
-    pub mirror: bool,
+    /// A custom game's rules (`rules`), from `--rules "level=6 cd=0.5"`
+    /// (or `CLAWBOUND_RULES`), `--gods <lobby|team|open>` (or
+    /// `CLAWBOUND_GODS`) and `--mirror` (or `CLAWBOUND_MIRROR=1`; implies
+    /// `--gods open`). Default: a normal match.
+    pub rules: crate::rules::MatchRules,
+    /// Why a `--rules` text was not read, if it was not.
+    pub rules_error: Option<String>,
 }
 
 impl LaunchOptions {
@@ -64,8 +65,18 @@ impl LaunchOptions {
                     o.ancestor = it.next();
                     o.quick_match = true;
                 }
-                "--gods" => o.gods = it.next().as_deref().and_then(crate::picks::GodLimit::from_key),
-                "--mirror" => o.mirror = true,
+                "--gods" => {
+                    if let Some(g) = it.next().as_deref().and_then(crate::picks::GodLimit::from_key) {
+                        o.rules.gods = g;
+                    }
+                }
+                "--mirror" => o.rules.mirror = true,
+                "--rules" => {
+                    let text = it.next().unwrap_or_default();
+                    if let Err(e) = o.rules.parse_onto(&text) {
+                        o.rules_error = Some(e);
+                    }
+                }
                 "--map" => {
                     if let Some(m) = it.next().as_deref().and_then(crate::map::MapId::from_key) {
                         o.map = m;
@@ -91,11 +102,16 @@ impl LaunchOptions {
             o.map = m;
         }
         if let Some(g) = env("CLAWBOUND_GODS").as_deref().and_then(crate::picks::GodLimit::from_key) {
-            o.gods = Some(g);
+            o.rules.gods = g;
         }
-        o.mirror |= env("CLAWBOUND_MIRROR").as_deref() == Some("1");
-        if o.mirror {
-            o.gods = Some(crate::picks::GodLimit::Open);
+        o.rules.mirror |= env("CLAWBOUND_MIRROR").as_deref() == Some("1");
+        if let Some(text) = env("CLAWBOUND_RULES") {
+            if let Err(e) = o.rules.parse_onto(&text) {
+                o.rules_error = Some(e);
+            }
+        }
+        if o.rules.mirror {
+            o.rules.gods = crate::picks::GodLimit::Open;
         }
         // a handoff means "we were sent here to play": don't sit at the menu
         if o.handoff.is_some() {
@@ -128,14 +144,20 @@ mod tests {
     }
 
     #[test]
-    fn the_god_limit_comes_from_the_flag_or_the_env() {
+    fn the_match_rules_come_from_the_flags_or_the_env() {
+        use crate::picks::GodLimit;
         let o = LaunchOptions::parse(vec!["--gods".to_string(), "team".to_string()], &env_of(&[]));
-        assert_eq!((o.gods, o.mirror), (Some(crate::picks::GodLimit::Team), false));
+        assert_eq!((o.rules.gods, o.rules.mirror), (GodLimit::Team, false));
         let o = LaunchOptions::parse(vec!["--mirror".to_string()], &env_of(&[]));
-        assert_eq!((o.gods, o.mirror), (Some(crate::picks::GodLimit::Open), true), "the mirror is a no-limit fill");
+        assert_eq!((o.rules.gods, o.rules.mirror), (GodLimit::Open, true), "the mirror is a no-limit fill");
         let o = LaunchOptions::parse(Vec::<String>::new(), &env_of(&[("CLAWBOUND_GODS", "open")]));
-        assert_eq!(o.gods, Some(crate::picks::GodLimit::Open));
-        assert_eq!(LaunchOptions::parse(Vec::<String>::new(), &env_of(&[])).gods, None);
+        assert_eq!(o.rules.gods, GodLimit::Open);
+        let o = LaunchOptions::parse(vec!["--rules".to_string(), "level=6 cd=0.5".to_string()], &env_of(&[]));
+        assert_eq!((o.rules.start_level, o.rules.cd_mul, o.rules_error.is_none()), (6, 0.5, true));
+        let o = LaunchOptions::parse(Vec::<String>::new(), &env_of(&[("CLAWBOUND_RULES", "gold=9000 wings=2")]));
+        assert_eq!(o.rules.start_gold, 9000.0, "the readable part still applies");
+        assert!(o.rules_error.as_deref().unwrap_or("").contains("wings"));
+        assert!(LaunchOptions::parse(Vec::<String>::new(), &env_of(&[])).rules.is_default());
     }
 
     #[test]

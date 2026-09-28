@@ -498,6 +498,9 @@ pub enum ZoneKind {
 
 pub struct Game {
     pub t: f32,
+    /// A custom game's rules (`rules`; the default is a normal match).
+    /// Set with [`Game::apply_rules`].
+    pub rules: crate::rules::MatchRules,
     pub gods: Vec<GodUnit>,
     pub minions: Vec<Minion>,
     pub towers: Vec<Tower>,
@@ -782,6 +785,7 @@ impl Game {
             vision: Default::default(),
             next_minion_id: 0,
             waves: 0,
+            rules: Default::default(),
         };
         for t in &g.towers {
             g.tower_alive[t.team as usize] += 1;
@@ -871,10 +875,11 @@ impl Game {
 
     pub fn recalc(&mut self, i: usize) {
         let def = self.def(i);
+        let hp_mul = self.rules.hp_mul;
         let g = &mut self.gods[i];
         let (base_hp, base_mana, _, base_power, base_prot) = def.at_level(g.level);
         let st = Self::item_stats(g);
-        let new_max = base_hp + st.health;
+        let new_max = (base_hp + st.health) * hp_mul;
         let hp_frac = if g.max_hp > 0.0 { g.hp / g.max_hp } else { 1.0 };
         g.max_hp = new_max;
         g.hp = (new_max * hp_frac).max(g.hp.min(new_max));
@@ -1266,7 +1271,7 @@ impl Game {
             g.deaths += 1;
             // overtime (the sky map) stretches the wait too: a won fight then
             // opens the base long enough for a wave to reach the Elder
-            g.respawn_t = respawn_time(g.level) * crate::map::active().overtime(self.t).min(2.0);
+            g.respawn_t = respawn_time(g.level) * crate::map::active().overtime(self.t).min(2.0) * self.rules.respawn_mul;
             g.hp = 0.0;
             g.shield = 0.0;
             g.dash = None;
@@ -1303,6 +1308,34 @@ impl Game {
         }
     }
 
+    /// Play this match under `rules`: every cat to the starting level (its
+    /// stats and ability ranks with it), full health and mana, the
+    /// starting gold. Call once, at the start, after `new_teams`.
+    ///
+    /// A bot has already made its opening buy from `START_GOLD` by then
+    /// (`new_teams`), so with a different purse that buy is undone and made
+    /// again from the new one; with the normal purse it is left alone, and
+    /// a normal match's rules change nothing.
+    pub fn apply_rules(&mut self, rules: crate::rules::MatchRules) {
+        self.rules = rules;
+        let purse = (rules.start_gold - START_GOLD).abs() > 1e-3;
+        for gi in 0..self.gods.len() {
+            if purse {
+                let g = &mut self.gods[gi];
+                g.items.clear();
+                g.stacks.clear();
+                g.gold = rules.start_gold;
+            }
+            self.set_level(gi, rules.start_level);
+            if purse && !self.gods[gi].is_player {
+                self.auto_buy(gi);
+            }
+            let g = &mut self.gods[gi];
+            g.hp = g.max_hp;
+            g.mana = g.max_mana;
+        }
+    }
+
     /// Put cat `gi` at `level` (XP cleared), its stats and ability ranks
     /// with it. For tests and shots that need a kit unlocked.
     pub fn set_level(&mut self, gi: usize, level: u32) {
@@ -1313,6 +1346,7 @@ impl Game {
 
     pub fn grant_xp(&mut self, gi: usize, mut xp: f32) {
         xp *= 1.0 + 0.02 * (self.t / 60.0).min(8.0); // late-game scaling
+        xp *= self.rules.xp_mul;
         let g = &mut self.gods[gi];
         g.xp += xp;
         let mut leveled = false;

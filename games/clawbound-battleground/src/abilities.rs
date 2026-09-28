@@ -151,7 +151,7 @@ impl Game {
             return;
         }
         // cooldown with CDR
-        let cd = ab.cooldown * (1.0 - g.cdr);
+        let cd = ab.cooldown * (1.0 - g.cdr) * self.rules.cd_mul;
         let (from, power, pen_pct, pen_flat) = (g.pos, g.power, g.pen_pct, g.pen_flat);
         let team = g.team;
         let pos_y = from + Vec3::Y * 1.3;
