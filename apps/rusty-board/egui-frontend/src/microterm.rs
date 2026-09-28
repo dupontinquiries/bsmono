@@ -148,16 +148,10 @@ pub fn microterm_ui(ui: &mut egui::Ui, m: &mut Microterm,
     let mut tapped = None;
     match m.content().clone() {
         Content::Status(s) => { ui.label(egui::RichText::new(s).small()); }
-        Content::VoicePreview { partial, .. } => {
-            ui.horizontal(|ui| {
-                let (r, _) = ui.allocate_exact_size(egui::Vec2::new(40.0, 6.0), egui::Sense::hover());
-                ui.painter().rect_filled(r, 2.0, colors.bg_card);
-                let mut f = r;
-                f.set_width(r.width() * m.level());
-                ui.painter().rect_filled(f, 2.0, colors.accent);
-                ui.label(egui::RichText::new(partial).italics().small());
-            });
-        }
+        // The transcript and its level meter are drawn ABOVE the keys by the
+        // keyboard (`demo_app::voice_live_panel`); this strip only holds the
+        // Done/Cancel row the caller draws around it.
+        Content::VoicePreview { .. } => {}
         Content::StenoSuggestions { buffer, .. } => {
             ui.horizontal_wrapped(|ui| {
                 if !buffer.trim().is_empty() {

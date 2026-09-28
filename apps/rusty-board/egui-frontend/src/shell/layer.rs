@@ -305,7 +305,8 @@ pub fn run(title: &str) -> Result<(), LayerError> {
         // keyboard UI about 20 times a second, forever, queueing each frame's textures:
         // reported as 4+ GB and an overheating phone.
         let can_paint = mapped && state.configured && !state.frame_pending;
-        let due = !state.events.is_empty()
+        let due = feel.take_needs_frame()
+            || !state.events.is_empty()
             || (state.needs_paint && can_paint)
             || wanted != mapped
             || Instant::now() >= repaint_at;
@@ -316,7 +317,7 @@ pub fn run(title: &str) -> Result<(), LayerError> {
         if !due {
             let sink_fd = feel.sink_wake_fd().filter(|_| !state.sink_fd_dead);
             let timeout = deadline_timeout(repaint_at, &state, sink_fd.is_some());
-            wait_for_socket(&conn, &mut queue, &mut state, timeout, sink_fd)?;
+            wait_for_socket(&conn, &mut queue, &mut state, timeout, sink_fd, feel.ctl_fd())?;
             continue;
         }
 
@@ -433,7 +434,7 @@ pub fn run(title: &str) -> Result<(), LayerError> {
         // ---- 4. sleep until the socket is readable or egui's next deadline.
         let sink_fd = feel.sink_wake_fd().filter(|_| !state.sink_fd_dead);
         let timeout = deadline_timeout(repaint_at, &state, sink_fd.is_some());
-        wait_for_socket(&conn, &mut queue, &mut state, timeout, sink_fd)?;
+        wait_for_socket(&conn, &mut queue, &mut state, timeout, sink_fd, feel.ctl_fd())?;
         let _ = repaint_delay;
     }
 
@@ -556,6 +557,7 @@ fn wait_for_socket(
     state: &mut State,
     timeout: Duration,
     sink_fd: Option<i32>,
+    ctl_fd: Option<i32>,
 ) -> Result<(), LayerError> {
     conn.flush().map_err(|e| LayerError::Runtime(anyhow::anyhow!("flush: {e}")))?;
     // Anything already buffered is dispatched before sleeping, so an event that arrived
@@ -566,17 +568,21 @@ fn wait_for_socket(
         // Our socket, plus the input-method connection's when the sink has one: an
         // Activate/Deactivate on that connection wakes us directly. The sink's socket is
         // only WATCHED here; `Feel::pump_sink` at the top of the loop reads it.
+        // A negative fd is ignored by poll(2), so absent ones simply never fire.
+        // The ctl socket (ctl.rs) is watched the same way: a command from the
+        // shell wakes an idle keyboard at once.
         let mut pfds = [
             libc::pollfd { fd: fd.as_fd().as_raw_fd_compat(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: sink_fd.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: ctl_fd.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
         ];
-        let n = if sink_fd.is_some() { 2 } else { 1 };
+        let n = 3;
         let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
         // SAFETY: pfds is a valid, initialised array of `n` pollfds for the duration of the call.
         let _ = unsafe { libc::poll(pfds.as_mut_ptr(), n as libc::nfds_t, ms) };
         // A hung-up input-method socket stays "ready" forever; stop watching it (the
         // sink's own pump logs the dead connection) rather than spin on it.
-        if n == 2 && pfds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        if sink_fd.is_some() && pfds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
             if !state.sink_fd_dead {
                 tracing::warn!("layer: input-method socket hung up; falling back to timed polling");
             }

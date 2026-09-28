@@ -13,7 +13,7 @@
 //! stays the popup's baseline either way (see `aperture_lsp`'s crate doc for
 //! why LSP is an ADDITIONAL tier, not a replacement).
 
-use aperture_lsp::{CompletionItem, Diagnostic, Hover, Location, LspClient};
+use aperture_lsp::{CompletionItem, Diagnostic, Hover, IncomingCall, Location, LspClient};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::Duration;
 
@@ -43,6 +43,7 @@ enum Msg {
     Complete { uri: String, line: u32, character: u32, generation: u64 },
     Definition { uri: String, line: u32, character: u32, generation: u64 },
     HoverAt { uri: String, line: u32, character: u32, generation: u64 },
+    Callers { uri: String, line: u32, character: u32, generation: u64 },
 }
 
 /// A completed (or failed-and-empty) completion request, tagged with the
@@ -63,6 +64,17 @@ pub struct DefinitionOutcome {
     pub locations: Vec<Location>,
 }
 
+/// Who calls / mentions the symbol at the caret. `calls` when the server
+/// has call hierarchy (every entry is a CALL, with its caller named);
+/// otherwise `refs` from `textDocument/references` (every mention, callers
+/// unnamed). `error` when the server offers neither — said, not silent.
+pub struct CallersOutcome {
+    pub generation: u64,
+    pub calls: Vec<IncomingCall>,
+    pub refs: Vec<Location>,
+    pub error: Option<String>,
+}
+
 /// Same shape again, for `textDocument/hover`.
 pub struct HoverOutcome {
     pub generation: u64,
@@ -75,25 +87,55 @@ pub struct LspWorker {
     diag_rx: Receiver<Vec<Diagnostic>>,
     def_rx: Receiver<DefinitionOutcome>,
     hover_rx: Receiver<HoverOutcome>,
+    callers_rx: Receiver<CallersOutcome>,
+    /// The handshake's result, once: `Ok` when the server is up, `Err`
+    /// when it could not be started or never answered `initialize`.
+    ready_rx: Receiver<Result<(), String>>,
 }
 
 impl LspWorker {
-    /// Spawn `cmd` and hand it `root_uri`. Fails exactly when
-    /// `LspClient::spawn` does (the command isn't on `PATH`, or the
-    /// `initialize` handshake itself errors) — there is no separate
-    /// "worker started but client didn't" state to reason about.
+    /// Start `cmd` for `root_uri` WITHOUT waiting for it.
+    ///
+    /// The handshake runs on the worker thread. It used to run here, on the
+    /// caller's thread — the UI thread, from `open_file` — and
+    /// `initialize` may wait up to `CALL_TIMEOUT` (90 s): a server that is
+    /// alive but slow or wedged froze the editor for that long every time a
+    /// .rs file was opened. Requests sent before the handshake finishes wait
+    /// in the inbox and are answered after it; [`Self::poll_ready`] reports
+    /// how it went, and on failure the worker thread exits.
     pub fn spawn(cmd: &str, args: &[&str], root_uri: &str) -> std::io::Result<Self> {
-        let client = LspClient::spawn(cmd, args, root_uri)?;
+        let (ready_tx, ready_rx) = channel::<Result<(), String>>();
+        let (cmd, args, root_uri) = (cmd.to_string(), args.iter().map(|a| a.to_string()).collect::<Vec<_>>(), root_uri.to_string());
         let (tx, worker_rx) = channel::<Msg>();
         let (out_tx, rx) = channel::<LspOutcome>();
         let (diag_tx, diag_rx) = channel::<Vec<Diagnostic>>();
         let (def_tx, def_rx) = channel::<DefinitionOutcome>();
         let (hover_tx, hover_rx) = channel::<HoverOutcome>();
+        let (callers_tx, callers_rx) = channel::<CallersOutcome>();
         std::thread::Builder::new()
             .name("aperture-lsp-worker".into())
-            .spawn(move || worker(client, worker_rx, out_tx, diag_tx, def_tx, hover_tx))
+            .spawn(move || {
+                let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                let client = match LspClient::spawn(&cmd, &argv, &root_uri) {
+                    Ok(c) => {
+                        let _ = ready_tx.send(Ok(()));
+                        c
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e.to_string()));
+                        return;
+                    }
+                };
+                worker(client, worker_rx, out_tx, diag_tx, def_tx, hover_tx, callers_tx)
+            })
             .expect("spawn LSP worker thread");
-        Ok(LspWorker { tx, rx, diag_rx, def_rx, hover_rx })
+        Ok(LspWorker { tx, rx, diag_rx, def_rx, hover_rx, callers_rx, ready_rx })
+    }
+
+    /// The handshake's outcome, reported once. `None` while it is still
+    /// running (and every time after it has been read).
+    pub fn poll_ready(&self) -> Option<Result<(), String>> {
+        self.ready_rx.try_recv().ok()
     }
 
     pub fn open(&self, uri: String, text: String) {
@@ -145,12 +187,28 @@ impl LspWorker {
     }
 
     /// Non-blocking; call once per frame.
+    pub fn request_callers(&self, uri: String, line: u32, character: u32, generation: u64) {
+        let _ = self.tx.send(Msg::Callers { uri, line, character, generation });
+    }
+
+    pub fn poll_callers(&self) -> Option<CallersOutcome> {
+        self.callers_rx.try_recv().ok()
+    }
+
     pub fn poll_hover(&self) -> Option<HoverOutcome> {
         self.hover_rx.try_recv().ok()
     }
 }
 
-fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx: Sender<Vec<Diagnostic>>, def_tx: Sender<DefinitionOutcome>, hover_tx: Sender<HoverOutcome>) {
+fn worker(
+    client: LspClient,
+    rx: Receiver<Msg>,
+    tx: Sender<LspOutcome>,
+    diag_tx: Sender<Vec<Diagnostic>>,
+    def_tx: Sender<DefinitionOutcome>,
+    hover_tx: Sender<HoverOutcome>,
+    callers_tx: Sender<CallersOutcome>,
+) {
     // Drain-to-newest before acting, same shape as aperture_complete's own
     // worker loop: Open/Change messages all apply in order (each is a real,
     // needed state transition the server must see), but if several
@@ -160,6 +218,7 @@ fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx:
     let mut pending_complete: Option<(String, u32, u32, u64)> = None;
     let mut pending_definition: Option<(String, u32, u32, u64)> = None;
     let mut pending_hover: Option<(String, u32, u32, u64)> = None;
+    let mut pending_callers: Option<(String, u32, u32, u64)> = None;
     // The URI diagnostics get checked against — whatever the last Open or
     // Change named. `publishDiagnostics` is a PUSH, not a reply to
     // anything this worker asked for, so there is no message to drain for
@@ -209,6 +268,9 @@ fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx:
                 Some(Msg::HoverAt { uri, line, character, generation }) => {
                     pending_hover = Some((uri, line, character, generation));
                 }
+                Some(Msg::Callers { uri, line, character, generation }) => {
+                    pending_callers = Some((uri, line, character, generation));
+                }
                 None => break,
             }
             match rx.try_recv() {
@@ -235,6 +297,12 @@ fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx:
                 return; // receiver dropped
             }
         }
+        if let Some((uri, line, character, generation)) = pending_callers.take() {
+            let outcome = callers(&client, &uri, line, character, generation);
+            if callers_tx.send(outcome).is_err() {
+                return; // receiver dropped
+            }
+        }
         if let Some(uri) = &current_uri {
             let latest = client.diagnostics(uri);
             if latest != last_diagnostics {
@@ -244,5 +312,45 @@ fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx:
                 }
             }
         }
+    }
+}
+
+
+fn callers(client: &LspClient, uri: &str, line: u32, character: u32, generation: u64) -> CallersOutcome {
+    let a = client.callers(uri, line, character);
+    CallersOutcome { generation, calls: a.calls, refs: a.refs, error: a.error }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn ready(w: &LspWorker) -> Result<(), String> {
+        let t = Instant::now();
+        loop {
+            if let Some(r) = w.poll_ready() {
+                return r;
+            }
+            assert!(t.elapsed() < Duration::from_secs(10), "no handshake result");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_wedged_server_does_not_block_the_caller() {
+        // Alive, reads nothing, answers nothing: `initialize` would wait
+        // out the full 90 s CALL_TIMEOUT.
+        let t = Instant::now();
+        let w = LspWorker::spawn("sh", &["-c", "sleep 30"], "file:///tmp").unwrap();
+        assert!(t.elapsed() < Duration::from_millis(500), "spawn waited {:?}", t.elapsed());
+        assert!(w.poll_ready().is_none(), "still handshaking, and that is fine");
+        w.request_definition("file:///x.rs".into(), 0, 0, 1); // queues, does not block
+    }
+
+    #[test]
+    fn a_missing_server_reports_failure_through_poll_ready() {
+        let w = LspWorker::spawn("aperture-no-such-language-server", &[], "file:///tmp").unwrap();
+        assert!(ready(&w).is_err());
     }
 }

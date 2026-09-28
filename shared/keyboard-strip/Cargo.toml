@@ -1,0 +1,9 @@
+[package]
+name = "keyboard-strip"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "An app tells the on-screen keyboard (rusty-board) which of its commands to offer while it has focus; the keyboard shows them as a strip above the keys and sends the chosen one back as a key chord. Protocol + the keyboard's datagram-socket transport; std + net-kit's field escaping."
+
+[dependencies]
+net-kit = { path = "../net-kit" }

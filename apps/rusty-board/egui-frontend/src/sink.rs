@@ -80,6 +80,12 @@ pub trait Sink {
     fn focus_source(&self) -> crate::focus_policy::FocusSource {
         crate::focus_policy::FocusSource::None
     }
+
+    /// What the focused field has told the keyboard about itself: its
+    /// purpose, and whether something is selected (`edit_actions`).
+    fn edit_context(&self) -> crate::edit_actions::EditContext {
+        Default::default()
+    }
 }
 
 /// The desktop/test sink: remembers everything, sends nothing.
@@ -184,6 +190,12 @@ impl Sink for crate::wayland::WaylandIntegration {
         crate::focus_policy::FocusSource::InputMethod {
             active: crate::wayland::WaylandIntegration::is_active(self),
             unavailable: board_compositor::im_health::input_method_unavailable(),
+        }
+    }
+    fn edit_context(&self) -> crate::edit_actions::EditContext {
+        crate::edit_actions::EditContext {
+            purpose: crate::edit_actions::Purpose::from_v1(board_compositor::content_purpose::content_purpose()),
+            selection: crate::wayland::WaylandIntegration::has_selection(self),
         }
     }
 }

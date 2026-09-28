@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Keyboard Settings
+GenericName=On-Screen Keyboard Settings
+Comment=Rusty Board settings and custom layouts
+Exec=rusty-board-settings
+Icon=org.rustyboard.RustyBoard
+Terminal=false
+Categories=Settings;Utility;Accessibility;
+Keywords=keyboard;osk;layout;rusty-board;
+StartupNotify=true
+StartupWMClass=org.rustyboard.RustyBoard.Settings
+X-Purism-FormFactor=Workstation;Mobile;

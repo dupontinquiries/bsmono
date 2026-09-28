@@ -147,7 +147,7 @@ pub fn parse(args: &[&str]) -> Result<Cmd, CmdError> {
                     // every real one -- those lists hold a single default,
                     // which is a starting point and not a menu. Only `Choice`
                     // has alternatives to be wrong about.
-                    if matches!(s.kind, Kind::Text | Kind::Secret | Kind::Color) {
+                    if matches!(s.kind, Kind::Text | Kind::Secret | Kind::Color | Kind::Font) {
                         return Ok(Cmd::Set(s.key, (*v).to_string()));
                     }
                     // Accept the DISPLAY label as well as the stored value:
@@ -205,6 +205,7 @@ fn kind_hint(k: Kind) -> &'static str {
         Kind::Text => "text",
         Kind::Secret => "secret",
         Kind::Color => "#rrggbb or empty",
+        Kind::Font => "font family or file, empty = built-in",
     }
 }
 

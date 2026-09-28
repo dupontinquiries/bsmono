@@ -41,7 +41,9 @@ impl Group {
         match self {
             Group::Layout => "Layout",
             Group::Typing => "Typing",
-            Group::Colors => "Colors",
+            // Fonts joined the colours; the key stays `Colors` so stored
+            // values and the CLI's group name keep working.
+            Group::Colors => "Look",
             Group::Llm => "LLM",
             Group::Experimental => "Experimental",
         }
@@ -85,6 +87,10 @@ pub enum Kind {
     /// colour that happens to equal the theme's are different states — one
     /// follows the theme when it changes and the other does not.
     Color,
+    /// A font: an installed family name (resolved with fontconfig) or a path
+    /// to a .ttf/.otf file. Empty is the built-in face. Its own kind because
+    /// the control is a picker over the installed fonts, not a text box.
+    Font,
 }
 
 /// One multiple-choice setting.
@@ -166,11 +172,12 @@ pub const SETTINGS: &[Setting] = &[
         key: "layout.experimental_mode", label: "Mode",
         help: "Off = normal keyboard. Cardinal = 3×3 swipe grid. \
                Stenotype = 4-button steno (very experimental). \
-               Words = 5-col cardinal with prose / C / Rust / Python clusters.",
+               Words = 5-col cardinal with prose / C / Rust / Python clusters. \
+               Morse = a three-key keyer (tap dot, hold dash).",
         group: Group::Experimental,
         kind: Kind::Choice,
-        options: &["Off", "Cardinal", "Stenotype", "Words"],
-        values: &["off", "cardinal", "stenotype", "words"],
+        options: &["Off", "Cardinal", "Stenotype", "Words", "Morse"],
+        values: &["off", "cardinal", "stenotype", "words", "morse"],
     },
     // ── Typing: ported from the GTK panel, help text verbatim ───────────
     //
@@ -202,6 +209,24 @@ pub const SETTINGS: &[Setting] = &[
         kind: Kind::Choice,
         options: &["Normal", "Slow", "Fast"], values: &["normal", "slow", "fast"],
     },
+    // Morse (morse.rs): the board is `layout.experimental_mode = morse`;
+    // these two tune it, and let every OTHER board teach it.
+    Setting {
+        key: "typing.morse_feel", label: "Feel words in Morse",
+        help: "On a vibrating phone, each swiped word plays its Morse code, so the \
+               code is learned in passing on the way to typing without looking.",
+        group: Group::Typing,
+        kind: Kind::Choice,
+        options: &["Off", "On"], values: &["off", "on"],
+    },
+    Setting {
+        key: "typing.morse_speed", label: "Morse speed",
+        help: "How long a hold is a dash and how long a pause ends a letter (Morse \
+               board), and how fast the words play (Feel words in Morse).",
+        group: Group::Typing,
+        kind: Kind::Choice,
+        options: &["Normal", "Slow", "Fast"], values: &["normal", "slow", "fast"],
+    },
     Setting {
         key: "typing.lenient_swipe", label: "Lenient swipe",
         help: "Accept faster, sloppier swipes. Trades precision for forgiveness.",
@@ -229,6 +254,37 @@ pub const SETTINGS: &[Setting] = &[
         group: Group::Typing,
         kind: Kind::Choice,
         options: &["On", "Off"], values: &["on", "off"],
+    },
+    // Key repeat: the GTK config's `key_repeat` / `repeat_delay_ms` /
+    // `repeat_interval_ms`, as two controls (key_hold.rs applies them).
+    Setting {
+        key: "typing.key_repeat", label: "Key repeat",
+        help: "Hold backspace or an arrow key to repeat it.",
+        group: Group::Typing,
+        kind: Kind::Choice,
+        options: &["On", "Off"], values: &["on", "off"],
+    },
+    Setting {
+        key: "typing.repeat_speed", label: "Repeat speed",
+        help: "How soon a held key starts repeating, and how fast.",
+        group: Group::Typing,
+        kind: Kind::Choice,
+        options: &["Normal", "Slow", "Fast"], values: &["normal", "slow", "fast"],
+    },
+    // ── Look: fonts ──────────────────────────────────────────────────────
+    Setting {
+        key: "look.font", label: "Key font",
+        help: "The face key labels are drawn in. Symbols it lacks still come from the built-in fallbacks.",
+        group: Group::Colors,
+        kind: Kind::Font,
+        options: &[""], values: &[""],
+    },
+    Setting {
+        key: "look.font_size", label: "Key label size",
+        help: "Label size relative to the key.",
+        group: Group::Colors,
+        kind: Kind::Choice,
+        options: &["Normal", "Small", "Large", "Larger"], values: &["normal", "small", "large", "larger"],
     },
     // ── Colors ───────────────────────────────────────────────────────────
     //
@@ -347,16 +403,16 @@ mod tests {
     }
 
     #[test]
-    fn the_experimental_mode_has_four_options_not_two() {
-        // Off, Cardinal, Stenotype, Words — a tap-to-toggle row that stopped at
-        // two would make the last two unreachable.
+    fn every_experimental_mode_is_reachable_by_tapping() {
+        // Off, Cardinal, Stenotype, Words, Morse — a tap-to-toggle row that
+        // stopped at two would make the rest unreachable.
         let s = find("layout.experimental_mode");
-        assert_eq!(s.options.len(), 4);
+        assert_eq!(s.options.len(), 5);
         let mut v = "off";
         let mut seen = vec![v];
-        for _ in 0..3 { v = s.next(v); seen.push(v); }
-        assert_eq!(seen, vec!["off", "cardinal", "stenotype", "words"]);
-        assert_eq!(s.next("words"), "off", "and wraps");
+        for _ in 0..4 { v = s.next(v); seen.push(v); }
+        assert_eq!(seen, vec!["off", "cardinal", "stenotype", "words", "morse"]);
+        assert_eq!(s.next("morse"), "off", "and wraps");
     }
 
     #[test]

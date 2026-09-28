@@ -121,21 +121,45 @@ impl App {
                 ui.label(egui::RichText::new(&self.status).small());
             }
             ui.add_space(8.0);
-            if screen == Screen::Display {
-                let mut st = std::mem::take(&mut self.status);
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    scale::ui(&mut self.shell_prefs, ui, &mut st);
-                });
-                self.status = st;
-                return;
-            }
-            if screen == Screen::Speaker {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    speaker::ui(&mut self.speaker, ui, TOUCH_H);
-                });
-                return;
-            }
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                actions = self.screen_body(ui, screen);
+            });
+        });
+        self.screen = want_screen;
+        for a in actions.clone() {
+            self.apply(a);
+        }
+        actions
+    }
+
+    /// One screen's content, with no tabs, panel or scroll area of its own:
+    /// what a host app (bsettings) embeds as a section. Changes are applied
+    /// and saved here, exactly as in the standalone app.
+    pub fn screen_ui(&mut self, ui: &mut egui::Ui, screen: Screen) {
+        if self.last_read.elapsed() >= REREAD {
+            self.reread();
+        }
+        if !self.status.is_empty() {
+            ui.label(egui::RichText::new(&self.status).small());
+        }
+        let actions = self.screen_body(ui, screen);
+        for a in actions {
+            self.apply(a);
+        }
+    }
+
+    fn screen_body(&mut self, ui: &mut egui::Ui, screen: Screen) -> Vec<Action> {
+        let mut actions = Vec::new();
+        match screen {
+            Screen::Display => {
+                let mut st = std::mem::take(&mut self.status);
+                scale::ui(&mut self.shell_prefs, ui, &mut st);
+                self.status = st;
+            }
+            Screen::Speaker => {
+                speaker::ui(&mut self.speaker, ui, TOUCH_H);
+            }
+            Screen::Cosmic => {
                 let mut section = "";
                 for i in 0..self.levers.len() {
                     let l = self.levers[i];
@@ -147,11 +171,7 @@ impl App {
                     }
                     row(ui, i, &l, &self.readings[i], self.details == Some(i), &mut actions);
                 }
-            });
-        });
-        self.screen = want_screen;
-        for a in actions.clone() {
-            self.apply(a);
+            }
         }
         actions
     }

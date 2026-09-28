@@ -107,3 +107,28 @@ fn the_way_back_shows_in_the_status_bar_after_a_jump() {
     harness.snapshot("nav_status");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn the_bucket_palette_at_phone_width() {
+    // A bucket with one resolved entry, shown the way Ctrl+K shows it.
+    let d = std::env::temp_dir().join(format!("ap_snap_bucket_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").arg("-C").arg(&d).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    std::fs::write(d.join("lib.rs"), "fn alpha() {}\n\nfn beta() {}\n").unwrap();
+    let mut s = AppState::new(None, false);
+    s.open_file(d.join("lib.rs"), 0);
+    s.open_buckets(0);
+    s.bucket_act(aperture_egui::palette_ui::BucketAct::Create("Collisions".into()), 0);
+    s.bucket_act(aperture_egui::palette_ui::BucketAct::AddHere, 0);
+    s.status = None;
+    let mut harness = harness_for(s);
+    harness.set_size(egui::Vec2::new(400.0, 500.0));
+    harness.run();
+    harness.snapshot("bucket_palette");
+    let _ = std::fs::remove_dir_all(&d);
+}

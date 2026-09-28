@@ -117,10 +117,12 @@ name = "bigsilicon-settings"
 version = "0.1.0"
 dependencies = [
  "bigsilicon-client",
+ "cosmic-levers",
  "eframe",
  "egui",
  "settings-kit",
  "snapclone-theme",
+ "tideshell-settings",
  "uikit-egui",
 ]
 
@@ -383,6 +385,10 @@ dependencies = [
 
 [[package]]
 name = "core-kit"
+version = "0.1.0"
+
+[[package]]
+name = "cosmic-levers"
 version = "0.1.0"
 
 [[package]]
@@ -2303,6 +2309,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.4",
+]
+
+[[package]]
+name = "tideshell-core"
+version = "0.1.0"
+
+[[package]]
+name = "tideshell-settings"
+version = "0.1.0"
+dependencies = [
+ "cosmic-levers",
+ "egui",
+ "tideshell-core",
+ "uikit-egui",
 ]
 
 [[package]]

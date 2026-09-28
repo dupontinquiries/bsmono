@@ -13,6 +13,14 @@ name = "rusty-board-egui"
 path = "src/bin/rusty_board_egui.rs"
 required-features = ["app"]
 
+# The companion: every setting plus the custom layout editor, as an ordinary
+# app window (and a CLI with arguments). Writes the files the keyboard reads
+# and pokes it over the ctl socket.
+[[bin]]
+name = "rusty-board-settings"
+path = "src/bin/rusty_board_settings.rs"
+required-features = ["app"]
+
 [features]
 # The default IS the deploy binary: the build orchestrator and anyone typing
 # `cargo build --release` get the docked, input-method keyboard. It used to be
@@ -88,6 +96,10 @@ settings-kit = { path = "../../../shared/settings-kit" }
 mic-kit = { path = "../../../shared/mic-kit" }
 voice-kit = { path = "../../../shared/voice-kit" }
 signal-kit = { path = "../../../shared/signal-kit" }
+# Apps (aperture) declare commands for the strip above the keys.
+keyboard-strip = { path = "../../../shared/keyboard-strip" }
+# Vibration motor (sysfs leds "vibrator"): Morse feedback.
+haptic-kit = { path = "../../../shared/haptic-kit" }
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
 
 # Only under `layer` — see the feature's comment.

@@ -54,6 +54,12 @@ aperture-lsp = { workspace = true }
 aperture-engine = { workspace = true }
 egui = { workspace = true }
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
+# Touch gestures (tap / double-tap / long-press / pan / fling) for the editor
+# surface: the fleet's shared recognizer, std-only.
+touchkit = { path = "../../../../shared/touchkit" }
+# Offer the navigation commands on the on-screen keyboard (rusty-board) while
+# focused, instead of a toolbar a desktop would also have to look at.
+keyboard-strip = { path = "../../../../shared/keyboard-strip" }
 snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../../../shared/settings-kit" }
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }

@@ -649,10 +649,25 @@ impl WaylandBackend {
                     .vkbd
                     .as_ref()
                     .ok_or_else(|| anyhow!("no virtual keyboard (v2 mode)"))?;
-                let entry = inner
-                    .keymap
-                    .lookup_keysym_name(base_name)
-                    .ok_or_else(|| anyhow!("unknown keysym {:?}", base_name))?;
+                // A single character ("Ctrl+c" from a latched modifier) is
+                // found by character: the named table only has BackSpace,
+                // arrows and the like. A shifted character adds Shift.
+                let mut mods = mods;
+                let entry = match inner.keymap.lookup_keysym_name(base_name) {
+                    Some(e) => e,
+                    None => {
+                        let mut cs = base_name.chars();
+                        let e = match (cs.next(), cs.next()) {
+                            (Some(c), None) => inner.keymap.lookup_char(c),
+                            _ => None,
+                        }
+                        .ok_or_else(|| anyhow!("unknown keysym {:?}", base_name))?;
+                        if e.shifted {
+                            mods |= 1;
+                        }
+                        e
+                    }
+                };
                 let evdev = entry.evdev_keycode;
                 let time = monotonic_ms();
                 if mods != 0 {
@@ -676,7 +691,16 @@ impl WaylandBackend {
                     let _ = conn.flush();
                     return Ok(());
                 };
+                // Printable ASCII: the keysym IS the code point (a chord like
+                // "Ctrl+c" from a latched modifier).
                 let sym = xkb_keysym_from_name(base_name)
+                    .or_else(|| {
+                        let mut cs = base_name.chars();
+                        match (cs.next(), cs.next()) {
+                            (Some(c), None) if (' '..='~').contains(&c) => Some(c as u32),
+                            _ => None,
+                        }
+                    })
                     .ok_or_else(|| anyhow!("unknown keysym name {:?}", base_name))?;
                 let serial = inner.app_data.im_v1_serial;
                 let time = monotonic_ms();
@@ -932,7 +956,9 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppData {
                     WEnum::Unknown(raw) => raw,
                 };
                 debug!("v2 ContentType: purpose={}", raw);
-                crate::content_purpose::set_content_purpose(raw.min(255) as u8);
+                // v2 carries text-input-v3 numbering, which differs from
+                // v1's after `password`; see set_content_purpose_v3.
+                crate::content_purpose::set_content_purpose_v3(raw);
             }
             // TextChangeCause: not yet wired.
             _ => {}

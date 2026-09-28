@@ -71,9 +71,16 @@ use board_compositor::wayland_backend::{self, InputMethodActiveCallback, Surroun
 pub struct WaylandIntegration {
     pub(crate) vk: Box<dyn VirtualKeyboard>,
     visible: Rc<Cell<bool>>,
+    /// The field's surrounding text reported anchor != cursor.
+    selection: Rc<Cell<bool>>,
 }
 
 impl WaylandIntegration {
+    /// Whether the focused field last reported a selection.
+    pub fn has_selection(&self) -> bool {
+        self.selection.get()
+    }
+
     /// Try to stand up the real backend. `Err` covers everything from
     /// "not actually on Wayland" to "compositor has neither input-method
     /// protocol" — `sink::detect()` treats any `Err` here the same way:
@@ -94,12 +101,13 @@ impl WaylandIntegration {
         let visible_for_cb = visible.clone();
         let im_callback: InputMethodActiveCallback =
             Rc::new(move |active| visible_for_cb.set(active));
-        // Surrounding-text isn't consumed by anything in this port yet
-        // (no Synonym/Rewrite-style feature reaching for editor context
-        // the way the GTK build's does) — an intentionally empty sink,
-        // not a placeholder for something broken.
+        // Surrounding text: only whether something is SELECTED (anchor !=
+        // cursor), for the Cut/Copy commands (edit_actions.rs). The text
+        // itself is not kept.
+        let selection = Rc::new(Cell::new(false));
+        let selection_for_cb = selection.clone();
         let surrounding_text_callback: SurroundingTextCallback =
-            Rc::new(|_text: String, _cursor: u32, _anchor: u32| {});
+            Rc::new(move |_text: String, cursor: u32, anchor: u32| selection_for_cb.set(cursor != anchor));
 
         let backend = wayland_backend::try_new_standalone(
             im_callback,
@@ -113,6 +121,7 @@ impl WaylandIntegration {
         Ok(Self {
             vk: Box::new(WaylandVirtualKeyboard::with_backend(backend)),
             visible,
+            selection,
         })
     }
 

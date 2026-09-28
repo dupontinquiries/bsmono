@@ -61,6 +61,9 @@ pub enum K {
     L,
     I,
     U,
+    /// The letter K. Not `K`: `key()` does `use K::*`, and a variant named
+    /// like its enum makes that glob ambiguous.
+    LetterK,
 }
 
 /// Incremental search. Matches are absolute char ranges, kept sorted; the
@@ -257,6 +260,19 @@ pub struct AppState {
     /// A file switch refused because this buffer has unsaved edits. Asking
     /// for the SAME file again discards them; anything else re-arms.
     discard_armed: Option<PathBuf>,
+    /// Buckets for the current workspace root, loaded on first Ctrl+K and
+    /// again whenever the root changes. Saved on every change to a bucket
+    /// (never per keystroke: a save is two git subprocesses).
+    pub buckets: Option<aperture_core::bucket::Workspace>,
+    /// Offer `strip_actions` to the on-screen keyboard while focused. Off by
+    /// default so tests never talk to a keyboard running on the machine
+    /// they run on; the binary turns it on.
+    pub strip_enabled: bool,
+    /// The focus state last told to the keyboard.
+    strip_sent: Option<bool>,
+    /// Finger gestures on the editor surface (touch_input.rs).
+    pub touch: crate::touch_input::TouchInput,
+    bucket_delete_armed: bool,
     pub lang: Language,
     pub syntax: Syntax,
     pub find: Option<FindState>,
@@ -489,6 +505,10 @@ pub struct AppState {
     /// throughout, per `lsp_worker`'s own doc. Only Rust (`rust-analyzer`)
     /// is wired up; every other language simply never sets this.
     lsp: Option<crate::lsp_worker::LspWorker>,
+    /// The root the running (or starting) server was given, and a root
+    /// whose server failed to start — not retried this session.
+    lsp_root: Option<String>,
+    lsp_failed_root: Option<String>,
     lsp_uri: Option<String>,
     /// The document text as of the LAST successful sync (`didOpen` or
     /// `didChange`) — `notify_lsp_changed` diffs against this to compute
@@ -517,6 +537,8 @@ pub struct AppState {
     /// `DefinitionOutcome` is applied only if this still matches — same
     /// generation-gate `lsp_gen` already is for completions.
     lsp_definition_gen: u64,
+    /// Generation of the last Shift+F12 (callers) request.
+    lsp_callers_gen: u64,
     /// Bumped on every hover request; an arriving `HoverOutcome` is
     /// applied only if this still matches.
     lsp_hover_gen: u64,
@@ -588,6 +610,11 @@ impl AppState {
             dirty: false,
             nav: Default::default(),
             discard_armed: None,
+            buckets: None,
+            touch: Default::default(),
+            strip_enabled: false,
+            strip_sent: None,
+            bucket_delete_armed: false,
             lang,
             syntax: Syntax::new(lang),
             find: None,
@@ -673,12 +700,15 @@ impl AppState {
             theme_id: snapclone_theme::PaletteId::Night,
             status: None,
             lsp: None,
+            lsp_root: None,
+            lsp_failed_root: None,
             lsp_uri: None,
             lsp_last_synced_text: String::new(),
             lsp_doc_version: 1,
             lsp_gen: 0,
             lsp_pending_prefix_start: None,
             lsp_definition_gen: 0,
+            lsp_callers_gen: 0,
             lsp_hover_gen: 0,
             hover_overlay: None,
             lsp_diagnostics: Vec::new(),
@@ -2133,6 +2163,14 @@ impl AppState {
     /// for the request the popup is actually waiting on. Called once per
     /// frame from the view's tick, same shape as `poll_completions`.
     pub fn poll_lsp(&mut self, now_ms: u64) {
+        // The handshake runs off the UI thread (lsp_worker::spawn); a server
+        // that failed it is dropped here, quietly — no rust-analyzer is the
+        // common case and the local tier still works.
+        if let Some(Err(_)) = self.lsp.as_ref().and_then(|l| l.poll_ready()) {
+            self.lsp = None;
+            self.lsp_failed_root = self.lsp_root.take();
+            return;
+        }
         let Some(lsp) = &self.lsp else { return };
         // Drained into a local Vec, not processed inline: `jump_to_lsp_
         // definition` needs `&mut self` (it can call `open_file`, which
@@ -2142,6 +2180,10 @@ impl AppState {
         let mut definition_outcomes = Vec::new();
         while let Some(outcome) = lsp.poll_definition() {
             definition_outcomes.push(outcome);
+        }
+        let mut callers_outcomes = Vec::new();
+        while let Some(outcome) = lsp.poll_callers() {
+            callers_outcomes.push(outcome);
         }
         let mut hover_outcomes = Vec::new();
         while let Some(outcome) = lsp.poll_hover() {
@@ -2202,6 +2244,12 @@ impl AppState {
                 Some(loc) => self.jump_to_lsp_definition(&loc, now_ms),
                 None => self.set_status("go to definition: nothing found", now_ms),
             }
+        }
+        for outcome in callers_outcomes {
+            if outcome.generation != self.lsp_callers_gen {
+                continue; // superseded
+            }
+            self.show_callers(outcome, now_ms);
         }
         for outcome in hover_outcomes {
             if outcome.generation != self.lsp_hover_gen {
@@ -2391,6 +2439,7 @@ impl AppState {
             (A, true) => self.editor.select_all(),
             (S, true) => self.save(now_ms),
             (O, true) => self.open_palette_in_open_mode(),
+            (LetterK, true) => self.open_buckets(now_ms),
             (P, true) => self.open_palette(),
             (F, true) if shift => self.open_project_search(),
             (F, true) => self.open_find(),
@@ -2408,6 +2457,7 @@ impl AppState {
                     self.open_find();
                 } 
             }
+            (F12, false) if shift => self.find_callers(now_ms),
             (F12, false) => self.go_to_definition(now_ms),
             (I, true) => self.request_hover(now_ms),
             (Space, true) if shift => self.trigger_completion_now(now_ms),
@@ -2679,6 +2729,22 @@ impl AppState {
                 self.discard_extra_cursors(); // a whole new Editor; old offsets mean nothing
                 self.path = Some(path);
                 self.dirty = false;
+                // A DIFFERENT FILE HAS A DIFFERENT HISTORY. The repo, the
+                // file's repo-relative path and its timeline were computed
+                // once, in `new`, for whatever file the app started on, and
+                // never again: after Ctrl+O the gutter diffed the old file,
+                // Ctrl+, loaded the OLD file's revisions into this buffer,
+                // and a session started on a scratch buffer never learned it
+                // was in a repo at all (so the workspace root, the picker and
+                // bucket storage all fell back to the file's directory).
+                self.rev_ix = None;
+                self.live_text = None;
+                self.git = self.path.as_deref().and_then(gitspace::discover);
+                self.revs = match &self.git {
+                    Some((r, rel)) => gitspace::history(r, rel, 48),
+                    None => Vec::new(),
+                };
+                self.refresh_git();
                 self.ghost.dismiss();
                 self.debounce.cancel();
                 self.cam.scroll_y.snap(0.0);
@@ -2784,6 +2850,276 @@ impl AppState {
         }
     }
 
+    // ── buckets (aperture_core::bucket) ─────────────────────────────────────
+
+    /// Where buckets live: git refs (`refs/aperture/bucket/*`) when the
+    /// file is in a repo, else a directory under the user's data dir keyed
+    /// by the workspace root — never a file dropped into the project.
+    fn bucket_store(&self) -> Box<dyn aperture_core::bucket::Store + '_> {
+        use aperture_core::bucket::{slug, FileStore};
+        match &self.git {
+            Some((r, _)) => Box::new(aperture_core::gitspace::GitStore::new(r)),
+            None => {
+                let base = std::env::var_os("XDG_DATA_HOME")
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_absolute())
+                    .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+                    .unwrap_or_else(std::env::temp_dir);
+                let key = slug(&self.workspace_root().to_string_lossy());
+                Box::new(FileStore::new(base.join("aperture/buckets").join(key)))
+            }
+        }
+    }
+
+    /// The loaded workspace, (re)loading it when absent or for another root.
+    fn bucket_ws(&mut self) -> &mut aperture_core::bucket::Workspace {
+        let root = self.workspace_root();
+        if self.buckets.as_ref().map(|w| &w.root) != Some(&root) {
+            let (ws, _skipped) = aperture_core::bucket::Workspace::load(root, &*self.bucket_store());
+            self.buckets = Some(ws);
+        }
+        self.buckets.as_mut().expect("just loaded")
+    }
+
+    fn save_bucket(&mut self, i: usize, now_ms: u64) {
+        let Some(ws) = self.buckets.clone() else { return };
+        let r = ws.save(i, &*self.bucket_store());
+        if let Err(e) = r {
+            self.set_status(&format!("bucket not saved: {e}"), now_ms);
+        }
+    }
+
+    /// The caret's place as a bucket entry: the innermost item, or the file.
+    fn entry_here(&mut self) -> Option<aperture_core::bucket::Entry> {
+        use aperture_core::bucket::Entry;
+        let path = self.path.clone()?;
+        let rel = self.bucket_ws().rel(&path);
+        Some(match self.nav_here() {
+            Some((aperture_core::entity::EntityId::Item { kind, name, .. }, _)) => Entry { kind: Some(kind), ..Entry::symbol(rel, name) },
+            _ => Entry::file(rel),
+        })
+    }
+
+    /// The commands aperture offers on the on-screen keyboard: the
+    /// navigation that has a shortcut on a desktop and no key on a phone.
+    /// Each is the chord the editor already binds, so the keyboard sends it
+    /// like any key and nothing new has to be handled here.
+    pub fn strip_actions() -> Vec<keyboard_strip::Action> {
+        use keyboard_strip::Action;
+        vec![
+            Action::new("‹", "Alt+Left", "back to where the jump started"),
+            Action::new("›", "Alt+Right", "forward again"),
+            Action::new("Def", "F12", "go to definition"),
+            Action::new("Callers", "Shift+F12", "who calls this"),
+            Action::new("Symbols", "Ctrl+t", "go to symbol in workspace"),
+            Action::new("Buckets", "Ctrl+k", "buckets"),
+            Action::new("Find", "Ctrl+f", "find in file"),
+            Action::new("Cmds", "Ctrl+p", "command palette"),
+        ]
+    }
+
+    /// Tell the keyboard when focus changes: our strip on focus, cleared on
+    /// blur. Only on a CHANGE — this runs every frame. A send that fails (no
+    /// keyboard running: every desktop) is fine and silent.
+    pub fn sync_keyboard_strip(&mut self, focused: bool) {
+        if !self.strip_enabled || self.strip_sent == Some(focused) {
+            return;
+        }
+        self.strip_sent = Some(focused);
+        let msg = if focused {
+            keyboard_strip::Msg::Show { app: "aperture".into(), pid: std::process::id(), actions: Self::strip_actions() }
+        } else {
+            keyboard_strip::Msg::Clear { app: "aperture".into() }
+        };
+        let _ = keyboard_strip::send(&msg);
+    }
+
+    /// Ctrl+K.
+    pub fn open_buckets(&mut self, _now_ms: u64) {
+        let active = self.bucket_ws().active;
+        self.bucket_delete_armed = false;
+        self.palette = Some(crate::palette_ui::PaletteState::buckets(active));
+    }
+
+    /// The rows the Bucket palette shows for `open` (None = the list) and
+    /// the typed `filter`. Resolves each entry by NAME against its file's
+    /// outline (the open buffer for the current file), so an entry follows
+    /// its function when the function moves; one that no longer resolves
+    /// is listed as such, never dropped.
+    pub fn bucket_rows(&mut self, open: Option<usize>, filter: &str) -> Vec<crate::palette_ui::BucketRow> {
+        use crate::palette_ui::{BucketAct, BucketRow};
+        use aperture_core::bucket::{locate, Located};
+        let f = filter.trim().to_lowercase();
+        let ws = self.bucket_ws().clone();
+        let row = |label: String, detail: String, act: BucketAct| BucketRow { label, detail, act, removable: None };
+        let Some(bi) = open.filter(|i| *i < ws.buckets.len()) else {
+            let mut rows: Vec<BucketRow> = ws
+                .buckets
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| f.is_empty() || b.name.to_lowercase().contains(&f))
+                .map(|(i, b)| row(b.name.clone(), format!("{} place{}", b.entries.len(), if b.entries.len() == 1 { "" } else { "s" }), BucketAct::Open(i)))
+                .collect();
+            let exact = ws.buckets.iter().any(|b| b.slug() == aperture_core::bucket::slug(filter.trim()));
+            if !f.is_empty() && !exact {
+                rows.insert(0, row(format!("+ New bucket \"{}\"", filter.trim()), "Enter creates it".into(), BucketAct::Create(filter.trim().to_string())));
+            }
+            if rows.is_empty() {
+                rows.push(row("No buckets yet".into(), "type a name to make one".into(), BucketAct::None));
+            }
+            return rows;
+        };
+        let b = &ws.buckets[bi];
+        let mut rows = vec![row("‹ All buckets".into(), b.name.clone(), BucketAct::Back)];
+        if let Some(entry) = self.entry_here() {
+            let label = entry.symbol.clone().unwrap_or_else(|| entry.path.clone());
+            if b.contains(&entry) {
+                rows.push(row(format!("{label} is in this bucket"), "the item under the caret".into(), BucketAct::None));
+            } else {
+                rows.push(row(format!("+ Add {label}"), "the item under the caret".into(), BucketAct::AddHere));
+            }
+        }
+        let trail = self.nav.visited().len();
+        if trail > 0 {
+            rows.push(row(format!("+ Keep the jump trail ({trail} place{})", if trail == 1 { "" } else { "s" }), self.nav.breadcrumb(4), BucketAct::KeepTrail));
+        }
+        let mut outlines: std::collections::HashMap<PathBuf, Vec<(String, String, usize)>> = Default::default();
+        for (ei, e) in b.entries.iter().enumerate() {
+            let abs = {
+                let p = PathBuf::from(&e.path);
+                if p.is_absolute() { p } else { ws.root.join(p) }
+            };
+            let label = match &e.symbol {
+                Some(s) => format!("{s}  ·  {}", e.path),
+                None => e.path.clone(),
+            };
+            if !f.is_empty() && !label.to_lowercase().contains(&f) {
+                continue;
+            }
+            let outline = outlines.entry(abs.clone()).or_insert_with(|| {
+                if self.path.as_ref() == Some(&abs) {
+                    self.syntax.outline(&self.editor.buffer).into_iter().map(|it| (format!("{:?}", it.kind).to_lowercase(), it.name, it.line)).collect()
+                } else {
+                    aperture_core::workspace_symbols::index_files(&ws.root, std::slice::from_ref(&abs), 1)
+                        .into_iter()
+                        .map(|s| (format!("{:?}", s.item.kind).to_lowercase(), s.item.name, s.item.line))
+                        .collect()
+                }
+            });
+            let triples: Vec<(&str, &str, usize)> = outline.iter().map(|(k, n, l)| (k.as_str(), n.as_str(), *l)).collect();
+            let (detail, act) = if !abs.exists() {
+                ("file is gone".to_string(), BucketAct::None)
+            } else {
+                match locate(e, &triples) {
+                    Located::Line(l) => (format!("line {}", l + 1), BucketAct::Jump { path: abs.clone(), line: l }),
+                    Located::FileOnly => ("file".to_string(), BucketAct::Jump { path: abs.clone(), line: 0 }),
+                    Located::Unresolved => ("not found in the file (renamed?)".to_string(), BucketAct::Jump { path: abs.clone(), line: 0 }),
+                }
+            };
+            rows.push(BucketRow { label, detail, act, removable: Some(ei) });
+        }
+        rows.push(row(
+            if self.bucket_delete_armed { "Delete this bucket? (choose again)".into() } else { "Delete this bucket".into() },
+            "its entries are references; no code is touched".into(),
+            BucketAct::DeleteBucket,
+        ));
+        rows
+    }
+
+    /// Carry out a Bucket row. Returns whether the palette should close.
+    pub fn bucket_act(&mut self, act: crate::palette_ui::BucketAct, now_ms: u64) -> bool {
+        use crate::palette_ui::{BucketAct, PaletteState};
+        use aperture_core::bucket::Entry;
+        let open = self.palette.as_ref().and_then(|p| p.bucket_open);
+        if !matches!(act, BucketAct::DeleteBucket) {
+            self.bucket_delete_armed = false;
+        }
+        match act {
+            BucketAct::None => false,
+            BucketAct::Open(i) => {
+                self.bucket_ws().active = Some(i);
+                self.palette = Some(PaletteState::buckets(Some(i)));
+                false
+            }
+            BucketAct::Create(name) => {
+                let i = self.bucket_ws().open(&name);
+                self.save_bucket(i, now_ms);
+                self.palette = Some(PaletteState::buckets(Some(i)));
+                false
+            }
+            BucketAct::Back => {
+                self.palette = Some(PaletteState::buckets(None));
+                false
+            }
+            BucketAct::AddHere => {
+                let Some(bi) = open else { return false };
+                let Some(entry) = self.entry_here() else { return false };
+                if let Some(b) = self.bucket_ws().buckets.get_mut(bi) {
+                    b.add(entry);
+                }
+                self.save_bucket(bi, now_ms);
+                false
+            }
+            BucketAct::KeepTrail => {
+                let Some(bi) = open else { return false };
+                // nav's entity paths are workspace-relative, like bucket paths.
+                let mut added = 0;
+                for id in self.nav.visited() {
+                    let e = match id {
+                        aperture_core::entity::EntityId::Item { path, kind, name } => Entry { kind: Some(kind), ..Entry::symbol(path, name) },
+                        aperture_core::entity::EntityId::File { path } => Entry::file(path),
+                        _ => continue,
+                    };
+                    if let Some(b) = self.bucket_ws().buckets.get_mut(bi) {
+                        if !b.contains(&e) {
+                            b.add(e);
+                            added += 1;
+                        }
+                    }
+                }
+                self.save_bucket(bi, now_ms);
+                self.set_status(&format!("kept {added} place{} from the trail", if added == 1 { "" } else { "s" }), now_ms);
+                false
+            }
+            BucketAct::Jump { path, line } => {
+                self.palette_jump(path, Some(line), aperture_core::entity::Relation::Opened, now_ms);
+                true
+            }
+            BucketAct::Remove(ei) => {
+                let Some(bi) = open else { return false };
+                if let Some(b) = self.bucket_ws().buckets.get_mut(bi) {
+                    b.remove(ei);
+                }
+                self.save_bucket(bi, now_ms);
+                false
+            }
+            BucketAct::DeleteBucket => {
+                let Some(bi) = open else { return false };
+                if !self.bucket_delete_armed {
+                    self.bucket_delete_armed = true;
+                    return false;
+                }
+                self.bucket_delete_armed = false;
+                let mut ws = self.bucket_ws().clone();
+                let r = ws.close(bi, &*self.bucket_store());
+                self.buckets = Some(ws);
+                if let Err(e) = r {
+                    self.set_status(&format!("bucket not deleted: {e}"), now_ms);
+                }
+                self.palette = Some(PaletteState::buckets(None));
+                false
+            }
+        }
+    }
+
+    /// [`Self::palette_jump`] to an exact column (a call site, a reference).
+    pub fn palette_jump_at(&mut self, path: PathBuf, line: usize, col: usize, rel: aperture_core::entity::Relation, now_ms: u64) {
+        let from = self.nav_here();
+        if self.go_to_site(path, line, col, now_ms) {
+            self.nav_record(from, rel);
+        }
+    }
+
     /// Absolute `file://` URI for `path` — LSP addresses documents by URI,
     /// never by a bare path, and a relative one would be ambiguous about
     /// which directory it's relative TO once it crosses the wire to a
@@ -2808,8 +3144,16 @@ impl AppState {
         let uri = Self::file_uri(&path);
         let root_uri = Self::file_uri(&self.workspace_root());
         if self.lsp.is_none() {
+            // Tried and failed for this root already: do not respawn on
+            // every file open (the handshake result arrives in `poll_lsp`).
+            if self.lsp_failed_root.as_deref() == Some(root_uri.as_str()) {
+                return;
+            }
             match crate::lsp_worker::LspWorker::spawn("rust-analyzer", &[], &root_uri) {
-                Ok(w) => self.lsp = Some(w),
+                Ok(w) => {
+                    self.lsp = Some(w);
+                    self.lsp_root = Some(root_uri.clone());
+                }
                 Err(_) => return, // no server available — stay on the local-only tier
             }
         }
@@ -2844,6 +3188,95 @@ impl AppState {
         let line_text = self.editor.buffer.line(p.line);
         let utf16_col = aperture_core::width::char_col_to_utf16(&line_text, p.col);
         lsp.request_definition(uri.clone(), p.line as u32, utf16_col, self.lsp_definition_gen);
+    }
+
+    /// Shift+F12: who calls the symbol at the caret. Answered in
+    /// `poll_lsp` -> [`Self::show_callers`].
+    pub fn find_callers(&mut self, now_ms: u64) {
+        let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) else {
+            self.set_status("callers: no language server running", now_ms);
+            return;
+        };
+        self.lsp_callers_gen += 1;
+        let p = self.editor.caret_pos();
+        let line_text = self.editor.buffer.line(p.line);
+        let utf16_col = aperture_core::width::char_col_to_utf16(&line_text, p.col);
+        lsp.request_callers(uri.clone(), p.line as u32, utf16_col, self.lsp_callers_gen);
+        self.set_status("callers: asking the language server…", now_ms);
+    }
+
+    /// Turn a callers answer into rows: one per CALL SITE (a caller that
+    /// calls twice is two places you might want), columns converted from
+    /// UTF-16 against the target line's real text. One row jumps straight
+    /// there; several open [`crate::palette_ui::Mode::Callers`].
+    pub fn show_callers(&mut self, outcome: crate::lsp_worker::CallersOutcome, now_ms: u64) {
+        use crate::palette_ui::{CallerHit, PaletteState};
+        if let Some(e) = &outcome.error {
+            if outcome.calls.is_empty() && outcome.refs.is_empty() {
+                self.set_status(&format!("callers: {e}"), now_ms);
+                return;
+            }
+        }
+        let root = self.workspace_root();
+        // Line text for a (path, line): the OPEN buffer for the current
+        // file (it may have unsaved edits the server has seen), disk for
+        // the rest, read once per file.
+        let mut files: std::collections::HashMap<PathBuf, Vec<String>> = Default::default();
+        let current = self.path.clone();
+        let mut line_of = |path: &PathBuf, line: usize, this: &Self| -> String {
+            if current.as_ref() == Some(path) {
+                return this.editor.buffer.line(line.min(this.editor.buffer.len_lines().saturating_sub(1))).to_string();
+            }
+            let lines = files.entry(path.clone()).or_insert_with(|| {
+                std::fs::read_to_string(path).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default()
+            });
+            lines.get(line).cloned().unwrap_or_default()
+        };
+        let mut hits = Vec::new();
+        let rel = |p: &PathBuf| p.strip_prefix(&root).unwrap_or(p).to_string_lossy().into_owned();
+        let are_calls = !outcome.calls.is_empty();
+        if are_calls {
+            for call in &outcome.calls {
+                let Some(path) = Self::path_from_file_uri(&call.uri) else { continue };
+                let sites: Vec<(u32, u32)> = if call.sites.is_empty() { vec![(call.line, call.character)] } else { call.sites.clone() };
+                for (l, c) in sites {
+                    let text = line_of(&path, l as usize, self);
+                    hits.push(CallerHit {
+                        col: aperture_core::width::utf16_col_to_char(&text, c),
+                        line: l as usize,
+                        title: call.name.clone(),
+                        detail: format!("{}:{}  {}", rel(&path), l + 1, text.trim()),
+                        path: path.clone(),
+                    });
+                }
+            }
+        } else {
+            for loc in &outcome.refs {
+                let Some(path) = Self::path_from_file_uri(&loc.uri) else { continue };
+                let text = line_of(&path, loc.line as usize, self);
+                hits.push(CallerHit {
+                    col: aperture_core::width::utf16_col_to_char(&text, loc.character),
+                    line: loc.line as usize,
+                    title: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    detail: format!("{}:{}  {}", rel(&path), loc.line + 1, text.trim()),
+                    path: path.clone(),
+                });
+            }
+        }
+        use aperture_core::entity::Relation;
+        let relation = if are_calls { Relation::CalledBy } else { Relation::ReferencedBy };
+        match hits.len() {
+            0 => self.set_status("callers: none found", now_ms),
+            1 => {
+                let h = hits.remove(0);
+                self.palette_jump_at(h.path, h.line, h.col, relation, now_ms);
+                self.set_status(&format!("{} — the only {} (Alt+Left returns)", h.title, if are_calls { "caller" } else { "reference" }), now_ms);
+            }
+            n => {
+                self.set_status(&format!("{n} {}", if are_calls { "call sites" } else { "references" }), now_ms);
+                self.palette = Some(PaletteState::callers(hits, are_calls));
+            }
+        }
     }
 
     /// Ctrl+I: ask the LSP worker for a type signature / doc summary at
@@ -5539,6 +5972,231 @@ mod nav_tests {
         s.nav_go(true, 3);
         assert_eq!(caret_line_col(&s), (0, 1), "back to just after the Z");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    fn outcome(calls: Vec<aperture_lsp::IncomingCall>, refs: Vec<aperture_lsp::Location>) -> crate::lsp_worker::CallersOutcome {
+        crate::lsp_worker::CallersOutcome { generation: 0, calls, refs, error: None }
+    }
+    fn uri(p: &std::path::Path) -> String {
+        format!("file://{}", p.display())
+    }
+
+    #[test]
+    fn one_caller_jumps_straight_there_at_the_utf16_corrected_column() {
+        let d = nav_dir("callers1");
+        // "é" is one char but one UTF-16 unit; "𝄞" is one char, TWO units.
+        std::fs::write(d.join("sub/b.txt"), "zero\n  𝄞 target();\n").unwrap();
+        let mut s = AppState::new(None, false);
+        s.open_file(d.join("a.txt"), 0);
+        let call = aperture_lsp::IncomingCall {
+            name: "caller".into(), kind: 12, uri: uri(&d.join("sub/b.txt")),
+            line: 1, character: 0, sites: vec![(1, 5)], // after "  𝄞 " = 2+2+1 units
+        };
+        s.show_callers(outcome(vec![call], vec![]), 1);
+        assert!(s.palette.is_none(), "one answer needs no list");
+        assert_eq!(s.path.as_deref(), Some(d.join("sub/b.txt").as_path()));
+        assert_eq!(caret_line_col(&s), (1, 4), "UTF-16 col 5 is char col 4 on that line");
+        assert_eq!(s.nav.all().last().unwrap().rel, aperture_core::entity::Relation::CalledBy);
+        s.nav_go(true, 2);
+        assert_eq!(s.path.as_deref(), Some(d.join("a.txt").as_path()), "Alt+Left comes back");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn several_call_sites_open_a_list_one_row_per_site() {
+        let d = nav_dir("callers2");
+        let mut s = AppState::new(None, false);
+        s.open_file(d.join("a.txt"), 0);
+        let call = aperture_lsp::IncomingCall {
+            name: "caller".into(), kind: 12, uri: uri(&d.join("sub/b.txt")),
+            line: 0, character: 0, sites: vec![(1, 0), (3, 1)],
+        };
+        s.show_callers(outcome(vec![call], vec![]), 1);
+        let p = s.palette.as_ref().expect("a list");
+        assert_eq!(p.mode, crate::palette_ui::Mode::Callers);
+        assert!(p.callers_are_calls);
+        assert_eq!(p.callers.len(), 2, "two sites, two rows");
+        assert!(p.callers[1].detail.contains("sub/b.txt:4") && p.callers[1].detail.contains("four"), "{}", p.callers[1].detail);
+        assert_eq!(s.path.as_deref(), Some(d.join("a.txt").as_path()), "nothing moved yet");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn references_are_the_fallback_and_are_labelled_as_mentions() {
+        let d = nav_dir("callers3");
+        let mut s = AppState::new(None, false);
+        s.open_file(d.join("a.txt"), 0);
+        let refs = vec![
+            aperture_lsp::Location { uri: uri(&d.join("a.txt")), line: 2, character: 0 },
+            aperture_lsp::Location { uri: uri(&d.join("sub/b.txt")), line: 0, character: 1 },
+        ];
+        s.show_callers(outcome(vec![], refs), 1);
+        let p = s.palette.as_ref().unwrap();
+        assert!(!p.callers_are_calls);
+        assert_eq!(p.callers[0].title, "a.txt");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_server_without_either_says_so() {
+        let mut s = AppState::new(None, false);
+        let mut o = outcome(vec![], vec![]);
+        o.error = Some("the language server offers neither call hierarchy nor references".into());
+        s.show_callers(o, 1);
+        assert!(s.status.as_ref().unwrap().0.contains("neither"));
+        assert!(s.palette.is_none());
+    }
+
+    #[test]
+    fn shift_f12_is_not_plain_f12() {
+        let mut s = AppState::new(None, false);
+        s.handle(Ev::Key { key: K::F12, ctrl: false, shift: true, alt: false }, 0);
+        assert!(s.status.as_ref().unwrap().0.starts_with("callers:"), "{:?}", s.status);
+    }
+
+
+    /// A throwaway repo with two committed files. GIT_CONFIG_GLOBAL is the
+    /// caller's business (a signing config can hang `git commit`).
+    fn repo(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ap_repo_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(&d).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(d.join("src/a.rs"), "fn alpha() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "a one"]);
+        std::fs::write(d.join("src/b.rs"), "fn beta() {}\n\nfn gamma() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "b one"]);
+        std::fs::write(d.join("src/b.rs"), "fn beta() {}\n\nfn gamma() { 1; }\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "b two"]);
+        d
+    }
+
+    #[test]
+    fn opening_another_file_brings_its_own_repo_and_history() {
+        let d = repo("hist");
+        let mut s = AppState::new(None, false); // a scratch start: no repo known
+        assert!(s.open_file(d.join("src/a.rs"), 0));
+        assert_eq!(s.git.as_ref().map(|(_, rel)| rel.as_str()), Some("src/a.rs"));
+        assert_eq!(s.revs.len(), 1, "a.rs has one commit");
+        assert!(s.open_file(d.join("src/b.rs"), 1));
+        assert_eq!(s.git.as_ref().map(|(_, rel)| rel.as_str()), Some("src/b.rs"), "not a.rs's");
+        assert_eq!(s.revs.len(), 2, "b.rs's own two commits");
+        assert_eq!(s.workspace_root().canonicalize().unwrap(), d.canonicalize().unwrap(), "the repo root, not src/");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_bucket_keeps_places_by_name_in_git_and_follows_a_moved_function() {
+        use crate::palette_ui::BucketAct;
+        let d = repo("bucket");
+        let mut s = AppState::new(None, false);
+        s.open_file(d.join("src/b.rs"), 0);
+        s.go_to_site(d.join("src/b.rs"), 2, 4, 0); // inside gamma
+        s.open_buckets(0);
+        let rows = s.bucket_rows(None, "Collisions");
+        assert_eq!(rows[0].act, BucketAct::Create("Collisions".into()));
+        s.bucket_act(BucketAct::Create("Collisions".into()), 1);
+        assert_eq!(s.palette.as_ref().unwrap().bucket_open, Some(0));
+        s.bucket_act(BucketAct::AddHere, 2);
+
+        // Stored as a git ref, readable by a fresh session.
+        let mut fresh = AppState::new(None, false);
+        fresh.open_file(d.join("src/a.rs"), 0);
+        let ws = fresh.bucket_ws().clone();
+        assert_eq!(ws.buckets.len(), 1);
+        let e = &ws.buckets[0].entries[0];
+        assert_eq!((e.path.as_str(), e.symbol.as_deref()), ("src/b.rs", Some("gamma")));
+
+        // gamma moves down three lines; the entry still finds it.
+        std::fs::write(d.join("src/b.rs"), "fn beta() {}\n\n\n\n\nfn gamma() { 1; }\n").unwrap();
+        let rows = fresh.bucket_rows(Some(0), "");
+        let row = rows.iter().find(|r| r.label.starts_with("gamma")).expect("the entry row");
+        assert_eq!(row.act, BucketAct::Jump { path: d.join("src/b.rs"), line: 5 });
+        fresh.bucket_act(row.act.clone(), 3);
+        assert_eq!(fresh.path.as_deref(), Some(d.join("src/b.rs").as_path()));
+        assert_eq!(caret_line_col(&fresh).0, 5);
+        assert!(fresh.nav.can_go_back(), "a bucket jump is a nav step too");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_renamed_entry_is_shown_not_dropped_and_delete_asks_first() {
+        use crate::palette_ui::BucketAct;
+        let d = repo("rename");
+        let mut s = AppState::new(None, false);
+        s.open_file(d.join("src/b.rs"), 0);
+        s.go_to_site(d.join("src/b.rs"), 0, 3, 0); // beta
+        s.open_buckets(0);
+        s.bucket_act(BucketAct::Create("tmp".into()), 1);
+        s.bucket_act(BucketAct::AddHere, 2);
+        std::fs::write(d.join("src/b.rs"), "fn beta_renamed() {}\n").unwrap();
+        s.open_file(d.join("src/b.rs"), 3); // re-read from disk (clean buffer)
+        s.palette = Some(crate::palette_ui::PaletteState::buckets(Some(0)));
+        let rows = s.bucket_rows(Some(0), "");
+        assert!(rows.iter().any(|r| r.label.starts_with("beta ") && r.detail.contains("not found")), "{rows:?}");
+        s.bucket_act(BucketAct::DeleteBucket, 4);
+        assert_eq!(s.buckets.as_ref().unwrap().buckets.len(), 1, "first press only asks");
+        s.bucket_act(BucketAct::DeleteBucket, 5);
+        assert!(s.buckets.as_ref().unwrap().buckets.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ctrl_k_opens_buckets() {
+        let mut s = AppState::new(None, false);
+        s.handle(Ev::Key { key: K::LetterK, ctrl: true, shift: false, alt: false }, 0);
+        assert_eq!(s.palette.as_ref().map(|p| p.mode.clone()), Some(crate::palette_ui::Mode::Bucket));
+    }
+
+
+    /// The chords the strip sends are the ones the editor binds: a strip
+    /// button that sends a chord nothing handles would be a dead button.
+    #[test]
+    fn every_keyboard_strip_chord_reaches_a_binding() {
+        for a in AppState::strip_actions() {
+            let mut s = AppState::new(None, false);
+            let (mut ctrl, mut shift, mut alt) = (false, false, false);
+            let mut key = a.keys.as_str();
+            while let Some((m, rest)) = key.split_once('+') {
+                match m {
+                    "Ctrl" => ctrl = true,
+                    "Shift" => shift = true,
+                    "Alt" => alt = true,
+                    _ => panic!("modifier {m}"),
+                }
+                key = rest;
+            }
+            let k = match key {
+                "Left" => K::Left, "Right" => K::Right, "F12" => K::F12,
+                "t" => K::T, "k" => K::LetterK, "f" => K::F, "p" => K::P,
+                other => panic!("no K for {other}"),
+            };
+            assert!(s.palette.is_none() && s.find.is_none() && s.status.is_none(), "a clean start");
+            s.handle(Ev::Key { key: k, ctrl, shift, alt }, 0);
+            let did = s.palette.is_some() || s.find.is_some() || s.status.is_some();
+            assert!(did, "{} ({}) did nothing", a.label, a.keys);
+        }
+    }
+
+    #[test]
+    fn the_strip_is_only_sent_when_enabled_and_focus_changes() {
+        let mut s = AppState::new(None, false);
+        s.sync_keyboard_strip(true);
+        assert_eq!(s.strip_sent, None, "tests never talk to a real keyboard");
+        s.strip_enabled = true;
+        s.sync_keyboard_strip(true);
+        assert_eq!(s.strip_sent, Some(true));
     }
 
 }

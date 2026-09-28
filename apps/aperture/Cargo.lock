@@ -154,8 +154,10 @@ dependencies = [
  "eframe",
  "egui",
  "egui_kittest",
+ "keyboard-strip",
  "settings-kit",
  "snapclone-theme",
+ "touchkit",
  "uikit-egui",
 ]
 
@@ -559,6 +561,10 @@ dependencies = [
  "core-foundation",
  "libc",
 ]
+
+[[package]]
+name = "core-kit"
+version = "0.1.0"
 
 [[package]]
 name = "coreaudio-rs"
@@ -1572,6 +1578,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyboard-strip"
+version = "0.1.0"
+dependencies = [
+ "net-kit",
+]
+
+[[package]]
 name = "khronos-egl"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1839,6 +1852,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "net-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
 ]
 
 [[package]]

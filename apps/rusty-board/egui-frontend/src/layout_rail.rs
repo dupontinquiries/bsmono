@@ -14,15 +14,18 @@ use crate::layout_icons::{self, Kind};
 use egui::{Align2, Color32, CornerRadius, FontId, Rect, Sense, Ui, Vec2};
 
 /// Expanded width, in points. Wide enough for a 20pt icon with a margin a thumb can hit.
-pub const RAIL_W: f32 = 40.0;
+/// HALF of what it was (40): the keys get the width back. Switching is a
+/// vertical swipe on the rail now (demo_app `rail_gestures`), so the icons
+/// no longer need to be comfortable tap targets on their own.
+pub const RAIL_W: f32 = 20.0;
 /// Collapsed width: a sliver that still reads as a handle and is still tappable.
-pub const RAIL_COLLAPSED_W: f32 = 16.0;
+pub const RAIL_COLLAPSED_W: f32 = 10.0;
 /// One board's cell height.
 pub const CELL: f32 = 36.0;
 /// The collapse chevron's row.
 pub const CHEVRON_H: f32 = 24.0;
 /// Icon size inside a cell.
-pub const ICON: f32 = 20.0;
+pub const ICON: f32 = 13.0;
 
 /// One board in the rail.
 #[derive(Debug, Clone)]
@@ -85,7 +88,9 @@ pub fn show(
             .max_height((height - CHEVRON_H).max(CELL))
             .auto_shrink([false, true])
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-            .drag_to_scroll(true)
+            // A vertical drag on the rail SWITCHES boards now; letting the
+            // list scroll under the same finger would fight it.
+            .drag_to_scroll(false)
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 for (i, e) in entries.iter().enumerate() {
@@ -102,7 +107,7 @@ pub fn show(
 fn cell(ui: &mut Ui, e: &Entry, selected: bool, colors: &uikit_egui::PaletteColors) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(RAIL_W, CELL), Sense::click());
     let p = ui.painter();
-    let tile = rect.shrink2(Vec2::new(3.0, 2.0));
+    let tile = rect.shrink2(Vec2::new(1.5, 2.0));
     if selected {
         p.rect_filled(tile, CornerRadius::same(6), uikit_egui::glass_tint(colors.accent, 72));
     } else if resp.hovered() {

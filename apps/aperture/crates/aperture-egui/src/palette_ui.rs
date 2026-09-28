@@ -28,6 +28,59 @@ pub enum Mode {
     GoToRoute,
     AiEditPrompt,
     VoiceCommand,
+    /// Shift+F12's answer: who calls (or mentions) the symbol at the caret.
+    /// The list is fixed when the mode opens; typing filters it.
+    Callers,
+    /// Ctrl+K: buckets — named packs of places (`aperture_core::bucket`).
+    /// Lists the buckets; entering one lists its entries.
+    Bucket,
+}
+
+/// What a row in [`Mode::Bucket`] does when chosen. Rows are computed by
+/// `AppState::bucket_rows` (which can read files and the outline); the
+/// view only picks one.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BucketAct {
+    /// Enter bucket `i` (index into the workspace's list).
+    Open(usize),
+    /// Make a bucket with this name and enter it.
+    Create(String),
+    /// Back to the list of buckets.
+    Back,
+    /// Add the item (or file) under the caret to the open bucket.
+    AddHere,
+    /// Add every place the jump trail visited.
+    KeepTrail,
+    /// Go to a resolved entry.
+    Jump { path: std::path::PathBuf, line: usize },
+    /// Remove entry `entry` of the open bucket.
+    Remove(usize),
+    /// Delete the open bucket (asks once).
+    DeleteBucket,
+    /// Nothing: an unresolved entry shown for information.
+    None,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BucketRow {
+    pub label: String,
+    pub detail: String,
+    pub act: BucketAct,
+    /// A remove button on the row (entries only).
+    pub removable: Option<usize>,
+}
+
+/// One row of [`Mode::Callers`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct CallerHit {
+    pub path: std::path::PathBuf,
+    pub line: usize,
+    /// Char column (already converted from LSP's UTF-16).
+    pub col: usize,
+    /// "caller" or the file name.
+    pub title: String,
+    /// "src/other.rs:7" and the line's text.
+    pub detail: String,
 }
 
 #[derive(Clone, Debug)]
@@ -60,44 +113,62 @@ pub struct PaletteState {
     /// then fuzzy-ranked fresh every render against whatever's typed. Empty
     /// and unused in every other mode.
     pub symbols: Vec<aperture_core::workspace_symbols::Symbol>,
+    /// [`Mode::Callers`]' rows; empty in every other mode.
+    pub callers: Vec<CallerHit>,
+    /// Whether `callers` are real calls (call hierarchy) or mentions
+    /// (references fallback) — the nav step's relation and the heading.
+    pub callers_are_calls: bool,
+    /// [`Mode::Bucket`]: the bucket being shown, None = the list of them.
+    pub bucket_open: Option<usize>,
     pub focus_placed: bool,
 }
 
 impl PaletteState {
     pub fn commands() -> Self {
-        PaletteState { mode: Mode::Commands, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new(), symbols: Vec::new() }
+        PaletteState { mode: Mode::Commands, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new(), symbols: Vec::new(), callers: Vec::new(), callers_are_calls: false, bucket_open: None }
     }
     pub fn open_file(root: std::path::PathBuf, files: Vec<std::path::PathBuf>) -> Self {
-        PaletteState { mode: Mode::OpenFile, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root, files, symbols: Vec::new() }
+        PaletteState { mode: Mode::OpenFile, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root, files, symbols: Vec::new(), callers: Vec::new(), callers_are_calls: false, bucket_open: None }
     }
     pub fn project_search(root: std::path::PathBuf, files: Vec<std::path::PathBuf>) -> Self {
-        PaletteState { mode: Mode::ProjectSearch, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root, files, symbols: Vec::new() }
+        PaletteState { mode: Mode::ProjectSearch, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root, files, symbols: Vec::new(), callers: Vec::new(), callers_are_calls: false, bucket_open: None }
     }
     pub fn workspace_symbol(root: std::path::PathBuf, files: Vec<std::path::PathBuf>) -> Self {
         // Capped at 1500 files, well past the walk cap's typical hit rate
         // for a Rust-only index in a mixed-language monorepo, but still a
         // real bound — see workspace_symbols::index_files's own doc.
         let symbols = aperture_core::workspace_symbols::index_files(&root, &files, 1500);
-        PaletteState { mode: Mode::WorkspaceSymbol, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root, files, symbols }
+        PaletteState { mode: Mode::WorkspaceSymbol, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root, files, symbols, callers: Vec::new(), callers_are_calls: false, bucket_open: None }
     }
     pub fn go_to_route(root: std::path::PathBuf, files: Vec<std::path::PathBuf>) -> Self {
         // Same symbol index workspace_symbol builds — route::candidates
         // scores against it too, so there's no reason to index twice.
         let symbols = aperture_core::workspace_symbols::index_files(&root, &files, 1500);
-        PaletteState { mode: Mode::GoToRoute, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root, files, symbols }
+        PaletteState { mode: Mode::GoToRoute, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root, files, symbols, callers: Vec::new(), callers_are_calls: false, bucket_open: None }
     }
     /// A plain text-entry mode: the typed line IS the instruction, sent to
     /// `AppState::request_edit` on Enter. No candidate list, so `root`/
     /// `files`/`symbols` stay empty — nothing in this mode reads them.
     pub fn ai_edit_prompt() -> Self {
-        PaletteState { mode: Mode::AiEditPrompt, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new(), symbols: Vec::new() }
+        PaletteState { mode: Mode::AiEditPrompt, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new(), symbols: Vec::new(), callers: Vec::new(), callers_are_calls: false, bucket_open: None }
     }
 
     /// A plain text-entry mode: the typed line IS the utterance, sent to
     /// `AppState::run_voice_command` on Enter. A typed stand-in for what a
     /// real transcript would say — see `aperture_core::voice`'s module doc.
+    pub fn callers(hits: Vec<CallerHit>, are_calls: bool) -> Self {
+        PaletteState { mode: Mode::Callers, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new(), symbols: Vec::new(), callers: hits, callers_are_calls: are_calls, bucket_open: None }
+    }
+
+    pub fn buckets(open: Option<usize>) -> Self {
+        let mut p = Self::commands();
+        p.mode = Mode::Bucket;
+        p.bucket_open = open;
+        p
+    }
+
     pub fn voice_command() -> Self {
-        PaletteState { mode: Mode::VoiceCommand, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new(), symbols: Vec::new() }
+        PaletteState { mode: Mode::VoiceCommand, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new(), symbols: Vec::new(), callers: Vec::new(), callers_are_calls: false, bucket_open: None }
     }
 }
 
@@ -118,6 +189,8 @@ pub enum Cmd {
     ProjectSearchMode,
     WorkspaceSymbolMode,
     GoToRouteMode,
+    FindCallers,
+    BucketMode,
     AiEditMode,
     VoiceCommandMode,
     ToggleAi,
@@ -144,6 +217,8 @@ pub fn command_list() -> Vec<(String, Cmd)> {
         ("Find: In Project… (Ctrl+Shift+F)".to_string(), Cmd::ProjectSearchMode),
         ("Go to Symbol in Workspace… (Ctrl+T)".to_string(), Cmd::WorkspaceSymbolMode),
         ("Go to via Route… (Ctrl+G)".to_string(), Cmd::GoToRouteMode),
+        ("Go to: Callers of this symbol (Shift+F12)".to_string(), Cmd::FindCallers),
+        ("Buckets… (Ctrl+K)".to_string(), Cmd::BucketMode),
         ("AI: Edit Selection…".to_string(), Cmd::AiEditMode),
         ("Voice: run command…".to_string(), Cmd::VoiceCommandMode),
         ("AI: Toggle ghost completions".to_string(), Cmd::ToggleAi),
@@ -222,6 +297,15 @@ pub fn apply(cmd: Cmd, s: &mut AppState, now_ms: u64) {
             let files = crate::file_finder::walk_files(&root, 4000);
             s.palette = Some(PaletteState::go_to_route(root, files));
             return; // keep the palette open, in its new mode
+        }
+        Cmd::BucketMode => {
+            s.open_buckets(now_ms);
+            return;
+        }
+        Cmd::FindCallers => {
+            s.palette = None;
+            s.find_callers(now_ms);
+            return;
         }
         Cmd::AiEditMode => {
             s.palette = Some(PaletteState::ai_edit_prompt());

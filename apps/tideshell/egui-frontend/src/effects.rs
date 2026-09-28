@@ -195,6 +195,11 @@ impl Executor for System {
                 self.start_with(&a[..7], false, on.then_some(Undo::KeyboardShown))
             }
             Action::ShowTrackpad(on) => Outcome::Done(format!("trackpad overlay {}", if *on { "shown" } else { "hidden" })),
+            Action::KeyboardCommand(cmd) => match send_keyboard_command(cmd) {
+                Ok(()) => Outcome::Done(format!("keyboard: {cmd}")),
+                // Not running, or an older build without the socket: say so, do not fail loudly.
+                Err(e) => Outcome::Failed(format!("keyboard: {cmd}: {e}")),
+            },
             Action::SavePrefs => Outcome::Unwired("caller persists prefs (save_prefs) since the executor does not hold them"),
             Action::HideSystemCursor(on) => match cosmic_config_home() {
                 Some(base) => hide_system_cursor_in(&base, *on),
@@ -678,6 +683,15 @@ pub fn rotate_output(deg: u32) -> Outcome {
 /// a transport swap, not a format change.
 /// The fleet settings file settingsd persists (bsettings writes through it):
 /// `$XDG_CONFIG_HOME/gitmind/settings.conf`, `k = v` lines.
+/// One datagram to rusty-board-egui's control socket.
+pub fn send_keyboard_command(cmd: &str) -> Result<(), String> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is not set")?;
+    let path = PathBuf::from(dir).join("rusty-board.ctl");
+    let sock = std::os::unix::net::UnixDatagram::unbound().map_err(|e| e.to_string())?;
+    sock.send_to(cmd.as_bytes(), &path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(())
+}
+
 pub fn fleet_settings_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
     Some(base.join("gitmind").join("settings.conf"))

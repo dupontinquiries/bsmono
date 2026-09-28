@@ -43,6 +43,11 @@ impl DictationService {
         self.dictation.start();
     }
 
+    /// The user's filter strength (settings-kit `a11y.voice_filter`).
+    pub fn set_filter_level(&mut self, level: settings_kit::VoiceFilter) {
+        self.dictation.filter_level = level;
+    }
+
     /// Note how much audio exists so far, so the next partial can be windowed.
     pub fn captured(&mut self, samples: usize) { self.captured = samples; }
 

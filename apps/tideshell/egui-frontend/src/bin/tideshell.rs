@@ -45,6 +45,13 @@ struct Shellbox {
     sensor_gate: tideshell_egui::sensors::SensorGate,
     /// Whether the cover wanted the camera last iteration (its rising edge opens a live window).
     last_want_cam: bool,
+    /// Glove flicks (cold mode): the accelerometer/orientation ratchet from
+    /// uikit-egui's glove module, and the cold state last told to the keyboard.
+    ratchet: uikit_egui::glove::Ratchet,
+    last_ratchet_ms: u64,
+    escaped: bool,
+    told_keyboard_cold: Option<bool>,
+    told_keyboard_at: u64,
     /// Sleeping hours from bsettings (settingsd's file) and that file's mtime.
     fleet_sleep: settings_kit::SleepPrefs,
     fleet_sleep_seen: Option<std::time::SystemTime>,
@@ -163,6 +170,26 @@ impl Shellbox {
             };
             self.shell.note(o.describe());
         }
+    }
+
+    /// One glove-ratchet reading; a completed flick (or the face-down escape)
+    /// becomes a shell intent. Cold mode only (the caller checks).
+    fn feed_ratchet(&mut self, o: uikit_egui::glove::Orient, t: uikit_egui::glove::Tilt, now_ms: u64) {
+        let dt = now_ms.saturating_sub(self.last_ratchet_ms).min(500) as f32;
+        self.last_ratchet_ms = now_ms;
+        let fired = self.ratchet.feed(o, t, dt);
+        let mut out = Vec::new();
+        if let Some((dx, dy)) = fired.and_then(|f| f.direction()) {
+            if let Some(flick) = tideshell_core::gloveflick::flick_from_direction(dx, dy) {
+                out.extend(self.shell.on_flick(flick));
+            }
+        }
+        let escaping = self.ratchet.escaping();
+        if escaping && !self.escaped {
+            out.extend(self.shell.on_flick(tideshell_core::gloveflick::Flick::Escape));
+        }
+        self.escaped = escaping;
+        self.execute(out);
     }
 
     /// What the pad should say when it cannot work.
@@ -541,6 +568,11 @@ fn main() {
     let mut sb = Shellbox {
         sensor_gate: sensor_gate.clone(),
         last_want_cam: false,
+        ratchet: uikit_egui::glove::Ratchet::default(),
+        last_ratchet_ms: 0,
+        escaped: false,
+        told_keyboard_cold: None,
+        told_keyboard_at: 0,
         fleet_sleep: settings_kit::SleepPrefs::default(),
         fleet_sleep_seen: None,
         cam_probe: tideshell_egui::camera::CaptureProbe::default(),
@@ -811,6 +843,19 @@ fn main() {
         }
         for (g, a) in sb.imu.rx.try_iter().collect::<Vec<_>>() {
             sb.shell.on_imu(g, a, now_ms);
+            // Glove flicks from the raw accelerometer (m/s² -> g), in cold mode.
+            if sb.shell.cold.on && a != [0.0; 3] {
+                let (o, t) = uikit_egui::glove::from_accel(a[0] / 9.81, a[1] / 9.81, a[2] / 9.81);
+                sb.feed_ratchet(o, t, now_ms);
+            }
+        }
+        // Keep the keyboard in step with cold mode: on change, and again every
+        // minute in case it restarted (a datagram to a missing socket is lost).
+        if sb.told_keyboard_cold != Some(sb.shell.cold.on) || now_ms.saturating_sub(sb.told_keyboard_at) >= 60_000 {
+            let cmd = if sb.shell.cold.on { "cold on" } else { "cold off" };
+            let _ = tideshell_egui::effects::send_keyboard_command(cmd);
+            sb.told_keyboard_cold = Some(sb.shell.cold.on);
+            sb.told_keyboard_at = now_ms;
         }
         for h in sb.compass.rx.try_iter().collect::<Vec<_>>() {
             sb.shell.on_heading(h);
@@ -989,6 +1034,12 @@ fn main() {
             sb.shell.on_proximity(n, now_ms);
         }
         let readings: Vec<String> = sb.orientation.rx.try_iter().collect();
+        for o in &readings {
+            // No raw accelerometer? iio-sensor-proxy's strings are enough for the ratchet.
+            if sb.shell.cold.on && sb.imu.status().contains("no gyro or accelerometer") {
+                sb.feed_ratchet(uikit_egui::glove::Orient::parse(o), uikit_egui::glove::Tilt::Unsupported, now_ms);
+            }
+        }
         for o in readings {
             let out = sb.shell.on_orientation(&o, now_ms);
             // The speakers turn with the screen. Told from the same rotation

@@ -81,6 +81,15 @@ pub fn install(ctx: &Context) {
     if ctx.data(|d| d.get_temp::<bool>(egui::Id::new(INSTALLED))).unwrap_or(false) {
         return;
     }
+    let defs = definitions();
+    ctx.set_fonts(defs);
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(INSTALLED), true));
+}
+
+/// egui's defaults plus the symbol fallbacks: what [`install`] sets. Public
+/// so an app that sets its own fonts ([`set_primary_font`]) starts from the
+/// same list instead of silently dropping the fallbacks.
+pub fn definitions() -> FontDefinitions {
     let mut defs = FontDefinitions::default();
     for (name, bytes) in [
         (
@@ -97,6 +106,20 @@ pub fn install(ctx: &Context) {
         for family in [FontFamily::Proportional, FontFamily::Monospace] {
             defs.families.entry(family).or_default().push(name.to_owned());
         }
+    }
+    defs
+}
+
+/// A user-chosen face FIRST in the proportional family (it draws Latin), with
+/// egui's faces and the symbol fallbacks behind it for anything it lacks — a
+/// text face with no `⇧` or `→` still gets them. `None` goes back to the
+/// defaults. Marks the context installed, so a later [`install`] (every
+/// `apply_palette`) does not reset it.
+pub fn set_primary_font(ctx: &Context, face: Option<(&str, Vec<u8>)>) {
+    let mut defs = definitions();
+    if let Some((name, bytes)) = face {
+        defs.font_data.insert(name.to_owned(), std::sync::Arc::new(FontData::from_owned(bytes)));
+        defs.families.entry(FontFamily::Proportional).or_default().insert(0, name.to_owned());
     }
     ctx.set_fonts(defs);
     ctx.data_mut(|d| d.insert_temp(egui::Id::new(INSTALLED), true));
