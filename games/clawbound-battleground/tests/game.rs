@@ -642,9 +642,12 @@ fn a_thicket_slows_a_cat_and_does_not_stop_it() {
 fn a_bot_steers_off_a_line_that_runs_into_a_trunk() {
     use clawbound::blockers::{Blocker, Blockers, Cover, Shape};
     use glam::Vec3;
+    // (what the brain decides, read the tick it decides it: no reaction
+    // delay between it and the body, `reaction`)
     let fresh = || {
         let mut g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
         g.blockers = std::sync::Arc::new(Blockers::new(200.0, 6.0));
+        g.rules.bot_reaction = 0.0;
         g
     };
     let bot = 1;
@@ -3586,9 +3589,9 @@ mod god_limit {
     use clawbound::picks::{Fill, GodLimit};
     use clawbound::sim::{AiBrain, Event, Game, Rng};
 
-    /// Every ancestor, ten of it in one 5v5 on the jungle, for 90 s of
-    /// bots: nothing panics, every cat stays finite, and the mirrored kits
-    /// are used (casts from both sides).
+    /// Every ancestor, ten of it in one 5v5 on the jungle from level 3,
+    /// for 90 s of bots: nothing panics, every cat stays finite, and the
+    /// mirrored kits are used (casts from both sides).
     #[test]
     fn every_ancestor_can_mirror_itself() {
         map::with(MapId::Jungle, || {
@@ -3599,6 +3602,11 @@ mod god_limit {
                 let mut g = Game::new_teams(&b, &r);
                 g.blockers = blockers.clone();
                 g.gods[0].ai = Some(AiBrain::new(Lane::Mid, 0.9));
+                // level 3: the whole basic kit unlocked, so "the kit is
+                // used" means the kit and not only its first ability (at
+                // level 1 Oremantle has only one, unusable at arm's length,
+                // and a side of her that fought close never cast)
+                g.apply_rules(clawbound::rules::MatchRules { start_level: 3, ..Default::default() });
                 let mut casts = [0u32; 2];
                 for _ in 0..(90 * 30) {
                     g.tick(1.0 / 30.0);
@@ -3783,5 +3791,70 @@ mod mud_kittens {
                 }
             });
         });
+    }
+}
+
+/// Bots act a reaction time after they see (`reaction`): the same scene --
+/// an enemy cat appears in reach of a bot with its kit ready -- answered at
+/// the match's reaction setting, not in the tick it happens.
+mod reaction {
+    use clawbound::rules::MatchRules;
+    use clawbound::sim::{Event, Game};
+    use glam::Vec3;
+
+    /// Seconds from the enemy appearing to the bot's first cast, and to the
+    /// bot first moving toward it.
+    fn answer(reaction: Option<f32>) -> (f32, f32) {
+        let mut g = Game::new_teams(&[0, 3], &[1]);
+        // None: a normal match's rules (only the level raised, for a kit)
+        let d = MatchRules::default();
+        g.apply_rules(MatchRules { bot_reaction: reaction.unwrap_or(d.bot_reaction), start_level: 6, ..d });
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+        }
+        let bot = 1;
+        g.gods[bot].ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+        let home = Vec3::new(20.0, 0.0, 0.0);
+        g.gods[bot].pos = home;
+        g.gods[2].pos = Vec3::new(300.0, 0.0, 300.0);
+        g.gods[0].pos = Vec3::new(-300.0, 0.0, 300.0);
+        g.minions.clear();
+        // settle with nobody near
+        for _ in 0..60 {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+            g.minions.clear();
+            g.gods[bot].pos = home;
+        }
+        // the enemy is there
+        g.gods[2].pos = home + Vec3::new(0.0, 0.0, 9.0);
+        let t0 = g.t;
+        let (mut cast, mut turn) = (None, None);
+        for _ in 0..120 {
+            g.gods[2].pos = home + Vec3::new(0.0, 0.0, 9.0);
+            g.tick(1.0 / 60.0);
+            if cast.is_none() && g.events.iter().any(|e| matches!(*e, Event::Cast { god, .. } | Event::CastStart { god, .. } if god == bot)) {
+                cast = Some(g.t - t0);
+            }
+            if turn.is_none() && g.gods[bot].move_dir.z > 0.3 {
+                turn = Some(g.t - t0);
+            }
+            g.events.clear();
+            g.minions.clear();
+        }
+        (cast.expect("the bot never cast"), turn.expect("the bot never moved to it"))
+    }
+
+    #[test]
+    fn a_bot_answers_a_reaction_time_late() {
+        let (cast0, turn0) = answer(Some(0.0));
+        let (cast2, turn2) = answer(Some(0.2));
+        // a normal match plays the pro's reaction, not the instant bot
+        assert_eq!(answer(None), (cast2, turn2), "a normal match's bots are not the 0.2 s bots");
+        let d = clawbound::reaction::delay_for(0.2, 1);
+        eprintln!("instant: cast {cast0:.3} turn {turn0:.3}; 0.2 s: cast {cast2:.3} turn {turn2:.3} (this bot's delay {d:.3})");
+        assert!(cast0 < 0.1 && turn0 < 0.1, "the instant bot is not instant: {cast0} {turn0}");
+        assert!((cast2 - cast0 - d).abs() < 0.035, "the cast came {:.3} s later, not {d:.3}", cast2 - cast0);
+        assert!((turn2 - turn0 - d).abs() < 0.035, "the move came {:.3} s later, not {d:.3}", turn2 - turn0);
     }
 }

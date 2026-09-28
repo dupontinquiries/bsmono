@@ -34,6 +34,9 @@ pub struct MatchRules {
     pub cd_mul: f32,
     pub xp_mul: f32,
     pub respawn_mul: f32,
+    /// How long after it sees a bot acts, s (`reaction`; 0: the instant
+    /// bot of before).
+    pub bot_reaction: f32,
 }
 
 impl Default for MatchRules {
@@ -48,6 +51,7 @@ impl Default for MatchRules {
             cd_mul: 1.0,
             xp_mul: 1.0,
             respawn_mul: 1.0,
+            bot_reaction: crate::reaction::PRO,
         }
     }
 }
@@ -58,6 +62,7 @@ pub enum Unit {
     Level,
     Gold,
     Times,
+    Secs,
 }
 
 /// One numeric rule: its key in the text form, its label, its range and
@@ -86,6 +91,7 @@ impl Knob {
             Unit::Level => format!("{}", v as u32),
             Unit::Gold => format!("{}", v as u32),
             Unit::Times => format!("x{}", trim(v)),
+            Unit::Secs => if v <= 0.0 { "instant".to_string() } else { format!("{} s", trim(v)) },
         }
     }
 }
@@ -106,6 +112,9 @@ pub const KNOBS: &[Knob] = &[
     // (not 0: a cat with no respawn wait is never counted dead, and would
     // stand in the lane at 0 health -- systems' respawn needs a wait > 0)
     Knob { key: "respawn", label: "Respawn time", min: 0.25, max: 3.0, step: 0.25, unit: Unit::Times, get: |r| r.respawn_mul, set: |r, v| r.respawn_mul = v },
+    // 0.20: a strong player's reaction; 0.35 an ordinary one's; 0 the old
+    // instant bot
+    Knob { key: "reaction", label: "Bot reaction", min: 0.0, max: 0.6, step: 0.05, unit: Unit::Secs, get: |r| r.bot_reaction, set: |r, v| r.bot_reaction = v },
 ];
 
 impl MatchRules {

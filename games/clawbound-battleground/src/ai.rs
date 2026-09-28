@@ -535,6 +535,16 @@ pub fn think(game: &mut Game, gi: usize) {
         d
     };
 
+    // What the brain decided goes to the body a reaction time late
+    // (`reaction`): it moves and casts on what it saw, not what is.
+    let (move_dir, casts) = {
+        let delay = crate::reaction::delay_for(game.rules.bot_reaction, gi);
+        let intent = crate::reaction::Intent { state: new_state, target, off_lane: goal.is_some() };
+        let b = game.gods[gi].ai.as_mut().unwrap();
+        crate::reaction::through(&mut b.pending, &mut b.body, t, delay, crate::reaction::Act { due: 0.0, move_dir, cast: cast_req, intent })
+    };
+    let move_dir = move_dir.unwrap_or(game.gods[gi].move_dir);
+
     // write back
     {
         let g = &mut game.gods[gi];
@@ -561,10 +571,9 @@ pub fn think(game: &mut Game, gi: usize) {
     if let Some(c) = new_call {
         game.calls[team as usize] = Some(c);
     }
-    if let Some((slot, aim)) = cast_req {
+    for (slot, aim) in casts {
         game.cast_queue.push((gi, slot, aim));
     }
-    let _ = t;
 }
 
 /// Choose an ability cast for the current target based on archetype heuristics.

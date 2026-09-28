@@ -178,6 +178,12 @@ pub struct AiBrain {
     /// Somewhere it is walking to off its lane this tick (a boss, the
     /// Moonwell): what the floor router routes to, instead of the lane.
     pub goal: Option<Vec3>,
+    /// What it has decided and its body has not yet done (`reaction`):
+    /// each tick's move and cast, due a reaction time after the tick that
+    /// decided them.
+    pub pending: std::collections::VecDeque<crate::reaction::Act>,
+    /// The intent its body is on (None until the first one reaches it).
+    pub body: Option<crate::reaction::Intent>,
 }
 
 impl AiBrain {
@@ -199,6 +205,8 @@ impl AiBrain {
             stance_t: 0.0,
             anchor: None,
             goal: None,
+            pending: Default::default(),
+            body: None,
         }
     }
 }
