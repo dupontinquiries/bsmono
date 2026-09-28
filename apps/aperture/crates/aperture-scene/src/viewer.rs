@@ -127,6 +127,12 @@ pub struct Viewer {
     /// `visited_oid`'s position in `self.revs` (newest-first), if it's
     /// within the fetched window — the doorway into winding forward.
     pub homecoming_start_ix: Option<usize>,
+
+    // ── the way back (aperture_core::nav) ────────────────────────────────────
+    /// Station clicks and graph-node jumps, as edges — the same `NavPath` the
+    /// flat editor keeps, with the same entity naming (outline kind + name),
+    /// so a path means the same thing in both shells. ←/→ walk it.
+    pub nav: aperture_core::nav::NavPath,
 }
 
 /// Plaque text width — chosen WITH the plaque's world aspect: 14 columns over
@@ -174,6 +180,7 @@ impl Viewer {
             visited_oid: None,
             since_visited_changed: Vec::new(),
             homecoming_start_ix: None,
+            nav: Default::default(),
         };
         out.git = out.path.as_deref().and_then(gitspace::discover);
         if let Some((r, rel)) = &out.git {
@@ -260,7 +267,134 @@ impl Viewer {
     /// it from a screen click; `jump_to_rev` stays the shared internal
     /// engine both this and `enter_homecoming` walk through.
     pub fn jump_to_graph_node(&mut self, ix: usize) {
-        self.jump_to_rev(ix.min(self.revs.len().saturating_sub(1)));
+        let ix = ix.min(self.revs.len().saturating_sub(1));
+        let (from, fsite) = self.nav_rev_here();
+        self.jump_to_rev(ix);
+        let (to, tsite) = self.nav_rev_here();
+        self.nav.push(aperture_core::nav::NavStep::new(from, aperture_core::entity::Relation::TouchedBy, to).at(fsite).landed(tsite));
+    }
+
+    /// A station jump someone ASKED for (a plaque click), recorded so ←
+    /// comes back. `[`/`]` walk the corridor in order and are not recorded:
+    /// the order itself is the way back.
+    pub fn jump_recorded(&mut self, to: usize) {
+        let from = self.nav_station_here();
+        self.jump(to);
+        let landed = self.nav_station_here();
+        if let (Some((f, fs)), Some((t, ts))) = (from, landed) {
+            self.nav.push(aperture_core::nav::NavStep::new(f, aperture_core::entity::Relation::Opened, t).at(fs).landed(ts));
+        }
+    }
+
+    /// The trail to light: stations the path has visited, in order, as
+    /// indices into THIS corridor (by kind + name — a revision rebuilds the
+    /// stations, and an item this version lacks simply drops out of the
+    /// trail). Only the part behind the cursor: going back dims the steps
+    /// you have undone.
+    pub fn trail_stations(&self) -> Vec<usize> {
+        use aperture_core::entity::EntityId;
+        let find = |id: &EntityId| match id {
+            EntityId::Item { kind, name, .. } => self
+                .stations
+                .iter()
+                .position(|s| &s.item.name == name && &format!("{:?}", s.item.kind).to_lowercase() == kind),
+            _ => None,
+        };
+        let mut out: Vec<usize> = Vec::new();
+        for step in self.nav.trail() {
+            for id in [&step.from, &step.to] {
+                if let Some(i) = find(id) {
+                    if out.last() != Some(&i) {
+                        out.push(i);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn nav_rel_path(&self) -> String {
+        match (&self.git, &self.path) {
+            (Some((_, rel)), _) => rel.clone(),
+            (None, Some(p)) => p.to_string_lossy().into_owned(),
+            (None, None) => "[scratch]".into(),
+        }
+    }
+
+    /// The focused station as an entity — named exactly as the flat
+    /// editor's `nav_here` names an item, so the two agree on identity.
+    fn nav_station_here(&self) -> Option<(aperture_core::entity::EntityId, aperture_core::entity::Site)> {
+        let st = self.stations.get(self.focus)?;
+        let rel = self.nav_rel_path();
+        let id = aperture_core::entity::EntityId::item(rel.clone(), format!("{:?}", st.item.kind).to_lowercase(), st.item.name.clone());
+        Some((id, aperture_core::entity::Site::new(rel, st.item.line as u32, 0)))
+    }
+
+    /// Which version of the file is showing: a commit, or the live file.
+    fn nav_rev_here(&self) -> (aperture_core::entity::EntityId, aperture_core::entity::Site) {
+        let rel = self.nav_rel_path();
+        let site = aperture_core::entity::Site::new(rel.clone(), self.top.target.max(0.0) as u32, 0);
+        match self.rev_ix.and_then(|i| self.revs.get(i)) {
+            Some(r) => (aperture_core::entity::EntityId::Commit { oid: r.oid.clone() }, site),
+            None => (aperture_core::entity::EntityId::file(rel), site),
+        }
+    }
+
+    /// ← (`back`) / →: go to where a recorded jump started, or where it
+    /// landed. A station is found by NAME in whatever revision is showing
+    /// (the corridor is rebuilt per revision, so indices do not survive);
+    /// one that does not exist in this version is said, not guessed at.
+    pub fn nav_go(&mut self, back: bool) {
+        let step = if back { self.nav.back().cloned() } else { self.nav.forward().cloned() };
+        let Some(step) = step else {
+            self.branch_msg = Some((if back { "nothing to go back to" } else { "nothing ahead" }.into(), 2.0));
+            return;
+        };
+        let (target, site) = if back { (step.from.clone(), step.site.clone()) } else { (step.to.clone(), step.landing.clone()) };
+        use aperture_core::entity::EntityId;
+        let ok = match &target {
+            EntityId::Item { kind, name, .. } => {
+                match self.stations.iter().position(|s| &s.item.name == name && &format!("{:?}", s.item.kind).to_lowercase() == kind) {
+                    Some(i) => {
+                        self.jump(i);
+                        true
+                    }
+                    None => {
+                        self.branch_msg = Some((format!("{name} is not in this version"), 2.5));
+                        false
+                    }
+                }
+            }
+            EntityId::Commit { oid } => match self.revs.iter().position(|r| &r.oid == oid) {
+                Some(i) => {
+                    self.jump_to_rev(i);
+                    true
+                }
+                None => false,
+            },
+            EntityId::File { .. } => {
+                // The live file.
+                while self.rev_ix.is_some() {
+                    let before = self.rev_ix;
+                    self.rev_step(-1);
+                    if self.rev_ix == before {
+                        break;
+                    }
+                }
+                true
+            }
+            _ => false,
+        };
+        if !ok {
+            // Did not move: put the cursor back so the step is still there.
+            if back { self.nav.forward(); } else { self.nav.back(); }
+            return;
+        }
+        if matches!(target, EntityId::Commit { .. } | EntityId::File { .. }) {
+            if let Some(s) = site {
+                self.top.target = (s.line as f32).clamp(0.0, self.max_top());
+            }
+        }
     }
 
     fn jump_to_rev(&mut self, ix: usize) {
@@ -1178,6 +1312,14 @@ mod tests {
         // Clicking an out-of-range index clamps rather than panicking.
         v.jump_to_graph_node(9999);
         assert_eq!(v.rev_ix, Some(v.revs.len() - 1));
+
+        // The way back walks the revisions in reverse: to "two", then live.
+        v.nav_go(true);
+        assert_eq!(v.rev_ix, Some(target), "back to the revision the last jump left");
+        v.nav_go(true);
+        assert!(v.rev_ix.is_none(), "and back again to the live file");
+        v.nav_go(false);
+        assert_eq!(v.rev_ix, Some(target), "forward retakes it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1246,6 +1388,56 @@ mod tests {
         let before = (v.tx.target, v.ty.target, v.tz.target, v.dist.target);
         v.frame_points(&[]);
         assert_eq!((v.tx.target, v.ty.target, v.tz.target, v.dist.target), before);
+    }
+
+
+    #[test]
+    fn a_plaque_click_is_recorded_and_arrow_left_flies_back() {
+        let src = "fn alpha() {}\n".to_string() + &"// pad\n".repeat(50) + "struct Beta { x: u32 }\nfn omega() {}\n";
+        let mut v = Viewer::from_text(&src, Language::Rust, None);
+        let beta = v.stations.iter().position(|s| s.item.name == "Beta").unwrap();
+        let omega = v.stations.iter().position(|s| s.item.name == "omega").unwrap();
+        v.jump_rel(1); // walking the corridor in order: not recorded
+        assert!(v.nav.is_empty());
+        v.jump(0);
+        v.jump_recorded(beta);
+        v.jump_recorded(omega);
+        assert_eq!(v.nav.len(), 2);
+        v.nav_go(true);
+        assert_eq!(v.focus, beta);
+        v.nav_go(true);
+        assert_eq!(v.focus, 0, "back to alpha, where the first click started");
+        v.nav_go(true);
+        assert_eq!(v.focus, 0, "nothing further back: stays put");
+        assert!(v.branch_msg.as_ref().unwrap().0.contains("nothing to go back"));
+        v.nav_go(false);
+        assert_eq!(v.focus, beta);
+    }
+
+    #[test]
+    fn going_back_to_an_item_this_version_lacks_says_so_and_keeps_the_step() {
+        let src = "fn alpha() {}\nfn beta() {}\n";
+        let mut v = Viewer::from_text(src, Language::Rust, None);
+        v.jump_recorded(1);
+        // A different version of the file, without alpha.
+        v.set_text("fn beta() {}\nfn gamma() {}\n");
+        v.nav_go(true);
+        assert!(v.branch_msg.as_ref().unwrap().0.contains("alpha is not in this version"));
+        assert!(v.nav.can_go_back(), "the step is still there for when alpha is");
+    }
+
+
+    #[test]
+    fn the_trail_is_the_visited_stations_in_order_and_shrinks_when_you_go_back() {
+        let src = "fn alpha() {}\n".to_string() + &"// pad\n".repeat(30) + "struct Beta { x: u32 }\nfn omega() {}\n";
+        let mut v = Viewer::from_text(&src, Language::Rust, None);
+        let beta = v.stations.iter().position(|s| s.item.name == "Beta").unwrap();
+        let omega = v.stations.iter().position(|s| s.item.name == "omega").unwrap();
+        v.jump_recorded(omega);
+        v.jump_recorded(beta);
+        assert_eq!(v.trail_stations(), vec![0, omega, beta]);
+        v.nav_go(true);
+        assert_eq!(v.trail_stations(), vec![0, omega], "the undone step is no longer lit");
     }
 
 }

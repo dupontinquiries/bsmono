@@ -32,6 +32,11 @@ pub mod ctl;
 pub mod focus_policy;
 pub mod companion;
 pub mod modlatch;
+pub mod sheet_throw;
+pub mod edit_actions;
+pub mod rail_boards;
+pub mod morse;
+pub mod haptics;
 pub mod key_hold;
 pub mod user_font;
 pub mod layout_edit;
@@ -500,6 +505,42 @@ impl Layout {
         }
     }
 
+    /// The **Morse** board (`morse.rs`): three big keys and the three every
+    /// board needs. CENTRE is the keyer (tap = dot, hold = dash; its face is
+    /// relabelled live with the pattern and the letter it spells), LEFT is
+    /// "that, with a dash in front", RIGHT is "that, inverted". Few targets,
+    /// all large, and none of them needs looking at: the half-board style
+    /// (`layout.one_handed`) makes it a one-thumb pad.
+    pub fn morse() -> Layout {
+        use real_layout::{morse_emit, MorseKey};
+        let side = |label: &str, k: MorseKey| {
+            let mut key = Key::emitting(label, &morse_emit(k), 1.0);
+            key.role = KeyRole::Modifier;
+            key
+        };
+        let left = side("−◂", MorseKey::DashFront);
+        let right = side("⇅", MorseKey::Invert);
+        let mut keyer = Key::emitting("·−", &morse_emit(MorseKey::Key), 2.0);
+        keyer.role = KeyRole::Action;
+        Layout {
+            hints: false,
+            name: "morse".into(),
+            rows: vec![
+                // Two rows on a board sized for four: every key is double height.
+                Row { keys: vec![left, keyer, right], weight: 1.0 },
+                Row {
+                    keys: vec![
+                        Key::emitting("⌫", "\u{8}", 1.0),
+                        Key::emitting("🎤", &real_layout::voice_emit(), 1.0),
+                        Key::emitting("space", " ", 2.0),
+                        Key::emitting("⏎", "\n", 1.0),
+                    ],
+                    weight: 1.0,
+                },
+            ],
+        }
+    }
+
     /// A symbols/numbers layout, reached by swiping the keyboard sideways.
     pub fn symbols() -> Layout {
         fn row(keys: &[&str]) -> Row {
@@ -571,7 +612,7 @@ pub struct Board {
 impl Board {
     /// Default board: qwerty + symbols.
     pub fn new() -> Board {
-        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8(), Layout::stenotype()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0), voice_active: false,
+        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8(), Layout::stenotype(), Layout::morse()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0), voice_active: false,
             shift: real_layout::Shift::Off, before_symbols: None, palette: "system".to_string() }
     }
     pub fn current(&self) -> &Layout {
@@ -593,6 +634,7 @@ impl Board {
             "cardinal" => "cardinal",
             "stenotype" => "stenotype",
             "words" => "cardinal8",
+            "morse" => "morse",
             // "off", and anything a newer build might write that this one does not know:
             // the letter board, which is the safe answer. An unknown mode must not leave the
             // keyboard on whatever was last selected.
@@ -830,11 +872,14 @@ pub struct Style {
     pub calibrated_reach: Option<f32>,
     /// Key label size multiplier (`look.font_size`).
     pub label_scale: f32,
+    /// Board-switch animation progress, 0 = just switched, 1 = landed
+    /// (`sheet_throw`). At 1 nothing is offset.
+    pub sheet_t: f32,
 }
 
 impl Default for Style {
     fn default() -> Self {
-        Style { calibrated_reach: None, key_radius: None, opacity: 1.0, magnifier: true, half: crate::halfboard::Side::Off, arc: true, label_scale: 1.0 }
+        Style { calibrated_reach: None, key_radius: None, opacity: 1.0, magnifier: true, half: crate::halfboard::Side::Off, arc: true, label_scale: 1.0, sheet_t: 1.0 }
     }
 }
 
@@ -857,6 +902,7 @@ impl Style {
             arc: true,
             calibrated_reach: None,
             label_scale: 1.0,
+            sheet_t: 1.0,
         }
     }
 
@@ -950,7 +996,10 @@ pub fn keyboard_ui_styled(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, pal
     let mut emitted = None;
     for (row_i, row) in layout.rows.iter().enumerate() {
         for (col, key) in row.keys.iter().enumerate() {
-            let rect = rects[row_i][col];
+            // The sheet throw: a freshly switched board's keys slide in from
+            // the rail's side (`sheet_throw`); zero once landed.
+            let dx = crate::sheet_throw::key_offset(style.sheet_t, row_i, col, full_rect.width() * 0.6);
+            let rect = rects[row_i][col].translate(Vec2::new(-dx, 0.0));
             if let Some(e) = paint_key(ui, key, rect, (row_i, col), row_i == 0, &colors, glass, layout.hints, style) {
                 emitted = Some(e);
             }
@@ -1875,10 +1924,12 @@ mod tests {
         assert_eq!(b.current().name, "cardinal8");
         b.swipe(1);
         assert_eq!(b.current().name, "Stenotype", "the steno board joined the rotation");
+        b.swipe(1);
+        assert_eq!(b.current().name, "morse");
         b.swipe(1); // wraps back
         assert_eq!(b.current().name, "en_us_qwerty");
         b.swipe(-1); // wraps backward to the last layout
-        assert_eq!(b.current().name, "Stenotype");
+        assert_eq!(b.current().name, "morse");
     }
 
     #[test]
@@ -2463,7 +2514,8 @@ mod gtk_parity_tests {
                                 | crate::real_layout::Press::SymbolsToggle
                                 | crate::real_layout::Press::Backspace
                                 | crate::real_layout::Press::Return
-                                | crate::real_layout::Press::Steno(..)),
+                                | crate::real_layout::Press::Steno(..)
+                                | crate::real_layout::Press::Morse(..)),
                     "{p:?} came out of a shifted layout"
                 ),
             }

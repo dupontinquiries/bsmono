@@ -51,6 +51,32 @@ pub struct Location {
     pub character: u32,
 }
 
+/// [`LspClient::callers`]' answer: `calls` when call hierarchy answered,
+/// otherwise `refs`; `error` only when there is nothing to show and a
+/// reason for it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CallersAnswer {
+    pub calls: Vec<IncomingCall>,
+    pub refs: Vec<Location>,
+    pub error: Option<String>,
+}
+
+/// One caller from `callHierarchy/incomingCalls`: the calling item, and
+/// every place in it that makes the call (a function can call the same
+/// thing several times, and each is a separate site you might want).
+#[derive(Clone, Debug, PartialEq)]
+pub struct IncomingCall {
+    pub name: String,
+    /// LSP `SymbolKind` number (12 = Function, 6 = Method, ...).
+    pub kind: u32,
+    pub uri: String,
+    /// The caller's name (its `selectionRange` start).
+    pub line: u32,
+    pub character: u32,
+    /// `fromRanges` starts: the call sites, in the CALLER's file.
+    pub sites: Vec<(u32, u32)>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiagnosticSeverity {
     Error,
@@ -103,6 +129,10 @@ pub struct LspClient {
     /// update would silently desync its copy of the file, which is a far
     /// worse failure than this client falling back to full sync.
     sync_kind: Mutex<Option<i64>>,
+    /// The server's whole `capabilities` object from `initialize`, so a
+    /// feature can be refused when the server never offered it rather
+    /// than sent and left to fail (or hang) on the other side.
+    server_caps: Mutex<Value>,
     /// Set by the reader when the server's stdout closes. A request made
     /// after that fails at once instead of waiting out `CALL_TIMEOUT`.
     closed: Arc<AtomicBool>,
@@ -177,6 +207,7 @@ impl LspClient {
             pending,
             diagnostics,
             sync_kind: Mutex::new(None),
+            server_caps: Mutex::new(Value::Null),
             closed,
             _reader: reader,
         };
@@ -195,7 +226,10 @@ impl LspClient {
             // whatever capabilities it's told a client has.
             "capabilities": {
                 "textDocument": {
-                    "completion": { "completionItem": { "snippetSupport": false } }
+                    "completion": { "completionItem": { "snippetSupport": false } },
+                    // Parsed by `references` / `incoming_calls` below.
+                    "references": { "dynamicRegistration": false },
+                    "callHierarchy": { "dynamicRegistration": false }
                 }
             }
         });
@@ -203,6 +237,7 @@ impl LspClient {
             .request("initialize", params)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("initialize failed: {e}")))?;
         *self.sync_kind.lock().unwrap() = parse_sync_kind(&result);
+        *self.server_caps.lock().unwrap() = result.get("capabilities").cloned().unwrap_or(Value::Null);
         self.notify("initialized", json!({}))?;
         Ok(())
     }
@@ -330,6 +365,104 @@ impl LspClient {
         Ok(parse_definition_result(&result))
     }
 
+    /// Whether the server advertised `name` in its capabilities: `true` or
+    /// an options object both count (the spec allows either); `false`,
+    /// `null` and absent do not.
+    fn has_capability(&self, name: &str) -> bool {
+        match self.server_caps.lock().unwrap().get(name) {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::Object(_)) => true,
+            _ => false,
+        }
+    }
+
+    pub fn supports_references(&self) -> bool {
+        self.has_capability("referencesProvider")
+    }
+
+    pub fn supports_call_hierarchy(&self) -> bool {
+        self.has_capability("callHierarchyProvider")
+    }
+
+    /// `textDocument/references` for the symbol at `(line, character)`,
+    /// WITHOUT the declaration itself (you are usually standing on it, and
+    /// "every place that mentions this" is the question). Refuses, without
+    /// sending, when the server did not advertise `referencesProvider`.
+    pub fn references(&self, uri: &str, line: u32, character: u32) -> std::io::Result<Vec<Location>> {
+        if !self.supports_references() {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "server does not provide references"));
+        }
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+            "context": { "includeDeclaration": false },
+        });
+        let result = self
+            .request("textDocument/references", params)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("references failed: {e}")))?;
+        Ok(parse_definition_result(&result))
+    }
+
+    /// Who calls the symbol at `(line, character)`: `prepareCallHierarchy`,
+    /// then `incomingCalls` on the first item it names. Unlike
+    /// [`Self::references`] every answer is a CALL, and it arrives with the
+    /// calling item already named — which is what a caller edge in the
+    /// entity graph needs. Refuses when `callHierarchyProvider` is absent.
+    pub fn incoming_calls(&self, uri: &str, line: u32, character: u32) -> std::io::Result<Vec<IncomingCall>> {
+        if !self.supports_call_hierarchy() {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "server does not provide call hierarchy"));
+        }
+        let err = |e: String| std::io::Error::new(std::io::ErrorKind::Other, e);
+        let items = self
+            .request(
+                "textDocument/prepareCallHierarchy",
+                json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } }),
+            )
+            .map_err(|e| err(format!("prepareCallHierarchy failed: {e}")))?;
+        // The item goes back to the server VERBATIM: it may carry a `data`
+        // field only the server understands.
+        let Some(item) = items.as_array().and_then(|a| a.first()).cloned() else {
+            return Ok(Vec::new());
+        };
+        let calls = self
+            .request("callHierarchy/incomingCalls", json!({ "item": item }))
+            .map_err(|e| err(format!("incomingCalls failed: {e}")))?;
+        Ok(parse_incoming_calls(&calls))
+    }
+
+    /// "Who uses this": call hierarchy first (every answer a call, its
+    /// caller named); `references` when the server has no call hierarchy
+    /// OR answered it with nothing (some servers return an empty
+    /// `prepareCallHierarchy` for symbols they do index).
+    pub fn callers(&self, uri: &str, line: u32, character: u32) -> CallersAnswer {
+        let mut out = CallersAnswer::default();
+        let (ch, refs) = (self.supports_call_hierarchy(), self.supports_references());
+        if !ch && !refs {
+            out.error = Some("the language server offers neither call hierarchy nor references".into());
+            return out;
+        }
+        if ch {
+            match self.incoming_calls(uri, line, character) {
+                Ok(c) if !c.is_empty() => {
+                    out.calls = c;
+                    return out;
+                }
+                Ok(_) => {}
+                Err(e) => out.error = Some(e.to_string()),
+            }
+        }
+        if refs {
+            match self.references(uri, line, character) {
+                Ok(r) => {
+                    out.refs = r;
+                    out.error = None;
+                }
+                Err(e) => out.error = Some(e.to_string()),
+            }
+        }
+        out
+    }
+
     /// `textDocument/hover` at `(line, character)` — usually a type
     /// signature and/or doc comment for whatever's under the caret.
     /// `Ok(None)` for a `null` response (nothing hoverable there, a normal
@@ -419,7 +552,13 @@ fn reader_loop<R: BufRead>(
                 // specifically is handled below; every other notification
                 // (log messages, progress, ...) is still dropped — a real
                 // gap, not an oversight, see the crate-level doc.
-                if let Some(id) = msg.get("id").and_then(Value::as_i64) {
+                // A message with BOTH an id and a method is a request FROM
+                // the server (`workspace/configuration`,
+                // `window/workDoneProgress/create`, ...), not a reply.
+                // Treating it as one would hand its params to whichever of
+                // OUR requests happened to share that id.
+                let is_reply = msg.get("method").is_none();
+                if let Some(id) = msg.get("id").and_then(Value::as_i64).filter(|_| is_reply) {
                     if let Some(tx) = pending.lock().unwrap().remove(&id) {
                         let outcome = if let Some(err) = msg.get("error") {
                             Err(err.clone())
@@ -527,6 +666,32 @@ fn parse_definition_result(result: &Value) -> Vec<Location> {
         vec![result]
     };
     items.iter().filter_map(|it| parse_one_location(it)).collect()
+}
+
+fn parse_incoming_calls(result: &Value) -> Vec<IncomingCall> {
+    let Some(arr) = result.as_array() else { return Vec::new() };
+    let start = |r: &Value| -> Option<(u32, u32)> {
+        let s = r.get("start")?;
+        Some((s.get("line")?.as_u64()? as u32, s.get("character")?.as_u64()? as u32))
+    };
+    arr.iter()
+        .filter_map(|c| {
+            let from = c.get("from")?;
+            let (line, character) = start(from.get("selectionRange").or_else(|| from.get("range"))?)?;
+            Some(IncomingCall {
+                name: from.get("name")?.as_str()?.to_string(),
+                kind: from.get("kind").and_then(Value::as_u64).unwrap_or(0) as u32,
+                uri: from.get("uri")?.as_str()?.to_string(),
+                line,
+                character,
+                sites: c
+                    .get("fromRanges")
+                    .and_then(Value::as_array)
+                    .map(|rs| rs.iter().filter_map(start).collect())
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 fn parse_one_location(v: &Value) -> Option<Location> {

@@ -349,3 +349,53 @@ fn incremental_did_change_is_reflected_when_the_server_supports_it() {
     client.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Cross-FILE callers through a real rust-analyzer — the capability the
+/// entity graph lacked. Written without a rust-analyzer to run it against
+/// (the sandbox it was written in could not install one); the request
+/// shapes are proven by `stub_server.rs`, and this is what proves a real
+/// server answers them. If it fails on first real run, suspect indexing
+/// time before suspecting the client: the retry loop is the same one the
+/// F12 test needed.
+#[test]
+fn callers_finds_a_cross_file_caller_through_a_real_rust_analyzer() {
+    if !rust_analyzer_available() {
+        eprintln!("SKIPPED: rust-analyzer not on PATH");
+        return;
+    }
+    let dir = scratch_package("callers");
+    let main_rs = dir.join("src/main.rs");
+    let util_rs = dir.join("src/util.rs");
+    let util = "pub fn compute_total() -> i32 {\n    42\n}\n";
+    let main = "mod util;\n\nfn report() {\n    let _ = util::compute_total();\n}\n\nfn main() {\n    report();\n}\n";
+    std::fs::write(&util_rs, util).unwrap();
+    std::fs::write(&main_rs, main).unwrap();
+    let util_uri = format!("file://{}", util_rs.display());
+    let main_uri = format!("file://{}", main_rs.display());
+    let client = aperture_lsp::LspClient::spawn("rust-analyzer", &[], &format!("file://{}", dir.display()))
+        .expect("spawn rust-analyzer");
+    client.did_open(&main_uri, "rust", main, 1).expect("didOpen main");
+    client.did_open(&util_uri, "rust", util, 1).expect("didOpen util");
+    assert!(client.supports_references(), "rust-analyzer advertises references");
+
+    // Inside the name `compute_total` in its definition (line 0).
+    let mut answer = aperture_lsp::CallersAnswer::default();
+    for attempt in 0..20 {
+        answer = client.callers(&util_uri, 0, 10);
+        if !answer.calls.is_empty() || !answer.refs.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500 * (attempt + 1).min(4)));
+    }
+    if client.supports_call_hierarchy() {
+        let caller = answer.calls.first().unwrap_or_else(|| panic!("no incoming calls: {answer:?}"));
+        assert_eq!(caller.name, "report");
+        assert_eq!(caller.uri, main_uri, "the caller is in the OTHER file");
+        assert_eq!(caller.sites.first().map(|s| s.0), Some(3), "called on main.rs line 3");
+    } else {
+        let r = answer.refs.first().unwrap_or_else(|| panic!("no references: {answer:?}"));
+        assert_eq!((r.uri.as_str(), r.line), (main_uri.as_str(), 3));
+    }
+    client.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

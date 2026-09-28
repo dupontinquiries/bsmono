@@ -531,6 +531,60 @@ impl<B: Backend> Companion<B> {
         }
     }
 
+    /// Every board the keyboard would put on its rail, as the keyboard
+    /// names them: the code-built boards, the user's layouts, the files.
+    pub fn rail_candidates(&self) -> Vec<(String, String)> {
+        let mut board = crate::Board::new();
+        let user: Vec<Layout> = self.layouts.iter().filter_map(|e| self.backend.load_layout(&e.path).ok()).collect();
+        board.set_user_layouts(&user);
+        let real = crate::real_layout::RealBoard::new();
+        crate::rail_boards::all(&board, &real).into_iter().map(|e| (e.id, e.name)).collect()
+    }
+
+    /// Toggle one board on the rail. All ticked is stored as "" (= all),
+    /// so boards added later appear without being ticked; the last one
+    /// cannot be unticked (a rail with nothing on it cannot switch).
+    pub fn toggle_rail(&mut self, name: &str) {
+        let all: Vec<String> = self.rail_candidates().into_iter().map(|(id, _)| id).collect();
+        let cur = self.values.get(crate::rail_boards::KEY).cloned().unwrap_or_default();
+        let mut kept = crate::rail_boards::parse(&cur).unwrap_or_else(|| all.iter().cloned().collect());
+        kept.retain(|n| all.contains(n));
+        if kept.contains(name) {
+            if kept.len() == 1 {
+                self.status = Some(("One board has to stay on the rail.".into(), true));
+                return;
+            }
+            kept.remove(name);
+        } else {
+            kept.insert(name.to_string());
+        }
+        let value = if all.iter().all(|n| kept.contains(n)) { String::new() } else { crate::rail_boards::render(&kept) };
+        self.set(crate::rail_boards::KEY, &value);
+    }
+
+    fn rail_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(16.0);
+        ui.heading("On the rail");
+        ui.separator();
+        ui.label(egui::RichText::new("Swipe up or down on the keyboard's left rail to page through these. All are on it until you trim.").weak());
+        let cur = self.values.get(crate::rail_boards::KEY).cloned().unwrap_or_default();
+        let kept = crate::rail_boards::parse(&cur);
+        let mut toggle = None;
+        ui.horizontal_wrapped(|ui| {
+            for (id, name) in self.rail_candidates() {
+                let on = kept.as_ref().is_none_or(|k| k.contains(&id));
+                let shown = if id.starts_with("file:") { format!("{name} (file)") } else { name.clone() };
+                let label = if on { format!("✓ {shown}") } else { shown };
+                if ui.add(sel_button(on, label).min_size(egui::vec2(0.0, 40.0))).clicked() {
+                    toggle = Some(id);
+                }
+            }
+        });
+        if let Some(n) = toggle {
+            self.toggle_rail(&n);
+        }
+    }
+
     fn layout_list(&mut self, ui: &mut egui::Ui) {
         let big = |t: &str| egui::Button::new(t.to_string()).min_size(egui::vec2(0.0, 40.0));
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
@@ -600,6 +654,9 @@ impl<B: Backend> Companion<B> {
                     self.view = LayoutView::Import(String::new());
                 }
             });
+
+            ui.add_space(16.0);
+            self.rail_section(ui);
 
             ui.add_space(16.0);
             ui.heading("Built-in boards");
@@ -1044,4 +1101,34 @@ mod tests {
             let _ = ctx.run(input(), |ctx| c.ui(ctx));
         }
     }
+
+    #[test]
+    fn trimming_the_rail_stores_the_kept_boards_and_all_is_stored_as_empty() {
+        let mut c = app(true);
+        let all: Vec<String> = c.rail_candidates().into_iter().map(|(id, _)| id).collect();
+        assert!(all.len() >= 3);
+        c.toggle_rail(&all[1]);
+        let v = c.backend.settings.get(crate::rail_boards::KEY).cloned().unwrap();
+        let kept = crate::rail_boards::parse(&v).unwrap();
+        assert!(!kept.contains(&all[1]) && kept.contains(&all[0]));
+        assert_eq!(c.backend.sent.last().map(String::as_str), Some("reload-settings"));
+        c.toggle_rail(&all[1]);
+        assert_eq!(c.backend.settings.get(crate::rail_boards::KEY).map(String::as_str), Some(""), "everything ticked = all");
+    }
+
+    #[test]
+    fn the_last_board_cannot_leave_the_rail() {
+        let mut c = app(true);
+        let all: Vec<String> = c.rail_candidates().into_iter().map(|(id, _)| id).collect();
+        let unique: std::collections::BTreeSet<&String> = all.iter().collect();
+        assert_eq!(unique.len(), all.len(), "rail ids are unique even where names repeat");
+        for n in &all[1..] {
+            c.toggle_rail(n);
+        }
+        c.toggle_rail(&all[0]);
+        let v = c.backend.settings.get(crate::rail_boards::KEY).cloned().unwrap();
+        assert_eq!(crate::rail_boards::parse(&v).unwrap().len(), 1);
+        assert!(c.status.as_ref().unwrap().1, "said why");
+    }
+
 }

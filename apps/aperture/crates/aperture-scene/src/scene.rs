@@ -176,6 +176,28 @@ pub fn build_rooms(
     revs: &[Rev],
     rev_ix: Option<usize>,
 ) -> World {
+    build_rooms_with_trail(stations, focus, aspect, atlas_cell_px, atlas_h, revs, rev_ix, &[])
+}
+
+/// Floor tiles along the way back: one every this many world units.
+pub const TRAIL_STEP: f32 = 2.2;
+
+/// [`build_rooms`], plus the jump trail lit on the floor: `trail` is
+/// station indices in the order they were visited (the viewer's `NavPath`,
+/// resolved to this corridor). Consecutive stations are joined by a line of
+/// glowing tiles, and a visited station's plaque burns a little brighter —
+/// "where have I been" readable from the far end of the corridor.
+#[allow(clippy::too_many_arguments)]
+pub fn build_rooms_with_trail(
+    stations: &[Station],
+    focus: usize,
+    aspect: f32,
+    atlas_cell_px: f32,
+    atlas_h: f32,
+    revs: &[Rev],
+    rev_ix: Option<usize>,
+    trail: &[usize],
+) -> World {
     if stations.is_empty() {
         return build_with_history(aspect, revs, rev_ix);
     }
@@ -273,10 +295,12 @@ pub fn build_rooms(
             MAT_INSCRIPTION2,
         );
         plq.uvs = Some(vec![[0.0, v1], [1.0, v1], [1.0, v0], [0.0, v0]]);
-        plq.emissive = if i == focus { 0.35 } else { 0.10 };
+        plq.emissive = if i == focus { 0.35 } else if trail.contains(&i) { 0.22 } else { 0.10 };
         plaque_ix.push((i, meshes.len()));
         meshes.push(plq);
     }
+
+    push_trail(&mut meshes, stations, trail);
 
     // The one lectern, at the focused station, nudged toward the center line.
     let f = &stations[focus.min(stations.len() - 1)];
@@ -285,6 +309,29 @@ pub fn build_rooms(
         push_lectern(&mut meshes, anchor, aspect);
 
     World { meshes, page_ix, page_center, page_right, page_up, page_w, page_h, plaque_ix, graph_node_ix }
+}
+
+/// Glowing floor tiles between consecutive trail stations, on the corridor
+/// floor's top face (y = 0), in front of each plinth. Tiles, not a strip:
+/// every mesh here is an axis-aligned cuboid, and a diagonal between two
+/// stations is a line of small squares rather than a skewed slab.
+fn push_trail(meshes: &mut Vec<Mesh3>, stations: &[Station], trail: &[usize]) {
+    let at = |i: usize| stations.get(i).map(|s| V(s.pos.x * 0.6, 0.05, s.pos.z + 3.0));
+    for w in trail.windows(2) {
+        let (Some(a), Some(b)) = (at(w[0]), at(w[1])) else { continue };
+        let d = V(b.x - a.x, 0.0, b.z - a.z);
+        let len = (d.x * d.x + d.z * d.z).sqrt();
+        let n = (len / TRAIL_STEP).ceil().max(1.0) as usize;
+        for k in 0..=n {
+            let t = k as f32 / n as f32;
+            let mut tile = with_mat(
+                cuboid(V(a.x + d.x * t, 0.05, a.z + d.z * t), V(0.35, 0.05, 0.35), Color32::from_rgb(236, 196, 110)),
+                2.0,
+            );
+            tile.emissive = 0.6;
+            meshes.push(tile);
+        }
+    }
 }
 
 /// Slide the page quad's V window: `v0..v1` in texture space (0 = top row of
@@ -459,6 +506,26 @@ mod tests {
         assert!(build(2.2).graph_node_ix.is_empty());
         let rev = Rev { oid: "a".into(), time: 0, subject: "a".into(), kind: aperture_core::gitspace::RevKind::Commit, parents: vec![] };
         assert!(build_with_history(2.2, &[rev], None).graph_node_ix.is_empty());
+    }
+
+
+    #[test]
+    fn the_jump_trail_is_lit_on_the_floor_and_brightens_visited_plaques() {
+        let st = layout(items());
+        let cell = 16.0;
+        let atlas_h = cell * (st.len() as f32 + 2.0);
+        let plain = build_rooms(&st, 0, 2.2, cell, atlas_h, &[], None);
+        let lit = build_rooms_with_trail(&st, 0, 2.2, cell, atlas_h, &[], None, &[0, 2, 1]);
+        let tiles = lit.meshes.len() - plain.meshes.len();
+        assert!(tiles >= 4, "two legs of tiles, got {tiles}");
+        let glow = |w: &World, i: usize| w.meshes[w.plaque_ix[i].1].emissive;
+        assert!(glow(&lit, 2) > glow(&plain, 2), "a visited plaque burns brighter");
+        assert_eq!(glow(&lit, 0), glow(&plain, 0), "the focused one is already brightest");
+        // The plaque indices still point at plaques: the trail is added
+        // after them, never between.
+        assert_eq!(lit.plaque_ix, plain.plaque_ix);
+        let one = build_rooms_with_trail(&st, 0, 2.2, cell, atlas_h, &[], None, &[1]);
+        assert_eq!(one.meshes.len(), plain.meshes.len(), "one station is not a trail");
     }
 
 }

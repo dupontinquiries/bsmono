@@ -100,6 +100,28 @@ pub enum Press {
     /// `steno::engine::{StenoButton, StenoGesture}` and feed the
     /// engine directly, NOT commit them as text.
     Steno(String, String),
+    /// A key of the Morse board (`morse.rs`).
+    Morse(MorseKey),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MorseKey {
+    /// The keyer: tap = dot, hold = dash. Its duration is measured by the
+    /// hold path (`key_hold::Kind::Morse`), not by this release.
+    Key,
+    /// The pattern with a dash in front.
+    DashFront,
+    /// The pattern with dots and dashes swapped.
+    Invert,
+}
+
+/// The emit token for a Morse board key.
+pub fn morse_emit(k: MorseKey) -> String {
+    format!("{ACT}{}", match k {
+        MorseKey::Key => "morse_key",
+        MorseKey::DashFront => "morse_dash_front",
+        MorseKey::Invert => "morse_invert",
+    })
 }
 
 /// Reserved emit-token prefix for action keys crossing the render layer. `\u{0}` can't occur in
@@ -225,6 +247,9 @@ pub fn display_label(value: &str) -> std::borrow::Cow<'_, str> {
         Press::Text(t) if t == "\t" => "⇥",
         Press::SymbolsToggle => "?123",
         Press::Voice => "🎤",
+        Press::Morse(MorseKey::Key) => "·−",
+        Press::Morse(MorseKey::DashFront) => "−◂",
+        Press::Morse(MorseKey::Invert) => "⇅",
         // An action this function has no glyph for is shown as its name, never as the
         // token with its NUL.
         _ => value.trim_start_matches(ACT),
@@ -248,6 +273,9 @@ pub fn classify(emit: &str) -> Press {
         Some("right") => Press::Arrow(Arrow::Right),
         Some("up") => Press::Arrow(Arrow::Up),
         Some("down") => Press::Arrow(Arrow::Down),
+        Some("morse_key") => Press::Morse(MorseKey::Key),
+        Some("morse_dash_front") => Press::Morse(MorseKey::DashFront),
+        Some("morse_invert") => Press::Morse(MorseKey::Invert),
         Some(other) => Press::Text(other.to_string()),
         None => Press::Text(emit.to_string()),
     }

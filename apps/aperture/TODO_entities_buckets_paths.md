@@ -282,7 +282,19 @@ Still to do:
    already built for this — an exact LSP answer at the same site clears the
    flag, and there is a test pinning that a later guess cannot un-clear it.
 
-### D. `aperture-lsp`: references and call hierarchy — small + real-server test
+### D. `aperture-lsp`: references and call hierarchy — DONE except the real-server run
+
+Landed 2026-09-27: `LspClient::{references, incoming_calls, callers}`,
+capability-gated (refused unsent when not advertised), a fifth worker
+channel with its own generation, and Shift+F12 in the shell (one answer
+jumps, several open a `Callers` palette list, one row per call SITE; the
+jump is a `CalledBy` / `ReferencedBy` nav step). Proven over real stdio
+against `aperture-lsp/examples/lsp_stub.rs` (`tests/stub_server.rs`),
+including a server->client request reusing an in-flight id, which the
+reader used to take as our reply. NOT yet run against rust-analyzer: the
+test is written (`callers_finds_a_cross_file_caller_through_a_real_rust_
+analyzer`) and skips without one. Nothing feeds the answers into
+`entity::Graph` yet — that waits for a consumer (item N).
 
 `textDocument/references` (with `includeDeclaration: false`) and
 `callHierarchy/prepareCallHierarchy` + `incomingCalls`, gated on the
@@ -294,7 +306,7 @@ with the retry-on-empty the F12 test already needed. Then a fifth
 `lsp_worker.rs` outcome channel (own generation counter — the reason the
 fourth one has its own is written in root `TODO.md`).
 
-### E. `NavPath` + jump-back — core DONE, flat-editor shell DONE, viewer unstarted
+### E. `NavPath` + jump-back — DONE (core, editor, viewer)
 
 Shell half landed (2026-09-27): steps are pushed by F12
 (`jump_to_lsp_definition`, relation References) and every palette accept
@@ -308,8 +320,10 @@ entities made every same-file F12 a dropped self-loop. Sites carry the
 absolute path: `workspace_root()` is per-file outside a repo. Found on the
 way: `open_file` silently discarded unsaved edits on every file switch
 (F12, picker, search hits); it now refuses once and discards on the same
-request repeated. Still to do: `aperture-view`'s `jump_to_graph_node` and
-station clicks.
+request repeated. Viewer half also landed: plaque clicks and graph-node
+jumps push steps (`[`/`]` do not — walking in order is its own way back),
+←/→ walk them, and a station is re-found by kind+name in whichever
+revision is showing.
 
 Core is in the same patch as B. `NavStep{from, rel, to, site}`, `NavPath`
 with a cursor (back returns the STEP, so the callsite comes with it),
@@ -385,7 +399,24 @@ Correcting what §4 says below: a blob ref **is** carried by
 tags only. Fetch explicitly, exactly like `refs/notes/toolcalls`
 (CLAUDE.md §1). Measured, not assumed.
 
-Still to do, shell side, and unstarted:
+**Shell half landed (2026-09-27)**, except the `workspace_root()` change:
+Ctrl+K opens a `Bucket` palette (list / filter / type a new name to make
+one; inside: "+ Add <item under caret>", "+ Keep the jump trail" from
+`NavPath::visited`, entries resolved by name with `locate` — unresolved
+ones listed with "renamed?", never dropped — a ✕ per entry, and a delete
+that asks once). Storage is `GitStore` in a repo, else a `FileStore`
+under `$XDG_DATA_HOME/aperture/buckets/<slug of root>` (never a file in
+the project). Saved on every bucket change. Jumps from a bucket are nav
+steps. Needed `K::LetterK` (a variant named `K` is ambiguous under the
+`use K::*` in `key()`) plus the `EK::K` mapping.
+
+Found on the way and fixed: `open_file` never re-discovered the repo or
+the file's history — `git`, `revs` and the diff gutter stayed the FIRST
+file's, so Ctrl+, after Ctrl+O loaded the old file's revisions into the
+new buffer, and a session started on a scratch buffer never knew it was in
+a repo (so `workspace_root()` was the file's directory).
+
+Still to do, shell side:
 
 * `AppState::workspace_root()` (state.rs:670) returns a `PathBuf`;
   make it a `bucket::Workspace`. `file_finder::walk_files` becomes one
@@ -548,7 +579,15 @@ Three things to decide before lifting it, in order of how much they cost:
    two versions of the ghost. Do that after E and F; it wants a real
    screen, not a test.
 
-### N. aperture-view consumes buckets and paths — small, after H and E
+### N. aperture-view consumes buckets and paths — trail DONE, bucket wing not
+
+The lit trail landed (2026-09-27): `Viewer::trail_stations` resolves the
+path behind the cursor to this corridor's stations by kind+name, and
+`scene::build_rooms_with_trail` lays glowing floor tiles between them and
+brightens visited plaques. Tested on the mesh list; NOT seen on screen
+(aperture-view needs GL, which the sandbox this was written in lacks).
+The bucket wing is not started: it needs stations from OTHER files in a
+viewer that holds one buffer, which is a real change to `Viewer`.
 
 A bucket is a wing (its entries as stations in bucket order); the active
 `NavPath` is a lit trail between stations. Uses `frame_points` for
@@ -578,7 +617,7 @@ From `state.rs` 2280–2345 at HEAD. Ctrl unless stated.
 | Alt+Left / Alt+Right | nav back / forward | E |
 | Shift+D | previous occurrence | G |
 | U | undo last cursor | G |
-| K | bucket palette | H |
+| K | bucket palette | H (taken, 2026-09-27) |
 
 Free after that: J, N, R, W, Q, Shift+K, Shift+U. Ctrl+Shift+V-family is
 not usable — egui delivers Ctrl+C/V/X as clipboard events before they are

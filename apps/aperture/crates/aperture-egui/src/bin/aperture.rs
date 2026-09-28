@@ -24,6 +24,12 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         view::frame(ui, &mut self.state);
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Take our commands off the keyboard. (A crash cannot do this; the
+        // keyboard notices the pid is gone within a second.)
+        self.state.sync_keyboard_strip(false);
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -48,6 +54,10 @@ fn main() -> eframe::Result<()> {
             viewport: uikit_egui::desktop::viewport(APP_ID, "aperture", [1100.0, 760.0]),
             ..Default::default()
         },
-        Box::new(move |_cc| Ok(Box::new(App { state: AppState::new(path, true) }))),
+        Box::new(move |_cc| {
+            let mut state = AppState::new(path, true);
+            state.strip_enabled = true;
+            Ok(Box::new(App { state }))
+        }),
     )
 }

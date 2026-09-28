@@ -22,7 +22,7 @@
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
     VoiceStart,
     VoiceDone,
@@ -31,6 +31,8 @@ pub enum Cmd {
     Cold(bool),
     ReloadSettings,
     ReloadLayouts,
+    /// An app's command strip (`keyboard_strip`): show it, or clear it.
+    Strip(keyboard_strip::Msg),
 }
 
 pub fn parse(s: &str) -> Option<Cmd> {
@@ -43,7 +45,7 @@ pub fn parse(s: &str) -> Option<Cmd> {
         "cold off" => Some(Cmd::Cold(false)),
         "reload-settings" => Some(Cmd::ReloadSettings),
         "reload-layouts" => Some(Cmd::ReloadLayouts),
-        _ => None,
+        other => keyboard_strip::decode(other).map(Cmd::Strip),
     }
 }
 
@@ -95,7 +97,8 @@ impl Ctl {
     /// Everything queued, oldest first. Non-blocking.
     pub fn drain(&mut self) -> Vec<Cmd> {
         let mut out = Vec::new();
-        let mut buf = [0u8; 256];
+        // A strip declaration is several lines; 256 bytes cut it off.
+        let mut buf = [0u8; 8192];
         while let Ok(n) = self.sock.recv(&mut buf) {
             match std::str::from_utf8(&buf[..n]).ok().and_then(parse) {
                 Some(c) => out.push(c),
@@ -140,6 +143,8 @@ mod tests {
         assert_eq!(parse("cold off"), Some(Cmd::Cold(false)));
         assert_eq!(parse("cold"), None);
         assert_eq!(parse("reload-layouts"), Some(Cmd::ReloadLayouts));
+        let show = keyboard_strip::Msg::Show { app: "aperture".into(), pid: 7, actions: vec![keyboard_strip::Action::new("Back", "Alt+Left", "")] };
+        assert_eq!(parse(&keyboard_strip::encode(&show)), Some(Cmd::Strip(show)));
         assert_eq!(parse("reload-settings\n"), Some(Cmd::ReloadSettings));
     }
 }

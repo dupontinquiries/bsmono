@@ -956,7 +956,9 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppData {
                     WEnum::Unknown(raw) => raw,
                 };
                 debug!("v2 ContentType: purpose={}", raw);
-                crate::content_purpose::set_content_purpose(raw.min(255) as u8);
+                // v2 carries text-input-v3 numbering, which differs from
+                // v1's after `password`; see set_content_purpose_v3.
+                crate::content_purpose::set_content_purpose_v3(raw);
             }
             // TextChangeCause: not yet wired.
             _ => {}

@@ -122,6 +122,14 @@ pub fn frame(root: &mut Ui, app: &mut App) {
         if i.key_pressed(Key::End) {
             app.viewer.goto_bottom();
         }
+        // The way back (plaque clicks, graph-node jumps). Plain arrows: the
+        // viewer's keys are unmodified, and ←/→ were free.
+        if i.key_pressed(Key::ArrowLeft) {
+            app.viewer.nav_go(true);
+        }
+        if i.key_pressed(Key::ArrowRight) {
+            app.viewer.nav_go(false);
+        }
     });
 
     // ── animate, rasterize, window ──────────────────────────────────────────
@@ -153,7 +161,8 @@ pub fn frame(root: &mut Ui, app: &mut App) {
         app.viewer.world_dirty = false;
         if let Some(atlas) = &app.viewer.atlas {
             let aspect = (COLS as f32 * 1.0) / (ROWS as f32 * 2.0);
-            app.world = scene::build_rooms(
+            let trail = app.viewer.trail_stations();
+            app.world = scene::build_rooms_with_trail(
                 &app.viewer.stations,
                 app.viewer.focus,
                 aspect,
@@ -161,6 +170,7 @@ pub fn frame(root: &mut Ui, app: &mut App) {
                 atlas.size[1] as f32,
                 &app.viewer.revs,
                 app.viewer.rev_ix,
+                &trail,
             );
         }
     }
@@ -263,7 +273,7 @@ pub fn frame(root: &mut Ui, app: &mut App) {
                         .filter_map(|c| project(&cam, rect, *c))
                         .collect();
                     if pts.len() == 4 && Rect::from_points(&pts).contains(click) {
-                        app.viewer.jump(*station_ix);
+                        app.viewer.jump_recorded(*station_ix);
                         jumped = true;
                         break;
                     }

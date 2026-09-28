@@ -26,6 +26,46 @@ pub fn set_content_purpose(purpose: u8) {
     CONTENT_PURPOSE.store(purpose, Ordering::Relaxed);
 }
 
+/// Store a purpose that arrived in `text-input-v3` numbering — what
+/// `input-method-v2`'s `content_type` carries.
+///
+/// The two enums DIVERGE after `password` (8): v3 inserts `pin` at 9, so
+/// date/time/datetime/terminal are 10/11/12/13 there and 9/10/11/12 in v1.
+/// The v2 handler stored the raw value, so on every v2 compositor (sway,
+/// cosmic-comp, phoc) a terminal (13) was not recognised as one and a
+/// date-and-time field (12) was taken for a terminal. Normalised here to
+/// the v1 numbering the rest of this module documents; `pin` is a numeric
+/// password and is stored as `password`.
+pub fn set_content_purpose_v3(purpose: u32) {
+    let v1 = match purpose {
+        0..=8 => purpose,
+        9 => 8,             // pin -> password
+        10..=13 => purpose - 1,
+        other => other,
+    };
+    set_content_purpose(v1.min(255) as u8);
+}
+
+/// The password purpose (v1 numbering, which is what is stored).
+pub const CONTENT_PURPOSE_PASSWORD: u8 = 8;
+
+#[cfg(test)]
+mod v3_tests {
+    use super::*;
+
+    #[test]
+    fn v3_numbers_are_stored_in_v1_numbering() {
+        set_content_purpose_v3(13);
+        assert_eq!(content_purpose(), CONTENT_PURPOSE_TERMINAL, "v3 terminal is a terminal");
+        set_content_purpose_v3(12);
+        assert_ne!(content_purpose(), CONTENT_PURPOSE_TERMINAL, "v3 datetime is not");
+        set_content_purpose_v3(9);
+        assert_eq!(content_purpose(), CONTENT_PURPOSE_PASSWORD, "a pin is a password");
+        set_content_purpose_v3(5);
+        assert_eq!(content_purpose(), 5, "url is the same in both");
+    }
+}
+
 pub fn content_purpose() -> u8 {
     CONTENT_PURPOSE.load(Ordering::Relaxed)
 }

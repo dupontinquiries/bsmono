@@ -66,6 +66,9 @@ pub enum Kind {
     /// Repeats this keysym.
     Repeat(String),
     Caret,
+    /// The Morse keyer: sends nothing while held; the caller reads
+    /// [`Hold::held_ms`] on release (a tap is a dot, a hold a dash).
+    Morse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +97,11 @@ impl Hold {
         Hold { kind, origin, started_ms: now_ms, next_ms: None, fired: 0, axis: None, tracked: 0, last_pos: origin, last_move_ms: now_ms }
     }
 
+    /// How long the key has been down.
+    pub fn held_ms(&self, now_ms: f64) -> f64 {
+        now_ms - self.started_ms
+    }
+
     /// Whether anything was sent while held: the release must not type too.
     pub fn consumed(&self) -> bool {
         self.fired > 0
@@ -104,6 +112,7 @@ impl Hold {
         let out = match self.kind.clone() {
             Kind::Repeat(k) => self.tick_repeat(&k, now_ms, rep),
             Kind::Caret => self.tick_caret(pos, now_ms, car),
+            Kind::Morse => vec![],
         };
         self.fired += out.len() as u32;
         out
@@ -198,6 +207,7 @@ pub fn kind_for(emit: &str) -> Option<Kind> {
         Press::Text(t) if t == "\u{8}" => Some(Kind::Repeat("BackSpace".into())),
         Press::Arrow(a) => Some(Kind::Repeat(a.keysym().into())),
         Press::Text(t) if t == " " => Some(Kind::Caret),
+        Press::Morse(crate::real_layout::MorseKey::Key) => Some(Kind::Morse),
         _ => None,
     }
 }
@@ -271,5 +281,10 @@ mod tests {
         assert_eq!(kind_for(&format!("{}backspace", crate::real_layout::ACT)), Some(Kind::Repeat("BackSpace".into())));
         assert_eq!(kind_for(" "), Some(Kind::Caret));
         assert_eq!(kind_for("a"), None, "a letter's hold is its accents");
+        let keyer = crate::real_layout::morse_emit(crate::real_layout::MorseKey::Key);
+        assert_eq!(kind_for(&keyer), Some(Kind::Morse));
+        let mut h = Hold::new(Kind::Morse, pos2(0.0, 0.0), 100.0);
+        assert!(run(&mut h, &[(0.0, 0.0, 400.0)]).is_empty(), "the keyer sends nothing while held");
+        assert_eq!(h.held_ms(400.0), 300.0);
     }
 }

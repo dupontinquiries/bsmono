@@ -96,6 +96,10 @@ settings-kit = { path = "../../../shared/settings-kit" }
 mic-kit = { path = "../../../shared/mic-kit" }
 voice-kit = { path = "../../../shared/voice-kit" }
 signal-kit = { path = "../../../shared/signal-kit" }
+# Apps (aperture) declare commands for the strip above the keys.
+keyboard-strip = { path = "../../../shared/keyboard-strip" }
+# Vibration motor (sysfs leds "vibrator"): Morse feedback.
+haptic-kit = { path = "../../../shared/haptic-kit" }
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
 
 # Only under `layer` — see the feature's comment.

@@ -38,6 +38,7 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
 
     state.poll_completions(now_ms);
     state.poll_lsp(now_ms);
+    state.sync_keyboard_strip(ctx.input(|i| i.focused));
     state.poll_note();
     state.poll_route_ai();
     state.poll_edit_ai(now_ms);
@@ -392,7 +393,52 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
         m.line_h,
         ui.ctx().pixels_per_point(),
     );
-    if response.double_clicked() {
+    // FINGERS FIRST. A touch drag scrolls (a mouse drag selects), a tap
+    // places the caret, a long-press starts a selection — touch_input.rs.
+    // While a touch is in play the simulated pointer below is ignored, or
+    // every tap would also be a click and every scroll a selection.
+    let now_f = now_ms as f64;
+    let events: Vec<egui::Event> = ui.ctx().input(|i| i.events.clone());
+    let touched_now = events.iter().any(|e| matches!(e, egui::Event::Touch { .. }));
+    let touch_acts = state.touch.feed(&events, rect, now_f);
+    let at = |state: &AppState, p: egui::Pos2| {
+        state.caret_from_click_line(p.x - content_left, click_grid.line_at(p.y), m.char_w)
+    };
+    for act in touch_acts {
+        use crate::touch_input::EditAct;
+        match act {
+            EditAct::Caret(p) => {
+                let ci = at(state, p);
+                state.click_set_caret(ci, false);
+            }
+            EditAct::Word(p) => {
+                let ci = at(state, p);
+                state.click_set_caret(ci, false);
+                state.editor.move_word(-1, false);
+                state.editor.move_word(1, true);
+            }
+            EditAct::SelectStart(p) => {
+                let ci = at(state, p);
+                state.click_set_caret(ci, false);
+            }
+            EditAct::SelectTo(p) => {
+                let ci = at(state, p);
+                state.click_set_caret(ci, true);
+            }
+            EditAct::Scroll(d) => {
+                // 1:1 under the finger: move both, so the camera's easing
+                // does not trail behind the thumb.
+                state.cam.scroll_y.pos += d;
+                state.cam.scroll_y.target += d;
+            }
+        }
+    }
+    if state.touch.wants_frames() {
+        ui.ctx().request_repaint();
+    }
+    if touched_now || state.touch.owns_pointer(now_f) {
+        // (the pointer branch below is the mouse's)
+    } else if response.double_clicked() {
         state.editor.move_word(-1, false);
         state.editor.move_word(1, true);
     } else if response.clicked() || response.drag_started() {
@@ -1255,6 +1301,21 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
     let mut apply: Option<(String, palette_ui::Cmd)> = None;
     let mut open_path: Option<String> = None;
     let mut open_hit: Option<(std::path::PathBuf, usize)> = None;
+<<<<<<< ours
+=======
+    // A Callers row: exact column, and whether the list was real calls.
+    let mut open_site: Option<(std::path::PathBuf, usize, usize, bool)> = None;
+    // Bucket rows need `&mut AppState` (outlines, files), so they are
+    // computed here, before the overlay borrows the palette.
+    let bucket_rows = match state.palette.as_ref() {
+        Some(p) if p.mode == Mode::Bucket => {
+            let (open, input) = (p.bucket_open, p.input.clone());
+            state.bucket_rows(open, &input)
+        }
+        _ => Vec::new(),
+    };
+    let mut bucket_pick: Option<palette_ui::BucketAct> = None;
+>>>>>>> theirs
     // Which palette produced a hit, for the nav step's relation.
     let hit_mode = state.palette.as_ref().map(|p| p.mode.clone());
     let mut submit_edit: Option<String> = None;
@@ -1302,6 +1363,8 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                         Mode::GoToRoute => "describe what you're looking for…",
                         Mode::AiEditPrompt => "instruction for the selection…",
                         Mode::VoiceCommand => "say a command — \"save\", \"find total\", \"go to line 12\"…",
+                        Mode::Callers => "filter callers…",
+                        Mode::Bucket => if p.bucket_open.is_some() { "filter this bucket…" } else { "bucket name — filter, or type a new one…" },
                     };
                     let edit = egui::TextEdit::singleline(&mut p.input).id_salt("view-p_input")
                         .hint_text(hint)
@@ -1709,6 +1772,117 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 submit_edit = Some(p.input.trim().to_string());
                             }
                         }
+                        Mode::Bucket => {
+                            ui.label(
+                                egui::RichText::new("Ctrl+K buckets · Enter choose · Esc close")
+                                    .color(colors.text_weak)
+                                    .small(),
+                            );
+                            let rows = &bucket_rows;
+                            if !rows.is_empty() {
+                                if up {
+                                    p.selected = p.selected.saturating_sub(1);
+                                    p.follow_selection = true;
+                                }
+                                if down {
+                                    p.selected = (p.selected + 1).min(rows.len() - 1);
+                                    p.follow_selection = true;
+                                }
+                                egui::ScrollArea::vertical()
+                                    .id_salt("palette_bucket")
+                                    .max_height(palette_list_h(ui))
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| {
+                                        for (i, r) in rows.iter().enumerate() {
+                                            let selected = i == p.selected;
+                                            let bg = if selected { colors.accent.gamma_multiply(0.25) } else { Color32::TRANSPARENT };
+                                            let text_color = if selected { colors.text } else { colors.text_weak };
+                                            let resp = egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(4)).inner_margin(4.0)
+                                                .show(ui, |ui| {
+                                                    ui.set_width(ui.available_width());
+                                                    ui.horizontal(|ui| {
+                                                        ui.vertical(|ui| {
+                                                            ui.label(egui::RichText::new(&r.label).color(text_color).strong());
+                                                            ui.label(egui::RichText::new(&r.detail).color(colors.text_weak).small());
+                                                        });
+                                                        if let Some(ei) = r.removable {
+                                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                                if ui.add(egui::Button::new("✕").min_size(Vec2::new(32.0, 28.0)))
+                                                                    .on_hover_text("remove from this bucket").clicked()
+                                                                {
+                                                                    bucket_pick = Some(palette_ui::BucketAct::Remove(ei));
+                                                                }
+                                                            });
+                                                        }
+                                                    });
+                                                })
+                                                .response
+                                                .interact(Sense::click());
+                                            if selected && p.follow_selection {
+                                                resp.scroll_to_me(None);
+                                            }
+                                            if resp.clicked() && bucket_pick.is_none() {
+                                                bucket_pick = Some(r.act.clone());
+                                            }
+                                        }
+                                    });
+                                if enter && bucket_pick.is_none() {
+                                    bucket_pick = Some(rows[p.selected.min(rows.len() - 1)].act.clone());
+                                }
+                            }
+                        }
+                        Mode::Callers => {
+                            let f = p.input.to_lowercase();
+                            let rows: Vec<&crate::palette_ui::CallerHit> = p
+                                .callers
+                                .iter()
+                                .filter(|h| f.is_empty() || h.title.to_lowercase().contains(&f) || h.detail.to_lowercase().contains(&f))
+                                .collect();
+                            ui.label(
+                                egui::RichText::new(if p.callers_are_calls { "calls · Enter jump · Esc cancel" } else { "references (no call hierarchy) · Enter jump · Esc cancel" })
+                                    .color(colors.text_weak)
+                                    .small(),
+                            );
+                            if !rows.is_empty() {
+                                if up {
+                                    p.selected = p.selected.saturating_sub(1);
+                                }
+                                if down {
+                                    p.selected = (p.selected + 1).min(rows.len() - 1);
+                                }
+                                egui::ScrollArea::vertical()
+                                    .id_salt("palette_callers")
+                                    .max_height(palette_list_h(ui))
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| {
+                                        for (i, h) in rows.iter().enumerate() {
+                                            let selected = i == p.selected;
+                                            let bg = if selected { colors.accent.gamma_multiply(0.25) } else { Color32::TRANSPARENT };
+                                            let text_color = if selected { colors.text } else { colors.text_weak };
+                                            let resp = egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(4)).inner_margin(4.0)
+                                                .show(ui, |ui| {
+                                                    ui.set_width(ui.available_width());
+                                                    ui.vertical(|ui| {
+                                                        ui.label(egui::RichText::new(&h.title).color(text_color).strong());
+                                                        ui.label(egui::RichText::new(&h.detail).color(colors.text_weak).small());
+                                                    });
+                                                })
+                                                .response
+                                                .interact(Sense::click());
+                                            if selected && p.follow_selection {
+                                                resp.scroll_to_me(None);
+                                            }
+                                            if resp.clicked() {
+                                                open_site = Some((h.path.clone(), h.line, h.col, p.callers_are_calls));
+                                            }
+                                        }
+                                    });
+                                if enter {
+                                    let h = rows[p.selected.min(rows.len() - 1)];
+                                    open_site = Some((h.path.clone(), h.line, h.col, p.callers_are_calls));
+                                }
+                            }
+                        }
                         Mode::VoiceCommand => {
                             // Computed once, before the row, so both the
                             // button (inside the closure below) and the
@@ -1832,7 +2006,23 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
         palette_ui::apply(cmd, state, now_ms);
         return;
     }
+<<<<<<< ours
     use aperture_core::entity::Relation;
+=======
+    if let Some(act) = bucket_pick {
+        if state.bucket_act(act, now_ms) {
+            state.palette = None;
+        }
+        return;
+    }
+    use aperture_core::entity::Relation;
+    if let Some((path, line, col, calls)) = open_site {
+        let rel = if calls { Relation::CalledBy } else { Relation::ReferencedBy };
+        state.palette_jump_at(path, line, col, rel, now_ms);
+        state.palette = None;
+        return;
+    }
+>>>>>>> theirs
     if let Some(path) = open_path {
         state.palette_jump(std::path::PathBuf::from(path), None, Relation::Opened, now_ms);
         state.palette = None;
@@ -1882,6 +2072,7 @@ fn map_key(key: egui::Key) -> Option<K> {
         EK::G => K::G,
         EK::D => K::D,
         EK::U => K::U,
+        EK::K => K::LetterK,
         EK::L => K::L,
         EK::I => K::I,
         EK::F => K::F,

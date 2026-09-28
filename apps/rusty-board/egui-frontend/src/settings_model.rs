@@ -172,11 +172,12 @@ pub const SETTINGS: &[Setting] = &[
         key: "layout.experimental_mode", label: "Mode",
         help: "Off = normal keyboard. Cardinal = 3×3 swipe grid. \
                Stenotype = 4-button steno (very experimental). \
-               Words = 5-col cardinal with prose / C / Rust / Python clusters.",
+               Words = 5-col cardinal with prose / C / Rust / Python clusters. \
+               Morse = a three-key keyer (tap dot, hold dash).",
         group: Group::Experimental,
         kind: Kind::Choice,
-        options: &["Off", "Cardinal", "Stenotype", "Words"],
-        values: &["off", "cardinal", "stenotype", "words"],
+        options: &["Off", "Cardinal", "Stenotype", "Words", "Morse"],
+        values: &["off", "cardinal", "stenotype", "words", "morse"],
     },
     // ── Typing: ported from the GTK panel, help text verbatim ───────────
     //
@@ -204,6 +205,24 @@ pub const SETTINGS: &[Setting] = &[
     Setting {
         key: "typing.swipe_speed", label: "Swipe speed",
         help: "How hard you pause to mark a letter. Slow = gentle pauses count; Fast = only near-stops.",
+        group: Group::Typing,
+        kind: Kind::Choice,
+        options: &["Normal", "Slow", "Fast"], values: &["normal", "slow", "fast"],
+    },
+    // Morse (morse.rs): the board is `layout.experimental_mode = morse`;
+    // these two tune it, and let every OTHER board teach it.
+    Setting {
+        key: "typing.morse_feel", label: "Feel words in Morse",
+        help: "On a vibrating phone, each swiped word plays its Morse code, so the \
+               code is learned in passing on the way to typing without looking.",
+        group: Group::Typing,
+        kind: Kind::Choice,
+        options: &["Off", "On"], values: &["off", "on"],
+    },
+    Setting {
+        key: "typing.morse_speed", label: "Morse speed",
+        help: "How long a hold is a dash and how long a pause ends a letter (Morse \
+               board), and how fast the words play (Feel words in Morse).",
         group: Group::Typing,
         kind: Kind::Choice,
         options: &["Normal", "Slow", "Fast"], values: &["normal", "slow", "fast"],
@@ -384,16 +403,16 @@ mod tests {
     }
 
     #[test]
-    fn the_experimental_mode_has_four_options_not_two() {
-        // Off, Cardinal, Stenotype, Words — a tap-to-toggle row that stopped at
-        // two would make the last two unreachable.
+    fn every_experimental_mode_is_reachable_by_tapping() {
+        // Off, Cardinal, Stenotype, Words, Morse — a tap-to-toggle row that
+        // stopped at two would make the rest unreachable.
         let s = find("layout.experimental_mode");
-        assert_eq!(s.options.len(), 4);
+        assert_eq!(s.options.len(), 5);
         let mut v = "off";
         let mut seen = vec![v];
-        for _ in 0..3 { v = s.next(v); seen.push(v); }
-        assert_eq!(seen, vec!["off", "cardinal", "stenotype", "words"]);
-        assert_eq!(s.next("words"), "off", "and wraps");
+        for _ in 0..4 { v = s.next(v); seen.push(v); }
+        assert_eq!(seen, vec!["off", "cardinal", "stenotype", "words", "morse"]);
+        assert_eq!(s.next("morse"), "off", "and wraps");
     }
 
     #[test]

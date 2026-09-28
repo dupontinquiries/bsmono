@@ -10,5 +10,6 @@ pub mod loop_pane;
 pub mod lsp_worker;
 pub mod page;
 pub mod palette_ui;
+pub mod touch_input;
 pub mod state;
 pub mod view;

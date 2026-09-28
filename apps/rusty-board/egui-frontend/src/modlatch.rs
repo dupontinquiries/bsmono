@@ -79,7 +79,7 @@ impl Mods {
         match s {
             RailSwipe::Ctrl => self.ctrl = self.ctrl.cycle(),
             RailSwipe::Alt => self.alt = self.alt.cycle(),
-            RailSwipe::Tab => {}
+            RailSwipe::Tab | RailSwipe::NextBoard | RailSwipe::PrevBoard => {}
         }
     }
 }
@@ -89,6 +89,9 @@ pub enum RailSwipe {
     Tab,
     Ctrl,
     Alt,
+    /// Steeply up / down: the next / previous board.
+    NextBoard,
+    PrevBoard,
 }
 
 /// Shortest drag that counts, in points. Above egui's click slop (a tap on a
@@ -97,14 +100,24 @@ pub const MIN_SWIPE: f32 = 32.0;
 /// Within this angle of horizontal: Tab.
 pub const LEVEL_DEG: f32 = 25.0;
 /// Up to this angle from horizontal: a diagonal (Ctrl/Alt). Steeper is a
-/// vertical drag, which belongs to the rail's scroll.
+/// vertical swipe: next / previous board.
 pub const DIAGONAL_DEG: f32 = 70.0;
 
 /// Classify a drag that started on the rail (screen y grows downward).
 /// Only rightward drags count: the rail sits at the left screen edge, where a
 /// leftward drag has no room and meets the compositor's edge gestures.
 pub fn classify(delta: Vec2) -> Option<RailSwipe> {
-    if delta.length() < MIN_SWIPE || delta.x <= 0.0 {
+    if delta.length() < MIN_SWIPE {
+        return None;
+    }
+    // Steep enough in either horizontal direction: a board switch. Checked
+    // first, and allowed to lean left, because a thumb swiping "down the
+    // rail" at the screen edge drifts inward OR outward.
+    let steep = (delta.y.abs()).atan2(delta.x.abs()).to_degrees();
+    if steep > DIAGONAL_DEG {
+        return Some(if delta.y < 0.0 { RailSwipe::NextBoard } else { RailSwipe::PrevBoard });
+    }
+    if delta.x <= 0.0 {
         return None;
     }
     let deg = (-delta.y).atan2(delta.x).to_degrees();
@@ -155,7 +168,8 @@ mod tests {
         assert_eq!(classify(vec2(60.0, 5.0)), Some(RailSwipe::Tab));
         assert_eq!(classify(vec2(50.0, -50.0)), Some(RailSwipe::Ctrl), "up-right");
         assert_eq!(classify(vec2(50.0, 50.0)), Some(RailSwipe::Alt), "down-right");
-        assert_eq!(classify(vec2(5.0, -80.0)), None, "vertical is the rail's scroll");
+        assert_eq!(classify(vec2(5.0, -80.0)), Some(RailSwipe::NextBoard), "up the rail: next board");
+        assert_eq!(classify(vec2(-6.0, 80.0)), Some(RailSwipe::PrevBoard), "down, leaning out: previous");
         assert_eq!(classify(vec2(-60.0, 0.0)), None, "leftward is not offered");
         assert_eq!(classify(vec2(10.0, 0.0)), None, "a tap's wobble");
     }
