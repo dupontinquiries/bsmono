@@ -132,6 +132,10 @@ pub struct Vfx {
     pub gusts: Vec<Gust>,
     crumble_t: f32,
     crumble_seed: u64,
+    /// Seconds to the next mote of starlight up each lift (`lift`).
+    lift_mote_t: f32,
+    /// Seconds to the next bubble of laughter off a giggling cat.
+    giggle_t: f32,
 }
 
 /// A dash's wake through cloud: from `from` to `to`, `age` seconds ago.
@@ -347,6 +351,7 @@ impl Vfx {
                 // a fallen star: as bright as lightning, and wider
                 Event::StarfallFx { at, radius } => add(*at + Vec3::Y * 3.0, [0.88, 0.94, 1.0], radius * 4.0, 0.6, 18.0),
                 Event::HealFx { pos, radius } => add(*pos + Vec3::Y, [0.45, 1.0, 0.55], radius * 1.5, 0.6, 2.0),
+                Event::GiggleFx { pos, radius } => add(*pos + Vec3::Y, [1.0, 0.55, 0.8], radius * 1.5, 0.5, 3.0),
                 Event::ShieldFx { pos, dur, color } => add(*pos + Vec3::Y, *color, 4.0, dur.min(1.5), 1.5),
                 Event::BeamFx { from, dir, length, color, dur, .. } => add(*from + *dir * (length * 0.5) + Vec3::Y, *color, length * 0.6 + 2.0, dur.min(2.0), 3.0),
                 _ => {}
@@ -611,6 +616,48 @@ impl Vfx {
                 }
             }
         }
+        // the lifts: a column of starlight motes rising off every pad --
+        // the tall one up from the islands to over the Aerie, a short one
+        // from each top pad -- and a trail streaming off anyone riding
+        self.lift_mote_t -= dt;
+        while self.lift_mote_t <= 0.0 {
+            self.lift_mote_t += 0.03;
+            let top = crate::sky::UPPER_Y + crate::lift::CREST;
+            for (k, (lo, hi)) in crate::sky::lifts().into_iter().enumerate() {
+                for (pad, low) in [(lo, true), (lo, true), (hi, false)] {
+                    let a = self.perturb(3.0 + k as f32 * 0.7) * 3.1416;
+                    let r = crate::lift::PAD_R * (0.3 + 0.35 * (self.perturb(1.0 + k as f32 * 0.3) + 1.0));
+                    let speed = 6.5 + self.perturb(1.5);
+                    let life = if low { (top - lo.y) / speed } else { 1.4 };
+                    let gold = self.perturb(1.0 + k as f32 * 1.3) > 0.4;
+                    self.particles.push(Particle {
+                        pos: pad + Vec3::new(a.cos() * r, 0.2, a.sin() * r),
+                        vel: Vec3::new(-a.sin(), 0.0, a.cos()) * 0.8 + Vec3::Y * speed,
+                        life,
+                        max_life: life,
+                        size: if gold { 0.14 } else { 0.19 },
+                        color: if gold { [1.0, 0.9, 0.62] } else { [0.8, 0.9, 1.0] },
+                        alpha: 0.75,
+                        gravity: 0.0,
+                        drag: 0.0,
+                    });
+                }
+            }
+            for g in game.gods.iter().filter(|g| g.lift.is_some() && g.respawn_t <= 0.0) {
+                let j = self.perturb(0.6);
+                self.particles.push(Particle {
+                    pos: g.pos + Vec3::new(j, 0.4 + j.abs(), -j),
+                    vel: Vec3::new(j * 2.0, -1.0, -j * 2.0),
+                    life: 0.8,
+                    max_life: 0.8,
+                    size: 0.3,
+                    color: [1.0, 0.94, 0.75],
+                    alpha: 0.8,
+                    gravity: 0.0,
+                    drag: 1.0,
+                });
+            }
+        }
         // crumbling: now and then a piece of an island's edge near the
         // player breaks away and falls, shedding snow as it goes
         self.crumble_t -= dt;
@@ -732,7 +779,7 @@ impl Vfx {
                     s.plough(pos - dir * 2.6, pos, 1.2);
                     continue;
                 }
-                Event::BeamFx { from, dir, length, width, color, .. } if from.y < 4.0 => {
+                Event::BeamFx { from, dir, length, width, color, .. } if from.y - crate::map::ground_y(from.x, from.z) < 4.0 => {
                     // a beam along the ground scours a furrow
                     let n = (length / 2.0).ceil().clamp(1.0, 20.0) as usize;
                     for q in 0..=n {
@@ -743,7 +790,8 @@ impl Vfx {
                 }
                 _ => continue,
             };
-            if !pos.is_finite() || pos.y > 4.0 {
+            // near the ground it stands over (the islands, or the Aerie)
+            if !pos.is_finite() || pos.y - crate::map::ground_y(pos.x, pos.z) > 4.0 {
                 continue;
             }
             let there = s.depth_at(pos.x, pos.z);
@@ -924,6 +972,17 @@ impl Vfx {
         self.tick_wisps(dt, game);
         self.tick_snow(dt, events, game);
         self.tick_sky_life(dt, events, game);
+        // giggling cats: bubbles of laughter bobbing up off them (`kit`)
+        self.giggle_t -= dt;
+        if self.giggle_t <= 0.0 {
+            self.giggle_t = 0.08;
+            for (i, g) in game.gods.iter().enumerate() {
+                if g.giggle_t > 0.0 && g.respawn_t <= 0.0 {
+                    let a = self.time * 5.0 + i as f32;
+                    self.particles.push(Particle { pos: g.pos + Vec3::new(a.cos() * 0.4, 2.0, a.sin() * 0.4), vel: Vec3::new(a.cos() * 0.6, 1.8, a.sin() * 0.6), life: 0.7, max_life: 0.7, size: 0.16, color: [1.4, 0.8, 1.2], alpha: 0.85, gravity: -0.5, drag: 0.5 });
+                }
+            }
+        }
         self.time += dt;
         let atm = game.weather.atmosphere();
         self.ground.tick(dt, atm.rain, atm.wetness);
@@ -1193,6 +1252,25 @@ impl Vfx {
                             gravity: 0.0,
                             drag: 0.5,
                         });
+                    }
+                }
+                Event::GiggleFx { pos, radius } => {
+                    // the laugh going round: a pink ring out to its reach, and
+                    // bubbles of it bouncing up all over
+                    self.rings.push(Ring { pos: *pos + Vec3::Y * 0.05, r0: 0.5, r1: *radius, until: 0.45, dur: 0.45, color: [1.0, 0.55, 0.85], thick: 0.2 });
+                    for k in 0..40 {
+                        let a = k as f32 * 2.399;
+                        let r = *radius * ((k as f32 * 0.618).fract());
+                        let c = if k % 3 == 0 { [1.4, 1.2, 0.5] } else { [1.4, 0.7, 1.1] };
+                        self.particles.push(Particle { pos: *pos + Vec3::new(a.cos() * r, 0.8, a.sin() * r), vel: Vec3::new(a.cos(), 4.0 + (k % 4) as f32, a.sin()), life: 0.8, max_life: 0.8, size: 0.22, color: c, alpha: 0.9, gravity: 5.0, drag: 1.0 });
+                    }
+                }
+                Event::KitlingPop { pos } => {
+                    // a kitten pops: a puff of confetti
+                    let cols = [[1.4, 0.7, 1.0], [0.7, 1.3, 0.6], [1.4, 1.2, 0.5], [0.6, 1.0, 1.4]];
+                    for k in 0..18 {
+                        let a = k as f32 * 2.399;
+                        self.particles.push(Particle { pos: *pos + Vec3::Y * 0.5, vel: Vec3::new(a.cos() * 2.5, 3.5 + (k % 3) as f32, a.sin() * 2.5), life: 0.9, max_life: 0.9, size: 0.14, color: cols[k % 4], alpha: 1.0, gravity: 6.0, drag: 1.5 });
                     }
                 }
                 Event::HealFx { pos, radius } => {
@@ -1832,6 +1910,24 @@ impl Vfx {
                         });
                     }
                     let _ = trigger_t;
+                }
+                ZoneKind::Dance { .. } => {
+                    // the dance floor: spots of coloured light thrown by the
+                    // glitter-ball, wheeling across the ground under it
+                    let colors = [[1.0, 0.35, 0.7], [0.35, 0.85, 1.0], [1.0, 0.9, 0.3], [0.5, 1.0, 0.45], [0.8, 0.45, 1.0]];
+                    let n = (z.radius * 5.0) as usize;
+                    for i in 0..n {
+                        let k = i as f32;
+                        let a = k * 2.399 + self.time * (0.6 + 0.25 * (i % 3) as f32);
+                        let r = z.radius * ((k * 0.618).fract() * 0.9 + 0.05);
+                        let c = colors[i % colors.len()];
+                        let p = z.pos + Vec3::new(a.cos() * r, 0.0, a.sin() * r);
+                        out.push(VoxInst {
+                            off_ao: [p.x, crate::map::ground_y(p.x, p.z) + 0.1, p.z, 1.0],
+                            color: [c[0] * 1.6, c[1] * 1.6, c[2] * 1.6, 0.8],
+                            misc: [0.45, 0.0, 0.0, 0.0],
+                        });
+                    }
                 }
             }
         }

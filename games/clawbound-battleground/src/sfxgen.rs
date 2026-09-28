@@ -352,6 +352,65 @@ pub fn ability(def: &GodDef, slot: usize) -> Vec<f32> {
             x = tones(0.8, &[b * 4.0, b * 5.0, b * 6.0, b * 8.0], 0.01, 0.35, 0.8, 0.0);
             reverb(&mut x, 0.6, 0.3);
         }
+        Archetype::Litter { count, .. } => {
+            // a scatter of small paws, and a mew rising out of each kitten
+            for k in 0..(count * 3) {
+                let p = thud(0.05, 900.0 + 120.0 * (k % 4) as f32, 400.0, 0.0, &mut n);
+                mix_at(&mut x, &p, 0.02 + k as f32 * 0.035, 0.45);
+            }
+            for k in 0..count {
+                let f = b * (6.0 + 0.9 * k as f32);
+                let len = 0.16;
+                let mut m = vec![0.0; secs(len)];
+                let mut ph = 0.0f32;
+                for (i, o) in m.iter_mut().enumerate() {
+                    let t = i as f32 / RATE;
+                    ph = (ph + lerp_exp(f, f * 1.6, t / len) / RATE).fract();
+                    let v = (ph * std::f32::consts::TAU).sin();
+                    *o = (v + 0.3 * (2.0 * ph * std::f32::consts::TAU).sin()) * env(t, 0.01, 0.07);
+                }
+                mix_at(&mut x, &m, 0.04 + k as f32 * 0.08, 0.55);
+            }
+        }
+        Archetype::Giggle { .. } => {
+            // "hee-hee-hee-hee": bursts falling in pitch, each shaken fast
+            for k in 0..5 {
+                let f = b * (7.5 - 0.6 * k as f32);
+                let len = 0.11;
+                let mut h = vec![0.0; secs(len)];
+                let mut ph = 0.0f32;
+                for (i, o) in h.iter_mut().enumerate() {
+                    let t = i as f32 / RATE;
+                    ph = (ph + f * (1.0 + 0.04 * (t * 38.0 * std::f32::consts::TAU).sin()) / RATE).fract();
+                    let breath = n.next() * 0.25;
+                    *o = ((ph * std::f32::consts::TAU).sin() + breath) * env(t, 0.008, 0.06);
+                }
+                mix_at(&mut x, &h, k as f32 * 0.13, 0.8);
+            }
+            reverb(&mut x, 0.3, 0.2);
+        }
+        Archetype::DanceParty { .. } => {
+            // four on the floor, a hi-hat between, and a glittering major
+            // chord over the top: the glitter-ball going up
+            for k in 0..8 {
+                let kick = thud(0.18, 120.0, 45.0, 0.2, &mut n);
+                if k % 2 == 0 {
+                    mix_at(&mut x, &kick, k as f32 * 0.125, 1.0);
+                }
+                let len = 0.04;
+                let mut hat = vec![0.0; secs(len)];
+                let mut hp = Svf::default();
+                for (i, o) in hat.iter_mut().enumerate() {
+                    let (_, _, h) = hp.run(n.next(), 7000.0, 0.7);
+                    *o = h * env(i as f32 / RATE, 0.001, 0.02);
+                }
+                mix_at(&mut x, &hat, k as f32 * 0.125 + 0.0625, 0.4);
+            }
+            let chord = tones(1.1, &[b * 4.0, b * 5.04, b * 6.0, b * 8.0, b * 12.0], 0.02, 0.6, 0.4, 0.5);
+            mix_at(&mut x, &chord, 0.0, 0.55);
+            let sparkle = tones(0.9, &[b * 16.0, b * 20.2, b * 24.0], 0.005, 0.3, 1.2, 0.8);
+            mix_at(&mut x, &sparkle, 0.12, 0.25);
+        }
     }
     let mut x = tail(x);
     if ab.ult {

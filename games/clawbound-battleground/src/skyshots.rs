@@ -191,6 +191,27 @@ pub fn run() -> Result<(), String> {
         let f = crate::consts::Team::Blue.fountain();
         shoot(&mut renderer, &game, &mut vfx, "sky_camp.png", cam(f + Vec3::new(26.0, 20.0, -52.0), f + Vec3::new(0.0, 1.0, -16.0), 1.0))?;
     }
+    // the Aerie: the upper layer over the inner chasms, its three islets
+    // and sky-bridges, and the lifts' starlight rising to it
+    if want("aerie") || want("lift") {
+        let keep = (game.gods[0].pos, game.gods[0].lift, game.gods[0].ai.take());
+        let (lo, hi) = sky::lifts()[1];
+        // one cat riding lift 1, a second into the ride
+        let r = crate::lift::Ride { from: lo, to: hi, t: 1.0, lift: 1, to_pad: 1 };
+        game.gods[0].lift = Some(r);
+        game.gods[0].pos = r.at(r.t);
+        game.gods[0].yaw = (hi.z - lo.z).atan2(hi.x - lo.x);
+        // let the columns of motes fill
+        for _ in 0..240 {
+            vfx.update(1.0 / 60.0, &[], &game);
+        }
+        shoot(&mut renderer, &game, &mut vfx, "sky_aerie.png", cam(Vec3::new(-80.0, 62.0, -160.0), Vec3::new(0.0, 12.0, -82.0), 1.0))?;
+        shoot(&mut renderer, &game, &mut vfx, "sky_lift.png", cam(lo + Vec3::new(-14.0, 4.0, -12.0), lo + Vec3::new(10.0, 13.0, 8.0), 1.05))?;
+        shoot(&mut renderer, &game, &mut vfx, "sky_aerie_top.png", cam(Vec3::new(-4.0, sky::UPPER_Y + 5.0, -112.0), Vec3::new(18.0, sky::UPPER_Y - 1.0, -74.0), 1.0))?;
+        game.gods[0].pos = keep.0;
+        game.gods[0].lift = keep.1;
+        game.gods[0].ai = keep.2;
+    }
     // the Elder on its ground, the push lane marked out before it
     {
         let h = crate::consts::Team::Blue.titan_pos();

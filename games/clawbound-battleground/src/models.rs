@@ -298,6 +298,36 @@ fn god_grid(def: &GodDef, team: Team) -> Grid {
                 g.ellipsoid(x, y, z, r, r, r * 1.3, solid(mix(accent, second, t)));
             }
         }
+        PeltKind::Kit => {
+            // a kitten: the head rounder and bigger than any grown cat's
+            // (still inside the head's cut), a white bib and muzzle, eyes
+            // huge and bright with a catchlight, a soft fluff on the crown
+            // -- and a green sprout of two leaves growing out of it
+            g.ellipsoid(cxf, hy + 0.5, hz - 0.5, 6.4, 6.0, 6.0, solid(pelt));
+            g.ellipsoid(cxf, hy - 2.5, hz + 4.5, 3.4, 2.8, 2.6, solid(second));
+            g.ellipsoid(cxf, 26.0, czf + 17.0, 4.0, 3.5, 2.5, solid(second));
+            g.set(cx, hy as i32 - 1, hz as i32 + 6, solid([0.95, 0.55, 0.60]));
+            let white = [0.98, 0.98, 1.0];
+            // big eyes set in the front of the round head: a dark rim, a
+            // wide bright iris, a catchlight
+            for sx in [-1i32, 1] {
+                let ex = cx + sx * 3;
+                let ez = hz as i32 + 4;
+                g.filled_box(ex - 1, hy as i32 - 1, ez + 1, ex + 1, hy as i32 + 2, ez + 1, solid([0.06, 0.05, 0.08]));
+                g.filled_box(ex.min(ex - sx), hy as i32, ez + 2, ex.max(ex - sx), hy as i32 + 1, ez + 2, solid(eye));
+                g.set(ex, hy as i32, ez + 2, solid([0.04, 0.04, 0.06]));
+                g.set(ex - sx, hy as i32 + 1, ez + 2, solid(white));
+            }
+            g.ellipsoid(cxf, hy + 5.5, hz - 1.0, 2.2, 1.4, 2.0, solid(mix(pelt, second, 0.4)));
+            // the sprout: a stem and two round leaves
+            let leaf = solid(accent);
+            let stem = solid(mix(accent, [0.2, 0.4, 0.1], 0.5));
+            for y in 0..4 {
+                g.set(cx, hy as i32 + 7 + y, hz as i32 - 1, stem);
+            }
+            g.ellipsoid(cxf - 1.8, hy + 11.0, hz - 1.0, 1.8, 0.8, 1.2, leaf);
+            g.ellipsoid(cxf + 1.8, hy + 11.5, hz - 1.0, 1.8, 0.8, 1.2, leaf);
+        }
         PeltKind::Antlers => {
             // antlers: a main beam sweeping up and back with two tines each
             for sx in [-1i32, 1] {
@@ -358,7 +388,7 @@ mod rig_tests {
     /// a hole that only shows in one pose.
     #[test]
     fn every_ancestor_cuts_into_ten_nonempty_parts_and_loses_nothing() {
-        assert_eq!(ROSTER.len(), 14);
+        assert_eq!(ROSTER.len(), 15);
         for def in ROSTER.iter() {
             let grid = god_grid(def, Team::Blue);
             let plan = feline_cut_plan(role_bulk(def.role), matches!(def.pelt, PeltKind::Antlers));
@@ -999,6 +1029,36 @@ pub fn build_titan(team: Team) -> (VoxelMesh, VoxelMesh) {
 // ---------------------------------------------------------------------------
 // Projectiles
 // ---------------------------------------------------------------------------
+
+/// Voxel size of Sproutkit's glitter-ball.
+pub const DISCO_VOX: f32 = 0.1;
+
+/// Sproutkit's glitter-ball: a sphere of small mirror tiles, each a
+/// slightly different silver (some catch the light: emissive), under a
+/// little cap and hook. Centred on the ball.
+pub fn disco_ball() -> VoxelMesh {
+    let n = 28;
+    let mut g = Grid::new(n, n + 4, n);
+    let c = n as f32 * 0.5;
+    g.ellipsoid(c, c, c, 12.0, 12.0, 12.0, [0.8, 0.82, 0.86, 1.0]);
+    g.filled_box(c as i32 - 2, n as i32 - 3, c as i32 - 2, c as i32 + 1, n as i32 - 1, c as i32 + 1, [0.35, 0.33, 0.30, 1.0]);
+    g.set(c as i32, n as i32, c as i32, [0.35, 0.33, 0.30, 1.0]);
+    let mut m = g.mesh(DISCO_VOX, false);
+    for (k, i) in m.inst.iter_mut().enumerate() {
+        if i.color[0] > 0.7 {
+            // mirror tiles: most dark (they reflect the night), a few
+            // catching the light
+            let h = ((k as u32).wrapping_mul(2654435761) >> 24) as f32 / 255.0;
+            let v = 0.25 + 0.55 * h;
+            i.color = [v, v, v * 1.08, 1.0];
+            if h > 0.86 {
+                i.color = [1.0, 0.97, 0.9, 1.0];
+                i.misc[2] = 3.0;
+            }
+        }
+    }
+    m
+}
 
 pub fn build_orb(color: [f32; 3]) -> VoxelMesh {
     let mut g = Grid::new(7, 7, 7);

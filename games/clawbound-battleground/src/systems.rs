@@ -59,6 +59,7 @@ impl Game {
         // 6. projectiles + zones
         self.projectiles_tick(dt);
         self.zones_tick(dt);
+        self.kit_tick(dt);
 
         // 6b. sky + map events (weather.rs / map_events.rs)
         self.atmosphere_tick(dt);
@@ -131,6 +132,8 @@ impl Game {
                 left_at: None,
                 // ranks spread wider on a wide lane
                 lane_off: o[1] * if melee + casters > 5 { 1.6 } else { 1.0 },
+                giggle_t: 0.0,
+                dance_t: 0.0,
             });
         }
     }
@@ -342,7 +345,12 @@ impl Game {
                 g.ride_plan = ride.map(|k| k as u8);
             }
         }
+        // the starlight lifts (lift.rs): riders are carried, not walked
+        self.lifts_tick(dt);
         for i in 0..self.gods.len() {
+            if self.gods[i].lift.is_some() {
+                continue;
+            }
             if self.gods[i].respawn_t > 0.0 {
                 // A cat that dies mid-leap respawns on the ground.
                 self.gods[i].leap = None;
@@ -382,7 +390,7 @@ impl Game {
             // a wind-up slows the caster; a channel roots it
             let speed = self.move_speed(i) * self.gods[i].casting.map_or(1.0, |c| c.move_mul);
             self.gods[i].face_hold = (self.gods[i].face_hold - dt).max(0.0);
-            let dir = self.gods[i].move_dir;
+            let dir = crate::kit::confused(self.gods[i].move_dir, self.gods[i].giggle_t, self.t, i);
             let yaw_cur = self.gods[i].yaw;
             let g = &mut self.gods[i];
             g.leap_cd = (g.leap_cd - dt).max(0.0);
@@ -632,7 +640,8 @@ impl Game {
                 Some(target) => {
                     let d = Vec3::new(target.x - m.pos.x, 0.0, target.z - m.pos.z);
                     if d.length_squared() > 0.001 {
-                        let step = (7.4 * dt).min(d.length());
+                        let shuffle = if m.dance_t > 0.0 { crate::kit::DANCE_MOVE } else { 1.0 };
+                        let step = (7.4 * shuffle * dt).min(d.length());
                         m.pos += d.normalize() * step;
                         m.yaw = d.z.atan2(d.x);
                         m.walk_anim += dt * 10.0;
@@ -676,7 +685,8 @@ impl Game {
             if self.gods[i].respawn_t > 0.0 {
                 continue;
             }
-            let wants = self.gods[i].attack_held || self.gods[i].ai.is_some();
+            // a giggling or dancing cat does not strike (`kit`)
+            let wants = (self.gods[i].attack_held || self.gods[i].ai.is_some()) && self.kit_free(i);
             if !wants {
                 self.gods[i].atk_timer = (self.gods[i].atk_timer - dt).max(0.0);
                 self.gods[i].atk_anim = (self.gods[i].atk_anim - dt * 4.0).max(0.0);
@@ -856,7 +866,7 @@ impl Game {
             let m = &mut self.minions[mi];
             m.atk_timer -= dt;
             m.atk_anim = (m.atk_anim - dt * 4.0).max(0.0);
-            if m.atk_timer > 0.0 || target.is_none() {
+            if m.atk_timer > 0.0 || target.is_none() || m.giggle_t > 0.0 || m.dance_t > 0.0 {
                 continue;
             }
             m.atk_timer = MINION_ATK_CD;
@@ -1265,9 +1275,10 @@ impl Game {
                 let (kid, t, v, st) = match &z.kind {
                     ZoneKind::Storm { until, dps, strike_t, owner: _ } => (0u8, *until, *dps, *strike_t),
                     ZoneKind::Ring { trigger_t, dmg, .. } => (1u8, *trigger_t, *dmg, 0.0),
+                    ZoneKind::Dance { until, .. } => (2u8, *until, 0.0, 0.0),
                 };
                 let own = match &z.kind {
-                    ZoneKind::Storm { owner, .. } | ZoneKind::Ring { owner, .. } => *owner,
+                    ZoneKind::Storm { owner, .. } | ZoneKind::Ring { owner, .. } | ZoneKind::Dance { owner, .. } => *owner,
                 };
                 (z.team, z.pos, z.radius, z.color, kid, t, v, st, own)
             };
@@ -1308,6 +1319,14 @@ impl Game {
                 if let ZoneKind::Storm { until, strike_t, .. } = &mut self.zones[i].kind {
                     *until = new_timer;
                     *strike_t = strike2;
+                }
+            } else if kind_id == 2 {
+                // the glitter-ball: its dancers are `kit_tick`'s; here it
+                // only counts down
+                if new_timer <= 0.0 {
+                    remove = true;
+                } else if let ZoneKind::Dance { until, .. } = &mut self.zones[i].kind {
+                    *until = new_timer;
                 }
             } else {
                 // ring: detonate at trigger

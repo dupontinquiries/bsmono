@@ -84,6 +84,17 @@ pub enum Archetype {
     /// Vault into the sky and come down as a falling star at the aim
     /// (within `range`), `vault` seconds later: a blast of `radius`.
     Meteor { range: f32, radius: f32, dmg: f32, vault: f32 },
+    /// A litter of `count` kitten doubles bursts out toward the aim, each
+    /// running at `speed` for the nearest enemy; one that reaches it nips
+    /// (`dmg`) and pops into giggles. Gone after `life` seconds (`kit`).
+    Litter { count: u32, dmg: f32, speed: f32, life: f32 },
+    /// A laugh that catches: enemies within `radius` giggle for `secs` --
+    /// no auto-attacks, no casts, and their paws wander (`kit`).
+    Giggle { radius: f32, dmg: f32, secs: f32 },
+    /// A glitter-ball over the aim for `duration`: every enemy under it
+    /// dances (no attacks, no casts, a shuffle), and when the music stops
+    /// for it, it drags its paws -- `slow` for `slow_secs` (`kit`).
+    DanceParty { radius: f32, duration: f32, slow: f32, slow_secs: f32 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -165,6 +176,7 @@ pub enum PeltKind {
     Antlers,   // Stillsmoke — antlered, scaled, saber-fanged
     Crag,      // Stonewhisper — thick grey pelt, no markings
     Comet,     // Cometail — night-blue, starred back, a tail that streams light
+    Kit,       // Sproutkit — a kitten: round head, huge eyes, a sprout on the brow
 }
 
 impl GodDef {
@@ -194,7 +206,7 @@ const fn ab(
     AbilityDef { name, desc, arch, cooldown: cd, cost, color, key, ult, power_scale: scale }
 }
 
-pub const ROSTER_LEN: usize = 14;
+pub const ROSTER_LEN: usize = 15;
 
 pub const ROSTER: [GodDef; ROSTER_LEN] = [
     // ── GOLDENMANE — the lion-clan of legend ──
@@ -433,6 +445,23 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
             ab("Meteor Pounce", "He leaps and comes down burning — everything under the arc is scorched.", Archetype::Dash { dist: 12.0, dmg: 110.0 }, 9.0, 65.0, [1.00, 0.78, 0.40], 1, false, 0.50),
             ab("Flare", "His whole coat lights at once — a white blast that blinds and staggers.", Archetype::Nova { radius: 6.5, dmg: 105.0, slow: 0.35 }, 10.0, 70.0, [1.00, 0.97, 0.85], 2, false, 0.50),
             ab("Falling Star", "He vaults into the night and is gone — then he is the star, and he is falling.", Archetype::Meteor { range: 22.0, radius: 8.5, dmg: 300.0, vault: 1.1 }, 80.0, 130.0, [1.00, 0.88, 0.55], 3, true, 0.75),
+        ],
+    },
+    // ── SPROUTKIT — the ever-young, kit of the first spring ──
+    GodDef {
+        id: 14, name: "Sproutkit", title: "the ever-young, kit of the first spring, god of every life that is still growing",
+        philosophy: "Everything that lives was small once. Everything small is still growing.",
+        role: Role::Mage, auto: AutoKind::Ranged, dmg_type: DmgType::Magical,
+        palette: [[0.95, 0.80, 0.58], [0.40, 0.62, 0.30], [0.99, 0.97, 0.92], [0.55, 0.92, 0.42]],
+        weapon: WeaponKind::None, pelt: PeltKind::Kit,
+        hp: 540.0, hp_growth: 88.0, mana: 400.0, mana_growth: 45.0,
+        auto_dmg: 42.0, auto_growth: 3.0, power: 13.0, power_growth: 3.4,
+        protection: 18.0, prot_growth: 2.3, move_speed: 12.9, auto_range: 9.0, auto_cd: 1.0,
+        abilities: [
+            ab("Litter", "He is never only one: a tumble of kittens bursts from him and scampers at whoever is near, nips, and pops into giggles.", Archetype::Litter { count: 4, dmg: 55.0, speed: 13.0, life: 3.5 }, 9.0, 70.0, [1.00, 0.82, 0.55], 0, false, 0.35),
+            ab("Giggle Fit", "His laugh is catching: everyone near collapses into giggles -- they cannot strike or cast, and their paws go where they please.", Archetype::Giggle { radius: 7.0, dmg: 60.0, secs: 1.8 }, 14.0, 80.0, [1.00, 0.60, 0.85], 1, false, 0.35),
+            ab("First Spring", "The green of the first spring: for a moment he and his friends are young again, and wounds close.", Archetype::Heal { amount: 150.0, radius: 9.0 }, 12.0, 75.0, [0.55, 0.95, 0.50], 2, false, 0.50),
+            ab("Dance Party", "A glitter-ball rises over the fight and nobody can help it: every enemy under it dances, and long after the music stops they drag their paws.", Archetype::DanceParty { radius: 9.0, duration: 5.0, slow: 0.45, slow_secs: 6.0 }, 90.0, 140.0, [0.85, 0.55, 1.00], 3, true, 0.0),
         ],
     },
 ];

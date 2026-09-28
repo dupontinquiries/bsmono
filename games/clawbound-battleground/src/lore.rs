@@ -50,7 +50,7 @@ pub struct Ancestor {
     pub instruments: &'static str,
 }
 
-pub const ANCESTORS: [Ancestor; 14] = [
+pub const ANCESTORS: [Ancestor; 15] = [
     Ancestor {
         name: "Goldenmane",
         species: "lion",
@@ -176,6 +176,15 @@ pub const ANCESTORS: [Ancestor; 14] = [
         gender: Gender::Male,
         story: "A caracal who leapt so high after the birds that he caught the tail of a falling comet, and came down with it onto the glacier. Where he landed, the Starwell opened, and he has been a little made of starlight ever since. He never once asked where he might land.",
         instruments: "glass harmonica, crystal bowls, frame drum, overtone singing; the hiss of a meteor, ice cracking in the cold",
+    },
+    Ancestor {
+        name: "Sproutkit",
+        species: "a kitten -- of no one clan, and so of every clan",
+        age: "every spring",
+        land: "wherever something is being born",
+        gender: Gender::Male,
+        story: "The youngest of the ancestors, and the only one who never grew up. Every litter born in every clan is a little of him, so there is always more of him than anyone counted. He turns every fight into a game, and every game into a dance -- and what dances cannot fight. Where he naps, the first green of the year comes up through the snow.",
+        instruments: "toy piano, music box, ukulele, kazoo, handclaps, a disco beat; birdsong, a spring brook",
     },
 ];
 

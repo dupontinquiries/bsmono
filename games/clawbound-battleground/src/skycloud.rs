@@ -35,6 +35,11 @@ pub const SIGHT_DEPTH: f32 = 6.0;
 pub const CLOSE: f32 = 5.0;
 /// How far a cat sees at all (clear air).
 pub const SIGHT_RANGE: f32 = 48.0;
+/// The cloud's top: the banks and wisps lie over the islands up to about
+/// here, and the Aerie (`sky::UPPER_Y`) stands clear above them. Air above
+/// it is clear -- a cat up there is in plain sight, and one looking down
+/// into a bank sees only as far as the bank lets it.
+pub const CLOUD_TOP: f32 = 12.0;
 /// Banks come in from this far out.
 const RIM: f32 = 340.0;
 /// Seconds for a cloud to thicken as it forms, or thin as it goes.
@@ -190,6 +195,15 @@ pub fn density(cs: &[Cloud], x: f32, z: f32) -> f32 {
     cs.iter().map(|c| c.density(x, z)).sum::<f32>().min(1.0)
 }
 
+/// [`density`] at a point in the air: none above [`CLOUD_TOP`].
+pub fn density_at(cs: &[Cloud], p: Vec3) -> f32 {
+    if p.y > CLOUD_TOP {
+        0.0
+    } else {
+        density(cs, p.x, p.z)
+    }
+}
+
 /// Can someone at `a` see someone at `b` through the clouds `cs`? Within
 /// [`CLOSE`], always; beyond [`SIGHT_RANGE`], never; between, unless the
 /// cloud along the line adds up to [`SIGHT_DEPTH`].
@@ -208,7 +222,13 @@ pub fn sees(cs: &[Cloud], a: Vec3, b: Vec3) -> bool {
     let n = (len / step).ceil() as usize;
     let mut fog = 0.0;
     for k in 0..n {
-        let p = a + d * ((k as f32 + 0.5) / n as f32);
+        let u = (k as f32 + 0.5) / n as f32;
+        let p = a + d * u;
+        // the line climbs from a's height to b's: above the cloud's top it
+        // runs through clear air
+        if a.y + (b.y - a.y) * u > CLOUD_TOP {
+            continue;
+        }
         fog += near.iter().map(|c| c.density(p.x, p.z)).sum::<f32>().min(1.0) * (len / n as f32);
         if fog >= SIGHT_DEPTH {
             return false;
@@ -337,6 +357,22 @@ mod tests {
         // a thinning bank lets sight back through
         let thin = [Cloud { thick: 0.05, ..bank }];
         assert!(sees(&thin, Vec3::new(-20.0, 0.0, 0.0), Vec3::new(20.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn the_aerie_stands_above_the_cloud() {
+        let bank = Cloud { kind: Kind::Bank, pos: Vec3::ZERO, dir: Vec3::X, r: 40.0, w: 40.0, thick: 1.0, seed: 1, age: 100.0, life: 300.0 };
+        let cs = [bank];
+        let up = crate::sky::UPPER_Y;
+        assert!(up > CLOUD_TOP + 4.0, "the Aerie is clear of the cloud's top");
+        // two cats on the Aerie see each other over a bank
+        assert!(sees(&cs, Vec3::new(-20.0, up, 0.0), Vec3::new(20.0, up, 0.0)), "clear air up there");
+        assert_eq!(density_at(&cs, Vec3::new(0.0, up, 0.0)), 0.0);
+        assert!(density_at(&cs, Vec3::ZERO) > 0.9);
+        // looking down into the bank: blind to a cat deep in it, not to one
+        // at its edge
+        assert!(!sees(&cs, Vec3::new(-30.0, up, 0.0), Vec3::new(10.0, 0.0, 0.0)), "down into a bank");
+        assert!(sees(&cs, Vec3::new(-30.0, up, 60.0), Vec3::new(-30.0, 0.0, 45.0)), "down into clear air");
     }
 
     #[test]

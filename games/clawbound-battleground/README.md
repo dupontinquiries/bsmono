@@ -1,6 +1,6 @@
 # Clawbound — Battleground · Rust + wgpu Microvoxel Edition
 
-A three-map arena for the **fourteen legendary ancestors of Clawbound**,
+A three-map arena for the **fifteen legendary ancestors of Clawbound**,
 built as a native Linux game in Rust + wgpu. No engine, no assets — every
 ancestor, minion, tower, Elder, projectile and ability effect is procedurally
 generated microvoxels: tens of thousands of instanced cubes with baked ambient
@@ -44,6 +44,14 @@ what else is known-but-unresolved.
   be auto-attacked, bots do not go for it); a thick wisp between two groups
   hides each from the other. Towers and bases see through cloud; minions
   give no sight.
+- **The Aerie** (Starwell's upper layer): three small islets a side, 20 u
+  above the islands over the inner chasms, every islet bridged to both
+  others and served by its own updraft. Step onto a starlit pad on the
+  islands and the updraft carries you up a column of starlight and sets you
+  down on the Aerie's pad (3.2 s, unsteerable, and you can be hit on the
+  way); step off and back on to ride down. The Aerie stands above the
+  cloud, so a cat up there is in plain sight -- a lookout, not a hideout.
+  Bots do not use the lifts.
 - **The Elders move**: each guards its ground -- a circle round its pedestal
   and a push lane out toward the enemy, marked with faint stones of light.
   It turns to face what steps onto its ground, strides out to meet it,
@@ -57,13 +65,19 @@ what else is known-but-unresolved.
   it keeps falling, the wind drifts it from the blown stretches into the lee,
   cats bound through drifts ploughing a trench and leave separate prints on
   powder, and blasts throw craters, fire melts it, frost lays more.
-- **14 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
+- **15 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
   Windclaw, Faryowl, Oldroar, Twofang, Suneye, Snowhush, Riptail, Stillsmoke,
   Stonewhisper, Cometail (the star-fallen caracal: Starshot, Meteor Pounce,
-  Flare, and the Falling Star ultimate) — across 5 roles (Warrior / Guardian / Mage / Hunter / Assassin).
+  Flare, and the Falling Star ultimate) and Sproutkit (the ever-young kitten,
+  god of life and youth: **Litter** sends kitten doubles scampering at the
+  nearest enemies to nip them into giggles; **Giggle Fit** sets everyone near
+  laughing -- no attacks, no casts, and their paws wander; **First Spring**
+  heals; the **Dance Party** ultimate hangs a glitter-ball over a fight, and
+  every enemy under it dances -- no attacks or casts, a shuffle -- then drags
+  its paws for 6 s after the music stops; `src/kit.rs`) — across 5 roles (Warrior / Guardian / Mage / Hunter / Assassin).
   Each is a quadruped feline voxel body with a pelt signature (mane, stripes,
   rosettes, saber fangs, antlers, sun disc, ear tufts…) and its crest colour,
-  plus **4 mechanical abilities** (52 total) built from 13 archetype systems.
+  plus **4 mechanical abilities** (60 total) built from 17 archetype systems.
   Clawbound kits are a passive + two techniques + an ultimate; here the passive
   is reforged as a third short-cooldown technique (see `src/gods.rs`).
 - **Dynamic weather** (`src/weather.rs`) — Clear / Overcast / Rain / Storm /
@@ -118,6 +132,34 @@ what else is known-but-unresolved.
   shaders bend the canopy by height with a travelling gust wave and tip
   flutter, so trees, palms, bamboo, ferns and vine curtains lean and shiver
   together (rocks and ruins stay put). Big gusts tear leaves loose.
+- **Recorded voices** (`assets/audio/voice/<ancestor>/<line>.opus`, the
+  lines in `dev/voice_script/recording_sheet.tsv`): Goldenmane, Oldroar,
+  Twofang and Windclaw, voiced by Kessler, one performer given four chains
+  (Goldenmane a touch lower with a clean low-mid boom, a three-voice chorus
+  and a hall; Oldroar down a major third with the formants, slowed, a deep
+  sub, grit with the top rolled off, a cave; Twofang dry, bitten,
+  hard-compressed, with a viper's tremolo rattle; Windclaw up, quicker,
+  bright and airy, in a small room). Under each, layers synthesised from
+  the line itself (`dev/voice_script/beast.py`: a vocoder putting the words
+  on a growl or on breath): Goldenmane an octave-down double and a lion's
+  growl that swells on his shouts; Oldroar a louder octave-down double and
+  a 38 Hz cave rumble; Twofang a hiss through his words, a snarl on the loud
+  ones and a hiss trailing his kill, death and select lines; Windclaw wind,
+  a faint fifth-up spirit voice and a caracal chirrup before his select
+  call, after his kills and on "Up, up!".
+  `dev/voice_script/master_take.py` cuts, cleans and masters a session;
+  `tests/voice_assets.rs` checks every recorded ancestor is complete,
+  trimmed and levelled. The other ten speak with stand-in voices until they
+  are recorded: `dev/voice_script/synth_session.py` speaks their lines with
+  the Kokoro-82M text-to-speech model (one speaker per ancestor, cast from
+  the recording sheets) and `master_take.py` gives them their own layers and
+  chains the same way (a tiger's breath and chuff for Duskstripe, a
+  leopard's rasp for Rainspots, a whispered double for Nightpelt, a singing
+  fifth and octave for Faryowl, a choir for Suneye, a lynx's hiss for
+  Snowhush, the crags answering Stonewhisper, a flooded jaguar's growl for
+  Riptail, thunder under Stillsmoke, a comet's streak after Cometail). A
+  real session replaces them file for file. Bots speak their lines like the
+  player does (`tests/voice_assets.rs`, `the_bots_speak_their_own_lines`).
 - **Procedural ambience** (`src/audio.rs`, cpal, feature `audio`, on by
   default) — no samples: a wind body, a place-shaped howl (the resonant band
   the wind excites depends on where you stand — a whistle over the river, a
@@ -320,6 +362,8 @@ src/
 ├── weather.rs     weather state machine → `Atmosphere` sample (plain numbers)
 ├── map_events.rs  event scheduler + effects; `speed_mul` / `gold_mul` hooks
 ├── wild.rs        heal trees, prey (hare / stag / glowfish), the hunt, Riverblessing
+├── lift.rs        Starwell's updrafts: pads, rides up to the Aerie and down
+├── kit.rs         Sproutkit's litter (kitten doubles), giggles and dance party
 ├── bosses.rs      the Elder Boar + Storm Drake: pits, AI, rewards, TargetRef::Boss
 ├── disasters.rs   wildfire / tempest / earthquake / flood / tornado + map scars
 ├── audio.rs       acoustics_at(pos) → howl/reverb voicing; WindSynth DSP; cpal shell
