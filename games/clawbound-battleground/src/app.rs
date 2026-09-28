@@ -90,6 +90,8 @@ struct AppState {
     /// This tick's events, for the audio cues.
     audio_events: Vec<crate::sim::Event>,
     voice_gate: crate::cues::VoiceGate,
+    /// Sounds that follow what made them, while they play (`emitters`).
+    emitters: crate::emitters::Emitters,
     /// Whether this match's music has been started.
     music_on: bool,
     /// The game-state announcer (`announcer`).
@@ -433,6 +435,7 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         bank: None,
         audio_events: Vec::new(),
         voice_gate: Default::default(),
+        emitters: Default::default(),
         music_on: false,
         announcer: Default::default(),
         space_tick: 0,
@@ -1095,12 +1098,12 @@ fn render(s: &mut AppState) {
                     if before == 0.0 {
                         let key = if it.is_full() { "music/intro_full" } else { "music/intro" };
                         if let Some(id) = bank.pick(key) {
-                            s.intro_music = amb.mixer.play(Play { clip: id, bus: Bus::Music, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: None });
+                            s.intro_music = amb.mixer.play(Play { handle: 0, clip: id, bus: Bus::Music, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: None });
                         }
                     }
                     for key in it.narration_due(before, it.t) {
                         if let Some(id) = bank.pick(&format!("narrator/{key}")) {
-                            amb.mixer.play(Play { clip: id, bus: Bus::Voice, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: Some(u16::MAX - 1) });
+                            amb.mixer.play(Play { handle: 0, clip: id, bus: Bus::Voice, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: Some(u16::MAX - 1) });
                         }
                     }
                     if s.skip_intro {
@@ -1115,7 +1118,7 @@ fn render(s: &mut AppState) {
                     #[cfg(feature = "audio")]
                     if let (Some(amb), Some(bank)) = (s.ambience.as_mut(), s.bank.as_mut()) {
                         if let Some(id) = bank.pick("music/fanfare") {
-                            played = amb.mixer.play(crate::mixer::Play { clip: id, bus: crate::mixer::Bus::Music, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: None });
+                            played = amb.mixer.play(crate::mixer::Play { handle: 0, clip: id, bus: crate::mixer::Bus::Music, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: None });
                         }
                     }
                     if !played {
@@ -1314,7 +1317,7 @@ fn render(s: &mut AppState) {
                 // the map's music waits for the intro (and its score) to end
                 if !s.music_on && s.intro.is_none() {
                     if let Some(id) = bank.pick(&format!("music/{}", crate::map::active().key())) {
-                        amb.mixer.play(Play { clip: id, bus: Bus::Music, gain: 0.8, pan: 0.0, priority: 9, looped: true, speaker: None });
+                        amb.mixer.play(Play { handle: 0, clip: id, bus: Bus::Music, gain: 0.8, pan: 0.0, priority: 9, looped: true, speaker: None });
                     }
                     s.music_on = true;
                 }
@@ -1338,7 +1341,7 @@ fn render(s: &mut AppState) {
                     let key = format!("announcer/{}", call.key);
                     let secs = match bank.pick(&key) {
                         Some(id) => {
-                            amb.mixer.play(Play { clip: id, bus: Bus::Voice, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: Some(u16::MAX) });
+                            amb.mixer.play(Play { handle: 0, clip: id, bus: Bus::Voice, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: Some(u16::MAX) });
                             bank.secs(id, amb.sample_rate)
                         }
                         None => 1.2, // unrecorded: keep the pacing anyway
@@ -1346,15 +1349,26 @@ fn render(s: &mut AppState) {
                     s.announcer.playing(g.t, secs);
                 }
                 for ev in s.audio_events.drain(..) {
+                    // what its sounds follow while they play, if they do
+                    let follow = crate::emitters::follow_for(&ev, g);
                     for cue in crate::cues::cues_for(&ev, g) {
                         let Some((gain, pan)) = crate::cues::place(&cue, ear, right) else { continue };
                         if !s.voice_gate.allow(&cue, g.t) {
                             continue;
                         }
                         if let Some(id) = bank.first(&cue.keys) {
-                            amb.mixer.play(Play { clip: id, bus: cue.bus, gain, pan, priority: cue.priority, looped: false, speaker: cue.speaker.map(|x| x as u16) });
+                            let handle = match (follow, cue.pos) {
+                                (Some(f), Some(at)) => s.emitters.start(f, cue.gain, cue.bus, cue.speaker, at, g.t, bank.secs(id, amb.sample_rate)),
+                                _ => 0,
+                            };
+                            amb.mixer.play(Play { handle, clip: id, bus: cue.bus, gain, pan, priority: cue.priority, looped: false, speaker: cue.speaker.map(|x| x as u16) });
                         }
                     }
+                }
+                // and every following sound moved to where its source is now,
+                // as heard from where the ear is now
+                for (handle, gain, pan) in s.emitters.places(g, ear, right) {
+                    amb.mixer.send(Cmd::Place { handle, gain, pan });
                 }
             }
             _ => {
@@ -1592,7 +1606,7 @@ fn render(s: &mut AppState) {
                 let def = &crate::gods::ROSTER[(s.ui.selected as usize).min(crate::gods::ROSTER.len() - 1)];
                 let who = def.name.to_ascii_lowercase().replace([' ', '\''], "");
                 if let Some(id) = bank.pick(&format!("voice/{who}/select")) {
-                    amb.mixer.play(crate::mixer::Play { clip: id, bus: crate::mixer::Bus::Voice, gain: 1.0, pan: 0.0, priority: 9, looped: false, speaker: None });
+                    amb.mixer.play(crate::mixer::Play { handle: 0, clip: id, bus: crate::mixer::Bus::Voice, gain: 1.0, pan: 0.0, priority: 9, looped: false, speaker: None });
                 }
             }
         }
