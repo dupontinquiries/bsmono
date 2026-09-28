@@ -260,8 +260,6 @@ pub struct AppState {
     /// A file switch refused because this buffer has unsaved edits. Asking
     /// for the SAME file again discards them; anything else re-arms.
     discard_armed: Option<PathBuf>,
-<<<<<<< ours
-=======
     /// Buckets for the current workspace root, loaded on first Ctrl+K and
     /// again whenever the root changes. Saved on every change to a bucket
     /// (never per keystroke: a save is two git subprocesses).
@@ -275,7 +273,6 @@ pub struct AppState {
     /// Finger gestures on the editor surface (touch_input.rs).
     pub touch: crate::touch_input::TouchInput,
     bucket_delete_armed: bool,
->>>>>>> theirs
     pub lang: Language,
     pub syntax: Syntax,
     pub find: Option<FindState>,
@@ -613,14 +610,11 @@ impl AppState {
             dirty: false,
             nav: Default::default(),
             discard_armed: None,
-<<<<<<< ours
-=======
             buckets: None,
             touch: Default::default(),
             strip_enabled: false,
             strip_sent: None,
             bucket_delete_armed: false,
->>>>>>> theirs
             lang,
             syntax: Syntax::new(lang),
             find: None,
@@ -2762,8 +2756,6 @@ impl AppState {
             Err(e) => {
                 self.set_status(&format!("open failed: {e}"), now_ms);
                 false
-<<<<<<< ours
-=======
             }
         }
     }
@@ -2875,99 +2867,10 @@ impl AppState {
                     .unwrap_or_else(std::env::temp_dir);
                 let key = slug(&self.workspace_root().to_string_lossy());
                 Box::new(FileStore::new(base.join("aperture/buckets").join(key)))
->>>>>>> theirs
             }
         }
     }
 
-<<<<<<< ours
-    // ── navigation path (aperture_core::nav) ───────────────────────────────
-
-    /// Where the caret is, as the nav path names it: the innermost outline
-    /// item around it (a file with no grammar, or code outside every item,
-    /// is the FILE), and the exact line/column as the site.
-    pub fn nav_here(&mut self) -> Option<(aperture_core::entity::EntityId, aperture_core::entity::Site)> {
-        use aperture_core::entity::{EntityId, Site};
-        let path = self.path.clone()?;
-        let root = self.workspace_root();
-        let rel = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
-        let pos = self.editor.buffer.char_to_pos(self.editor.sel.head);
-        // The SITE carries the absolute path: it is what back/forward open,
-        // and `workspace_root()` is per-file outside a git repo, so a
-        // relative path recorded in one directory resolves against another
-        // one's root later. The entity stays workspace-relative -- it is an
-        // identity and a label, not a place to open.
-        let site = Site::new(path.to_string_lossy().into_owned(), pos.line as u32, pos.col as u32);
-        let item = self
-            .syntax
-            .outline(&self.editor.buffer)
-            .into_iter()
-            .filter(|it| it.line <= pos.line && pos.line <= it.end_line)
-            .max_by_key(|it| it.line);
-        let id = match item {
-            Some(it) => EntityId::item(rel, format!("{:?}", it.kind).to_lowercase(), it.name),
-            None => EntityId::file(rel),
-        };
-        Some((id, site))
-    }
-
-    /// Record the jump that just happened, from `from` (taken BEFORE it) to
-    /// wherever the caret is now.
-    fn nav_record(&mut self, from: Option<(aperture_core::entity::EntityId, aperture_core::entity::Site)>, rel: aperture_core::entity::Relation) {
-        let (Some((f, fs)), Some((t, ts))) = (from, self.nav_here()) else { return };
-        self.nav.push(aperture_core::nav::NavStep::new(f, rel, t).at(fs).landed(ts));
-    }
-
-    /// Put the caret at `line`/`col` (chars) in `path`, opening it when it is
-    /// not the current file. Same file: move within the OPEN buffer, so
-    /// unsaved edits there are kept. Returns false when the switch was
-    /// refused (unsaved edits elsewhere).
-    fn go_to_site(&mut self, path: PathBuf, line: usize, col: usize, now_ms: u64) -> bool {
-        if self.path.as_ref() != Some(&path) && !self.open_file(path, now_ms) {
-            return false;
-        }
-        let line = line.min(self.editor.buffer.len_lines().saturating_sub(1));
-        let len = self.editor.buffer.line(line).trim_end_matches(['\n', '\r']).chars().count();
-        let at = self.editor.buffer.pos_to_char(aperture_core::buffer::Pos::new(line, col.min(len)));
-        self.discard_extra_cursors();
-        self.editor.sel = Selection::caret(at);
-        self.follow_caret = true;
-        true
-    }
-
-    /// Alt+Left (`back`) / Alt+Right: return to where a jump started — the
-    /// exact callsite — or retake it to where it landed.
-    pub fn nav_go(&mut self, back: bool, now_ms: u64) {
-        let step = if back { self.nav.back().cloned() } else { self.nav.forward().cloned() };
-        let Some(step) = step else {
-            self.set_status(if back { "nothing to go back to" } else { "nothing ahead" }, now_ms);
-            return;
-        };
-        let Some(site) = (if back { step.site.clone() } else { step.landing.clone() }) else {
-            self.set_status("that step has no position recorded", now_ms);
-            return;
-        };
-        let path = PathBuf::from(&site.path);
-        let path = if path.is_absolute() { path } else { self.workspace_root().join(path) };
-        if !self.go_to_site(path, site.line as usize, site.col as usize, now_ms) {
-            // Refused (unsaved edits): the cursor did not really move.
-            if back { self.nav.forward(); } else { self.nav.back(); }
-            return;
-        }
-        let crumb = self.nav.breadcrumb(4);
-        self.set_status(&if crumb.is_empty() { format!("back at {}", step.from.label()) } else { crumb }, now_ms);
-    }
-
-    /// A palette jump (file picker, project search, symbols, route): open,
-    /// land, and record the step so Alt+Left comes back.
-    pub fn palette_jump(&mut self, path: PathBuf, line: Option<usize>, rel: aperture_core::entity::Relation, now_ms: u64) {
-        let from = self.nav_here();
-        let ok = match line {
-            Some(l) => self.go_to_site(path, l, 0, now_ms),
-            None => self.open_file(path, now_ms),
-        };
-        if ok {
-=======
     /// The loaded workspace, (re)loading it when absent or for another root.
     fn bucket_ws(&mut self) -> &mut aperture_core::bucket::Workspace {
         let root = self.workspace_root();
@@ -3213,7 +3116,6 @@ impl AppState {
     pub fn palette_jump_at(&mut self, path: PathBuf, line: usize, col: usize, rel: aperture_core::entity::Relation, now_ms: u64) {
         let from = self.nav_here();
         if self.go_to_site(path, line, col, now_ms) {
->>>>>>> theirs
             self.nav_record(from, rel);
         }
     }
@@ -6072,8 +5974,6 @@ mod nav_tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-<<<<<<< ours
-=======
 
     fn outcome(calls: Vec<aperture_lsp::IncomingCall>, refs: Vec<aperture_lsp::Location>) -> crate::lsp_worker::CallersOutcome {
         crate::lsp_worker::CallersOutcome { generation: 0, calls, refs, error: None }
@@ -6299,5 +6199,4 @@ mod nav_tests {
         assert_eq!(s.strip_sent, Some(true));
     }
 
->>>>>>> theirs
 }

@@ -47,11 +47,7 @@ pub fn parse(text: &str) -> BTreeMap<String, String> {
 pub fn valid_values(all: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for (k, v) in all {
-<<<<<<< ours
-        if k == USER_LAYOUT_KEY {
-=======
         if k == USER_LAYOUT_KEY || k == crate::rail_boards::KEY {
->>>>>>> theirs
             out.insert(k.clone(), v.clone());
             continue;
         }

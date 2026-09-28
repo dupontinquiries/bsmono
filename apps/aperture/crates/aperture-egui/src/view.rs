@@ -1301,8 +1301,6 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
     let mut apply: Option<(String, palette_ui::Cmd)> = None;
     let mut open_path: Option<String> = None;
     let mut open_hit: Option<(std::path::PathBuf, usize)> = None;
-<<<<<<< ours
-=======
     // A Callers row: exact column, and whether the list was real calls.
     let mut open_site: Option<(std::path::PathBuf, usize, usize, bool)> = None;
     // Bucket rows need `&mut AppState` (outlines, files), so they are
@@ -1315,7 +1313,6 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
         _ => Vec::new(),
     };
     let mut bucket_pick: Option<palette_ui::BucketAct> = None;
->>>>>>> theirs
     // Which palette produced a hit, for the nav step's relation.
     let hit_mode = state.palette.as_ref().map(|p| p.mode.clone());
     let mut submit_edit: Option<String> = None;
@@ -2006,9 +2003,6 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
         palette_ui::apply(cmd, state, now_ms);
         return;
     }
-<<<<<<< ours
-    use aperture_core::entity::Relation;
-=======
     if let Some(act) = bucket_pick {
         if state.bucket_act(act, now_ms) {
             state.palette = None;
@@ -2022,7 +2016,6 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
         state.palette = None;
         return;
     }
->>>>>>> theirs
     if let Some(path) = open_path {
         state.palette_jump(std::path::PathBuf::from(path), None, Relation::Opened, now_ms);
         state.palette = None;

@@ -111,8 +111,6 @@ pub struct Feel {
     cold: bool,
     /// Ctrl/Alt latches, set by swipes on the layout rail (modlatch.rs).
     mods: crate::modlatch::Mods,
-<<<<<<< ours
-=======
     /// The focused app's command strip (keyboard_strip), shown above the
     /// keys: its commands, and when its owner was last checked for life.
     app_strip: Option<(String, u32, Vec<keyboard_strip::Action>)>,
@@ -125,13 +123,10 @@ pub struct Feel {
     /// When the press in `rail_press` began (egui time, s).
     rail_press_at: f64,
     strip_checked: std::time::Instant,
->>>>>>> theirs
     /// Where a press that began on the rail started, until it is released.
     rail_press: Option<egui::Pos2>,
     /// The key being held (repeat / spacebar caret), key_hold.rs.
     hold: Option<crate::key_hold::Hold>,
-<<<<<<< ours
-=======
     /// The Morse board's keyer (morse.rs) and its feedback.
     keyer: crate::morse::Keyer,
     haptics: crate::haptics::Haptics,
@@ -141,7 +136,6 @@ pub struct Feel {
     morse_note: Option<(String, f64)>,
     /// The current keyer hold has already buzzed "that's a dash now".
     morse_dash_felt: bool,
->>>>>>> theirs
     repeat_cfg: crate::key_hold::RepeatCfg,
     /// config.toml's repeat values, before the `typing.repeat_*` settings.
     repeat_base: crate::key_hold::RepeatCfg,
@@ -396,12 +390,9 @@ impl Feel {
             // the eye reads as live (not the display's).
             ctx.request_repaint_after(std::time::Duration::from_millis(60));
         }
-<<<<<<< ours
-=======
         // The transcript is drawn at the top (`voice_live_panel`); the
         // microterm keeps the Done/Cancel row at the bottom.
         self.voice_level = level;
->>>>>>> theirs
         self.microterm.set_content(crate::microterm::Content::VoicePreview { partial: self.dictation.preview().to_string(), level });
         self.microterm.show();
     }
@@ -424,8 +415,6 @@ impl Feel {
             None => return,
         };
         for c in cmds {
-<<<<<<< ours
-=======
             self.apply_ctl(c);
         }
     }
@@ -433,7 +422,6 @@ impl Feel {
     /// One control command (from the socket, or a test).
     pub fn apply_ctl(&mut self, c: crate::ctl::Cmd) {
         {
->>>>>>> theirs
             use crate::ctl::Cmd;
             tracing::debug!("ctl: {c:?}");
             match c {
@@ -442,8 +430,6 @@ impl Feel {
                 Cmd::VoiceCancel => self.cancel_dictation(),
                 Cmd::VoiceToggle => self.toggle_dictation(),
                 Cmd::Cold(on) => self.cold = on,
-<<<<<<< ours
-=======
                 Cmd::Strip(keyboard_strip::Msg::Show { app, pid, actions }) => {
                     self.app_strip = (!actions.is_empty()).then_some((app, pid, actions));
                 }
@@ -454,7 +440,6 @@ impl Feel {
                         self.app_strip = None;
                     }
                 }
->>>>>>> theirs
                 Cmd::ReloadSettings => self.reload_settings(),
                 Cmd::ReloadLayouts => {
                     self.reload_user_layouts();
@@ -607,9 +592,6 @@ impl Feel {
             cold: false,
             mods: Default::default(),
             rail_press: None,
-<<<<<<< ours
-            hold: None,
-=======
             app_strip: None,
             voice_level: 0.0,
             throw_at: None,
@@ -622,7 +604,6 @@ impl Feel {
             morse_feel: false,
             morse_note: None,
             morse_dash_felt: false,
->>>>>>> theirs
             keys_full: egui::Rect::NOTHING,
             // The GTK keyboard's own repeat settings, same config file.
             repeat_cfg: crate::key_hold::RepeatCfg {
@@ -685,10 +666,7 @@ impl Feel {
         }
         self.style = self.base_style.with_settings(&self.setting_values);
         self.apply_repeat();
-<<<<<<< ours
-=======
         self.apply_morse_settings();
->>>>>>> theirs
         self.needs_frame = true;
     }
 
@@ -758,8 +736,6 @@ fn open_companion() {
 }
 
 impl Feel {
-<<<<<<< ours
-=======
     /// The rail's entries, in order: the code-built boards, then the layout
     /// files that have a tab. (Count and selected index; the rail draws the
     /// labels itself.)
@@ -946,7 +922,6 @@ impl Feel {
         }
     }
 
->>>>>>> theirs
     /// Start, run and end a held key (key_hold.rs). Returns whether this
     /// frame's release must be swallowed because the hold already acted.
     fn hold_step(&mut self, ui: &egui::Ui, render: &crate::Layout, keys_full: egui::Rect, adaptive: &uikit_egui::Adaptive) -> bool {
@@ -954,10 +929,7 @@ impl Feel {
             (i.pointer.primary_down(), i.pointer.primary_pressed(), i.pointer.press_origin(), i.pointer.interact_pos(), i.time * 1000.0)
         });
         if pressed {
-<<<<<<< ours
-=======
             self.morse_dash_felt = false;
->>>>>>> theirs
             self.hold = origin.and_then(|o| {
                 let rects = crate::key_rects(render, keys_full, adaptive, &self.style);
                 render.rows.iter().zip(&rects).find_map(|(row, rs)| {
@@ -979,8 +951,6 @@ impl Feel {
             for k in sends {
                 self.emit_key(k);
             }
-<<<<<<< ours
-=======
             // The keyer: one short buzz the moment a hold becomes a dash, so
             // a dash can be made without watching the key.
             let dash_now = self.hold.as_ref().is_some_and(|h| {
@@ -990,21 +960,17 @@ impl Feel {
                 self.morse_dash_felt = true;
                 self.haptics.play(haptic_kit::Pattern { pulses: vec![haptic_kit::Pulse { on_ms: 25, off_ms: 0 }] });
             }
->>>>>>> theirs
             // The keyboard's loop is lazy; a hold needs the clock to advance.
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
             return false;
         }
         let h = self.hold.take().expect("checked");
-<<<<<<< ours
-=======
         if h.kind == crate::key_hold::Kind::Morse {
             // The keyer's symbol is its DURATION; the release itself types
             // nothing (the letter commits after the gap, `morse_tick`).
             self.keyer.press(h.held_ms(now), now);
             return true;
         }
->>>>>>> theirs
         if h.consumed() && h.kind == crate::key_hold::Kind::Caret {
             // A caret drag along the space row is not a word.
             self.swipe.clear_candidates();
@@ -1028,24 +994,15 @@ impl Feel {
                 })
                 .collect()
         });
-<<<<<<< ours
-        for (pos, pressed) in buttons {
-            if pressed {
-                self.rail_press = rail.contains(pos).then_some(pos);
-=======
         let now = ui.input(|i| i.time);
         for (pos, pressed) in buttons {
             if pressed {
                 self.rail_press = rail.contains(pos).then_some(pos);
                 self.rail_press_at = now;
->>>>>>> theirs
             } else if let Some(o) = self.rail_press.take() {
                 use crate::modlatch::RailSwipe;
                 match crate::modlatch::classify(pos - o) {
                     Some(RailSwipe::Tab) => self.emit_key("Tab"),
-<<<<<<< ours
-                    Some(s) => self.mods.apply_swipe(s),
-=======
                     Some(RailSwipe::NextBoard) => self.rail_step(1),
                     Some(RailSwipe::PrevBoard) => self.rail_step(-1),
                     Some(s) => self.mods.apply_swipe(s),
@@ -1055,7 +1012,6 @@ impl Feel {
                     None if (pos - o).length() < 12.0 && now - self.rail_press_at >= RAIL_PIN_S => {
                         self.strip_pinned = !self.strip_pinned;
                     }
->>>>>>> theirs
                     None => {}
                 }
                 ui.ctx().request_repaint();
@@ -1267,11 +1223,8 @@ impl Feel {
 
     pub fn frame(&mut self, ctx: &egui::Context) {
         self.sync_font(ctx);
-<<<<<<< ours
-=======
         self.step_throw(ctx);
         self.morse_tick(ctx);
->>>>>>> theirs
         apply_theme(ctx);
 
         // Drive whatever background event processing the active sink
@@ -1754,10 +1707,7 @@ impl Feel {
                             }
                             self.style = self.base_style.with_settings(&self.setting_values);
                             self.apply_repeat();
-<<<<<<< ours
-=======
                             self.apply_morse_settings();
->>>>>>> theirs
                             if change.broadcast { ctx.request_repaint(); }
                         }
                         // The help line is where the options are EXPLAINED —
@@ -1864,16 +1814,9 @@ impl Feel {
             ui.horizontal_top(|ui| {
                 let rail_w = crate::layout_rail::width(self.rail_collapsed);
                 let rail_rect = ui.allocate_ui(egui::vec2(rail_w, board_h), |ui| {
-<<<<<<< ours
-                    // demo layouts first, then the REAL layout files (shift/symbols live)
-                    let mut entries: Vec<crate::layout_rail::Entry> = self
-                        .board
-                        .layout_names()
-=======
                     // The boards ON the rail (rail_boards: all, or the person's trim).
                     let (list, sel) = self.rail_entries();
                     let entries: Vec<crate::layout_rail::Entry> = list
->>>>>>> theirs
                         .iter()
                         .map(|e| crate::layout_rail::Entry::new(&e.name, matches!(e.source, crate::rail_boards::Source::File(_))))
                         .collect();
@@ -1912,13 +1855,9 @@ impl Feel {
                         // the real layout files: render via the projection, feed emissions through
                         // the board's state machine (shift/symbols absorbed), act on the rest
                         let render = self.real.render_rc();
-<<<<<<< ours
-                        if let Some(e) = keyboard_ui_styled(ui, &render, &adaptive, self.board.palette(), self.style).filter(|_| !swallow) {
-=======
                         let trimmed = self.voice_trim(&render);
                         let drawn: &crate::Layout = trimmed.as_ref().unwrap_or(&render);
                         if let Some(e) = keyboard_ui_styled(ui, drawn, &adaptive, self.board.palette(), self.style).filter(|_| !swallow) {
->>>>>>> theirs
                             key_fired = true;
                             // THROUGH THE SINK, not straight into the
                             // preview string. These wrote to `self.typed`
@@ -1968,9 +1907,6 @@ impl Feel {
                         // model failure, the sink closing — and a key latched on toggle
                         // would keep pulsing over a microphone that had already closed.
                         self.board.set_voice_active(self.dictation.is_active());
-<<<<<<< ours
-                        keyboard_ui_styled(ui, &self.board.rendered(), &adaptive, self.board.palette(), self.style)
-=======
                         let rendered = self.board.rendered();
                         let now_ms = ui.input(|i| i.time) * 1000.0;
                         let faced = self.morse_faces(&rendered, now_ms);
@@ -1978,7 +1914,6 @@ impl Feel {
                         let trimmed = self.voice_trim(base);
                         let drawn: &crate::Layout = trimmed.as_ref().unwrap_or(base);
                         keyboard_ui_styled(ui, drawn, &adaptive, self.board.palette(), self.style)
->>>>>>> theirs
                             .filter(|_| !swallow)
                     } {
                         key_fired = true;
@@ -2058,11 +1993,8 @@ impl Feel {
                         top_edge = Some(crate::topedge::classify(press, release, len, ms, col, m));
                     }
                     let swipe_done = self.swipe.update_half(ui, render, board_rect, &adaptive, self.style.half).is_some();
-<<<<<<< ours
-=======
                     // The voice line, in the top row's place (see `voice_trim`).
                     self.paint_voice_line(ui, keys_full, &adaptive);
->>>>>>> theirs
                     if swipe_done && swallow {
                         // The press was a HELD key (a spacebar caret drag, a repeating
                         // backspace), not a word: nothing it traced may commit or offer
@@ -2474,8 +2406,6 @@ mod hold_tests {
         assert_eq!(f.typed, "", "a caret drag types nothing");
         assert!(f.hold.is_none());
     }
-<<<<<<< ours
-=======
 
     #[test]
     fn a_long_press_on_the_rail_pins_the_command_strip_and_a_tap_does_not() {
@@ -2627,6 +2557,5 @@ mod hold_tests {
         assert!(f.desired_height().unwrap() <= h + 60.0, "no new band above the keys: {h} -> {:?}", f.desired_height());
     }
 
->>>>>>> theirs
 }
 
