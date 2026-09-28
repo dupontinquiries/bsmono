@@ -288,6 +288,10 @@ impl Game {
                     Seen { foe: f, class, dist: d }
                 });
                 foe = pick(cur, &seen);
+                // a mudslide kitten: cats first, no leash (`clay::kit_foe`)
+                if m.clay.is_some() {
+                    foe = self.kit_foe(m, foe);
+                }
             }
             if foe.is_some() && left_at.is_none() {
                 left_at = Some(m.pos);
@@ -636,9 +640,12 @@ impl Game {
         // ...and back out of anything the shove put them into: two cats
         // meeting beside a trunk pushed one into the bark, where it stayed
         // until its next step (on the ground only -- a cat in the air is
-        // resolved at its feet above)
+        // resolved at its feet above). A dash is on the ground: shoved
+        // mid-dash into a trunk, a cat was left 0.14 u inside the bark (it
+        // showed when bots began to move a reaction late, `reaction`, and
+        // one was still standing in the dash's way)
         for (gi, g) in self.gods.iter_mut().enumerate() {
-            if shoved[gi] && g.leap.is_none() && g.dash.is_none() && g.perch.is_none() && g.fall.is_none() {
+            if shoved[gi] && g.leap.is_none() && g.perch.is_none() && g.fall.is_none() {
                 g.pos = self.blockers.resolve(g.pos, GOD_RADIUS);
             }
         }
@@ -659,11 +666,12 @@ impl Game {
                     let want = if m.caster { reach * 0.85 } else { reach - 0.3 };
                     (flat(p - m.pos) > want).then_some(p)
                 }
-                // a mudslide kitten with no one in reach runs on the way the
-                // mud carried it (`clay`)
+                // a mudslide kitten with nothing to bite: round its potter,
+                // or down a lane (`clay::kit_idle_goal`); on the way the mud
+                // threw it only if there is no lane at all
                 None if self.minions[mi].clay.is_some() => {
                     let m = &self.minions[mi];
-                    Some(m.pos + m.clay.unwrap().heading * 4.0)
+                    self.kit_idle_goal(m).or(Some(m.pos + m.clay.unwrap().heading * 4.0))
                 }
                 None => {
                     let m = &mut self.minions[mi];

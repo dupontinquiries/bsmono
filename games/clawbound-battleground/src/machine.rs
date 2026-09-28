@@ -46,8 +46,9 @@ pub const ROLL_WARN: f32 = 4.0;
 /// Its fall off the chute's lip.
 pub const GRAVITY: f32 = 30.0;
 /// What it does to a cat it rolls over: a share of its health, thrown aside
-/// this far, and slowed.
-pub const HIT_SHARE: f32 = 0.18;
+/// this far, and slowed. (0.35, from 0.18: playtested, a stone "wasn't
+/// doing much" -- under a fifth of a bar was shrugged off.)
+pub const HIT_SHARE: f32 = 0.35;
 pub const KNOCK: f32 = 4.5;
 pub const HIT_SLOW: f32 = 0.4;
 /// How soon (s) a ball must be due at a bot before it steps off the track.

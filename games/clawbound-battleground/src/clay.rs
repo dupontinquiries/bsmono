@@ -59,6 +59,17 @@ pub const SLIDE_KIT_DMG: f32 = 30.0;
 pub const SLIDE_KIT_GOLD: f32 = 40.0;
 pub const SLIDE_KIT_LIFE: f32 = 20.0;
 pub const SLIDE_KIT_SPEED: f32 = 9.0;
+/// How far a mudslide kitten notices an enemy cat (a lane minion: 7), and
+/// how far it keeps chasing one it has. No leash: it lives 20 s, and a
+/// kitten walked back to a lane it never came from was wasted.
+pub const KIT_HUNT: f32 = 14.0;
+pub const KIT_KEEP: f32 = 18.0;
+/// A cat its potter hit this recently is the one the kittens go for.
+pub const KIT_FOCUS_SECS: f32 = 3.0;
+/// With nothing to bite, kittens this near their potter keep to him, in
+/// a ring this wide; further off they march the nearest lane.
+pub const KIT_ESCORT: f32 = 30.0;
+pub const KIT_RING: f32 = 2.6;
 /// For this long after he brings the bank down, his kills shape more: a
 /// god KITS_PER_GOD_KILL, a minion or a jungle beast KITS_PER_SMALL_KILL.
 pub const SURGE_SECS: f32 = 6.0;
@@ -227,6 +238,60 @@ impl Game {
         self.gods[gi].clay_surge_t = SURGE_SECS + len / speed.max(1.0);
         self.events.push(Event::MudslideFx { pos: from, dir });
         self.slide_kittens(gi, from + dir * 2.0, kits, dir);
+    }
+
+    /// A mudslide kitten's choice of what to bite. Not the lane minion's
+    /// (`minionai::pick`, which puts minions before cats and leashes a
+    /// chase to the lane): these were made by an ultimate to press a
+    /// fight. An enemy cat in [`KIT_HUNT`] first -- the one their potter
+    /// hit in the last [`KIT_FOCUS_SECS`] above all, then the most hurt,
+    /// then the nearest; one already held is kept to [`KIT_KEEP`]. Only
+    /// with no cat about, what a lane minion would take.
+    pub fn kit_foe(&self, m: &crate::sim::Minion, lane_pick: Option<crate::minionai::Foe>) -> Option<crate::minionai::Foe> {
+        use crate::minionai::Foe;
+        let kit = m.clay?;
+        let flat = |v: Vec3| Vec3::new(v.x, 0.0, v.z).length();
+        let alive_foe = |gi: usize| self.gods.get(gi).filter(|g| g.team != m.team && g.respawn_t <= 0.0 && self.sees(m.team, gi));
+        if let Some(Foe::God(gi)) = m.foe {
+            if alive_foe(gi).is_some_and(|g| flat(g.pos - m.pos) < KIT_KEEP) {
+                return m.foe;
+            }
+        }
+        let focus = |gi: usize| self.gods[gi].recent_damagers.iter().any(|&(s, t)| s == kit.owner && self.t - t < KIT_FOCUS_SECS);
+        let score = |gi: usize| {
+            let g = &self.gods[gi];
+            flat(g.pos - m.pos) - if focus(gi) { 10.0 } else { 0.0 } - 5.0 * (1.0 - g.hp / g.max_hp.max(1.0))
+        };
+        let cats: Vec<usize> = (0..self.gods.len()).filter(|&gi| alive_foe(gi).is_some_and(|g| flat(g.pos - m.pos) < KIT_HUNT)).collect();
+        if let Some(gi) = cats.into_iter().min_by(|&a, &b| score(a).total_cmp(&score(b))) {
+            return Some(Foe::God(gi));
+        }
+        lane_pick
+    }
+
+    /// Where a mudslide kitten with nothing to bite walks: round its potter
+    /// while he is near (each in its own place on a ring round him), else
+    /// on down the nearest lane toward the enemy.
+    pub fn kit_idle_goal(&self, m: &crate::sim::Minion) -> Option<Vec3> {
+        let kit = m.clay?;
+        let flat = |v: Vec3| Vec3::new(v.x, 0.0, v.z).length();
+        if let Some(o) = self.gods.get(kit.owner).filter(|o| o.respawn_t <= 0.0 && flat(o.pos - m.pos) < KIT_ESCORT) {
+            let a = m.id as f32 * 2.399; // the golden angle: places spread round
+            let at = o.pos + Vec3::new(a.cos(), 0.0, a.sin()) * KIT_RING;
+            return Some(crate::map::onto_floor(at, 0.4));
+        }
+        // the nearest point of any of its side's lanes, then the next one on
+        let mut best: Option<(f32, Vec3)> = None;
+        for &lane in crate::map::lanes() {
+            let path = crate::consts::lane_path(lane, m.team);
+            for (i, p) in path.iter().enumerate() {
+                let d = flat(*p - m.pos);
+                if best.is_none_or(|(bd, _)| d < bd) {
+                    best = Some((d, path[(i + 1).min(path.len() - 1)]));
+                }
+            }
+        }
+        best.map(|(_, next)| next)
     }
 
     /// `n` of his mudslide kittens at `at`, fanned round `heading`.

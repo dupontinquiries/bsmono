@@ -216,35 +216,81 @@ fn xp_curve_monotonic() {
 /// A dash into a tree trunk goes round it, not through it: the dash used to
 /// set the cat's position from its line every tick, throwing away the
 /// shove the trunk gave it, so a cat dashed straight through the bark.
+///
+/// The dash alone (every other cat parked far off): head on (0.3 u off the
+/// trunk's centre line) and glancing (1.6 u off), it never enters the bark
+/// and slides round the trunk and on. (This test used to claim the head-on
+/// dash STOPPED at the bark. That held only because a teammate standing at
+/// the base was in the dash's way; when bots began to move a reaction late
+/// (`reaction`) that teammate moved differently and the claim fell. Alone,
+/// a head-on dash slides round, as a glancing one does.)
 #[test]
 fn a_dash_into_a_trunk_goes_round_it() {
+    for off in [0.3f32, 1.6] {
+        let (closest, r, end, tree) = dash_at_trunk(off, None);
+        assert!(closest >= r - 0.05, "off {off}: the dash went {closest:.2} u from the trunk's centre; the bark is at {r:.2}");
+        assert!(end > tree + r * 0.5, "off {off}: ended at x {end:.2}, short of round the tree at {tree:.2}");
+    }
+}
+
+/// A dash shoved by the cats around it still never ends up in the bark:
+/// the push-out after cats shove each other skipped a dashing cat, and at
+/// the base with the whole team about (bots moving at a normal match's
+/// reaction, `reaction`) one was left 0.14 u inside a trunk.
+#[test]
+fn a_dash_shoved_by_a_cat_does_not_go_into_the_bark() {
+    let mut worst = (f32::MAX, 0.0, 0.0, 0.0);
+    let mut tried = 0;
+    for off in [-0.8f32, -0.3, 0.3, 0.8, 1.6] {
+        for sx in 0..9 {
+            for sz in 0..9 {
+                let stand = glam::Vec3::new(1.0 + sx as f32 * 0.5, 0.0, off - 2.0 + sz as f32 * 0.5);
+                let (closest, r, _, _) = dash_at_trunk(off, Some(stand));
+                tried += 1;
+                if closest - r < worst.0 {
+                    worst = (closest - r, off, stand.x, stand.z);
+                }
+            }
+        }
+    }
+    eprintln!("SWEEP {tried} scenes, worst: {:.3} u into the bark (off {}, a cat at {:.1},{:.1})", -worst.0, worst.1, worst.2, worst.3);
+    assert!(worst.0 >= -0.05, "off {}, a cat standing at ({:.1}, {:.1}): the dash went {:.2} u into the bark", worst.1, worst.2, worst.3, -worst.0);
+}
+
+/// Dash cat 0 9 u along +x past a trunk `off` from its line, 4 u out, with
+/// every other cat parked far off -- or, `crowd`, left where the match put
+/// them, the bots thinking. Returns (closest approach to the trunk's
+/// centre, the bark's radius for a cat, where the dash ended in x, the
+/// tree's x).
+fn dash_at_trunk(off: f32, stand: Option<glam::Vec3>) -> (f32, f32, f32, f32) {
     use clawbound::blockers::{Blockers, PropKind};
     use clawbound::sim::DashState;
     use glam::Vec3;
-    let from = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]).gods[0].pos;
+    let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    let from = game.gods[0].pos;
     let to = from + Vec3::new(9.0, 0.0, 0.0);
     let r = PropKind::JungleTree.footprint().radius + clawbound::consts::GOD_RADIUS;
-    // head on (0.3 u off the trunk's centre line): stopped at the bark;
-    // a glancing line (1.6 u off): shouldered round it and on past
-    for (off, past) in [(0.3f32, false), (1.6, true)] {
-        let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
-        let tree = from + Vec3::new(4.0, 0.0, off);
-        let mut b = Blockers::new(200.0, 6.0);
-        b.push_prop(PropKind::JungleTree, tree.x, tree.z, 0.0, 1.0);
-        game.blockers = std::sync::Arc::new(b);
-        game.gods[0].pos = from;
-        game.gods[0].dash = Some(DashState { from, to, t: 0.0, dur: 0.4, dmg: 0.0, arc: 0.35, blast: None });
-        let mut closest = f32::MAX;
-        for _ in 0..40 {
-            game.tick(1.0 / 60.0);
-            let p = game.gods[0].pos;
-            closest = closest.min(Vec3::new(p.x - tree.x, 0.0, p.z - tree.z).length());
-        }
-        assert!(game.gods[0].dash.is_none(), "off {off}: the dash ended");
-        assert!(closest >= r - 0.05, "off {off}: the dash went {closest:.2} u from the trunk's centre; the bark is at {r:.2}");
-        let end = game.gods[0].pos.x;
-        assert_eq!(end > tree.x, past, "off {off}: ended at x {end:.2}, the tree at {:.2}", tree.x);
+    let tree = from + Vec3::new(4.0, 0.0, off);
+    let mut b = Blockers::new(200.0, 6.0);
+    b.push_prop(PropKind::JungleTree, tree.x, tree.z, 0.0, 1.0);
+    game.blockers = std::sync::Arc::new(b);
+    for k in 1..game.gods.len() {
+        game.gods[k].ai = None;
+        game.gods[k].pos = Vec3::new(300.0 + k as f32 * 5.0, 0.0, 300.0);
     }
+    if let Some(s) = stand {
+        game.gods[1].pos = from + s;
+    }
+    game.gods[0].pos = from;
+    game.gods[0].dash = Some(DashState { from, to, t: 0.0, dur: 0.4, dmg: 0.0, arc: 0.35, blast: None });
+    let mut closest = f32::MAX;
+    for _ in 0..40 {
+        game.tick(1.0 / 60.0);
+        let p = game.gods[0].pos;
+        closest = closest.min(Vec3::new(p.x - tree.x, 0.0, p.z - tree.z).length());
+    }
+    assert!(game.gods[0].dash.is_none(), "off {off}: the dash ended");
+    (closest, r, game.gods[0].pos.x, tree.x)
 }
 
 /// The leap, through the real sim loop: press toward a rock, end up standing
@@ -596,9 +642,12 @@ fn a_thicket_slows_a_cat_and_does_not_stop_it() {
 fn a_bot_steers_off_a_line_that_runs_into_a_trunk() {
     use clawbound::blockers::{Blocker, Blockers, Cover, Shape};
     use glam::Vec3;
+    // (what the brain decides, read the tick it decides it: no reaction
+    // delay between it and the body, `reaction`)
     let fresh = || {
         let mut g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
         g.blockers = std::sync::Arc::new(Blockers::new(200.0, 6.0));
+        g.rules.bot_reaction = 0.0;
         g
     };
     let bot = 1;
@@ -3540,9 +3589,9 @@ mod god_limit {
     use clawbound::picks::{Fill, GodLimit};
     use clawbound::sim::{AiBrain, Event, Game, Rng};
 
-    /// Every ancestor, ten of it in one 5v5 on the jungle, for 90 s of
-    /// bots: nothing panics, every cat stays finite, and the mirrored kits
-    /// are used (casts from both sides).
+    /// Every ancestor, ten of it in one 5v5 on the jungle from level 3,
+    /// for 90 s of bots: nothing panics, every cat stays finite, and the
+    /// mirrored kits are used (casts from both sides).
     #[test]
     fn every_ancestor_can_mirror_itself() {
         map::with(MapId::Jungle, || {
@@ -3553,6 +3602,11 @@ mod god_limit {
                 let mut g = Game::new_teams(&b, &r);
                 g.blockers = blockers.clone();
                 g.gods[0].ai = Some(AiBrain::new(Lane::Mid, 0.9));
+                // level 3: the whole basic kit unlocked, so "the kit is
+                // used" means the kit and not only its first ability (at
+                // level 1 Oremantle has only one, unusable at arm's length,
+                // and a side of her that fought close never cast)
+                g.apply_rules(clawbound::rules::MatchRules { start_level: 3, ..Default::default() });
                 let mut casts = [0u32; 2];
                 for _ in 0..(90 * 30) {
                     g.tick(1.0 / 30.0);
@@ -3602,5 +3656,205 @@ mod god_limit {
             // (measured 99 at most: none would mean the kittens never came)
             assert!((1..=400).contains(&most_kits), "{most_kits} kittens at once");
         });
+    }
+}
+
+/// Claypaw's mudslide kittens think for themselves (`clay::kit_foe`,
+/// `clay::kit_idle_goal`): they hunt cats past a lane minion's notice and
+/// past its leash, go for the one their potter is fighting, keep to him
+/// with nothing to bite, and march a lane when he is gone.
+mod mud_kittens {
+    use clawbound::map::{self, MapId};
+    use clawbound::sim::Game;
+    use glam::Vec3;
+
+    fn claypaw() -> u32 {
+        clawbound::gods::ROSTER.iter().find(|d| d.name == "Claypaw").unwrap().id
+    }
+
+    /// Claypaw (0) against two cats (1, 2), nobody driven, no towers to
+    /// distract, the enemies parked far off unless a test places them.
+    fn quiet() -> Game {
+        let mut g = Game::new_teams(&[claypaw()], &[0, 1]);
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+        }
+        for t in g.towers.iter_mut() {
+            t.hp = 0.0;
+        }
+        g.gods[1].pos = Vec3::new(400.0, 0.0, 400.0);
+        g.gods[2].pos = Vec3::new(-400.0, 0.0, 400.0);
+        g
+    }
+
+    fn run(g: &mut Game, secs: f32, mut each: impl FnMut(&mut Game)) {
+        for _ in 0..(secs * 30.0) as usize {
+            each(g);
+            g.tick(1.0 / 30.0);
+            g.events.clear();
+            // only the kittens: no lane waves wander in
+            g.minions.retain(|m| m.clay.is_some());
+        }
+    }
+
+    fn kits(g: &Game) -> Vec<Vec3> {
+        g.minions.iter().filter(|m| m.clay.is_some()).map(|m| m.pos).collect()
+    }
+
+    /// A cat 12 u BEHIND the mud (a lane minion notices at 7), walking
+    /// away: the kittens turn, catch it and bite, and follow it well past
+    /// a lane minion's 9 u leash.
+    #[test]
+    fn they_hunt_a_cat_behind_them_and_past_the_leash() {
+        let mut g = quiet();
+        let at = Vec3::new(10.0, 0.0, -20.0);
+        g.gods[0].pos = at + Vec3::new(0.0, 0.0, -40.0); // the potter out of it
+        g.gods[1].pos = at - Vec3::X * 12.0;
+        let hp0 = g.gods[1].hp;
+        g.slide_kittens(0, at, 6, Vec3::X);
+        run(&mut g, 4.0, |g| g.gods[1].pos -= Vec3::X * (2.5 / 30.0));
+        assert!(g.gods[1].hp < hp0 - 50.0, "the kittens never bit: {} of {hp0}", g.gods[1].hp);
+        let far = kits(&g).iter().map(|k| (*k - at).length()).fold(0.0f32, f32::max);
+        assert!(far > 15.0, "no kitten followed past the leash: furthest {far:.1} u");
+    }
+
+    /// Two cats, the nearer one untouched, the other just hit by the
+    /// potter: the kittens go for his.
+    #[test]
+    fn they_go_for_the_cat_their_potter_is_fighting() {
+        let mut g = quiet();
+        let at = Vec3::new(10.0, 0.0, -20.0);
+        g.gods[0].pos = at + Vec3::new(-6.0, 0.0, 0.0);
+        g.gods[1].pos = at + Vec3::new(0.0, 0.0, 7.0);
+        g.gods[2].pos = at + Vec3::new(0.0, 0.0, -10.0);
+        g.slide_kittens(0, at, 6, Vec3::X);
+        run(&mut g, 1.2, |g| {
+            let t = g.t;
+            g.gods[2].recent_damagers = vec![(0, t)];
+        });
+        let (a, b) = (g.gods[1].pos, g.gods[2].pos);
+        let to_b = kits(&g).iter().filter(|k| (**k - b).length() < (**k - a).length()).count();
+        assert!(to_b >= 5, "only {to_b} of 6 went for the potter's cat");
+    }
+
+    /// Nothing to bite: they keep round the potter as he walks, not off
+    /// the way the mud threw them.
+    #[test]
+    fn with_nothing_to_bite_they_keep_to_their_potter() {
+        let mut g = quiet();
+        let at = Vec3::new(10.0, 0.0, -20.0);
+        g.gods[0].pos = at;
+        g.slide_kittens(0, at + Vec3::X * 2.0, 6, Vec3::X);
+        run(&mut g, 6.0, |g| g.gods[0].pos += Vec3::Z * (5.0 / 30.0));
+        let o = g.gods[0].pos;
+        let far = kits(&g).iter().map(|k| (*k - o).length()).fold(0.0f32, f32::max);
+        assert!(!kits(&g).is_empty() && far < 6.0, "a kitten strayed {far:.1} u from its potter");
+    }
+
+    /// The potter dead: they march the nearest lane, not on into the wild.
+    #[test]
+    fn without_their_potter_they_take_a_lane() {
+        let mut g = quiet();
+        g.gods[0].respawn_t = 100.0;
+        let lanes: Vec<Vec3> = map::lanes().iter().flat_map(|&l| clawbound::consts::lane_path(l, g.gods[0].team).to_vec()).collect();
+        let off = |p: Vec3| lanes.iter().map(|w| Vec3::new(w.x - p.x, 0.0, w.z - p.z).length()).fold(f32::MAX, f32::min);
+        // a spot well off any lane, thrown further off
+        let at = (0..400).map(|k| Vec3::new(-90.0 + (k % 20) as f32 * 9.0, 0.0, -90.0 + (k / 20) as f32 * 9.0)).find(|p| (18.0..30.0).contains(&off(*p))).expect("an off-lane spot");
+        let away = lanes.iter().min_by(|a, b| (**a - at).length().total_cmp(&(**b - at).length())).map(|w| Vec3::new(at.x - w.x, 0.0, at.z - w.z).normalize()).unwrap();
+        g.slide_kittens(0, at, 4, away);
+        let start = off(at);
+        run(&mut g, 6.0, |_| {});
+        let worst = kits(&g).iter().map(|k| off(*k)).fold(0.0f32, f32::max);
+        assert!(worst < 5.0, "a kitten is still {worst:.1} u off the lanes (started {start:.1})");
+    }
+
+    /// On the Pass, thrown at a cliff with the scene's own collision:
+    /// no kitten ever stands in the rock.
+    #[test]
+    fn on_the_pass_they_stay_out_of_the_rock() {
+        map::with(MapId::Pass, || {
+            let mut g = quiet();
+            g.blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+            g.gods[0].respawn_t = 100.0;
+            let f = map::floor().unwrap();
+            let path = clawbound::consts::lane_path(map::lanes()[0], g.gods[0].team);
+            // a lane point with rock close beside it, and the way to it
+            let (at, dir) = path
+                .iter()
+                .flat_map(|p| (0..16).map(move |k| (*p, Vec3::new((k as f32 * 0.3927).cos(), 0.0, (k as f32 * 0.3927).sin()))))
+                .find(|(p, d)| f.sdf(p.x, p.z) < -2.0 && f.sdf(p.x + d.x * 9.0, p.z + d.z * 9.0) > 1.0)
+                .expect("rock beside a lane");
+            g.slide_kittens(0, at, 6, dir);
+            run(&mut g, 8.0, |g| {
+                for m in &g.minions {
+                    assert!(f.sdf(m.pos.x, m.pos.z) <= 0.3, "a kitten in the rock at {} (sdf {:.2})", m.pos, f.sdf(m.pos.x, m.pos.z));
+                }
+            });
+        });
+    }
+}
+
+/// Bots act a reaction time after they see (`reaction`): the same scene --
+/// an enemy cat appears in reach of a bot with its kit ready -- answered at
+/// the match's reaction setting, not in the tick it happens.
+mod reaction {
+    use clawbound::rules::MatchRules;
+    use clawbound::sim::{Event, Game};
+    use glam::Vec3;
+
+    /// Seconds from the enemy appearing to the bot's first cast, and to the
+    /// bot first moving toward it.
+    fn answer(reaction: Option<f32>) -> (f32, f32) {
+        let mut g = Game::new_teams(&[0, 3], &[1]);
+        // None: a normal match's rules (only the level raised, for a kit)
+        let d = MatchRules::default();
+        g.apply_rules(MatchRules { bot_reaction: reaction.unwrap_or(d.bot_reaction), start_level: 6, ..d });
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+        }
+        let bot = 1;
+        g.gods[bot].ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+        let home = Vec3::new(20.0, 0.0, 0.0);
+        g.gods[bot].pos = home;
+        g.gods[2].pos = Vec3::new(300.0, 0.0, 300.0);
+        g.gods[0].pos = Vec3::new(-300.0, 0.0, 300.0);
+        g.minions.clear();
+        // settle with nobody near
+        for _ in 0..60 {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+            g.minions.clear();
+            g.gods[bot].pos = home;
+        }
+        // the enemy is there
+        g.gods[2].pos = home + Vec3::new(0.0, 0.0, 9.0);
+        let t0 = g.t;
+        let (mut cast, mut turn) = (None, None);
+        for _ in 0..120 {
+            g.gods[2].pos = home + Vec3::new(0.0, 0.0, 9.0);
+            g.tick(1.0 / 60.0);
+            if cast.is_none() && g.events.iter().any(|e| matches!(*e, Event::Cast { god, .. } | Event::CastStart { god, .. } if god == bot)) {
+                cast = Some(g.t - t0);
+            }
+            if turn.is_none() && g.gods[bot].move_dir.z > 0.3 {
+                turn = Some(g.t - t0);
+            }
+            g.events.clear();
+            g.minions.clear();
+        }
+        (cast.expect("the bot never cast"), turn.expect("the bot never moved to it"))
+    }
+
+    #[test]
+    fn a_bot_answers_a_reaction_time_late() {
+        let (cast0, turn0) = answer(Some(0.0));
+        let (cast2, turn2) = answer(Some(0.2));
+        // a normal match plays the pro's reaction, not the instant bot
+        assert_eq!(answer(None), (cast2, turn2), "a normal match's bots are not the 0.2 s bots");
+        let d = clawbound::reaction::delay_for(0.2, 1);
+        eprintln!("instant: cast {cast0:.3} turn {turn0:.3}; 0.2 s: cast {cast2:.3} turn {turn2:.3} (this bot's delay {d:.3})");
+        assert!(cast0 < 0.1 && turn0 < 0.1, "the instant bot is not instant: {cast0} {turn0}");
+        assert!((cast2 - cast0 - d).abs() < 0.035, "the cast came {:.3} s later, not {d:.3}", cast2 - cast0);
+        assert!((turn2 - turn0 - d).abs() < 0.035, "the move came {:.3} s later, not {d:.3}", turn2 - turn0);
     }
 }

@@ -84,6 +84,7 @@ pub mod geartooth;
 pub mod emitters;
 pub mod picks;
 pub mod rules;
+pub mod reaction;
 pub mod mazeworld;
 /// The Curio shelf's passives, worked (items::Passive).
 pub mod curios;

@@ -832,6 +832,17 @@ pub fn run_shop_shots() -> Result<(), String> {
         save_shot(&renderer.device, &renderer.queue, &target, name)?;
         println!("saved {name}");
     }
+    // A PinePhone held landscape: 720 x 360 logical, at 1280 x 640.
+    {
+        let (lw, lh) = (1280u32, 640u32);
+        let ltarget = mk(&renderer, lw, lh);
+        let lview = ltarget.create_view(&Default::default());
+        clear(&renderer.device, &renderer.queue, &lview);
+        let out = shop_frame(&egui_ctx, &mut game, &mut ui_state, lw, lh, lw as f32 / 720.0);
+        draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &lview, &egui_ctx, out, lw, lh);
+        save_shot(&renderer.device, &renderer.queue, &ltarget, "clawbound_shop_pinephone_landscape.png")?;
+        println!("saved clawbound_shop_pinephone_landscape.png");
+    }
     // The Curio shelf, one of them in the study pane.
     ui_state.shop_tab = crate::items::Cat::Curio;
     ui_state.shop_study = crate::items::all().iter().find(|i| i.name == "Thrice-Pounce Claws").map(|i| i.id);
