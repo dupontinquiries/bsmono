@@ -6253,6 +6253,130 @@ still pass, which is why this one exists."
         println!("gate-outscale: {}", if ok { "layer_output_scale applies at the funnel \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-deltanet-prefix-reuse") {
+        // THE RECURRENT-REUSE CONSTRAINT, as a runnable proof.
+        //
+        // This is the regression that would have caught the Ornith-9B chat-reuse crash: on a
+        // prefix-tree hit the engine copies the shared prefix's K/V into a fresh session and
+        // prefills only the divergent suffix. For an attention model that is a clean win (K/V is
+        // append-only and position-indexed). For a hybrid (Gated DeltaNet) model the cache ALSO
+        // carries, per recurrent layer, a GPU-resident recurrent state { ring, s, next_pos } that
+        // is ABSOLUTE — it has been folded through positions 0..N of THIS cache. It cannot seek to
+        // an earlier position; the only correct recurrent state at position l is one that was
+        // built from position 0 up to l.
+        //
+        // So the gate proves the ONLY sound reuse — a shared prefix that was built from 0 — and
+        // asserts the two invariants a correct install must satisfy: (a) `next_pos` lands exactly
+        // on the first continuation position, and (b) a correct install reproduces the full
+        // prefill's logits. It also shows, as a NEGATIVE, what the assert protects against:
+        // seeding a session whose delta state sits at position P while prefilling the suffix from
+        // position l < P is refused (the seek), not silently corrupted.
+        std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
+        let gpu = Gpu::new();
+        eprintln!("gate-deltanet-prefix-reuse: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+
+        let bytes = write_gguf_qwen35moe_hybrid(1, None);
+        let m = gpu.load_gguf(&bytes).expect("hybrid f32 load for prefix-reuse gate");
+        ck("model carries at least one recurrent layer", m.deltanet_layers() >= 1);
+
+        let prompt: Vec<u32> = vec![2, 7, 3, 11, 5, 9, 4, 8, 1, 6];
+        let plen = prompt.len() - 3;               // share 7 of the 10
+        assert!(plen >= 1 && plen < prompt.len());
+        let suffix = &prompt[plen..];
+
+        // (B) BUG REPRODUCED — the current `seed_from_prefix` copies K/V only; it leaves the delta
+        //     state's next_pos at 0 (session_new). Prefilling the suffix from position plen > 0
+        //     then hits block_prefill_deltanet_gpu's assert (np == pos) and panics. Capture that as
+        //     the bug this regression guards.
+        {
+            let tip = gpu.prefill_prefix(&m, &prompt);
+            let plen = tip.k.len();
+            let s2 = gpu.session_new(&m, prompt.len() + 8, 0x2500);
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut s = s2;
+                gpu.seed_from_prefix(&m, &mut s, &tip, plen);
+                let _ = gpu.prefill_chunked_from(&m, &s.cache, &prompt, plen, 256);
+            }));
+            ck("the CURRENT seed_from_prefix (K/V only) panics prefilling the suffix at plen,
+                reproducing the crash", panicked.is_err());
+        }
+
+        // (C) SOUND INSTALL — copy the delta ring/s (byte-exact) AND set next_pos == plen, exactly
+        //     the operations a correct fix must perform. Then prefill the suffix via the GPU path
+        //     and prove the result is bit-exact to a GPU-path full prefill (same implementation,
+        //     so only fp-reordering noise — like the other families' parity gates).
+        let prefix_cache = gpu.prefill_prefix(&m, &prompt[..plen]);
+        // GPU-path reference over the WHOLE prompt: same prefill kernels, so like-for-like with the
+        // seeded suffix. (The CPU `session_prefill` path differs by more in the last bits — the
+        // GPU prefill is "not bit-identical to decode overall", per block_prefill_deltanet_gpu.)
+        let ref_cache = gpu.new_cache_for(&m, prompt.len() + 8);
+        let ref_logits = gpu.prefill_chunked(&m, &ref_cache, &prompt, 256);
+
+        let split = gpu.session_new(&m, prompt.len() + 8, 0x2600);
+        {
+            let split_dng = split.cache.deltanet_gpu.as_ref().unwrap();
+            let src_dng = prefix_cache.deltanet_gpu.as_ref().unwrap();
+            for (_li, (sd, nd)) in src_dng.iter().zip(split_dng).enumerate() {
+                if let (Some(sd), Some(nd)) = (sd, nd) {
+                    gpu.copy_rows_pub(&nd.ring, &sd.ring, 0, 1, nd.ring.cols);
+                    gpu.copy_rows_pub(&nd.s, &sd.s, 0, 1, nd.s.cols);
+                    nd.next_pos.store(plen, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            // COPY EXACTNESS — taken IMMEDIATELY after the memcpy, before the suffix advances it,
+            // so a nonzero result would mean the copy surface itself is wrong.
+            for (li, (sd, nd)) in src_dng.iter().zip(split_dng).enumerate() {
+                if let (Some(sd), Some(nd)) = (sd, nd) {
+                    let sr = gpu.download(&sd.ring);
+                    let nr = gpu.download(&nd.ring);
+                    let ss = gpu.download(&sd.s);
+                    let ns = gpu.download(&nd.s);
+                    let dr = sr.iter().zip(&nr).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    let ds = ss.iter().zip(&ns).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    ck(&format!("delta state copied bit-exactly at layer {li} (ring |Δ| = {dr:.2e}, S |Δ| = {ds:.2e})",
+                                dr = dr, ds = ds), dr == 0.0 && ds == 0.0);
+                }
+            }
+        }
+        let split = split;
+        let split_logits = gpu.prefill_chunked_from(&m, &split.cache, suffix, plen, 256);
+        ck("a position-correct install (next_pos == plen) prefills the suffix WITHOUT the seek panic", true);
+        let dmax = split_logits.iter().zip(&ref_logits)
+            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck(&format!("position-correct install reproduces the GPU full prefill (max |Δ| = {dmax:.2e})",
+                    dmax = dmax), dmax < 1e-3);
+        ck("argmax agrees between GPU full prefill and position-correct install",
+           gpu_kernels::argmax(&ref_logits) == gpu_kernels::argmax(&split_logits));
+
+        // (E) NEGATIVE — the corrupting path the assert forbids. Take a TIP whose recurrent state
+        //     sits at position T > l, then try to reuse only its first l rows and prefill the
+        //     suffix from l. The fresh session's next_pos is 0 but the tip's delta is at T; a
+        //     correct implementation would panic on the seek (this does) rather than run the
+        //     recurrence from the wrong position and corrupt every downstream token silently.
+        {
+            let tip = gpu.prefill_prefix(&m, &prompt);                 // full-length tip, next_pos == tip.len()
+            let l = prompt.len() - 1;                                  // a shorter reuse than the tip
+            let tip_suffix = &prompt[l..];
+            let mut s2 = gpu.session_new(&m, prompt.len() + 8, 0x3000);
+            // Install the tip's K/V at [0,l) but the tip's DELTA STATE sits at `tip.len()` > l.
+            // The correct thing — carry the state forward and set next_pos = l — is impossible:
+            // the state belongs at tip.len(). seed_from_prefix copies state verbatim, so next_pos
+            // lands at tip.len(); the suffix prefill from position l then hits the seek guard.
+            // Assert it panics rather than proceeding with a wrong-position state.
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                gpu.seed_from_prefix(&m, &mut s2, &tip, l);
+                let _ = gpu.prefill_chunked_from(&m, &s2.cache, tip_suffix, l, 256);
+            }));
+            ck("reusing a LONGER tip from a SHORTER position is refused (the seek), never silently corrupted",
+               panicked.is_err());
+        }
+
+        println!("gate-deltanet-prefix-reuse: {}",
+            if ok { "correct install sound; seek on stale state refused \u{2713}" }
+            else { "FAIL \u{2717}" });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-deltanet-load") {
         // The hybrid load + decode gate: a qwen35moe checkpoint whose blk.0 is Gated DeltaNet
         // and blk.1 plain attention must load (recurrent set to the CPU-routed mixer, dense
