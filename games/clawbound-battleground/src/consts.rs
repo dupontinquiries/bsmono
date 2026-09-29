@@ -411,7 +411,9 @@ pub const MINION_ATK_CD: f32 = 1.4;
 
 /// Towers: 25% tougher and 25% harder-hitting than the 1450 / 168 they had
 /// (a lane held a while longer, a dive under one paid for).
-pub const TOWER_BUFF: f32 = 1.25;
+pub const TOWER_BUFF: f32 = 1.35; // the 1.75 felt too strong
+// pub const TOWER_BUFF: f32 = 1.75; // the 1.25 felt weak after more gods were added and the ways to dive or group up increased
+// pub const TOWER_BUFF: f32 = 1.25;
 pub const TOWER_HP: f32 = 1450.0 * TOWER_BUFF;
 pub const TOWER_DMG: f32 = 168.0 * TOWER_BUFF;
 /// Was 16. Measured against what it has to answer: ranged autos reach 14.4

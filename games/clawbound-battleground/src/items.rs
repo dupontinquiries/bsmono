@@ -305,6 +305,11 @@ fn build() -> Vec<Item> {
     push(&mut v, "Whetstone Fangs", 1, 600., Cat::AttackSpeed, s(0.,0.,0.,0.,0.,0.,0.10,0.,0.,0.,0.), None, "+10% Attack Speed.");
     push(&mut v, "Falcon Feather", 1, 650., Cat::AttackSpeed, s(0.,0.,0.,0.,0.,0.,0.08,0.,0.,0.,0.04), None, "+8% Attack Speed, +4% Move Speed.");
     push(&mut v, "Tempest Glove", 2, 1500., Cat::AttackSpeed, s(0.,0.,0.,0.,0.,0.,0.18,0.,0.,0.,0.), None, "+18% Attack Speed.");
+    // Dragon Feather and Blur Glove are for testing
+    push(&mut v, "Dragon Feather", 2, 950., Cat::AttackSpeed, s(0.,0.,0.,0.,0.,0.,0.08,0.,0.,0.,0.24), None, "+8% Attack Speed, +24% Move Speed.");
+    push(&mut v, "Blur Glove", 2, 1500., Cat::AttackSpeed, s(0.,0.,0.,0.,0.,0.,1.00,0.,0.,0.,0.), None, "+100% Attack Speed.");
+    // push(&mut v, "Falcon Feather", 1, 650., Cat::AttackSpeed, s(0.,0.,0.,0.,0.,0.,0.08,0.,0.,0.,0.04), None, "+8% Attack Speed, +4% Move Speed.");
+    // push(&mut v, "Tempest Glove", 2, 1500., Cat::AttackSpeed, s(0.,0.,0.,0.,0.,0.,0.18,0.,0.,0.,0.), None, "+18% Attack Speed.");
     push(&mut v, "Lightning Reflex", 2, 1650., Cat::AttackSpeed, s(0.,0.,0.,0.,0.,0.,0.19,0.,0.,0.,0.), None, "+19% Attack Speed.");
     push(&mut v, "Windrunner Cord", 2, 1600., Cat::AttackSpeed, s(0.,0.,0.,0.,0.,0.,0.20,0.,0.,0.,0.), None, "+20% Attack Speed.");
     push(&mut v, "Zephyr String", 2, 1700., Cat::AttackSpeed, s(0.,0.,0.,0.,0.,0.,0.17,100.,0.,0.,0.), None, "+17% Attack Speed, +100 HP.");
@@ -329,14 +334,33 @@ fn build() -> Vec<Item> {
     push(&mut v, "Undying Colossus", 3, 3100., Cat::Health, s(0.,0.,0.,0.,0.,0.,0.,620.,0.,0.10,0.), None, "+620 HP, +10% CDR.");
 
     // ── Stacking (8) ────────────────────────────────────────────────────────
-    push(&mut v, "Momentum Charm", 2, 1600., Cat::Stacking, s(20.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::MinionKill, Grow::Strength, 1.0, 40.0, 0.0), "+20 STR. Gains +1 STR per minion kill (max 40).");
-    push(&mut v, "Bloodletter's Pact", 2, 1800., Cat::Stacking, s(0.,0.,25.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::GodKill, Grow::Power, 4.0, 60.0, 0.0), "+25 Power. Gains +4 Power per god takedown (max 60).");
-    push(&mut v, "Siege Engine", 2, 1700., Cat::Stacking, s(0.,0.,0.,30.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::TowerKill, Grow::Protection, 5.0, 30.0, 0.0), "+30 Protection. Gains +5 per tower destroyed (max 30).");
-    push(&mut v, "Sage's Obsession", 2, 1600., Cat::Stacking, s(0.,25.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 2.0, 40.0, 60.0), "+25 INT. Gains +2 INT every minute (max 40).");
-    push(&mut v, "Warlord's Standard", 3, 2900., Cat::Stacking, s(45.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::MinionKill, Grow::Strength, 1.5, 75.0, 0.0), "+45 STR. Gains +1.5 STR per minion kill (max 75).");
+
+// fn st(kind: StackKind, grows: Grow, per: f32, max: f32, interval: f32) -> Option<Stacking> {
+//     Some(Stacking { kind, grows, per, max, interval })
+// }
+    push(&mut v, "Momentum Charm", 2, 1600., Cat::Stacking, s(20.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::MinionKill, Grow::Strength, 7.0, 42.0, 9.0), "+20 STR. Gains +7 STR per minion kill (max 42, time 9 seconds).");
+    push(&mut v, "Bloodletter's Pact", 2, 1800., Cat::Stacking, s(0.,0.,25.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::GodKill, Grow::Power, 6.0, 90.0, 240.0), "+25 Power. Gains +6 Power per god takedown (max 90, 240 seconds).");
+    push(&mut v, "Siege Engine", 2, 1700., Cat::Stacking, s(0.,0.,0.,30.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::TowerKill, Grow::Protection, 25.0, 120.0, 0.0), "+30 Protection. Gains +25 per tower destroyed (max 120).");
+    push(&mut v, "Sage's Obsession", 2, 1600., Cat::Stacking, s(0.,25.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 1.0, 600.0, 10.0), "+25 INT. Gains +6 INT every minute (max 400).");
+    // push(&mut v, "Sage's Obsession", 2, 1600., Cat::Stacking, s(0.,25.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 1.0, 600.0, 10.0), "+25 INT. Gains +6 INT every minute (max 400).");
+    push(&mut v, "Warlord's Standard", 3, 2900., Cat::Stacking, s(45.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::MinionKill, Grow::Strength, 0.5, 125.0, 0.0), "+45 STR. Gains +0.5 STR per minion kill (max 125).");
     push(&mut v, "Eternal Hunger", 3, 3000., Cat::Stacking, s(0.,0.,45.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::GodKill, Grow::Power, 6.0, 90.0, 0.0), "+45 Power. Gains +6 Power per god takedown (max 90).");
-    push(&mut v, "Beacon of Ages", 3, 2800., Cat::Stacking, s(0.,40.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 3.0, 60.0, 60.0), "+40 INT. Gains +3 INT every minute (max 60).");
-    push(&mut v, "Monument of Ruin", 3, 3100., Cat::Stacking, s(0.,0.,0.,0.,0.,0.,0.,500.,0.,0.,0.), st(StackKind::MinionKill, Grow::Health, 4.0, 320.0, 0.0), "+500 HP. Gains +4 HP per minion kill (max 320).");
+    push(&mut v, "Beacon of Ages", 3, 2800., Cat::Stacking, s(0.,40.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 1.0, 1000.0, 10.0), "+40 INT. Gains +6 INT every minute (max 1000)."); // there is a bug where it applies right away all 1k
+    // push(&mut v, "Beacon of Ages", 3, 2800., Cat::Stacking, s(0.,40.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 1.0, 1000.0, 10.0), "+40 INT. Gains +6 INT every minute (max 1000).");
+    // push(&mut v, "Beacon of Ages", 3, 2800., Cat::Stacking, s(0.,40.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 1.0, 2000.0, 10.0), "+40 INT. Gains +6 INT every minute (max 2000).");
+    push(&mut v, "Monument of Ruin", 3, 3100., Cat::Stacking, s(0.,0.,0.,0.,0.,0.,0.,500.,0.,0.,0.), st(StackKind::MinionKill, Grow::Health, 4.0, 640.0, 0.0), "+500 HP. Gains +4 HP per minion kill (max 640).");
+    // push(&mut v, "Monument of Ruin", 3, 3100., Cat::Stacking, s(0.,0.,0.,0.,0.,0.,0.,500.,0.,0.,0.), st(StackKind::MinionKill, Grow::Health, 4.0, 640.0, 0.0), "+500 HP. Gains +4 HP per minion kill (max 640 was 320).");
+    // push(&mut v, "Momentum Charm", 2, 1600., Cat::Stacking, s(20.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::MinionKill, Grow::Strength, 1.0, 40.0, 0.0), "+20 STR. Gains +1 STR per minion kill (max 40).");
+    // push(&mut v, "Bloodletter's Pact", 2, 1800., Cat::Stacking, s(0.,0.,25.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::GodKill, Grow::Power, 4.0, 60.0, 0.0), "+25 Power. Gains +4 Power per god takedown (max 60).");
+    // push(&mut v, "Siege Engine", 2, 1700., Cat::Stacking, s(0.,0.,0.,30.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::TowerKill, Grow::Protection, 5.0, 30.0, 0.0), "+30 Protection. Gains +5 per tower destroyed (max 30).");
+    // push(&mut v, "Sage's Obsession", 2, 1600., Cat::Stacking, s(0.,25.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 2.0, 40.0, 60.0), "+25 INT. Gains +2 INT every minute (max 40).");
+    // push(&mut v, "Warlord's Standard", 3, 2900., Cat::Stacking, s(45.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::MinionKill, Grow::Strength, 1.5, 75.0, 0.0), "+45 STR. Gains +1.5 STR per minion kill (max 75).");
+    // push(&mut v, "Eternal Hunger", 3, 3000., Cat::Stacking, s(0.,0.,45.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::GodKill, Grow::Power, 6.0, 90.0, 0.0), "+45 Power. Gains +6 Power per god takedown (max 90).");
+    // push(&mut v, "Beacon of Ages", 3, 2800., Cat::Stacking, s(0.,40.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 3.0, 60.0, 60.0), "+40 INT. Gains +3 INT every minute (max 60).");
+    // push(&mut v, "Monument of Ruin", 3, 3100., Cat::Stacking, s(0.,0.,0.,0.,0.,0.,0.,500.,0.,0.,0.), st(StackKind::MinionKill, Grow::Health, 4.0, 320.0, 0.0), "+500 HP. Gains +4 HP per minion kill (max 320).");
+    push(&mut v, "Persistence", 3, 1800., Cat::Stacking, s(0.,0.,25.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::MinionKill, Grow::Protection, 1000.0, 1000.0, 6.0), "+25 Power. Gains +1000 Protection briefly after minion kills (max 1000, 6 seconds).");
+    // TODO Windrunners Echo will be a move speed buff
+    // push(&mut v, "Windrunners Echo", 3, 1800., Cat::Stacking, s(0.,0.,25.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::GodKill, Grow::Power, 6.0, 90.0, 15.0), "+25 Power. Gains +6 Power per god takedown (max 90, 240 seconds).");
 
     // ── Siphon (2): raise the base defence every cat has (brawl) ─────────────
     push(&mut v, "Siphon Charm", 1, 700., Cat::Protection, s(0.,0.,0.,8.,0.,0.,0.,75.,0.,0.,0.), None, "A charm that drinks the storm. Ability damage from enemy ancestors returns 18% as mana (from 10%). +8 Protection, +75 HP.");

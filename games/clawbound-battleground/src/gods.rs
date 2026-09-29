@@ -661,12 +661,44 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
         hp: 790.0, hp_growth: 124.0, mana: 280.0, mana_growth: 30.0,
         auto_dmg: 52.0, auto_growth: 3.8, power: 9.0, power_growth: 2.6,
         protection: 33.0, prot_growth: 3.6, move_speed: 10.4, auto_range: 4.0, auto_cd: 1.25,
-        abilities: [
-            ab("Granite", "Her coat goes to granite: every friend near her, and she, is spared a share of every blow.", Archetype::Field { material: Material::Granite, radius: 7.0, amount: 0.15, secs: 0.0 }, 3.0, 0.0, [0.72, 0.70, 0.66], 0, false, 0.0),
-            ab("Rime", "Her coat goes to rime: the air around her freezes, and every enemy in it wades.", Archetype::Field { material: Material::Rime, radius: 7.5, amount: 0.25, secs: 0.0 }, 3.0, 0.0, [0.62, 0.85, 1.00], 1, false, 0.0),
-            ab("Lodestone", "Her coat goes to lodestone: every enemy near her is drawn in, step by step, whether it likes it or not.", Archetype::Field { material: Material::Lodestone, radius: 8.0, amount: 2.2, secs: 0.0 }, 3.0, 0.0, [0.45, 0.45, 0.62], 2, false, 0.0),
-            ab("The Mountain's Heart", "For a while her coat is the mountain's molten heart: everything near her burns. Then it cools back to what it was.", Archetype::Field { material: Material::Magma, radius: 9.0, amount: 55.0, secs: 7.0 }, 75.0, 0.0, [1.00, 0.45, 0.15], 3, true, 0.30),
+    // AbilityDef { name, desc, arch, cooldown: cd, cost, color, key, ult, power_scale: scale }
+         abilities: [
+            ab("Granite", "Her coat goes to granite: every friend near her, and she, is spared a share of every blow.", Archetype::Field { material: Material::Granite, radius: 13.0, amount: 0.30, secs: 0.0 }, 25.0, 0.0, [0.72, 0.70, 0.66], 0, false, 0.05),
+            ab("Rime", "Her coat goes to rime: the air around her freezes, and every enemy in it wades.", Archetype::Field { material: Material::Rime, radius: 24.0, amount: 0.10, secs: 0.0 }, 25.0, 0.0, [0.62, 0.85, 1.00], 1, false, 0.04),
+            ab("Lodestone", "Her coat goes to lodestone: every enemy near her is drawn in, step by step, whether it likes it or not.", Archetype::Field { material: Material::Lodestone, radius: 11.0, amount: 8.0, secs: 0.0 }, 25.0, 0.0, [0.45, 0.45, 0.62], 2, false, 0.05),
+            ab("The Mountain's Heart", "For a while her coat is the mountain's molten heart: everything near her burns. Then it cools back to what it was.", Archetype::Field { material: Material::Magma, radius: 35.0, amount: 4.0, secs: 120.0 }, 180.0, 0.0, [1.00, 0.45, 0.15], 3, true, 0.08),
         ],
+        // this one felt underpowered but tactful
+        //  abilities: [
+        //     ab("Granite", "Her coat goes to granite: every friend near her, and she, is spared a share of every blow.", Archetype::Field { material: Material::Granite, radius: 16.0, amount: 0.10, secs: 12.0 }, 15.0, 0.0, [0.72, 0.70, 0.66], 0, false, 0.09),
+        //     ab("Rime", "Her coat goes to rime: the air around her freezes, and every enemy in it wades.", Archetype::Field { material: Material::Rime, radius: 24.0, amount: 0.10, secs: 8.0 }, 15.0, 0.0, [0.62, 0.85, 1.00], 1, false, 0.06),
+        //     ab("Lodestone", "Her coat goes to lodestone: every enemy near her is drawn in, step by step, whether it likes it or not.", Archetype::Field { material: Material::Lodestone, radius: 16.0, amount: 5.0, secs: 4.0 }, 15.0, 0.0, [0.45, 0.45, 0.62], 2, false, 0.30),
+        //     ab("The Mountain's Heart", "For a while her coat is the mountain's molten heart: everything near her burns. Then it cools back to what it was.", Archetype::Field { material: Material::Magma, radius: 30.0, amount: 3.0, secs: 45.0 }, 95.0, 0.0, [1.00, 0.45, 0.15], 3, true, 0.03),
+        // ],
+        // this one was interesting but too OP and not fun to play
+        // abilities: [
+        //     ab("Granite", "Her coat goes to granite: every friend near her, and she, is spared a share of every blow.", Archetype::Field { material: Material::Granite, radius: 14.0, amount: 0.60, secs: 0.0 }, 15.0, 0.0, [0.72, 0.70, 0.66], 0, false, 0.09),
+        //     ab("Rime", "Her coat goes to rime: the air around her freezes, and every enemy in it wades.", Archetype::Field { material: Material::Rime, radius: 22.0, amount: 0.50, secs: 0.0 }, 15.0, 0.0, [0.62, 0.85, 1.00], 1, false, 0.06),
+        //     ab("Lodestone", "Her coat goes to lodestone: every enemy near her is drawn in, step by step, whether it likes it or not.", Archetype::Field { material: Material::Lodestone, radius: 6.0, amount: 6.0, secs: 0.0 }, 15.0, 0.0, [0.45, 0.45, 0.62], 2, false, 0.03),
+        //     ab("The Mountain's Heart", "For a while her coat is the mountain's molten heart: everything near her burns. Then it cools back to what it was.", Archetype::Field { material: Material::Magma, radius: 4.0, amount: 10.0, secs: 0.0 }, 95.0, 0.0, [1.00, 0.45, 0.15], 3, true, 3.00),
+        // ],
+        // this version was interesting it made for good play but I want to try something else
+        // abilities: [
+        //     ab("Granite", "Her coat goes to granite: every friend near her, and she, is spared a share of every blow.", Archetype::Field { material: Material::Granite, radius: 14.0, amount: 0.30, secs: 10.0 }, 15.0, 0.0, [0.72, 0.70, 0.66], 0, false, -0.03),
+        //     ab("Rime", "Her coat goes to rime: the air around her freezes, and every enemy in it wades.", Archetype::Field { material: Material::Rime, radius: 22.0, amount: 0.20, secs: 10.0 }, 15.0, 0.0, [0.62, 0.85, 1.00], 1, false, -0.03),
+        //     ab("Lodestone", "Her coat goes to lodestone: every enemy near her is drawn in, step by step, whether it likes it or not.", Archetype::Field { material: Material::Lodestone, radius: 15.0, amount: 4.0, secs: 10.0 }, 15.0, 0.0, [0.45, 0.45, 0.62], 2, false, -0.03),
+        //     ab("The Mountain's Heart", "For a while her coat is the mountain's molten heart: everything near her burns. Then it cools back to what it was.", Archetype::Field { material: Material::Magma, radius: 40.0, amount: 38.0, secs: 18.0 }, 95.0, 0.0, [1.00, 0.45, 0.15], 3, true, 0.90),
+        // ],
+        // this was an old version that I sort of liked but the protections were too low and the suction wasnt enough and the ult was dealing damage to towers... I want to change it so that the protection and slow effects have a 20% linear falloff based on distance
+        // and I also want the abilities to not be constant so when they activate they do a bit extra for two seconds then the base tick effect. that way there can be some skill to waiting to switch
+        // abilities: [
+        //     ab("Granite", "Her coat goes to granite: every friend near her, and she, is spared a share of every blow.", Archetype::Field { material: Material::Granite, radius: 8.0, amount: 0.10, secs: 0.0 }, 15.0, 0.0, [0.72, 0.70, 0.66], 0, false, 0.0),
+        //     ab("Rime", "Her coat goes to rime: the air around her freezes, and every enemy in it wades.", Archetype::Field { material: Material::Rime, radius: 22.0, amount: 0.20, secs: 0.0 }, 15.0, 0.0, [0.62, 0.85, 1.00], 1, false, 0.0),
+        //     ab("Lodestone", "Her coat goes to lodestone: every enemy near her is drawn in, step by step, whether it likes it or not.", Archetype::Field { material: Material::Lodestone, radius: 15.0, amount: 4.0, secs: 30.0 }, 15.0, 0.0, [0.45, 0.45, 0.62], 2, false, 0.0),
+        //     // ab("Lodestone", "Her coat goes to lodestone: every enemy near her is drawn in, step by step, whether it likes it or not.", Archetype::Field { material: Material::Lodestone, radius: 7.5, amount: 4.0, secs: 30.0 }, 15.0, 0.0, [0.45, 0.45, 0.62], 2, false, 0.0),
+        //     // TODO change this to a cone so that it is not all over the place
+        //     ab("The Mountain's Heart", "For a while her coat is the mountain's molten heart: everything near her burns. Then it cools back to what it was.", Archetype::Field { material: Material::Magma, radius: 40.0, amount: 38.0, secs: 18.0 }, 85.0, 0.0, [1.00, 0.45, 0.15], 3, true, 0.30),
+        // ],
     },
     // ── HOURWATCH — the Watcher, who keeps the hours ──
     // A Pallas's cat of the high steppe, where the sky is widest. She sat
@@ -704,8 +736,8 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
         abilities: [
             ab("Remold", "He presses the cracks shut with fresh clay: a share of his health back -- his own clay, the only healing that takes on him in full.", Archetype::Remold { heal: 0.22 }, 9.0, 90.0, [0.80, 0.55, 0.38], 0, false, 0.0),
             ab("Quicken", "River water over him: he is wet clay again, quick, and shaping kittens as fast as he can.", Archetype::Quicken { secs: 6.0 }, 14.0, 60.0, [0.55, 0.78, 0.85], 1, false, 0.0),
-            ab("Spin", "He spins down the aim like clay on the wheel, striking what he passes, and leaves mud behind him that no one keeps their feet on.", Archetype::Spin { dist: 9.0, dmg: 85.0, radius: 4.0, secs: 5.0 }, 10.0, 70.0, [0.62, 0.42, 0.28], 2, false, 0.55),
-            ab("Mudslide", "The bank gives way: a wave of mud down the aim strikes everything in front of it and carries it along -- friends forward, enemies away -- crushing through plants and sloshing back off walls. Eight kittens tumble out of it, and for a while every kill he makes shapes more. Each kitten broken is gold to whoever breaks it.", Archetype::Mudslide { len: 40.0, width: 16.0, speed: 16.0, dmg: 280.0, kits: 8 }, 90.0, 130.0, [0.55, 0.38, 0.25], 3, true, 1.1),
+            ab("Spin", "He spins down the aim like clay on the wheel, striking what he passes, and leaves mud behind him that no one keeps their feet on.", Archetype::Spin { dist: 11.0, dmg: 85.0, radius: 5.0, secs: 8.0 }, 10.0, 70.0, [0.62, 0.42, 0.28], 2, false, 0.55),
+            ab("Mudslide", "The bank gives way: a wave of mud down the aim strikes everything in front of it and carries it along -- friends forward, enemies away -- crushing through plants and sloshing back off walls. Eight kittens tumble out of it, and for a while every kill he makes shapes more. Each kitten broken is gold to whoever breaks it.", Archetype::Mudslide { len: 140.0, width: 16.0, speed: 16.0, dmg: 280.0, kits: 8 }, 90.0, 130.0, [0.55, 0.38, 0.25], 3, true, 1.1),
         ],
     },
 ];
