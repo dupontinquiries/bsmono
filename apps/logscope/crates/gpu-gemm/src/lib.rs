@@ -17272,6 +17272,42 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         session.pos = prefix_len;
     }
 
+    /// Carry the RECURRENT state from `prefix` into `session` for a hybrid model, so a turn-level
+    /// continuation does not drop the Gated DeltaNet hidden memory between turns. `seed_from_prefix`
+    /// above copies only K/V rows (per-layer one-row placeholders for delta-net layers) and sets
+    /// `pos` — it leaves the recurrent `ring`/`s` tensors at their zeroed start and `next_pos` at 0.
+    ///
+    /// The state here is the whole point of carrying it: delta-net layers are ABSOLUTE — folded
+    /// through positions 0..N of THIS cache, not seekable. The previous turn prefilled prompt P, so
+    /// its state encodes everything up to position |P|; the next turn appends Δ and must decode those
+    /// tokens at the same absolute positions (|P|…), which requires the carried state *and*
+    /// `next_pos == |P|`, not a freshly-zeroed one. Copying only the tensors but leaving `next_pos`
+    /// at 0 would pass the right hidden memory declared at the wrong position, and
+    /// `block_prefill_deltanet_gpu`'s `assert np == pos` fires before any wrong token is produced —
+    /// the exact protection the position-absolute invariant promises.
+    ///
+    /// `next_pos` is an `AtomicUsize` (not `Copy`/`Clone`), so it is SET here, not cloned out of the
+    /// source. Only recurrent layers (where `deltanet_gpu[li]` is `Some`) are touched; full-attention
+    /// layers get one-row placeholders and no state to carry. Returns whether anything was carried, so
+    /// a non-hybrid model (no recurrent state) reports false and the caller can treat that as "nothing
+    /// to do" without a debug line every turn.
+    pub fn carry_deltanet_state(&self, m: &Model, session: &mut Session, src: &KvCache, next_pos: usize) -> bool {
+        self.activate_model(m);
+        let Some(states) = src.deltanet_gpu.as_ref() else { return false };
+        let Some(dst) = session.cache.deltanet_gpu.as_mut() else {
+            return false;
+        };
+        for li in 0..states.len() {
+            if let Some(from) = states[li].as_ref() {
+                let to = dst[li].as_mut().expect("delta-net layer present in source but not destination cache");
+                self.write_rows(&to.ring, &from.ring, 0, from.ring.rows, from.ring.cols);
+                self.write_rows(&to.s, &from.s, 0, from.s.rows, from.s.cols);
+                to.next_pos.store(next_pos, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        true
+    }
+
     /// Continuous-batching generation. Processes a queue of requests keeping up to
     /// `max_batch` sessions decoding together via `decode_batched`; finished sessions
     /// (eos or `max_new`) are evicted and pending ones backfill the freed slots without

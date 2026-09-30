@@ -283,6 +283,22 @@ pub(crate) mod engine {
         /// and would strip the pool one turn at a time. One slot is all a linear chat needs, and it
         /// touches none of the pool's invariants.
         spec_anchor: Option<(Vec<u32>, gpu_kernels::SpecRun)>,
+        /// The PREVIOUS agent turn's prompt tokens and the recurrent checkpoint folded through
+        /// them — retained across `generate()` calls only on a linear agent run (see the guard below
+        /// in `generate`). This is the whole carry-forward: `generate_batched` prefills the shared
+        /// prefix once and decodes each branch from it, so turn N+1 pays for one more chunk rather
+        /// than a full prefill of the prompt every turn. A linear run means each turn's prompt is
+        /// the previous turn's prompt *appended* with exactly one new reply, so the previous turn's
+        /// terminal recurrent state (folded through positions 0..|P| of that cache) is a valid,
+        /// position-absolute anchor for the next turn — no seeking, no shared-prefix ambiguity.
+        ///
+        /// `(tokens, session)`: the token ids for the prefix check (the next turn's prompt must be a
+        /// superset of these, unchanged) and the session whose cache carries the delta-net state we
+        /// carry forward. `DeltanetGpuState` is `Copy`, so holding a `Session` by value is a cheap
+        /// shallow copy — no allocation, no borrow to release. The engine thread owns it; it never
+        /// crosses a thread, so no `Mutex`. Left `None` for every non-agent path, so a chat that
+        /// never advances the agent loop pays exactly nothing for this field's existence.
+        prev_turn: Option<(Vec<u32>, gpu_kernels::Session)>,
         /// Long-horizon watcher. ADVISORY ONLY — it observes the numbers this file already prints and
         /// says what it would do, and changes nothing.
         ///
@@ -852,7 +868,7 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 }
                 _ => None,
             };
-            Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, pool, warm, name, submit_tuner, embed_q8: None, draft, disable_windowing: false, spec_anchor: None,
+            Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, pool, warm, name, submit_tuner, embed_q8: None, draft, disable_windowing: false, spec_anchor: None, prev_turn: None,
                 horizon: std::sync::Mutex::new(gpu_kernels::horizon::Horizon::new(4096, 512, 0)) })
         }
         pub fn template(&self) -> TemplateKind { self.template }
@@ -904,6 +920,7 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 anchors: Vec::new(), kv_cap: 1, pool: None, warm: self.warm,
                 name: format!("{}#L{n}", self.name),
                 submit_tuner: None, embed_q8: None, draft: None, disable_windowing: false,
+                prev_turn: None,
             }
         }
 
@@ -1371,7 +1388,68 @@ per verification pass is at or below the 1.00 break-even, so the drafting cost b
             // pool already holds entries means the prefix diverged or was evicted — and that costs the
             // whole prompt again, which the log reported in words identical to a first turn.
             let mut had_cache = false;
+            // LINEAR AGENT RECURRENT-STATE CARRY-FORWARD (Gated DeltaNet). A hybrid model folds a
+            // recurrent hidden-state checkpoint through every position of its prompt, so a full
+            // cold prefill of the whole growing prompt every agent turn is pure waste — the model
+            // has already seen prompt[0..|P|] and its delta-net state *is* the compression of that
+            // history. On a LINEAR agent turn, the new prompt is the previous turn's prompt appended
+            // with exactly one reply, so the previous turn's terminal checkpoint (at next_pos ==
+            // |P|) is a valid, position-absolute anchor: seeding it and prefilling only the new
+            // Δ tokens decodes them at the same absolute positions the original prefill saw, giving a
+            // numerically identical result (the regression gate `gate-deltanet-prefix-reuse` proves
+            // this to 1e-3 and proves the alternative — a shorter shared prefix — panics).
+            //
+            // This is a NARROWER branch than the KV prefix tree below, not a replacement: it fires
+            // only for a hybrid model whose previous turn's prompt is a prefix of this one (the
+            // linear agent loop). A fan-out run (where pick_anchor would grab a shorter shared
+            // prefix) is guarded against below — the delta reuse refuses unless this prompt CONTAINS
+            // the previous turn's ENTIRE prompt unchanged, so a shared-prefix checkpoint can never
+            // be installed. Non-agent chat never retains a previous turn, so this is dead weight for
+            // it. Only the GPU-resident checkpoint (deltanet_gpu) is live by default;
+            // LOGSCOPE_DELTANET_CPU=1 routes to the CPU oracle, which this path detects and
+            // rejects (carry_deltanet_state returns false on the CPU route, so we fall through
+            // to a cold prefill).
+            let delta_seed = if let Some((prev_toks, prev_sess)) = &self.prev_turn {
+                if prev_toks.is_empty() {
+                    None
+                } else if prompt_ids.len() < prev_toks.len() {
+                    // A shorter prompt can't contain the previous turn's whole prompt — a
+                    // branch, the fan-out case this refuses. Drop the anchor so the next turn
+                    // starts fresh from position 0.
+                    None
+                } else if !prev_toks.iter().eq(prompt_ids[..prev_toks.len()].iter()) {
+                    // The prompt is longer but its HEAD diverges from the previous turn — a
+                    // different prompt entirely. Drop the anchor; don't reuse the state.
+                    None
+                } else {
+                    // The linear-continue invariant holds: prompt[0..|P|] == previous turn's
+                    // prompt, and this prompt is at least that long. Seed from the carried state.
+                    // Copy the Session OUT (it is Copy) so the reference never borrows
+                    // self.prev_turn past this point — the CPU path below mutates prev_turn, and
+                    // a live &Session borrowing it would be a conflict. Session is a cheap shallow
+                    // copy (device tensors + atomics are Copy), so this is not a device alloc.
+                    Some((prev_toks.len(), *prev_sess))
+                }
+            } else { None };
             let (reuse, l, pick_idx) = if kv_off {
+                (false, 0, 0)
+            } else if let Some(delta_l) = delta_seed {
+                // Linear recurrent-state carry-forward. Hybrid + previous turn's prompt is a
+                // prefix of this one → reuse the carried checkpoint instead of a cold prefill.
+                // `picked_session` is left None; this re-seeds from `self.prev_turn` directly in
+                // the branch below (the pool path can't represent an absolute recurrent state).
+                (true, delta_l, usize::MAX)
+            } else if self.model.deltanet_layers() > 0 {
+                // A hybrid (Gated DeltaNet) model carries, per recurrent layer, a GPU-resident
+                // recurrent state { ring, s, next_pos } that is ABSOLUTE — folded through positions
+                // 0..N of THIS cache, cannot seek to an earlier position. `pick_anchor` hands back a
+                // SHARED PREFIX `l` (a prefix of the stored tip, usually < its full length), so
+                // seeding a fresh session from it would install delta state built at `next_pos`
+                // while declaring it belongs at `l < next_pos`: the assert in block_prefill_deltanet_gpu
+                // fires, or worse, a correct-looking install silently corrupts every downstream token.
+                // The only sound recurrent reuse is a full prefill from position 0, so disable the
+                // KV prefix tree for every recurrent model. A first turn starts at position 0 anyway,
+                // so the tool-call loop pays nothing for this; every earlier reuse was silently wrong.
                 (false, 0, 0)
             } else if let Some(pool) = self.pool.as_mut() {
                 had_cache = !pool.is_empty();
@@ -1426,6 +1504,46 @@ tokens ({:.0}% of the prefill skipped), {} to prefill", self.name, prompt_ids.le
             if diffusion_path {
                 crate::diag!("wgpu-engine: [{}] diffusion model — skipping the KV prefill ({} prompt tokens); block denoising re-forwards the canvas and reads no cache",
                     self.name, prompt_ids.len());
+            } else if let Some((delta_l, delta_prev)) = delta_seed {
+                // LINEAR AGENT RECURRENT-STATE CARRY-FORWARD. The previous turn's prompt is a
+                // prefix of this one, so fold its terminal recurrent state into a fresh session
+                // and prefill only the appended Δ tokens. This is the whole win: turn N pays for
+                // the Δ suffix instead of a cold prefill of the whole growing prompt.
+                //
+                // Seed from the CARRIED session, not the KV pool (`picked_session`/`pick_idx` are
+                // left None / usize::MAX here — seeding from an anchor would install state at the
+                // wrong position). carry_deltanet_state copies the GPU-resident { ring, s } tensors
+                // AND sets next_pos == delta_l, so the fresh session's delta-net state is exactly
+                // the previous turn's terminal state, positioned for position delta_l, which is
+                // where the Δ suffix begins. Without setting next_pos the assert in
+                // block_prefill_deltanet_gpu would fire (you can't seek to an earlier position).
+                // On the CPU oracle route (LOGSCOPE_DELTANET_CPU=1) carry_deltanet_state returns
+                // false — the device tensors don't exist there — so we fall through to the cold
+                // prefill below rather than corrupting a state that isn't the live one.
+                let mut delta_ok = self.gpu.carry_deltanet_state(&self.model, &mut s, &delta_prev.cache, delta_l);
+                // Carry the K/V rows the prefix would have filled, too — a full prefill writes
+                // them, and a later turn may want them; cheap and keeps this turn's cache complete.
+                self.gpu.seed_from_prefix(&self.model, &mut s, &delta_prev.cache, delta_l);
+                if !delta_ok {
+                    // CPU oracle path: no device checkpoint to carry. Drop the anchor and cold-
+                    // prefill (the CPU oracle is an A/B reference, never the shipped route).
+                    self.prev_turn = None;
+                    crate::diag!("wgpu-engine: [{}] delta reuse — CPU oracle route, no device state; cold prefill",
+                        self.name);
+                    let pc = prefill_chunk_for_streaming(self.model.d, self.model.h,
+                        self.model.streams_experts(), self.model.moe_counts());
+                    s.logits = self.gpu.prefill_chunked(&self.model, &s.cache, &prompt_ids, pc);
+                    s.pos = prompt_ids.len();
+                    // skip the reuse log below
+                } else {
+                    let pc = prefill_chunk_for_streaming(self.model.d, self.model.h,
+                        self.model.streams_experts(), self.model.moe_counts());
+                    // Prefill the appended Δ at the carried positions — same batched kernel the
+                    // full prefill used, just the suffix rows. Bit-identical to a fresh full
+                    // prefill except fp-reordering (proven by the gate).
+                    s.logits = self.gpu.prefill_chunked_from(&self.model, &s.cache, &prompt_ids[delta_l..], delta_l, pc);
+                    s.pos = prompt_ids.len();
+                }
             } else if reuse {
                 // Seed from the picked tip: the pool handed us an owned Session; the FIFO borrows in place.
                 if let Some(src) = picked_session.as_ref() {
@@ -2262,6 +2380,17 @@ attention dispatches [LOGSCOPE_BG_CACHE]", self.name);
             // many leading rows were batch-prefilled — the only region ever re-seeded.
             let mut anchor_toks = prompt_ids.clone();
             anchor_toks.extend_from_slice(&s.generated);
+            // RECURRENT-STATE CARRY-FORWARD SNAPSHOT. For a hybrid (Gated DeltaNet) model this is the
+            // whole point of the turn: keep a copy of THIS turn's prompt tokens and the session whose
+            // cache carries the delta-net state folded through prompt[0..|P|] (at next_pos == |P|),
+            // so next turn's linear agent continuation can fold that terminal checkpoint into a fresh
+            // session and prefill only the appended Δ. Snapshot BEFORE `s` is moved into the pool or
+            // FIFO anchors below. Only meaningful for hybrid models; the delta check at the top of
+            // this function decides whether next turn actually reuses it (and a full-attention model
+            // here just gets an unused entry — no delta layers to carry).
+            if self.model.deltanet_layers() > 0 {
+                self.prev_turn = Some((anchor_toks.clone(), s));
+            }
             if let Some(pool) = self.pool.as_mut() {
                 pool.insert(&self.gpu, anchor_toks, prefill_len, s, self.kv_cap * 4);
                 if std::env::var("LOGSCOPE_KV_CENSUS").is_ok() {
