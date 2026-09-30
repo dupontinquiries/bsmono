@@ -154,6 +154,7 @@ pub(crate) mod engine {
     use super::TemplateKind;
     use gpu_kernels::tokenizer::Tokenizer;
     use gpu_kernels::{Gpu, Model, SamplerParams, Session};
+    use gpu_kernels::archetype::{ContextTurn, Refusal};
     use logscope::llm_backend::GenParams;
     use std::time::Instant;
 
@@ -298,7 +299,7 @@ pub(crate) mod engine {
         /// shallow copy — no allocation, no borrow to release. The engine thread owns it; it never
         /// crosses a thread, so no `Mutex`. Left `None` for every non-agent path, so a chat that
         /// never advances the agent loop pays exactly nothing for this field's existence.
-        prev_turn: Option<(Vec<u32>, gpu_kernels::Session)>,
+        prev_turn: Option<(Vec<u32>, gpu_kernels::Session, usize)>,
         /// Long-horizon watcher. ADVISORY ONLY — it observes the numbers this file already prints and
         /// says what it would do, and changes nothing.
         ///
@@ -1409,26 +1410,45 @@ per verification pass is at or below the 1.00 break-even, so the drafting cost b
             // LOGSCOPE_DELTANET_CPU=1 routes to the CPU oracle, which this path detects and
             // rejects (carry_deltanet_state returns false on the CPU route, so we fall through
             // to a cold prefill).
-            let delta_seed = if let Some((prev_toks, _prev_sess)) = &self.prev_turn {
-                if prev_toks.is_empty() {
-                    None
-                } else if prompt_ids.len() < prev_toks.len() {
-                    // A shorter prompt can't contain the previous turn's whole prompt — a
-                    // branch, the fan-out case this refuses. Drop the anchor so the next turn
-                    // starts fresh from position 0.
-                    None
-                } else if !prev_toks.iter().eq(prompt_ids[..prev_toks.len()].iter()) {
-                    // The prompt is longer but its HEAD diverges from the previous turn — a
-                    // different prompt entirely. Drop the anchor; don't reuse the state.
-                    None
+            let delta_seed = if self.model.deltanet_layers() > 0 {
+                // The linear-agent carry-forward is decided by the model's ARCHETYPE, not by folding
+                // the delta-state invariant into a token-prefix check the KV tree shares. The delta
+                // state is position-absolute: the previous turn's transcript was folded to next_pos ==
+                // delta_pos, so this turn's prompt must embed that transcript at identical absolute
+                // positions up to delta_pos — the RecurrentStream invariant. plan_context reports which
+                // invariant holds, and a Refusal reason if it does not, instead of a bare position.
+                if let Some((prev_toks, _sess, prev_pos)) = &self.prev_turn {
+                    let current = ContextTurn::current(prompt_ids.clone());
+                    let previous = ContextTurn::carried(prev_toks.clone(), prev_toks.clone(), *prev_pos);
+                    let plan = self.model.archetype().plan_context(Some(&previous), &current);
+                    plan.recurrent_seed
                 } else {
-                    // The linear-continue invariant holds: prompt[0..|P|] == previous turn's
-                    // prompt, and this prompt is at least that long. We only need the position
-                    // here — the carried Session is picked up by copy inside the branch below,
-                    // so this never borrows or moves self.prev_turn.
-                    Some(prev_toks.len())
+                    None
                 }
-            } else { None };
+            } else {
+                None
+            };
+            // CARRY-FORWARD DIAGNOSTIC. Fires every turn for a hybrid (Gated DeltaNet) model, so a
+            // run that never reuses (every turn logging "full prefill") shows exactly WHY: whether
+            // `prev_turn` is set at all (turn 1 never carried a session forward) or the carried
+            // transcript no longer embeds at the same absolute position (the driver's append broke
+            // — injected context, or a branch). The Refusal variant names the invariant that broke.
+            if self.model.deltanet_layers() > 0 {
+                let (recursed_reason, carried) = self.prev_turn.as_ref().map(|(prev_toks, _, prev_pos)| {
+                    let current = ContextTurn::current(prompt_ids.to_vec());
+                    let previous = ContextTurn::carried(prev_toks.clone(), prev_toks.clone(), *prev_pos);
+                    let plan = self.model.archetype().plan_context(Some(&previous), &current);
+                    (plan.refused_reason, plan.prompt_position)
+                }).unwrap_or((Some(Refusal::NoCarriedTurn), prompt_ids.len()));
+                let delta_used = match (self.prev_turn.is_some(), delta_seed, recursed_reason) {
+                    (true, Some(l), None) => format!("reused delta carry at position {l}"),
+                    (true, None, Some(reason)) => format!("delta carry NOT fired — {reason:?}"),
+                    (false, _, _) => "delta carry NOT fired — no prev_turn carried forward (first turn or cleared)".to_string(),
+                    // Unreachable: a set prev_turn yields either a seed or a refusal, never both or neither.
+                    (true, Some(_), Some(_)) | (true, None, None) => "delta carry NOT fired — planner inconsistent".to_string(),
+                };
+                crate::diag!("wgpu-engine: [{}] delta carry-forward: {}", self.name, delta_used);
+            }
             let (reuse, l, pick_idx) = if kv_off {
                 (false, 0, 0)
             } else if let Some(delta_l) = delta_seed {
@@ -1517,16 +1537,18 @@ tokens ({:.0}% of the prefill skipped), {} to prefill", self.name, prompt_ids.le
                 // the previous turn's terminal state, positioned for position delta_l, which is
                 // where the Δ suffix begins. Without setting next_pos the assert in
                 // block_prefill_deltanet_gpu would fire (you can't seek to an earlier position).
-                // Grab the carried session by copy (Session is Copy) — prev_turn already dropped its
-                // borrow by this point, so a live &prev_turn can't be in play.
-                // On the CPU oracle route (LOGSCOPE_DELTANET_CPU=1) carry_deltanet_state returns
-                // false — the device tensors don't exist there — so we fall through to the cold
-                // prefill below rather than corrupting a state that isn't the live one.
-                let delta_prev = match self.prev_turn.as_ref().map(|(_, sess)| *sess) {
+                // Grab the carried session's cache by reference: Session owns GPU buffers (wgpu::
+                // Buffer + a Mutex<AtomicUsize>) so it is NOT Copy/Clone, but carry_deltanet_state
+                // and seed_from_prefix only read src: &KvCache — no move needed, so a live
+                // &self.prev_turn can stay borrowed here. On the CPU oracle route
+                // (LOGSCOPE_DELTANET_CPU=1) carry_deltanet_state returns false — the device tensors
+                // don't exist there — so we fall through to the cold prefill below rather than
+                // corrupting a state that isn't the live one.
+                let delta_prev = match self.prev_turn.as_ref().map(|(_, s, _)| s) {
                     Some(sess) => sess,
                     None => return Err("delta reuse selected but the carried session is gone (prev_turn cleared?)".to_string()),
                 };
-                let mut delta_ok = self.gpu.carry_deltanet_state(&self.model, &mut s, &delta_prev.cache, delta_l);
+                let delta_ok = self.gpu.carry_deltanet_state(&self.model, &mut s, &delta_prev.cache, delta_l);
                 // Carry the K/V rows the prefix would have filled, too — a full prefill writes
                 // them, and a later turn may want them; cheap and keeps this turn's cache complete.
                 self.gpu.seed_from_prefix(&self.model, &mut s, &delta_prev.cache, delta_l);
@@ -2387,15 +2409,31 @@ attention dispatches [LOGSCOPE_BG_CACHE]", self.name);
             let mut anchor_toks = prompt_ids.clone();
             anchor_toks.extend_from_slice(&s.generated);
             // RECURRENT-STATE CARRY-FORWARD SNAPSHOT. For a hybrid (Gated DeltaNet) model this is the
-            // whole point of the turn: keep a copy of THIS turn's prompt tokens and the session whose
-            // cache carries the delta-net state folded through prompt[0..|P|] (at next_pos == |P|),
-            // so next turn's linear agent continuation can fold that terminal checkpoint into a fresh
-            // session and prefill only the appended Δ. Snapshot BEFORE `s` is moved into the pool or
-            // FIFO anchors below. Only meaningful for hybrid models; the delta check at the top of
-            // this function decides whether next turn actually reuses it (and a full-attention model
-            // here just gets an unused entry — no delta layers to carry).
-            if self.model.deltanet_layers() > 0 {
-                self.prev_turn = Some((anchor_toks.clone(), s));
+            // whole point of the turn: keep the carried session — its cache carries the delta-net
+            // state folded through prompt[0..|P|] (at next_pos == |P|) — so next turn's linear agent
+            // continuation can fold that terminal checkpoint into a fresh session and prefill only the
+            // appended Δ. Snapshot BEFORE `s` is moved into the pool or FIFO anchors below. Only
+            // meaningful for hybrid models; the delta check at the top of this function decides whether
+            // next turn actually reuses it (and a full-attention model here just gets an unused entry —
+            // no delta layers to carry).
+            //
+            // `Session` owns GPU buffers, so it is not Copy/Clone: the live `s` is swapped out into a
+            // fresh session (same `cap`) and the carried one handed to prev_turn — no buffer copy, just
+            // a fresh allocation on the swap-in. The swap runs only for a hybrid, so a non-hybrid chat
+            // pays nothing for carrying nothing (prev_turn stays None, `s` moves straight to the pool).
+            let carried = if self.model.deltanet_layers() > 0 {
+                Some(std::mem::replace(&mut s, self.gpu.session_new(&self.model, cap, self.rng)))
+            } else {
+                None
+            };
+            if let Some(carried) = carried {
+                // The delta state's TRUE next_pos: the carried transcript is prompt_ids + the reply
+                // folded through the recurrent path, so the checkpoint sits at next_pos == |prompt_ids|
+                // + |generated| == carried.pos. `mem::replace` above handed this old session to
+                // `carried`, so read pos off it — the session now bound to `s` is the fresh swap-in
+                // (pos == 0). Captured before the move into the tuple.
+                let delta_pos = carried.pos;
+                self.prev_turn = Some((anchor_toks.clone(), carried, delta_pos));
             }
             if let Some(pool) = self.pool.as_mut() {
                 pool.insert(&self.gpu, anchor_toks, prefill_len, s, self.kv_cap * 4);

@@ -47,6 +47,7 @@ pub mod expsplit;
 pub mod prefetch;
 pub mod mladims;
 pub mod deltanet; // Gated DeltaNet CPU oracle (Qwen3.5/3.6 hybrids) — see its module docs
+pub mod archetype; // how a model's context/state/prompt relate, and when a turn-to-turn carry is position-valid
 pub mod rolequant;
 pub mod ragged;
 pub mod steer;
@@ -10681,6 +10682,15 @@ impl Model {
     /// Nonzero means decode routes those layers through the CPU-routed block_decode_deltanet and
     /// the cache MUST come from new_cache_for; used by --gate-deltanet-load.
     pub fn deltanet_layers(&self) -> usize { self.layers.iter().filter(|b| b.deltanet.is_some()).count() }
+    /// This model's context/state/prompts shape — the answer to "what does a carry-forward mean for
+    /// me". Hybrids (delta layers present) are `Archetype::Hybrid` so the recurrent-state carry is
+    /// planned by recurrent-stream prefix, not whole-prompt token equality; transformers are
+    /// `Archetype::Transformer` and carry only a KV token prefix. Placed on `Model` (not a free
+    /// function) so a caller's `model.archetype()` reads as the model's own kind rather than an
+    /// external classification.
+    pub fn archetype(&self) -> crate::archetype::Archetype {
+        crate::archetype::Archetype::classify(self)
+    }
     /// How many blocks carry a gated attention output (per-head sigmoid gate split out of a
     /// double-width q projection at load). Used by --gate-deltanet-load.
     pub fn gated_attn_layers(&self) -> usize { self.layers.iter().filter(|b| b.attn_out_gate.is_some()).count() }
