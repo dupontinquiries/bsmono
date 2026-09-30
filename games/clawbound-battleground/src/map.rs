@@ -110,7 +110,9 @@ impl MapId {
     pub fn structure_hp_mul(self) -> f32 {
         match self {
             MapId::Jungle | MapId::Pass | MapId::Atlantis | MapId::Maze => 1.0,
-            MapId::Sky => 2.0,
+            // trying to see how buffing this plays out
+            MapId::Sky => 2.5,
+            // MapId::Sky => 2.0,
         }
     }
     /// Minion damage to towers and Elders, on top of the usual x2.4. The sky
@@ -160,13 +162,22 @@ impl MapId {
     /// standing: all but three of six on the three-lane maps, all but two
     /// of four on the sky.
     pub fn titan_towers_req(self) -> usize {
-        match self {
-            MapId::Jungle | MapId::Pass => crate::consts::TITAN_TOWERS_REQ,
-            // two lanes, two towers a side each: open when two fall
-            MapId::Sky | MapId::Maze => 3,
-            // one lane, two towers a side: the Elder opens when both fall
-            MapId::Atlantis => 1,
-        }
+        1
+        // match self {
+        //     MapId::Jungle | MapId::Pass => crate::consts::TITAN_TOWERS_REQ,
+        //     // two lanes, two towers a side each: open when two fall
+        //     MapId::Sky | MapId::Maze => 1 + crate::consts::TITAN_TOWERS_REQ,
+        //     // one lane, two towers a side: the Elder opens when both fall
+        //     MapId::Atlantis => 1,
+        // }
+        // match self {
+        //     MapId::Jungle | MapId::Pass => crate::consts::TITAN_TOWERS_REQ,
+        //     // two lanes, two towers a side each: open when two fall
+        //     MapId::Sky | MapId::Maze => 3,
+        //     // one lane, two towers a side: the Elder opens when both fall
+        //     MapId::Atlantis => 1,
+        // }
+        // crate::consts::TITAN_TOWERS_REQ
     }
 }
 
