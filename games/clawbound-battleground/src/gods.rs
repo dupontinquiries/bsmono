@@ -633,6 +633,8 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
         abilities: [
             ab("Step Between", "He is where his other was, and his other where he stood. Whoever waited by it is struck and stumbles.", Archetype::Swap { radius: 4.0, dmg: 70.0, slow: 0.4, secs: 1.0 }, 10.0, 60.0, [0.55, 0.60, 0.72], 0, false, 0.40),
             ab("Send the Other", "His other goes where he points, without a sound, and waits there.", Archetype::Send { range: 36.0, speed: 20.0 }, 14.0, 50.0, [0.30, 0.32, 0.42], 1, false, 0.0),
+            // TODO need a new Archetype::Projection(model: assets like a cat model but with tunable params like opacity and calling animaiton chains, collision: ProjCollide::Area/BBox/Sphere/GroudCircle, range, speed, cd, cost, color, slot, is_ult, power_scale)
+            // the long reach should change to a giant shadow paw that clutches up out of the ground 2d palette channeling -> 3d claws and some SFX... plus a root of 1s
             ab("The Long Reach", "An arm longer than it has any right to be, out of the fog.", Archetype::Beam { length: 6.0, width: 3.4, dmg: 140.0 }, 8.0, 65.0, [0.70, 0.74, 0.84], 2, false, 0.60),
             ab("Every Shadow", "For a few breaths there are six of him -- three here, three with his other -- and every one is hunting. He can step into any of them.", Archetype::Echoes { each: 2, life: 8.0, dmg: 45.0 }, 85.0, 130.0, [0.40, 0.45, 0.62], 3, true, 0.30),
         ],
@@ -687,6 +689,7 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
                 Archetype::Field { material: Material::Lodestone, radius: 13.0, amount: 7.0, secs: 0.0 },
                 25.0, 0.0, [0.45, 0.45, 0.62], 2, false, 0.15),
             
+            // this should be a base damage and there should also be a way to apply hotspots spread out as cracks on the pathable ground throughout the map where geyser-like magma ejections do extra damage when they channel at location then fire for 1sec. this should prevent abusive maneouvring onto towers and structures
             ab("The Mountain's Heart", "For a while her coat is the mountain's molten heart: everything near her burns. Then it cools back to what it was.",
                 Archetype::Field { material: Material::Magma, radius: 35.0, amount: 5.0, secs: 120.0 },
                 180.0, 0.0, [1.00, 0.45, 0.15], 3, true, 0.12),
@@ -764,6 +767,8 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
             ab("Mudslide", "The bank gives way: a wave of mud down the aim strikes everything in front of it and carries it along -- friends forward, enemies away -- crushing through plants and sloshing back off walls. Eight kittens tumble out of it, and for a while every kill he makes shapes more. Each kitten broken is gold to whoever breaks it.", Archetype::Mudslide { len: 140.0, width: 16.0, speed: 16.0, dmg: 280.0, kits: 8 }, 90.0, 130.0, [0.55, 0.38, 0.25], 3, true, 1.1),
         ],
     },
+    // GodDef {id: , name: , title: , philosophy: , role: , auto: , dmg_type: , palette: , weapon: , pelt: , hp: , hp_growth: , mana: , mana_growth: , auto_dmg: , auto_growth: , power: , power_growth: , protection: , prot_growth: , move_speed: , auto_range: , auto_cd: , abilities},
+    // GodDef {id: , name: , title: , philosophy: , role: , auto: , dmg_type: , palette: , weapon: , pelt: , hp: , hp_growth: , mana: , mana_growth: , auto_dmg: , auto_growth: , power: , power_growth: , protection: , prot_growth: , move_speed: , auto_range: , auto_cd: , abilities},
 ];
 
 pub fn god(id: u32) -> &'static GodDef {

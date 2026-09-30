@@ -382,7 +382,9 @@ pub fn tower_pos(lane: Lane, team: Team, inner: bool) -> Vec3 {
 pub const WAVE_FIRST: f32 = 12.0;
 pub const WAVE_INTERVAL: f32 = 30.0;
 
-pub const START_GOLD: f32 = 700.0;
+// trying out a zero gold start
+pub const START_GOLD: f32 = 0.0;
+// pub const START_GOLD: f32 = 700.0;
 pub const PASSIVE_GOLD: f32 = 1.9;
 // Waves went from three minions to four (five every third, `minionai::
 // wave_for`): per-minion gold and XP were cut by 0.7 so a wave is worth
@@ -390,7 +392,8 @@ pub const PASSIVE_GOLD: f32 = 1.9;
 pub const GOLD_MELEE: f32 = 15.0;
 pub const GOLD_CASTER: f32 = 19.0;
 pub const GOLD_GOD: f32 = 300.0;
-pub const GOLD_TOWER: f32 = 250.0;
+pub const GOLD_TOWER: f32 = 400.0;
+// pub const GOLD_TOWER: f32 = 250.0;
 /// Fraction of an item's cost refunded by `Game::sell_item`.
 pub const SELL_REFUND: f32 = 0.7;
 
@@ -432,6 +435,7 @@ pub const TOWER_RING_SHOW: f32 = 14.0;
 /// A tower's shot slows a cat: diving past is a decision, not a jog.
 pub const TOWER_SLOW: f32 = 0.25;
 pub const TOWER_SLOW_SECS: f32 = 1.2;
+// TODO: Towers need a buff in protections vs abilities because ultimates do too much damage... same with titans
 
 /// Inside some tower's cleared ground?
 pub fn in_tower_clearing(x: f32, z: f32) -> bool {
@@ -447,7 +451,10 @@ pub const TOWER_RAMP: f32 = 1.25;
 
 /// The Elders (titans): 75% more health and damage than the 4600 / 260
 /// they had -- the last stand should be one.
-pub const TITAN_BUFF: f32 = 1.75;
+/// TODO: Titans need to be more fun to play against and use abilities and have phases
+///       like how the starry sky map center enemy is when it flies around and bombs the lanes
+pub const TITAN_BUFF: f32 = 2.25;
+// pub const TITAN_BUFF: f32 = 1.75;
 pub const TITAN_HP: f32 = 4600.0 * TITAN_BUFF;
 pub const TITAN_DMG: f32 = 260.0 * TITAN_BUFF;
 pub const TITAN_RANGE: f32 = 6.5;
