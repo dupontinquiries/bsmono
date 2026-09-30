@@ -353,6 +353,7 @@ pub const ROSTER_LEN: usize = 20;
 
 pub const ROSTER: [GodDef; ROSTER_LEN] = [
     // ── GOLDENMANE — the lion-clan of legend ──
+    // he feels very good to play
     GodDef {
         id: 0, name: "Goldenmane", title: "the lion-clan of legend",
         philosophy: "A warrior alone is a whisker; a pride is a storm.",
@@ -482,9 +483,15 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
         auto_dmg: 57.0, auto_growth: 4.3, power: 8.0, power_growth: 2.4,
         protection: 23.0, prot_growth: 2.5, move_speed: 12.4, auto_range: 3.4, auto_cd: 1.00,
         abilities: [
-            ab("Saber Lunge", "The whole weight behind both fangs.", Archetype::Dash { dist: 12.0, dmg: 110.0 }, 8.5, 65.0, [0.85, 0.85, 0.90], 0, false, 0.50),
-            ab("Hamstring", "One rake low, and the running is over.", Archetype::Ring { radius: 5.0, delay: 0.4, dmg: 95.0 }, 9.0, 60.0, [0.80, 0.30, 0.30], 1, false, 0.40),
-            ab("The Saber Finishes", "A wounded foe is a finished foe — a thrown killing thrust.", Archetype::Bolt { speed: 32.0, dmg: 130.0, radius: 0.8 }, 9.0, 70.0, [0.90, 0.90, 0.95], 2, false, 0.55),
+            ab("Saber Chase", "The whole weight behind both fangs.", Archetype::Dash { dist: 8.0, dmg: 50.0 }, 8.5, 65.0, [0.85, 0.85, 0.90], 0, false, 0.50),
+            // TODO add a small channel to Saber Lunge
+            ab("Saber Lunge", "The whole weight behind both fangs.", Archetype::Dash { dist: 3.0, dmg: 130.0 }, 7.5, 65.0, [0.85, 0.85, 0.90], 0, false, 0.50),
+            // ab("Hamstring", "One rake low, and the running is over.", Archetype::Ring { radius: 5.0, delay: 0.4, dmg: 95.0 }, 9.0, 60.0, [0.80, 0.30, 0.30], 1, false, 0.40),
+            // a ranged 3rd slot ability on this character does not make sense
+            // ab("The Saber Finishes", "A wounded foe is a finished foe — a thrown killing thrust.", Archetype::Bolt { speed: 32.0, dmg: 130.0, radius: 0.8 }, 9.0, 70.0, [0.90, 0.90, 0.95], 2, false, 0.55),
+            ab("Face Death", "A meeting with death is never pleasant.",
+                Archetype::Field { material: Material::Rime, radius: 2.0, amount: 0.80, secs: 1.0 },
+                25.0, 0.0, [0.62, 0.85, 1.00], 1, false, 0.30),
             ab("The Killing Bite", "The bite the elder dawn is remembered by.", Archetype::Bolt { speed: 34.0, dmg: 380.0, radius: 1.1 }, 70.0, 110.0, [1.00, 0.35, 0.30], 3, true, 0.90),
         ],
     },
@@ -663,10 +670,23 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
         protection: 33.0, prot_growth: 3.6, move_speed: 10.4, auto_range: 4.0, auto_cd: 1.25,
     // AbilityDef { name, desc, arch, cooldown: cd, cost, color, key, ult, power_scale: scale }
          abilities: [
-            ab("Granite", "Her coat goes to granite: every friend near her, and she, is spared a share of every blow.", Archetype::Field { material: Material::Granite, radius: 13.0, amount: 0.30, secs: 0.0 }, 25.0, 0.0, [0.72, 0.70, 0.66], 0, false, 0.05),
-            ab("Rime", "Her coat goes to rime: the air around her freezes, and every enemy in it wades.", Archetype::Field { material: Material::Rime, radius: 24.0, amount: 0.10, secs: 0.0 }, 25.0, 0.0, [0.62, 0.85, 1.00], 1, false, 0.04),
-            ab("Lodestone", "Her coat goes to lodestone: every enemy near her is drawn in, step by step, whether it likes it or not.", Archetype::Field { material: Material::Lodestone, radius: 11.0, amount: 8.0, secs: 0.0 }, 25.0, 0.0, [0.45, 0.45, 0.62], 2, false, 0.05),
-            ab("The Mountain's Heart", "For a while her coat is the mountain's molten heart: everything near her burns. Then it cools back to what it was.", Archetype::Field { material: Material::Magma, radius: 35.0, amount: 4.0, secs: 120.0 }, 180.0, 0.0, [1.00, 0.45, 0.15], 3, true, 0.08),
+             
+            ab("Granite", "Her coat goes to granite: every friend near her, and she, is spared a share of every blow.",
+                Archetype::Field { material: Material::Granite, radius: 4.0, amount: 0.20, secs: 0.0 },
+                25.0, 0.0, [0.72, 0.70, 0.66], 0, false, 0.01),
+            
+            ab("Rime", "Her coat goes to rime: the air around her freezes, and every enemy in it wades.",
+                Archetype::Field { material: Material::Rime, radius: 32.0, amount: 0.12, secs: 0.0 },
+                25.0, 0.0, [0.62, 0.85, 1.00], 1, false, 0.09),
+            
+            ab("Lodestone", "Her coat goes to lodestone: every enemy near her is drawn in, step by step, whether it likes it or not.",
+                Archetype::Field { material: Material::Lodestone, radius: 13.0, amount: 7.0, secs: 0.0 },
+                25.0, 0.0, [0.45, 0.45, 0.62], 2, false, 0.15),
+            
+            ab("The Mountain's Heart", "For a while her coat is the mountain's molten heart: everything near her burns. Then it cools back to what it was.",
+                Archetype::Field { material: Material::Magma, radius: 35.0, amount: 5.0, secs: 120.0 },
+                180.0, 0.0, [1.00, 0.45, 0.15], 3, true, 0.12),
+            
         ],
         // this one felt underpowered but tactful
         //  abilities: [

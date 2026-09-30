@@ -134,6 +134,8 @@ pub struct Stacking {
     pub interval: f32,
 }
 
+use std::cmp::max;
+
 impl Stacking {
     /// Stacks at which it is full.
     pub fn cap(&self) -> f32 {
@@ -141,7 +143,8 @@ impl Stacking {
     }
     /// The stat it adds at `stacks` (a Time counter counts whole intervals).
     pub fn gained(&self, stacks: f32) -> f32 {
-        let n = if self.kind == StackKind::Time { stacks.floor() } else { stacks };
+        let n = if self.kind == StackKind::Time { max(0, stacks.floor() as u32 - 1) as f32 } else { stacks };
+        // let n = if self.kind == StackKind::Time { stacks.floor() } else { stacks };
         (n.min(self.cap()) * self.per).min(self.max)
     }
 }
