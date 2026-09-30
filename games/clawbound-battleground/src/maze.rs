@@ -881,6 +881,7 @@ pub fn bot_goal(game: &Game, gi: usize) -> Option<Vec3> {
         let p = room_pos(rm);
         matches!(game.wake.mood_at(p.x, p.z, t + 2.0), Mood::Calm) && !crate::machine::locked(game.wake.seed, t, p.x, p.z)
     };
+    // TODO: this might have to be reworked for a patrol based and not wave based minion minigame
     // A room with a standing enemy tower in it is no refuge and no way
     // through: a bot sent past one stood at the tower's edge, stepping in
     // for the refuge and backing out for the tower, alone in the thorns for
