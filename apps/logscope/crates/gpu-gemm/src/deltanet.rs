@@ -440,4 +440,46 @@ mod tests {
         assert_eq!((2usize) / share, 1, "v-head 2 reads k-head 1");
         assert_eq!((1usize) / share, 0, "v-head 1 reads k-head 0");
     }
+
+    /// THE CARRY-FORWARD INVARIANT. The whole agent-loop recurrence reuse depends on this: folding
+    /// `0..n` in ONE pass must give the same {ring, s, next_pos} as folding `0..l`, copying the
+    /// carried state into a fresh session (next_pos = l), then continuing `l..n`. If carry_deltanet
+    /// (or whatever carries it) drops part of the state — say the conv ring but not the delta S —
+    /// the two runs diverge. That is the ONLY way the two can disagree, so a passing run here is
+    /// the CPU-oracle proof that the carry is complete and position-correct.
+    #[test]
+    fn folding_0_to_n_equals_carrying_at_l_then_continuing() {
+        let m = dims();
+        let w = wts(&m, 13);
+        w.validate(&m).expect("synthetic weights validate");
+        // A prompt that mixes structure (so ring and S both carry information) with the conv's
+        // causal depthwise kernel: a pulse, then decay, then another pulse — the conv ring is
+        // nonzero at the carry point, so a ring-dropping carry would be caught here.
+        let xs: Vec<Vec<f32>> = (0..20).map(|t| {
+            if t % 7 == 0 { vec![1.0f32; m.d] } else if t % 7 == 6 { vec![0.3f32; m.d] } else { vec![0.0f32; m.d] }
+        }).collect();
+        let l = 8;
+        assert!(l > 1 && l < xs.len());
+
+        // ONE pass over 0..20.
+        let mut full = DeltaNetState::new(&m);
+        for x in &xs { let _ = step(&m, &w, &mut full, x, 1e-6); }
+
+        // SPLIT: fold 0..8, snapshot {ring, s, next_pos} into a fresh session, fold 8..20.
+        let mut carry = DeltaNetState::new(&m);
+        for x in &xs[..l] { let _ = step(&m, &w, &mut carry, x, 1e-6); }
+        let mut fresh = DeltaNetState::new(&m);
+        fresh.ring = carry.ring.clone();
+        fresh.s = carry.s.clone();
+        fresh.next_pos = carry.next_pos; // == l
+        for x in &xs[l..] { let _ = step(&m, &w, &mut fresh, x, 1e-6); }
+
+        // Both must have consumed all 20 tokens and agree on the carried state, down to the bit.
+        assert_eq!(full.next_pos, fresh.next_pos, "carry must advance next_pos through the suffix");
+        assert_eq!(full.next_pos, xs.len(), "both paths consume the whole prompt");
+        let ring_drift = full.ring.iter().zip(&fresh.ring).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let s_drift = full.s.iter().zip(&fresh.s).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(ring_drift == 0.0, "conv ring must carry across the split: |Δ| = {ring_drift:.3e}");
+        assert!(s_drift == 0.0, "delta-state S must carry across the split: |Δ| = {s_drift:.3e}");
+    }
 }
