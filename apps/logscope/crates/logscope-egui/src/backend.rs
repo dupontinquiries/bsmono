@@ -1409,7 +1409,7 @@ per verification pass is at or below the 1.00 break-even, so the drafting cost b
             // LOGSCOPE_DELTANET_CPU=1 routes to the CPU oracle, which this path detects and
             // rejects (carry_deltanet_state returns false on the CPU route, so we fall through
             // to a cold prefill).
-            let delta_seed = if let Some((prev_toks, prev_sess)) = &self.prev_turn {
+            let delta_seed = if let Some((prev_toks, _prev_sess)) = &self.prev_turn {
                 if prev_toks.is_empty() {
                     None
                 } else if prompt_ids.len() < prev_toks.len() {
@@ -1423,12 +1423,10 @@ per verification pass is at or below the 1.00 break-even, so the drafting cost b
                     None
                 } else {
                     // The linear-continue invariant holds: prompt[0..|P|] == previous turn's
-                    // prompt, and this prompt is at least that long. Seed from the carried state.
-                    // Copy the Session OUT (it is Copy) so the reference never borrows
-                    // self.prev_turn past this point — the CPU path below mutates prev_turn, and
-                    // a live &Session borrowing it would be a conflict. Session is a cheap shallow
-                    // copy (device tensors + atomics are Copy), so this is not a device alloc.
-                    Some((prev_toks.len(), *prev_sess))
+                    // prompt, and this prompt is at least that long. We only need the position
+                    // here — the carried Session is picked up by copy inside the branch below,
+                    // so this never borrows or moves self.prev_turn.
+                    Some(prev_toks.len())
                 }
             } else { None };
             let (reuse, l, pick_idx) = if kv_off {
@@ -1436,8 +1434,10 @@ per verification pass is at or below the 1.00 break-even, so the drafting cost b
             } else if let Some(delta_l) = delta_seed {
                 // Linear recurrent-state carry-forward. Hybrid + previous turn's prompt is a
                 // prefix of this one → reuse the carried checkpoint instead of a cold prefill.
-                // `picked_session` is left None; this re-seeds from `self.prev_turn` directly in
-                // the branch below (the pool path can't represent an absolute recurrent state).
+                // The carried Session is picked up by copy directly in the branch below
+                // (`picked_session` is left None here — seeding from a pool anchor would install
+                // state at the wrong position); this arm only supplies `l`, the position the Δ
+                // suffix starts at.
                 (true, delta_l, usize::MAX)
             } else if self.model.deltanet_layers() > 0 {
                 // A hybrid (Gated DeltaNet) model carries, per recurrent layer, a GPU-resident
@@ -1504,7 +1504,7 @@ tokens ({:.0}% of the prefill skipped), {} to prefill", self.name, prompt_ids.le
             if diffusion_path {
                 crate::diag!("wgpu-engine: [{}] diffusion model — skipping the KV prefill ({} prompt tokens); block denoising re-forwards the canvas and reads no cache",
                     self.name, prompt_ids.len());
-            } else if let Some((delta_l, delta_prev)) = delta_seed {
+            } else if let Some(delta_l) = delta_seed {
                 // LINEAR AGENT RECURRENT-STATE CARRY-FORWARD. The previous turn's prompt is a
                 // prefix of this one, so fold its terminal recurrent state into a fresh session
                 // and prefill only the appended Δ tokens. This is the whole win: turn N pays for
@@ -1517,9 +1517,15 @@ tokens ({:.0}% of the prefill skipped), {} to prefill", self.name, prompt_ids.le
                 // the previous turn's terminal state, positioned for position delta_l, which is
                 // where the Δ suffix begins. Without setting next_pos the assert in
                 // block_prefill_deltanet_gpu would fire (you can't seek to an earlier position).
+                // Grab the carried session by copy (Session is Copy) — prev_turn already dropped its
+                // borrow by this point, so a live &prev_turn can't be in play.
                 // On the CPU oracle route (LOGSCOPE_DELTANET_CPU=1) carry_deltanet_state returns
                 // false — the device tensors don't exist there — so we fall through to the cold
                 // prefill below rather than corrupting a state that isn't the live one.
+                let delta_prev = match self.prev_turn.as_ref().map(|(_, sess)| *sess) {
+                    Some(sess) => sess,
+                    None => return Err("delta reuse selected but the carried session is gone (prev_turn cleared?)".to_string()),
+                };
                 let mut delta_ok = self.gpu.carry_deltanet_state(&self.model, &mut s, &delta_prev.cache, delta_l);
                 // Carry the K/V rows the prefix would have filled, too — a full prefill writes
                 // them, and a later turn may want them; cheap and keeps this turn's cache complete.
