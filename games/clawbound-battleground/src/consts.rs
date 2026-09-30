@@ -515,8 +515,10 @@ pub const TITAN_ATK_CD: f32 = 1.0;
 pub const TITAN_MOVE_R: f32 = 10.0;
 /// ...and push forward, toward the enemy, this far, in a lane this wide
 /// (half-width): it comes out to meet a siege, it does not chase.
-pub const TITAN_PUSH: f32 = 24.0;
-pub const TITAN_PUSH_HALF: f32 = 11.0;
+// pub const TITAN_PUSH: f32 = 24.0;
+// pub const TITAN_PUSH_HALF: f32 = 11.0;
+pub const TITAN_PUSH: f32 = 32.0;
+pub const TITAN_PUSH_HALF: f32 = 15.0;
 /// It notices what is within this of it (inside its ground), walks at
 /// this pace, and turns this fast (rad/s); it strikes only what it faces.
 pub const TITAN_SIGHT: f32 = 22.0;
@@ -524,7 +526,9 @@ pub const TITAN_SPEED: f32 = 3.4;
 pub const TITAN_TURN: f32 = 1.9;
 pub const TITAN_FACE: f32 = 0.5;
 /// Titan is shielded while the owning team still has this many towers standing.
-pub const TITAN_TOWERS_REQ: usize = 4;
+/// TODO: try this 1 tree-tower gives immunity idea
+pub const TITAN_TOWERS_REQ: usize = 1;
+// pub const TITAN_TOWERS_REQ: usize = 4;
 
 pub const FOUNTAIN_RADIUS: f32 = 10.0;
 pub const FOUNTAIN_REGEN: f32 = 0.08; // fraction per second

@@ -1015,6 +1015,49 @@ const TV: f32 = 0.16;
 //       the stardust at enemy cats, slowing them and dealing slight damage
 
 
+// might use a giant tree variant not sure yet
+// pub fn mega_tree(s: f32, variant: i32) -> VoxelMesh {
+//     let mut g = Grid::new(34, 46, 34);
+//     let c = 17.0;
+//     let bark = [0.27, 0.20, 0.12];
+//     g.cyl_y(c, c, 5.0, 0, 16, solid(bark));
+//     g.cyl_y(c, c, 4.0, 16, 24, solid([0.23, 0.17, 0.10]));
+//     // flaring roots
+//     for k in 0..5 {
+//         let a = k as f32 * 1.26 + variant as f32 * 0.7;
+//         for i in 0..6 {
+//             let r = 5.0 + i as f32 * 1.7;
+//             let h = (12 - i * 2).max(3);
+//             let x = (c + a.cos() * r) as i32;
+//             let z = (c + a.sin() * r) as i32;
+//             g.filled_box(x - 1, 0, z - 1, x + 2, h, z + 2, solid(bark));
+//         }
+//     }
+//     // enormous canopy
+//     let leaf_a = [0.075, 0.26, 0.095];
+//     let leaf_b = [0.11, 0.33, 0.12];
+//     g.ellipsoid(c, 32.0, c, 13.0 * s, 5.0 * s, 13.0 * s, solid(leaf_a));
+//     g.ellipsoid(c - 7.0, 28.5, c + 4.0, 7.0 * s, 3.4 * s, 7.0 * s, solid(leaf_b));
+//     g.ellipsoid(c + 6.0, 29.5, c - 6.0, 6.4 * s, 3.2 * s, 6.4 * s, solid(leaf_b));
+//     g.ellipsoid(c, 37.0, c, 7.5 * s, 3.4 * s, 7.5 * s, solid(leaf_a));
+//     // hollow the underside for shape + voxel savings
+//     g.carve_sphere(c, 26.0, c, 9.0);
+//     // long hanging vines
+//     for k in 0..6 {
+//         let a = k as f32 * 1.05 + variant as f32 * 0.4;
+//         let x = (c + a.cos() * 10.0) as i32;
+//         let z = (c + a.sin() * 10.0) as i32;
+//         let len = 6 + (k * 3 + variant) % 6;
+//         for y in 0..len {
+//             let yy = 27 - y;
+//             if yy < 14 {
+//                 break;
+//             }
+//             g.set(x, yy, z, solid([0.13, 0.33, 0.12]));
+//         }
+//     }
+//     g.mesh(1.2, true)
+// }
 pub fn build_heal_tree_for_team(team: Team) -> (VoxelMesh, VoxelMesh) {
     // team color
     let tc = team.rgb();
