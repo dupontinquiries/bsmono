@@ -483,9 +483,9 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
         auto_dmg: 57.0, auto_growth: 4.3, power: 8.0, power_growth: 2.4,
         protection: 23.0, prot_growth: 2.5, move_speed: 12.4, auto_range: 3.4, auto_cd: 1.00,
         abilities: [
-            ab("Saber Chase", "The whole weight behind both fangs.", Archetype::Dash { dist: 8.0, dmg: 50.0 }, 8.5, 65.0, [0.85, 0.85, 0.90], 0, false, 0.50),
+            ab("Saber Chase", "The whole weight behind both fangs.", Archetype::Dash { dist: 9.0, dmg: 50.0 }, 8.5, 65.0, [0.85, 0.85, 0.90], 0, false, 0.50),
             // TODO add a small channel to Saber Lunge
-            ab("Saber Lunge", "The whole weight behind both fangs.", Archetype::Dash { dist: 3.0, dmg: 130.0 }, 7.5, 65.0, [0.85, 0.85, 0.90], 0, false, 0.50),
+            ab("Saber Lunge", "The whole weight behind both fangs.", Archetype::Dash { dist: 4.0, dmg: 150.0 }, 5.5, 75.0, [0.85, 0.85, 0.90], 0, false, 0.80),
             // ab("Hamstring", "One rake low, and the running is over.", Archetype::Ring { radius: 5.0, delay: 0.4, dmg: 95.0 }, 9.0, 60.0, [0.80, 0.30, 0.30], 1, false, 0.40),
             // a ranged 3rd slot ability on this character does not make sense
             // ab("The Saber Finishes", "A wounded foe is a finished foe — a thrown killing thrust.", Archetype::Bolt { speed: 32.0, dmg: 130.0, radius: 0.8 }, 9.0, 70.0, [0.90, 0.90, 0.95], 2, false, 0.55),
