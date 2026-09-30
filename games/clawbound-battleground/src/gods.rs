@@ -479,20 +479,24 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
         role: Role::Warrior, auto: AutoKind::Melee, dmg_type: DmgType::Physical,
         palette: [[0.60, 0.55, 0.50], [0.25, 0.22, 0.24], [0.85, 0.82, 0.78], [0.54, 0.54, 0.57]],
         weapon: WeaponKind::None, pelt: PeltKind::Sabers,
-        hp: 627.0, hp_growth: 100.0, mana: 300.0, mana_growth: 32.0,
+        // trying to nerf his health and mana a bit to keep him balanced as a hidden threat that can jump on many enemies
+        hp: 590.0, hp_growth: 90.0, mana: 300.0, mana_growth: 22.0,
+        // hp: 627.0, hp_growth: 100.0, mana: 300.0, mana_growth: 32.0,
         auto_dmg: 57.0, auto_growth: 4.3, power: 8.0, power_growth: 2.4,
         protection: 23.0, prot_growth: 2.5, move_speed: 12.4, auto_range: 3.4, auto_cd: 1.00,
         abilities: [
-            ab("Saber Chase", "The whole weight behind both fangs.", Archetype::Dash { dist: 9.0, dmg: 50.0 }, 8.5, 65.0, [0.85, 0.85, 0.90], 0, false, 0.50),
+            // ab("Saber Chase", "The whole weight behind both fangs.", Archetype::Dash { dist: 9.0, dmg: 50.0 }, 8.5, 65.0, [0.85, 0.85, 0.90], 0, false, 0.50),
+            ab("Saber Chase", "The whole weight behind both fangs.", Archetype::Dash { dist: 9.5, dmg: 60.0 }, 2.3, 65.0, [0.85, 0.85, 0.90], 0, false, 0.90),
             // TODO add a small channel to Saber Lunge
-            ab("Saber Lunge", "The whole weight behind both fangs.", Archetype::Dash { dist: 4.0, dmg: 150.0 }, 5.5, 75.0, [0.85, 0.85, 0.90], 0, false, 0.80),
+            ab("Saber Lunge", "The whole weight behind both fangs.", Archetype::Dash { dist: 4.0, dmg: 190.0 }, 2.3, 80.0, [0.85, 0.85, 0.90], 0, false, 2.40),
             // ab("Hamstring", "One rake low, and the running is over.", Archetype::Ring { radius: 5.0, delay: 0.4, dmg: 95.0 }, 9.0, 60.0, [0.80, 0.30, 0.30], 1, false, 0.40),
             // a ranged 3rd slot ability on this character does not make sense
             // ab("The Saber Finishes", "A wounded foe is a finished foe — a thrown killing thrust.", Archetype::Bolt { speed: 32.0, dmg: 130.0, radius: 0.8 }, 9.0, 70.0, [0.90, 0.90, 0.95], 2, false, 0.55),
             ab("Face Death", "A meeting with death is never pleasant.",
                 Archetype::Field { material: Material::Rime, radius: 2.0, amount: 0.80, secs: 1.0 },
-                25.0, 0.0, [0.62, 0.85, 1.00], 1, false, 0.30),
-            ab("The Killing Bite", "The bite the elder dawn is remembered by.", Archetype::Bolt { speed: 34.0, dmg: 380.0, radius: 1.1 }, 70.0, 110.0, [1.00, 0.35, 0.30], 3, true, 0.90),
+                25.0, 0.0, [0.62, 0.85, 1.00], 1, false, 0.50),
+            // ab("The Killing Bite", "The bite the elder dawn is remembered by.", Archetype::Bolt { speed: 34.0, dmg: 380.0, radius: 1.1 }, 70.0, 110.0, [1.00, 0.35, 0.30], 3, true, 0.90),
+            ab("The Killing Bite", "The bite the elder dawn is remembered by.", Archetype::Dash { dist: 6.5, dmg: 650.0 }, 18.0, 130.0, [1.00, 0.35, 0.30], 3, true, 6.90),
         ],
     },
     // ── SUNEYE — the sun-priests of the endless dunes ──
