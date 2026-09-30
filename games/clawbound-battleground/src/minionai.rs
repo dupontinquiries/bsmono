@@ -60,6 +60,9 @@ pub struct Seen {
 /// Seconds between re-thinks.
 pub const THINK_EVERY: f32 = 0.35;
 /// How far a minion notices things (it walks to them).
+/// TODO: this is too simplistic now because minions will have to intersect their search range and weight with territorial bounds
+///       an anger score against the other clan based on towers destroyed and cats attacked should also dynamically affect this
+///       throughout a match
 pub const AGGRO_MELEE: f32 = 7.0;
 pub const AGGRO_CASTER: f32 = 10.0;
 /// How far from where it left the lane a minion follows a target.

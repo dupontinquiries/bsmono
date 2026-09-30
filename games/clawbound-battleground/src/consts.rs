@@ -324,6 +324,56 @@ fn push_sampled(out: &mut Vec<Vec3>, from: Vec3, to: Vec3, step: f32) {
     }
 }
 
+// TODO: the waypoints/minion system has to accomodate minions that are smarter and more natural that do patrols and then return to base
+//       instead of running into the other territory. they watch the borders and prevent encroaching territory. the paths are more circular
+//       for a PatrolType::LongCircular vs shorter in and out and back loops on PatrolType::OvalCenterAngle
+//              .....................
+//          ....                     ....
+//      ....p1                           ....
+//  ....      i                              ....
+//                 o     
+//          i            
+//                       
+//                    o  
+//          i            
+//                      o
+//            i          
+//                       
+//                 i    o
+//                       
+//                     i 
+//                      ...
+//                      ...p0
+//                      ...
+//                      
+//      this is PatrolType::OvalCenterAngle
+//      it has a p0,p1
+//      p0: center of territory (basecamp)
+//      p1: patrol POI
+//              .....................
+//          ....                     ....
+//      ....p1        i          i       ....
+//  ....      i                          p2  ....
+//                       
+//          o                          i            
+//                       
+//                       
+//          o            
+//                                        i
+//            o          
+//                       
+//                 o                i
+//                       
+//                     o       i
+//                      ...
+//                      ...p0
+//                      ...
+//                      
+//      this is PatrolType::LongCircular
+//      it has a p0,p1,p2
+//      p0: center of territory (basecamp)
+//      p1: patrol initial border contact POI
+//      p2: start heading back POI
 /// Cached per (lane, team) dense waypoints (6 combos, built once).
 pub fn lane_path(lane: Lane, team: Team) -> &'static [Vec3] {
     use std::sync::OnceLock;
@@ -453,7 +503,8 @@ pub const TOWER_RAMP: f32 = 1.25;
 /// they had -- the last stand should be one.
 /// TODO: Titans need to be more fun to play against and use abilities and have phases
 ///       like how the starry sky map center enemy is when it flies around and bombs the lanes
-pub const TITAN_BUFF: f32 = 2.25;
+///       maybe titans should also scale with number of cats in lobby
+pub const TITAN_BUFF: f32 = 2.00;
 // pub const TITAN_BUFF: f32 = 1.75;
 pub const TITAN_HP: f32 = 4600.0 * TITAN_BUFF;
 pub const TITAN_DMG: f32 = 260.0 * TITAN_BUFF;
