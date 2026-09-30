@@ -1011,6 +1011,58 @@ pub fn build_minion(caster: bool, team: Team) -> VoxelMesh {
 
 const TV: f32 = 0.16;
 
+// TODO: the towers need to be reworked to ancient trees with star-pelted cats that throw
+//       the stardust at enemy cats, slowing them and dealing slight damage
+
+
+pub fn build_heal_tree_for_team(team: Team) -> (VoxelMesh, VoxelMesh) {
+    // team color
+    let tc = team.rgb();
+    // TODO fixup this tower grid shim
+    // let mut g = Grid::new(26, 36, 26);
+    let cx = 13; // something to do with banner space iiuc
+    let cz = 13;
+    let trim = mix(tc, [0.9, 0.9, 0.9], 0.15); // trim color
+    // bark
+    let mut g = Grid::new(22, 26, 22);
+    let c = 11.0;
+    let bark = [0.72, 0.68, 0.58];
+    let bark_d = [0.55, 0.5, 0.42];
+    g.cyl_y(c, c, 2.2, 0, 10, solid(bark));
+    g.cyl_y(c, c, 1.6, 10, 15, solid(bark_d));
+    for k in 0..5 {
+        let a = k as f32 * std::f32::consts::TAU / 5.0;
+        for i in 0..4 {
+            let r = 2.2 + i as f32 * 1.3;
+            let x = (c + a.cos() * r) as i32;
+            let z = (c + a.sin() * r) as i32;
+            g.filled_box(x - 1, 0, z - 1, x + 1, (5 - i).max(1), z + 1, solid(bark_d));
+        }
+    }
+    // leaves
+    let leaf_a = [0.42, 0.62, 0.36];
+    let leaf_b = [0.55, 0.75, 0.42];
+    g.ellipsoid(c, 18.0, c, 9.5, 3.0, 9.5, solid(leaf_a));
+    g.ellipsoid(c, 21.0, c, 6.5, 2.6, 6.5, solid(leaf_b));
+    g.ellipsoid(c, 23.5, c, 3.2, 1.8, 3.2, solid(leaf_a));
+    let crown = g.mesh(HEAL_TREE_VOXEL, true);
+    // fruit: separate mesh so it can be drawn emissive
+    let mut f = Grid::new(22, 26, 22);
+    for k in 0..14 {
+        let a = k as f32 * 2.399;
+        let r = 4.0 + (k % 3) as f32 * 2.0;
+        let x = c + a.cos() * r;
+        let z = c + a.sin() * r;
+        let y = 16.0 + (k % 4) as f32 * 1.5;
+        f.ellipsoid(x, y, z, 0.9, 0.9, 0.9, solid([1.0, 0.92, 0.55]));
+    }
+    // capital + banner plates
+    g.filled_box(cx - 10, 30, cz - 2, cx - 8, 34, cz + 2, solid(trim));
+    g.filled_box(cx + 8, 30, cz - 2, cx + 10, 34, cz + 2, solid(trim));
+    let body = g.mesh(TV, true);
+    (crown, f.mesh(HEAL_TREE_VOXEL, true))
+}
+
 pub fn build_tower(team: Team) -> (VoxelMesh, VoxelMesh) {
     let tc = team.rgb();
     let stone = [0.42, 0.40, 0.38];
@@ -1044,6 +1096,39 @@ pub fn build_tower(team: Team) -> (VoxelMesh, VoxelMesh) {
 
     (body, crystal)
 }
+// pub fn build_tower(team: Team) -> (VoxelMesh, VoxelMesh) {
+//     let tc = team.rgb();
+//     let stone = [0.42, 0.40, 0.38];
+//     let stone_dark = [0.30, 0.29, 0.28];
+//     let trim = mix(tc, [0.9, 0.9, 0.9], 0.15);
+
+//     let mut g = Grid::new(26, 36, 26);
+//     let cx = 13;
+//     let cz = 13;
+
+//     // base plinth
+//     g.filled_box(cx - 11, 0, cz - 11, cx + 11, 3, cz + 11, solid(stone_dark));
+//     g.filled_box(cx - 9, 3, cz - 9, cx + 9, 5, cz + 9, solid(stone));
+//     // shaft, tapering
+//     g.cone_y(cx as f32, cz as f32, 7.0, 5.0, 5, 28, solid(stone));
+//     // brick banding
+//     for y in (7..28).step_by(3) {
+//         g.cyl_y(cx as f32, cz as f32, 7.2 - (y as f32 - 5.0) * 0.08, y, y, solid(stone_dark));
+//     }
+//     // capital + banner plates
+//     g.filled_box(cx - 8, 28, cz - 8, cx + 8, 30, cz + 8, solid(stone));
+//     g.filled_box(cx - 10, 30, cz - 2, cx - 8, 34, cz + 2, solid(trim));
+//     g.filled_box(cx + 8, 30, cz - 2, cx + 10, 34, cz + 2, solid(trim));
+//     let body = g.mesh(TV, true);
+
+//     // floating crystal (separate mesh for emissive pulsing)
+//     let mut cg = Grid::new(10, 14, 10);
+//     cg.cone_y(5.0, 5.0, 3.2, 0.8, 0, 6, solid(mix(tc, [1.0, 1.0, 1.0], 0.35)));
+//     cg.cone_y(5.0, 5.0, 0.8, 3.2, 6, 12, solid(mix(tc, [1.0, 1.0, 1.0], 0.35)));
+//     let crystal = cg.mesh(TV, false);
+
+//     (body, crystal)
+// }
 
 // ---------------------------------------------------------------------------
 // Titans — 6u tall (voxel 0.145)
