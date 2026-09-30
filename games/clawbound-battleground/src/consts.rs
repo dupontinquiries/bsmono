@@ -8,7 +8,11 @@ use glam::Vec3;
 // ---------------------------------------------------------------------------
 
 /// Global layout scale — expands the whole valley (lanes, bases, towers).
-pub const MAP_SCALE: f32 = 1.42;
+// TODO I just want to see this lol
+pub const MAP_SCALE: f32 = 3.75;
+// TODO: investigate why setting MAP_SCALE to 10.42 flips cat legs upside down
+//       and also does not scale the jungle mountains slope as much as the travel dist
+// pub const MAP_SCALE: f32 = 1.42;
 
 /// Deep jungle added beyond the lanes, world units. The arena grows by this
 /// much WITHOUT moving a lane, a base or a tower: MAP_SCALE stretches the
