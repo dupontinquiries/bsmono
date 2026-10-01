@@ -3310,7 +3310,7 @@ them to", patches.len());
         let sess = self.gitmind_session.as_ref()?;
         let root = sess.work_dir();
         let class = self.read_class();
-        let b = crate::read_harness::budget(class);
+        let b = crate::read_harness::budget_for_window(class, self.ctx.n_ctx);
         let tree_cap = match class {
             crate::read_harness::ModelClass::Small => 40,
             crate::read_harness::ModelClass::Mid => 120,
@@ -3411,7 +3411,7 @@ the repository — a chat turn cannot open files.",
         let Some(sess) = self.gitmind_session.as_ref() else { return String::new() };
         let root = sess.work_dir();
         let class = self.read_class();
-        let b = crate::read_harness::budget(class);
+        let b = crate::read_harness::budget_for_window(class, self.ctx.n_ctx);
 
         // Tree entries scale with what the class can hold; the byte cap inside
         // fence() is the real backstop.

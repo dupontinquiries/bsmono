@@ -192,6 +192,23 @@ pub fn budget(class: ModelClass) -> ReadBudget {
     }
 }
 
+/// Evidence blocks a workspace prompt stacks (tree, notes, key files, history).
+/// Each is capped at `block_bytes` separately, so the prompt can hold this many.
+pub const EVIDENCE_BLOCKS: usize = 4;
+
+/// [`budget`] clamped to the live context window.
+///
+/// `budget` keys on model class alone, so a 9B (Mid) got 28 KB per block and
+/// four blocks stack: ~28k tokens of evidence into a 4096-token window, which
+/// compacts every turn on a 24k-line repo that "should" fit. Evidence may take
+/// at most a third of the window (4 bytes/token), split across the blocks.
+pub fn budget_for_window(class: ModelClass, n_ctx: u32) -> ReadBudget {
+    let mut b = budget(class);
+    let share = (n_ctx as usize * 4 / 3) / EVIDENCE_BLOCKS;
+    b.block_bytes = b.block_bytes.min(share.max(1024));
+    b
+}
+
 /// Strip what a prompt must never carry: ANSI escapes (CSI and OSC), C0
 /// controls other than `\n` and `\t`, and the Unicode direction-override and
 /// zero-width characters that make text render as something it is not (the
@@ -351,6 +368,20 @@ mod tests {
         }
         assert!(budget(ModelClass::Small).restate_task_after, "small gets the recency scaffold");
         assert!(!budget(ModelClass::Small).git_bodies, "small gets subjects only");
+    }
+
+    /// The window, not the class, bounds the evidence: stacked blocks stay within a
+    /// third of it, and a window big enough for the class leaves the class budget alone.
+    #[test]
+    fn window_clamps_evidence_blocks() {
+        let mid = budget(ModelClass::Mid).block_bytes;
+        let tight = budget_for_window(ModelClass::Mid, 4096).block_bytes;
+        assert!(tight < mid / 8, "4096 window must shrink a Mid block: {tight} vs {mid}");
+        assert!(tight * EVIDENCE_BLOCKS <= 4096 * 4 / 3 + 4096, "stacked evidence > a third of window");
+        assert_eq!(budget_for_window(ModelClass::Mid, 262_144).block_bytes, mid);
+        assert!(budget_for_window(ModelClass::Small, 256).block_bytes >= 1024, "floor holds");
+        let (a, b) = (budget_for_window(ModelClass::Mid, 4096), budget_for_window(ModelClass::Mid, 32768));
+        assert!(a.block_bytes < b.block_bytes, "larger window, larger block");
     }
 
     #[test]
