@@ -158,6 +158,9 @@ this session: read the previous boot's journal next time it is up).
 * Start test apps with `systemd-run --user --unit=… -E WAYLAND_DISPLAY=wayland-1`; a background `nohup` over
   ssh dies with the session.
 * Everything above that touches the phone is meant to be replayable from gitmind's `fp5_setup` plans.
+  Replay: `gitmind fp5 list | plan [PART] | apply USER@HOST [PART]` (the CLI; gitmind-egui has no page for it yet).
+  The cosmic-panel leak (protocol error on `cosmic_corner_radius_layer_v1@55`, ~7 MB/s, 5 GB seen, first seen on the
+  first autologin boot, not caused by the panel/dock config) is only bounded by the `panel memory watchdog` part.
 
 ## Git hygiene in this repo
 The real index holds the owner's staged work. Commit through a temp index, `export GIT_INDEX_FILE=… &&
