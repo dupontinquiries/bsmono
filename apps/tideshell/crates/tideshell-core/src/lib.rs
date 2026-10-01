@@ -28,6 +28,7 @@ pub mod ambient_sound;
 pub mod anim;
 pub mod audio;
 pub mod bar;
+pub mod appinfo;
 pub mod carousel;
 pub mod chaingraph;
 pub mod clock;
