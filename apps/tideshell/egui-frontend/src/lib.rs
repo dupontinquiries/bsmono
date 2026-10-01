@@ -1587,6 +1587,7 @@ impl ShellView {
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
+              egui::ScrollArea::vertical().id_salt("ts-settings-scroll").max_height((shell.screen.1 - 90.0).max(200.0)).show(ui, |ui| {
                 ui.label("Layout");
                 ui.radio_value(&mut draft.layout, Layout::PullDown, "Pull-down control center");
                 ui.radio_value(&mut draft.layout, Layout::RightBar, "Right-hand bar");
@@ -1685,6 +1686,32 @@ impl ShellView {
                     });
                 });
                 ui.separator();
+                ui.label("Cold mode (gloves: volume keys steer, flicks act)");
+                ui.horizontal(|ui| {
+                    for (v, label) in [("auto", "Auto"), ("on", "On"), ("off", "Off")] {
+                        ui.radio_value(&mut draft.cold, v.to_string(), label);
+                    }
+                });
+                ui.separator();
+                ui.label("Rotation");
+                ui.checkbox(&mut draft.autorotate, "Auto-rotate");
+                ui.checkbox(&mut draft.rotate_flip, "Landscape is mirrored on this panel (flip 90/270)");
+                ui.separator();
+                ui.label("Home widget (tap the clock on the cover to cycle)");
+                ui.horizontal(|ui| {
+                    use tideshell_core::prefs::HomeWidget as H;
+                    for (w, label) in [(H::Clock, "Clock"), (H::Snapclone, "Snapclone id"), (H::Temperature, "Temperature")] {
+                        ui.radio_value(&mut draft.home_widget, w, label);
+                    }
+                });
+                ui.checkbox(&mut draft.living, "Living lock screen (rear camera glass; uses the GPU)");
+                ui.separator();
+                ui.label("Unlock pattern (power key: . short, - long, 3+ symbols; empty = swipe only)");
+                ui.add(egui::TextEdit::singleline(&mut draft.unlock_morse).id(egui::Id::new("ts-morse")).hint_text("..-").desired_width(160.0));
+                if !draft.unlock_morse.is_empty() && tideshell_core::morse::parse(&draft.unlock_morse).is_none() {
+                    ui.colored_label(ui.visuals().warn_fg_color, "needs 3 or more of '.' and '-'; not saved as typed");
+                }
+                ui.separator();
                 ui.label("Accessibility");
                 ui.checkbox(&mut draft.digital_dim, "Dim below the panel's floor");
                 ui.label(
@@ -1704,6 +1731,7 @@ impl ShellView {
                         close = true;
                     }
                 });
+              });
             });
         if close || applied.is_some() {
             sheet.open = false;
