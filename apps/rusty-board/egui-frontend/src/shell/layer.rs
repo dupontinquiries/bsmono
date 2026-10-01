@@ -268,6 +268,8 @@ pub fn run(title: &str) -> Result<(), LayerError> {
     // and its first frame will say Visible(false) on a Wayland session with nothing focused.
     let mut mapped = true;
     let mut map_requested: Option<Instant> = None;
+    // Hidden by parking (1 px, no zone), and the transparent parked buffer is still owed.
+    let mut park_paint_owed = false;
     let start = Instant::now();
     let mut last_frame = Instant::now();
     // When egui next wants a frame regardless of input (animations, request_repaint_after).
@@ -347,7 +349,13 @@ pub fn run(title: &str) -> Result<(), LayerError> {
         }
 
         // ---- 1. one egui frame.
-        let (lw, lh) = state.logical_size();
+        // egui lays the board out against this height, and the board's wanted height depends on
+        // it: while parked (1 px) or before the show's configure arrives, keep telling it the
+        // full height, or it asks for a tiny surface when it comes back.
+        let (lw, mut lh) = state.logical_size();
+        if !(mapped && state.configured) {
+            lh = state.height;
+        }
         let ppp = state.scale.max(1) as f32;
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(lw as f32, lh as f32))),
@@ -376,10 +384,16 @@ pub fn run(title: &str) -> Result<(), LayerError> {
         }
         match want_visible {
             Some(false) if mapped => {
-                // Hide: null buffer + commit. The exclusive zone goes with the map state, so
-                // the app below gets its space back in the same commit.
-                state.layer.wl_surface().attach(None, 0, 0);
+                // Hide by PARKING, not unmapping: a null-buffer commit unmaps the surface, and
+                // cosmic-comp then never answers the next show with a configure (WAYLAND_DEBUG
+                // on the FP5: set_size + commit, no configure, ever; the board reserved its
+                // strip and drew nothing). A size change on a mapped surface is always
+                // answered, so shrink to one transparent pixel with no exclusive zone, which
+                // gives the app below its space back just the same.
+                state.layer.set_size(0, 1);
+                state.layer.set_exclusive_zone(0);
                 state.layer.wl_surface().commit();
+                park_paint_owed = true;
                 mapped = false;
                 state.configured = false;
                 state.frame_pending = false;
@@ -398,6 +412,9 @@ pub fn run(title: &str) -> Result<(), LayerError> {
                 // the shell. Phones that never hide the board never saw it.
                 apply_layer_state(&state.layer, state.height);
                 state.layer.wl_surface().commit();
+                park_paint_owed = false;
+                // The parked configure is stale: the resize back to full height gets its own.
+                state.configured = false;
                 mapped = true;
                 map_requested = Some(Instant::now());
                 tracing::debug!("layer: map requested");
@@ -410,7 +427,7 @@ pub fn run(title: &str) -> Result<(), LayerError> {
         //          rebuild; this does the same from what the frame measured. Only on change,
         //          so a steady board costs no requests; the configure that answers it resizes
         //          the next frame's screen_rect.
-        if let Some(h) = feel.desired_height().map(surface_height) {
+        if let Some(h) = feel.desired_height().map(surface_height).filter(|_| mapped && state.configured) {
             if h != state.height {
                 state.height = h;
                 if mapped {
@@ -454,6 +471,16 @@ pub fn run(title: &str) -> Result<(), LayerError> {
             gl.swap().map_err(LayerError::Runtime)?;
             state.needs_paint = false;
             stats.paints += 1;
+        }
+        // Parked: the compositor answered the 1 px resize, so give it a matching transparent
+        // buffer (a buffer of any other size is a surface of any other size).
+        if !mapped && park_paint_owed && state.configured {
+            let px = state.pixel_size();
+            gl.resize_if_needed(px).map_err(LayerError::Runtime)?;
+            gl.paint(px, ppp, &[], &egui::TexturesDelta::default());
+            gl.swap().map_err(LayerError::Runtime)?;
+            park_paint_owed = false;
+            tracing::debug!("layer: parked");
         }
 
         // ---- 4. sleep until the socket is readable or egui's next deadline.
