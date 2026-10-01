@@ -176,8 +176,9 @@ pub const PANEL_RSS_LIMIT_KB: u32 = 800_000;
 /// `cosmic-panel` on the FP5 (cosmic 1.9.0) can hit a Wayland protocol error on its
 /// `cosmic_corner_radius_layer_v1` object right after the session starts and then spin on the dead
 /// connection: ~7 MB/s leaked and a core burned until the phone runs out of memory (5 GB seen).
-/// Measured: 0 such errors in the boot before the first autologin boot, 460k and 1M in the next
-/// two. Not caused by the panel/dock config (zones, autohide, outputs and radius were each
+/// Measured: 0 such errors in the boot before 02:49 on 2026-10-01, then 460k and 1M in the next
+/// two, and 92k within minutes of a boot WITHOUT autologin (so autologin is not the cause). Not
+/// caused by the panel/dock config (zones, autohide, outputs and radius were each
 /// changed and the leak stayed). This does not fix it; it bounds it.
 pub fn panel_watchdog_plan() -> Vec<Step> {
     let script = format!("{BIN}/panel-watchdog");

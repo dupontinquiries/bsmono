@@ -142,6 +142,24 @@ crawled. Reboot cleared it (0 errors after). The writer is not identified (tides
 COSMIC's own control). `sudo`/`systemctl reboot` over ssh now ask for interactive authentication, so the
 reboot needed the owner (power button).
 
+## Later the same night  [measured unless noted]
+* cosmic-osd shows its own brightness slider (a 79% pill, seen in a screenshot) whenever tideshell's
+  auto-brightness writes the backlight. The session restarts cosmic-osd within a second of a kill and
+  `~/.local/bin` is last in its PATH, so it cannot be shadowed or removed without root. Open: replace it with
+  a tideshell dynamic-island pill in the bar, and find a way to silence the OSD.
+* rusty-board popped up on an empty home screen 45 s after login: the focus grace fallback ("no Activate,
+  assume the signal is broken"). Off on COSMIC now (`focus_policy::grace_for`).
+* Hold the Wi-Fi/Bluetooth/mobile-data tile to open that cosmic-settings page (desktop ids
+  `com.system76.CosmicSettings.{Wireless,Bluetooth,Network}`).
+* xwaylandvideobridge: stopped from autostarting (`fp5_setup::hide_video_bridge_plan`). The kernel cuts comm
+  to 15 characters, so `pkill -x xwaylandvideobridge` matches nothing; use `xwaylandvideobr`.
+* hatch hides by quitting on Wayland, so each tap on Apps is a fresh process; it now repaints every frame for
+  its first 1.5 s (cause inferred, not reproduced).
+* Landscape: the bar is shortened by the board's zone by design, and with the board up only two widgets fit
+  (a "+8" overflow). Landscape also leaves the keyboard 44% of the height. Ideas not built: two 3x3 Cardinal
+  pads at the left and right edges with the middle free, a compact landscape board, or the board beside the bar.
+* `shell.living` is off, and only snapclone reads `tideshell.palette` today: rusty-board and the bars do not.
+
 ## Not done (as of 2026-10-01 04:10)
 Who writes the backlight (see above); a raw accelerometer for the rotation margin; apk yt-dlp/ffmpeg (root);
 the `show`/`hide` summon and palette feel on the device; pinch-expand animation for the board (patch kept off-tree: scaling the layer also scales pointer positions
@@ -159,8 +177,8 @@ this session: read the previous boot's journal next time it is up).
   ssh dies with the session.
 * Everything above that touches the phone is meant to be replayable from gitmind's `fp5_setup` plans.
   Replay: `gitmind fp5 list | plan [PART] | apply USER@HOST [PART]` (the CLI; gitmind-egui has no page for it yet).
-  The cosmic-panel leak (protocol error on `cosmic_corner_radius_layer_v1@55`, ~7 MB/s, 5 GB seen, first seen on the
-  first autologin boot, not caused by the panel/dock config) is only bounded by the `panel memory watchdog` part.
+  The cosmic-panel leak (protocol error on `cosmic_corner_radius_layer_v1@55`, ~7 MB/s, 5 GB seen, first seen at the 02:49 boot; it
+  continued after autologin was reverted, so autologin is NOT the cause; not caused by the panel/dock config) is only bounded by the `panel memory watchdog` part.
 
 ## Git hygiene in this repo
 The real index holds the owner's staged work. Commit through a temp index, `export GIT_INDEX_FILE=… &&
