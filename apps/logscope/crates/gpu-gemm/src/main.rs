@@ -6901,7 +6901,9 @@ still pass, which is why this one exists."
         eprintln!("bench: d={} layers={} heads={}/{} ff={} vocab={} | prefill_ctx={ctx} | prewarming…",
             model.d, model.n_layers, model.n_heads, model.n_kv_heads, model.h, model.vocab);
         gpu.prewarm(&model);
-        let cache = gpu.new_cache(model.n_layers, ctx + n + 16, model.kv_dim());
+        // new_cache_for, not new_cache: a hybrid (Gated DeltaNet) model needs its per-layer recurrent state
+        // slots, and the raw cache made `--bench` panic on Ornith/Qwen3.5 before measuring anything.
+        let cache = gpu.new_cache_for(&model, ctx + n + 16);
         // prefill `ctx` tokens so decode attends a realistic-depth KV cache (the app runs at 500+)
         let warm: Vec<u32> = (0..ctx.max(1)).map(|j| (j as u32) % model.vocab as u32).collect();
         let _ = gpu.prefill_batched(&model, &cache, &warm);
