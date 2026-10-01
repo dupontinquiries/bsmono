@@ -28,6 +28,20 @@ pub struct Modes {
     pub trackpad: bool,
 }
 
+/// What the home (cover) widget shows besides the time. Filled in by the frontend: it owns the
+/// file and D-Bus reads.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HomeInfo {
+    /// This device's snapclone id (`sc-xxxxxxxx`), if an identity exists.
+    pub sc_id: Option<String>,
+    /// The on-device temperature estimate in degC, its 0..1 confidence and where it came from.
+    pub temp_c: Option<f32>,
+    pub temp_confidence: f32,
+    pub temp_source: String,
+    /// Why there is no temperature (the service is not running, ...), shown instead.
+    pub temp_note: String,
+}
+
 #[derive(Debug)]
 pub struct Shell {
     pub prefs: ShellPrefs,
@@ -66,6 +80,7 @@ pub struct Shell {
     /// The morse unlock, and when the power key last woke the screen (that press's release is not
     /// a symbol).
     pub morse: crate::morse::Morse,
+    pub home: HomeInfo,
     morse_wake_ms: Option<Millis>,
     /// The camera pane's world (gyro/gravity/compass) and its anchors.
     pub world: crate::world::World,
@@ -153,6 +168,7 @@ impl Shell {
             night_pulse: true,
             rotate,
             morse,
+            home: HomeInfo::default(),
             morse_wake_ms: None,
             world: crate::world::World::new(screen.0 * 0.9),
             sound: crate::ambient_sound::AmbientSound::default(),
@@ -512,7 +528,6 @@ impl Shell {
                 vec![]
             }
             GestureEvent::DrawerRelease { open } => {
-                self.drawer.landscape = matches!(self.rotate.applied, crate::rotate::Orientation::LeftUp | crate::rotate::Orientation::RightUp);
                 self.drawer.release(open);
                 self.log(format!("drawer release open={open}"));
                 vec![]
