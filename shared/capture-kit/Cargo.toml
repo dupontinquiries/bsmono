@@ -10,3 +10,5 @@ path = "src/lib.rs"
 
 [dependencies]
 device-kit = { path = "../device-kit" }
+# INI parsing and XDG dirs, shared with snapshot-cam's lens profiles. Dependency-free itself.
+config-kit = { path = "../config-kit" }

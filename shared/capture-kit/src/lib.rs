@@ -49,6 +49,7 @@
 
 pub mod focus;
 pub mod orient;
+pub mod profile;
 pub mod probe;
 
 use std::io::Read;

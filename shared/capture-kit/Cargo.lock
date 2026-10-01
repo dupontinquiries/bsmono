@@ -6,8 +6,13 @@ version = 4
 name = "capture-kit"
 version = "0.1.0"
 dependencies = [
+ "config-kit",
  "device-kit",
 ]
+
+[[package]]
+name = "config-kit"
+version = "0.1.0"
 
 [[package]]
 name = "device-kit"
