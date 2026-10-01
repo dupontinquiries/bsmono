@@ -117,6 +117,44 @@ pub fn audio_packages_plan(root: Root) -> Vec<Step> {
     ]
 }
 
+/// What vidkit-player needs on this phone to play a pasted PAGE link (a direct .mp4 needs
+/// neither): `yt-dlp` resolves the page and `ffmpeg` muxes/reads the streams. The phone shipped
+/// with neither, so "play from clipboard" found the URL and then could not do anything with it.
+pub const VIDEO_TOOLS: &[&str] = &["yt-dlp", "ffmpeg"];
+
+pub fn video_tools_plan(root: Root) -> Vec<Step> {
+    let add = VIDEO_TOOLS.join(" ");
+    vec![
+        Step { on: Where::Device, what: "the packages resolve (dry run, nothing installed)",
+               cmd: root_cmd(&format!("apk add -s {add}"), root), gate: Gate::ExitZero, rollback: None },
+        Step { on: Where::Device, what: "install yt-dlp and ffmpeg for vidkit-player",
+               cmd: root_cmd(&format!("apk add {add}"), root), gate: Gate::ExitZero,
+               rollback: Some(root_cmd(&format!("apk del {add}"), root)) },
+        Step { on: Where::Device, what: "both are on the path",
+               cmd: "command -v yt-dlp && command -v ffmpeg && echo TOOLS".into(),
+               gate: Gate::Contains("TOOLS".into()), rollback: None },
+    ]
+}
+
+/// COSMIC's panel and dock reserve an exclusive zone even while autohidden, which left the
+/// tideshell bar (anchored top+bottom) short of the bottom of the screen. Both are live config
+/// files: cosmic-panel applies them without a restart.
+pub fn panel_zones_plan() -> Vec<Step> {
+    let dir = "$HOME/.config/cosmic";
+    let set = |value: &str| {
+        format!(
+            "for n in Panel Dock; do d={dir}/com.system76.CosmicPanel.$n/v1; mkdir -p $d && printf '{value}' > $d/exclusive_zone; done"
+        )
+    };
+    vec![
+        Step { on: Where::Device, what: "the panel and dock stop reserving a zone",
+               cmd: set("false"), gate: Gate::ExitZero, rollback: Some(set("true")) },
+        Step { on: Where::Device, what: "both files say false",
+               cmd: format!("cat {dir}/com.system76.CosmicPanel.Panel/v1/exclusive_zone {dir}/com.system76.CosmicPanel.Dock/v1/exclusive_zone"),
+               gate: Gate::Contains("falsefalse".into()), rollback: None },
+    ]
+}
+
 /// Replace the running tideshell with the binary already uploaded to `staged` on the device.
 pub fn tideshell_swap_plan(staged: &str) -> Vec<Step> {
     let live = format!("{BIN}/tideshell");
@@ -301,6 +339,8 @@ pub fn all_parts(root: Root) -> Vec<(&'static str, Vec<Step>)> {
         ("hatch launcher alias", hatch_launcher_plan()),
         ("keyboard service", rusty_board_service_plan()),
         ("speaker-chain packages", audio_packages_plan(root)),
+        ("video tools for vidkit-player", video_tools_plan(root)),
+        ("panel and dock zones", panel_zones_plan()),
         ("emergency USB access", emergency_access_plan(root)),
     ]
 }
@@ -316,9 +356,21 @@ mod tests {
         v.extend(camera_app_plan("/tmp/snapshot-cam.new"));
         v.extend(hatch_swap_plan("/tmp/hatch-egui.new"));
         v.extend(emergency_access_plan(root));
+        v.extend(video_tools_plan(root));
+        v.extend(panel_zones_plan());
         v.extend(rescue_console_plan("/tmp/fp5-rescue", root));
         v.extend(autologin_plan("user", root));
         v
+    }
+
+    #[test]
+    fn the_video_and_zone_plans_say_what_they_change() {
+        let v = video_tools_plan(Root::NoPrompt);
+        assert!(v.iter().any(|s| s.cmd.contains("apk add yt-dlp ffmpeg") && s.rollback.as_deref().is_some_and(|r| r.contains("apk del yt-dlp ffmpeg"))));
+        let z = panel_zones_plan();
+        assert!(z[0].cmd.contains("CosmicPanel.$n/v1") && z[0].cmd.contains("printf 'false'"));
+        assert!(z[0].rollback.as_deref().unwrap().contains("printf 'true'"), "undo restores the zone");
+        assert!(all_parts(Root::NoPrompt).iter().any(|(n, _)| n.contains("panel and dock")));
     }
 
     #[test]
