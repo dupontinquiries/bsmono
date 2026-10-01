@@ -263,6 +263,38 @@ pub fn rescue_console_plan(staged: &str, root: Root) -> Vec<Step> {
     ]
 }
 
+const GREETD_CONF: &str = "/etc/greetd/cosmic-greeter.toml";
+
+/// The `[initial_session]` block greetd runs ONCE at boot instead of showing the greeter: the owner
+/// is logged straight into the COSMIC session, and tideshell's own cover is the lock screen. The
+/// greeter stays the `default_session`, so a logout (or a crash of the session) still lands on a
+/// login screen rather than a dead VT.
+pub fn autologin_block(user: &str) -> String {
+    format!("\n[initial_session]\ncommand = \"start-cosmic\"\nuser = \"{user}\"\n")
+}
+
+/// Skip the cosmic-greeter login at boot (its on-screen keyboard did not let the owner in). The
+/// original file is kept as `.before-autologin` and put back on any failure. Root. Takes effect at
+/// the next boot; nothing is restarted.
+pub fn autologin_plan(user: &str, root: Root) -> Vec<Step> {
+    let bak = format!("{GREETD_CONF}.before-autologin");
+    let append = format!("printf '%s' {} >> {GREETD_CONF}", crate::deploy::shell_quote(&autologin_block(user)));
+    let restore = root_cmd(&format!("[ ! -e {bak} ] || cp -p {bak} {GREETD_CONF}"), root);
+    vec![
+        Step { on: Where::Device, what: "the greetd config is the cosmic-greeter one",
+               cmd: format!("grep -q 'default_session' {GREETD_CONF} && echo GREETD"), gate: Gate::Contains("GREETD".into()), rollback: None },
+        Step { on: Where::Device, what: "the session command exists",
+               cmd: "command -v start-cosmic && echo SESSION_CMD".into(), gate: Gate::Contains("SESSION_CMD".into()), rollback: None },
+        Step { on: Where::Device, what: "keep the greeter config as .before-autologin",
+               cmd: root_cmd(&format!("[ -e {bak} ] || cp -p {GREETD_CONF} {bak}"), root), gate: Gate::ExitZero, rollback: None },
+        Step { on: Where::Device, what: "log the owner in at boot (initial_session)",
+               cmd: root_cmd(&format!("grep -q '^\\[initial_session\\]' {GREETD_CONF} || {append}"), root), gate: Gate::ExitZero,
+               rollback: Some(restore.clone()) },
+        Step { on: Where::Device, what: "the block is there exactly once",
+               cmd: format!("grep -c '^\\[initial_session\\]' {GREETD_CONF}"), gate: Gate::Contains("1".into()), rollback: Some(restore) },
+    ]
+}
+
 /// Every part that can be replayed without arguments, in a sensible order.
 pub fn all_parts(root: Root) -> Vec<(&'static str, Vec<Step>)> {
     vec![
@@ -285,6 +317,7 @@ mod tests {
         v.extend(hatch_swap_plan("/tmp/hatch-egui.new"));
         v.extend(emergency_access_plan(root));
         v.extend(rescue_console_plan("/tmp/fp5-rescue", root));
+        v.extend(autologin_plan("user", root));
         v
     }
 
@@ -305,7 +338,7 @@ mod tests {
     fn every_step_that_changes_the_phone_can_be_undone_or_says_why_not() {
         // Steps that mutate and have no rollback must be on this short, reviewed list: an upgrade
         // cannot be un-upgraded by a one-liner, and a backup copy is harmless to leave.
-        let allowed = ["align PipeWire with them (camera plugin left alone)", "keep the running build as tideshell.prev", "keep the installed camera as snapshot-cam.prev"];
+        let allowed = ["align PipeWire with them (camera plugin left alone)", "keep the running build as tideshell.prev", "keep the installed camera as snapshot-cam.prev", "keep the greeter config as .before-autologin"];
         for s in all_steps(Root::NoPrompt) {
             let mutates = ["apk add ", "apk upgrade", "mv ", "cp ", "ln -s", "enable", "systemctl --user restart", "printf"]
                 .iter().any(|m| s.cmd.contains(m)) && !s.cmd.contains("apk add -s");
@@ -361,6 +394,22 @@ mod tests {
         let bad = std::process::Command::new(sshd).arg("-t").arg("-f").arg(dir.join("sshd_config")).output().unwrap();
         assert!(!bad.status.success(), "sshd -t must refuse a broken drop-in");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_autologin_block_is_valid_toml_for_greetd_and_keeps_the_greeter() {
+        // The real file on the phone, plus the block: it must still parse, with both sessions.
+        let file = "[terminal]\nvt = \"1\"\n\n[general]\nservice = \"cosmic-greeter\"\n\n[default_session]\ncommand = \"cosmic-greeter-start\"\nuser = \"cosmic-greeter\"\n";
+        let text = format!("{file}{}", autologin_block("user"));
+        let n_init = text.matches("[initial_session]").count();
+        assert_eq!(n_init, 1);
+        let after = text.split("[initial_session]").nth(1).unwrap();
+        assert!(after.contains("command = \"start-cosmic\"") && after.contains("user = \"user\""));
+        assert!(text.contains("[default_session]") && text.contains("cosmic-greeter-start"), "the greeter stays the fallback");
+        // The append step is idempotent: its guard greps for the header it adds.
+        let step = autologin_plan("user", Root::NoPrompt).into_iter().find(|s| s.what.starts_with("log the owner in")).unwrap();
+        assert!(step.cmd.contains("initial_session") && step.cmd.contains("||"), "{}", step.cmd);
+        assert!(step.rollback.is_some());
     }
 
     #[test]
