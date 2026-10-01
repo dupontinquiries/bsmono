@@ -117,6 +117,12 @@ pub struct Shell {
     /// Last reflow request per window, so one the compositor will not
     /// shrink cannot turn into an unmaximize/maximize loop.
     reflow_at: HashMap<u64, Millis>,
+    /// The zone total `reflow_for_zone` last saw and since when (the layout must hold still
+    /// ZONE_SETTLE_MS before any window is re-maximized), and each window's last (maximized,
+    /// width) with the time it last CHANGED (a window mid-resize is not judged).
+    zone_seen: f32,
+    zone_since: Millis,
+    win_seen: HashMap<u64, (bool, Option<i32>, Millis)>,
     now: Millis,
     last_tick: Option<Millis>,
     trace: VecDeque<String>,
@@ -190,6 +196,9 @@ impl Shell {
             peek_dx: 0.0,
             windows: Vec::new(),
             reflow_at: HashMap::new(),
+            zone_seen: 0.0,
+            zone_since: 0,
+            win_seen: HashMap::new(),
             now: 0,
             last_tick: None,
             trace: VecDeque::new(),
@@ -296,6 +305,15 @@ impl Shell {
         let windows: Vec<WindowCard> = windows.into_iter().filter(|w| !crate::is_helper_window(&w.app_id)).collect();
         self.switcher.sync(&windows);
         let out = self.carousel.sync(&windows);
+        let now = self.now;
+        self.win_seen.retain(|id, _| windows.iter().any(|w| w.id == *id));
+        for w in &windows {
+            let cur = (w.maximized, w.width);
+            let e = self.win_seen.entry(w.id).or_insert((cur.0, cur.1, now));
+            if (e.0, e.1) != cur {
+                *e = (cur.0, cur.1, now);
+            }
+        }
         self.windows = windows;
         self.rebuild_palette();
         self.emit(out)
@@ -1256,6 +1274,13 @@ impl Shell {
 
 /// Minimum time between reflow requests for one window.
     pub const REFLOW_COOLDOWN: Millis = 3000;
+    /// The exclusive zones must have held still this long before a window is re-maximized. A
+    /// carousel step maps and unmaps peeks and re-lays windows out; judging mid-change made the
+    /// shell unmaximize/maximize windows through a distorted intermediate size, over and over.
+    pub const ZONE_SETTLE_MS: Millis = 700;
+    /// A window whose maximized state or width changed less than this ago is still being laid
+    /// out by the compositor, and its reported width is not yet the answer.
+    pub const WINDOW_SETTLE_MS: Millis = 500;
 
     /// Re-maximize maximized windows that are laid out wider than the space
     /// the shell's exclusive zones leave (`reserved` px in total: the bar,
@@ -1271,9 +1296,18 @@ impl Shell {
     pub fn reflow_for_zone(&mut self, reserved: f32) -> Vec<Action> {
         let limit = self.screen.0 - reserved + 1.0;
         let now = self.now;
+        if (reserved - self.zone_seen).abs() > 0.5 {
+            self.zone_seen = reserved;
+            self.zone_since = now;
+        }
+        if now.saturating_sub(self.zone_since) < Self::ZONE_SETTLE_MS {
+            return vec![]; // the zones are still changing: hold, do not chase them
+        }
+        let settled = |id: u64| self.win_seen.get(&id).is_none_or(|(_, _, t)| now.saturating_sub(*t) >= Self::WINDOW_SETTLE_MS);
         let ids: Vec<u64> = self
             .windows
             .iter()
+            .filter(|w| settled(w.id))
             .filter(|w| w.maximized && w.width.is_some_and(|wd| wd as f32 > limit))
             .filter(|w| self.reflow_at.get(&w.id).is_none_or(|t| now.saturating_sub(*t) >= Self::REFLOW_COOLDOWN))
             .map(|w| w.id)
@@ -1730,17 +1764,61 @@ mod tests {
             card(3, false, Some(1280)), // floating: not ours to resize
             card(4, true, None),        // geometry unknown: wait
         ]);
+        // The zones appeared just now: hold until they have settled.
+        assert!(sh.reflow_for_zone(64.0).is_empty());
+        sh.tick(Shell::ZONE_SETTLE_MS + 10);
         assert_eq!(sh.reflow_for_zone(64.0), vec![Action::SetMaximized(1, false), Action::SetMaximized(1, true)]);
         // Compositor has not shrunk it yet: no repeat within the cooldown...
-        sh.tick(1000);
+        sh.tick(Shell::ZONE_SETTLE_MS + 1000);
         assert!(sh.reflow_for_zone(64.0).is_empty());
         // ...but it is retried after.
-        sh.tick(Shell::REFLOW_COOLDOWN + 10);
+        sh.tick(Shell::ZONE_SETTLE_MS + Shell::REFLOW_COOLDOWN + 20);
         assert_eq!(sh.reflow_for_zone(64.0).len(), 2);
         // Once it is laid out right, nothing happens.
         sh.set_windows(vec![card(1, true, Some(1216))]);
-        sh.tick(2 * Shell::REFLOW_COOLDOWN + 20);
+        sh.tick(2 * Shell::REFLOW_COOLDOWN + 2 * Shell::ZONE_SETTLE_MS);
         assert!(sh.reflow_for_zone(64.0).is_empty());
+    }
+
+    #[test]
+    fn a_carousel_step_does_not_make_the_shell_chase_the_layout_through_resizes() {
+        let mut sh = Shell::new(ShellPrefs::default(), (1280.0, 800.0));
+        let card = |id, maximized, width| WindowCard { maximized, width, ..win(id, false) };
+        sh.set_windows(vec![card(1, true, Some(1216))]);
+        sh.tick(5000);
+        assert!(sh.reflow_for_zone(64.0).is_empty(), "laid out right: nothing");
+        // The carousel starts: the peeks add 2 x 96 of zone. The window is now too wide for the
+        // new total, but the zones have only just appeared.
+        let reserved = 64.0 + 192.0;
+        assert!(sh.reflow_for_zone(reserved).is_empty(), "zones changed this instant");
+        sh.tick(5000 + Shell::ZONE_SETTLE_MS - 50);
+        assert!(sh.reflow_for_zone(reserved).is_empty(), "still inside the settle window");
+        // A second change inside the window restarts it (the user stepped again).
+        sh.tick(5000 + Shell::ZONE_SETTLE_MS);
+        assert!(sh.reflow_for_zone(reserved + 1.0).is_empty(), "the total moved: the clock restarts");
+        sh.tick(5000 + 2 * Shell::ZONE_SETTLE_MS - 10);
+        assert!(sh.reflow_for_zone(reserved + 1.0).is_empty());
+        // Once it has held still, the window that is genuinely too wide is fixed, once.
+        sh.tick(5000 + 2 * Shell::ZONE_SETTLE_MS + 10);
+        assert_eq!(sh.reflow_for_zone(reserved + 1.0).len(), 2);
+        assert!(sh.reflow_for_zone(reserved + 1.0).is_empty(), "and not again inside the cooldown");
+    }
+
+    #[test]
+    fn a_window_that_is_still_being_resized_is_not_judged_by_its_in_flight_width() {
+        let mut sh = Shell::new(ShellPrefs::default(), (1280.0, 800.0));
+        let card = |id, maximized, width| WindowCard { maximized, width, ..win(id, false) };
+        sh.set_windows(vec![card(1, true, Some(1216))]);
+        sh.tick(5000);
+        sh.reflow_for_zone(64.0);
+        sh.tick(6000);
+        assert!(sh.reflow_for_zone(64.0).is_empty());
+        // It just got maximized and reports the old, wide width while the compositor works.
+        sh.set_windows(vec![card(1, true, Some(1280))]);
+        sh.tick(6000 + Shell::WINDOW_SETTLE_MS - 10);
+        assert!(sh.reflow_for_zone(64.0).is_empty(), "its width changed a moment ago: wait");
+        sh.tick(6000 + Shell::WINDOW_SETTLE_MS + 10);
+        assert_eq!(sh.reflow_for_zone(64.0).len(), 2, "still too wide once it has had time: now fix it");
     }
 
     #[test]
