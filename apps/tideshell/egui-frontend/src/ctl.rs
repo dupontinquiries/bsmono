@@ -22,6 +22,10 @@ pub enum Command {
     Lock,
     Palette,
     Switcher,
+    /// Toggle carousel mode, exactly as the carousel tile does.
+    Carousel,
+    /// Take a screenshot, save it and put it on the clipboard.
+    Screenshot,
     /// Re-read the prefs file. Sent by the settings app after it writes, so
     /// a change applies now rather than at the next launch — which matters
     /// most for the settings someone reaches for BECAUSE something is wrong
@@ -45,12 +49,14 @@ impl Command {
             "lock" => Some(Command::Lock),
             "palette" => Some(Command::Palette),
             "switcher" => Some(Command::Switcher),
+            "carousel" => Some(Command::Carousel),
+            "screenshot" => Some(Command::Screenshot),
             "reload-prefs" => Some(Command::ReloadPrefs),
             _ => None,
         }
     }
 
-    pub const NAMES: [&'static str; 7] = ["power-key", "volume-up", "volume-down", "lock", "palette", "switcher", "reload-prefs"];
+    pub const NAMES: [&'static str; 9] = ["power-key", "volume-up", "volume-down", "lock", "palette", "switcher", "carousel", "screenshot", "reload-prefs"];
 }
 
 /// The keys cosmic-comp should hand to tideshell, as (keysym name, command).
@@ -285,6 +291,17 @@ pub fn send(path: &Path, cmd: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn carousel_and_screenshot_are_socket_commands_and_listed() {
+        assert_eq!(Command::parse("carousel"), Some(Command::Carousel));
+        assert_eq!(Command::parse("screenshot\n"), Some(Command::Screenshot));
+        for n in ["carousel", "screenshot"] {
+            assert!(Command::NAMES.contains(&n), "{n} is advertised in the unknown-command error");
+        }
+        assert_eq!(Command::NAMES.len(), 9);
+        assert_eq!(Command::parse("screenshots"), None);
+    }
+
     use super::*;
 
     #[test]

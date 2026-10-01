@@ -179,6 +179,10 @@ impl System {
     }
 }
 
+/// Save a screenshot under `~/Pictures/Screenshots` and put the image on the clipboard.
+/// cosmic-screenshot prints the saved path and posts its own notification.
+pub const SCREENSHOT_SH: &str = r#"d="${XDG_PICTURES_DIR:-$HOME/Pictures}/Screenshots"; mkdir -p "$d" && f=$(cosmic-screenshot --interactive=false --save-dir="$d" 2>/dev/null | tail -1) && [ -f "$f" ] && wl-copy --type image/png < "$f""#;
+
 impl Executor for System {
     fn run(&mut self, action: &Action) -> Outcome {
         match action {
@@ -205,6 +209,7 @@ impl Executor for System {
             // One instance, poke-file toggle: starts hatch if it is not running.
             // --toggle pokes a running hatch and exits, or BECOMES the
             // resident instance when none runs: treat it as long-running.
+            Action::Screenshot => self.start(&["sh", "-c", SCREENSHOT_SH], false),
             Action::SummonLauncher => {
                 let prog = pick_launcher(&std::env::var("PATH").unwrap_or_default(), std::env::var("HATCH_BIN").ok().as_deref());
                 self.start(&[prog.as_str(), "--toggle"], true)
@@ -977,6 +982,17 @@ mod fleet_sleep_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_screenshot_script_saves_then_copies_the_saved_png_and_only_if_it_exists() {
+        let s = SCREENSHOT_SH;
+        assert!(s.contains("cosmic-screenshot --interactive=false"), "{s}");
+        assert!(s.contains("--save-dir=\"$d\"") && s.contains("Pictures}/Screenshots"), "saved where a person looks: {s}");
+        assert!(s.contains("wl-copy --type image/png < \"$f\""), "the image, not its path: {s}");
+        assert!(s.contains("[ -f \"$f\" ]"), "nothing is copied when the shot failed: {s}");
+        // the order matters: the copy comes after the save
+        assert!(s.find("cosmic-screenshot").unwrap() < s.find("wl-copy").unwrap());
+    }
+
     use super::*;
     use tideshell_core::prefs::Layout;
 

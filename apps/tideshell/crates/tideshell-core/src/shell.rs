@@ -336,6 +336,8 @@ impl Shell {
             // of the three modes is current -- the tile's own label carries
             // that (see the drawer's rendering).
             QuickKind::CpuGovernor => true,
+            // Momentary: it is never "on".
+            QuickKind::Screenshot => false,
             k => self.drawer.system_state(k),
         }
     }
@@ -885,6 +887,10 @@ impl Shell {
                 self.prefs.autorotate = self.rotate.enabled;
                 self.log(format!("auto-rotate {}", if self.rotate.enabled { "on" } else { "off" }));
                 self.emit(vec![Action::SavePrefs])
+            }
+            QuickKind::Screenshot => {
+                self.log("screenshot");
+                self.emit(vec![Action::Screenshot])
             }
             QuickKind::CpuGovernor => {
                 let a = self.drawer.cycle_governor();
@@ -1639,6 +1645,8 @@ mod tests {
         assert!(sh.drawer.is_visible());
         assert_eq!(sh.tap_quick(QuickKind::Trackpad), vec![Action::ShowTrackpad(true)]);
         assert_eq!(sh.tap_quick(QuickKind::Wifi), vec![Action::SetQuick(QuickKind::Wifi, true)]);
+        assert_eq!(sh.tap_quick(QuickKind::Screenshot), vec![Action::Screenshot], "the tile is a momentary action");
+        assert!(!sh.quick_state(QuickKind::Screenshot), "and never shows as on");
         assert_eq!(sh.long_press_quick(QuickKind::Wifi), vec![Action::LaunchApp("com.system76.CosmicSettings.Wireless".into())]);
         assert_eq!(sh.long_press_quick(QuickKind::Bluetooth), vec![Action::LaunchApp("com.system76.CosmicSettings.Bluetooth".into())]);
         assert!(sh.long_press_quick(QuickKind::Flashlight).is_empty(), "a long press never toggles or launches on the other tiles");

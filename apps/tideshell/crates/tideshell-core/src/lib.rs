@@ -103,6 +103,8 @@ pub enum Action {
     SetMaximized(u64, bool),
     /// Launch a desktop entry by id through hatch-core (so recents stay shared).
     LaunchApp(String),
+    /// Take a screenshot, save it, and put it on the clipboard.
+    Screenshot,
     /// Summon hatch's full app grid (`hatch-egui --toggle`).
     SummonLauncher,
     /// rusty-board `io.rustyboard.Keyboard1.Show` / `Hide`.

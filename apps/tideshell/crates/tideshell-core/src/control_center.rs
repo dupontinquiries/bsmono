@@ -31,6 +31,8 @@ pub enum QuickKind {
     /// see `CpuGovernor` -- so it is a mode tile like Keyboard/Trackpad/Carousel:
     /// routed specially in `Shell::tap_quick`, skipped by `toggle_system`.
     CpuGovernor,
+    /// A momentary action, not a state: tapping it takes a screenshot (and `ctl screenshot` does the same).
+    Screenshot,
 }
 
 /// The three governors this shell offers, in cycle order.
@@ -88,7 +90,7 @@ impl CpuGovernor {
 }
 
 impl QuickKind {
-    pub const ALL: [QuickKind; 12] = [
+    pub const ALL: [QuickKind; 13] = [
         QuickKind::Wifi,
         QuickKind::Bluetooth,
         QuickKind::MobileData,
@@ -101,6 +103,7 @@ impl QuickKind {
         QuickKind::Carousel,
         QuickKind::AutoBrightness,
         QuickKind::CpuGovernor,
+        QuickKind::Screenshot,
     ];
 
     pub fn token(self) -> &'static str {
@@ -117,6 +120,7 @@ impl QuickKind {
             QuickKind::Carousel => "carousel",
             QuickKind::AutoBrightness => "auto-brightness",
             QuickKind::CpuGovernor => "cpu-governor",
+            QuickKind::Screenshot => "screenshot",
         }
     }
 
@@ -149,13 +153,14 @@ impl QuickKind {
             QuickKind::Carousel => "Carousel",
             QuickKind::AutoBrightness => "Auto bright",
             QuickKind::CpuGovernor => "CPU mode",
+            QuickKind::Screenshot => "Screenshot",
         }
     }
 
     /// Shell-mode tiles are owned by `Shell::modes`, not by this drawer.
     pub fn is_mode(self) -> bool {
         matches!(self, QuickKind::Keyboard | QuickKind::Trackpad | QuickKind::Carousel
-                     | QuickKind::AutoBrightness | QuickKind::CpuGovernor | QuickKind::Rotation)
+                     | QuickKind::AutoBrightness | QuickKind::CpuGovernor | QuickKind::Rotation | QuickKind::Screenshot)
     }
 }
 

@@ -1211,6 +1211,11 @@ fn main() {
                     Ok(Command::Lock) => sb.shell.lock_now(),
                     Ok(Command::Palette) => sb.shell.open_palette(),
                     Ok(Command::Switcher) => sb.shell.open_switcher(),
+                    Ok(Command::Carousel) => {
+                        let out = sb.shell.toggle_mode(tideshell_core::hold::HoldOption::Carousel);
+                        sb.execute(out);
+                    }
+                    Ok(Command::Screenshot) => sb.execute(vec![tideshell_core::Action::Screenshot]),
                     // The settings app decided what the chain should do; we
                     // are the process with the PipeWire connection.
                     Ok(Command::ReloadPrefs) => {
