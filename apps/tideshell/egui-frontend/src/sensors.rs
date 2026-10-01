@@ -384,24 +384,20 @@ impl OrientationFeed {
                     set("orientation: no system bus".into());
                     return;
                 };
-                let p = match sensor_proxy(&bus) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        set(format!("orientation: iio-sensor-proxy unavailable ({e})"));
-                        return;
+                // iio-sensor-proxy finds the accelerometer a while AFTER login (17 s on the
+                // FP5, measured): asking once at start-up said "no accelerometer" and rotation
+                // stayed dead until the next restart. Keep asking.
+                let p = loop {
+                    match sensor_proxy(&bus) {
+                        Ok(p) => match p.get_property::<bool>("HasAccelerometer") {
+                            Ok(true) => break p,
+                            Ok(false) => set("orientation: iio-sensor-proxy reports no accelerometer (yet)".into()),
+                            Err(e) => set(format!("orientation: HasAccelerometer: {e}")),
+                        },
+                        Err(e) => set(format!("orientation: iio-sensor-proxy unavailable ({e})")),
                     }
+                    std::thread::sleep(Duration::from_secs(3));
                 };
-                match p.get_property::<bool>("HasAccelerometer") {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        set("orientation: iio-sensor-proxy reports no accelerometer".into());
-                        return;
-                    }
-                    Err(e) => {
-                        set(format!("orientation: HasAccelerometer: {e}"));
-                        return;
-                    }
-                }
                 if let Err(e) = p.call_method("ClaimAccelerometer", &()) {
                     set(format!("orientation: ClaimAccelerometer: {e}"));
                     return;
