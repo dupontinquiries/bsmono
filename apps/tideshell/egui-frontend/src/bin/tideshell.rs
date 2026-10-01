@@ -944,7 +944,11 @@ fn main() {
                     // exactly wrong for a tint that is supposed to mean
                     // something about the room.
                     exposure: Some(camera::Exposure::default()),
+                    turn: 0,
                 };
+                // Upright is decided from the sensor behind the chosen camera, after the name
+                // is known (the struct literal above cannot see its own `name`).
+                let choice = camera::CameraChoice { turn: camera::upright_turn(choice.name.as_deref()), ..choice };
                 sb.camera = Some(camera::ChildSource::start(&camera::gst_command(&choice, camera::FRAME_W, camera::FRAME_H), camera::FRAME_W, camera::FRAME_H));
             }
             camera::DutyAction::Stop => {

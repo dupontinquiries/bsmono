@@ -15,8 +15,10 @@ apps/tideshell/deploy
 apps/tideshell/egui-frontend
 apps/tideshell/settings
 shared/ambient-palette
+shared/capture-kit
 shared/config-kit
 shared/cosmic-levers
+shared/device-kit
 shared/math-kit
 shared/settings-kit
 shared/speaker-pose

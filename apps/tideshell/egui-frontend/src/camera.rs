@@ -40,6 +40,11 @@ pub struct CameraChoice {
     pub fps: Option<u32>,
     /// Freeze the exposure. See [`Exposure`].
     pub exposure: Option<Exposure>,
+    /// Clockwise degrees (0/90/180/270) the picture must be turned to be upright. The
+    /// FP5's three sensors all report `camera_sensor_rotation = 270` and libcamerasrc
+    /// applies none of it, so the lock-screen pane showed the room turned 90 degrees
+    /// clockwise — and, because the pane is portrait and the sensor landscape, squeezed.
+    pub turn: u32,
 }
 
 /// A fixed exposure, so what the pane shows is how bright the room actually
@@ -95,7 +100,7 @@ impl CameraChoice {
             let (w, h) = c.trim().split_once(['x', 'X'])?;
             Some((w.parse().ok()?, h.parse().ok()?))
         });
-        CameraChoice { name, capture, fps: None, exposure: None }
+        CameraChoice { name, capture, fps: None, exposure: None, turn: 0 }
     }
 }
 
@@ -339,8 +344,11 @@ pub fn glass(frame: &Frame, cols: usize, rows: usize) -> Vec<[u8; 3]> {
 }
 
 /// The pipeline the phone runs: libcamera through GStreamer, scaled to the
-/// pane's size, RGBA on stdout. `videoflip` is not applied: the pane
-/// rotates with the shell.
+/// pane's size, RGBA on stdout. With `choice.turn` set the picture is turned
+/// upright AFTER the scale down: a quarter turn swaps the axes, so it scales to the
+/// pane's size transposed (`h`x`w`) and `videoflip` then turns that small frame into
+/// `w`x`h`. Flipping first would rotate the sensor's full 4096x3072 frame on the CPU
+/// to throw most of it away.
 pub fn gst_command(choice: &CameraChoice, w: usize, h: usize) -> Vec<String> {
     let mut v: Vec<String> = vec!["gst-launch-1.0".into(), "-q".into(), "libcamerasrc".into()];
     if let Some(n) = &choice.name {
@@ -374,11 +382,48 @@ pub fn gst_command(choice: &CameraChoice, w: usize, h: usize) -> Vec<String> {
     for a in ["!", "videoconvert", "!", "videoscale", "!"] {
         v.push(a.into());
     }
-    v.push(format!("video/x-raw,format=RGBA,width={w},height={h}"));
+    let method = match choice.turn % 360 { 90 => Some("clockwise"), 180 => Some("rotate-180"), 270 => Some("counterclockwise"), _ => None };
+    let (sw, sh) = if matches!(choice.turn % 360, 90 | 270) { (h, w) } else { (w, h) };
+    v.push(format!("video/x-raw,format=RGBA,width={sw},height={sh}"));
+    if let Some(m) = method {
+        for a in ["!", "videoflip"] { v.push(a.into()); }
+        v.push(format!("method={m}"));
+    }
     for a in ["!", "fdsink", "fd=1", "sync=false"] {
         v.push(a.into());
     }
     v
+}
+
+/// Clockwise degrees to turn the picture of libcamera camera `camera_id` upright.
+///
+/// `TIDESHELL_CAMERA_TURN` (0/90/180/270) wins — the person's say over the sensor's.
+/// Otherwise the sensor behind the id is found by its I2C address
+/// (`capture_kit::focus::sensor_for_camera_id`) and its `camera_sensor_rotation` read.
+/// No id, an unknown sensor or a failed read is 0: leave the picture alone rather than
+/// guess a turn. Cached per id — `Start` runs every duty cycle and the answer does not change.
+pub fn upright_turn(camera_id: Option<&str>) -> u32 {
+    if let Some(n) = std::env::var("TIDESHELL_CAMERA_TURN").ok().and_then(|v| v.trim().parse::<i64>().ok()) {
+        return capture_kit::orient::Rotation::from_degrees(n).degrees();
+    }
+    let Some(id) = camera_id else { return 0 };
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(v) = cache.lock().ok().and_then(|c| c.get(id).copied()) { return v; }
+    let v = upright_turn_from(id, &capture_kit::focus::list_subdevs(),
+        |dev| capture_kit::orient::read_mounting("v4l2-ctl", dev).ok());
+    if let Ok(mut c) = cache.lock() { c.insert(id.to_string(), v); }
+    v
+}
+
+/// [`upright_turn`] with the world passed in, so it is tested without a camera.
+pub fn upright_turn_from(
+    camera_id: &str,
+    subdevs: &[(String, String)],
+    read: impl Fn(&str) -> Option<capture_kit::orient::Mounting>,
+) -> u32 {
+    let Some((path, _)) = capture_kit::focus::sensor_for_camera_id(camera_id, subdevs) else { return 0 };
+    capture_kit::orient::turn_for(None, read(path)).degrees()
 }
 
 /// The capture size to ask the sensor for, with a fallback. The default
@@ -567,7 +612,7 @@ mod tests {
         // The FP5's main rear camera, as `cam -l` printed it there.
         let id = "/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a";
         let c = CameraChoice::from_vars(Some(id), Some("1280x960"));
-        assert_eq!(c, CameraChoice { name: Some(id.into()), capture: Some((1280, 960)), fps: None, exposure: None });
+        assert_eq!(c, CameraChoice { name: Some(id.into()), capture: Some((1280, 960)), fps: None, exposure: None, turn: 0 });
         let cmd = gst_command(&c, 240, 320);
         let at = |x: &str| cmd.iter().position(|a| a == x).unwrap_or_else(|| panic!("{x} missing: {cmd:?}"));
         assert_eq!(at("libcamerasrc") + 1, at(&format!("camera-name={id}")), "the property belongs to libcamerasrc");
@@ -609,14 +654,14 @@ Available cameras:
 
     #[test]
     fn capping_the_rate_happens_at_the_source() {
-        let c = CameraChoice { name: Some("/base/cam@1a".into()), capture: Some((640, 480)), fps: Some(1), exposure: None };
+        let c = CameraChoice { name: Some("/base/cam@1a".into()), capture: Some((640, 480)), fps: Some(1), exposure: None, turn: 0 };
         let line = gst_command(&c, GLASS_W, GLASS_H).join(" ");
         assert!(line.contains("camera-name=/base/cam@1a"));
         assert!(line.contains("width=640,height=480,framerate=1/1"), "on the capture caps, not only downstream: {line}");
         assert!(line.contains("videorate"));
         assert!(line.contains("width=32,height=40"));
         // No fps asked for: the pipeline is exactly as it was before.
-        let plain = CameraChoice { name: None, capture: None, fps: None, exposure: None };
+        let plain = CameraChoice { name: None, capture: None, fps: None, exposure: None, turn: 0 };
         let l2 = gst_command(&plain, 240, 320).join(" ");
         assert!(!l2.contains("framerate") && !l2.contains("videorate"));
     }
@@ -731,14 +776,14 @@ mod exposure_tests {
 
     #[test]
     fn a_frozen_exposure_reaches_the_pipeline() {
-        let c = CameraChoice { name: None, capture: None, fps: Some(2), exposure: Some(Exposure::default()) };
+        let c = CameraChoice { name: None, capture: None, fps: Some(2), exposure: Some(Exposure::default()), turn: 0 };
         let line = gst_command(&c, GLASS_W, GLASS_H).join(" ");
         assert!(line.contains("ae-enable=false"), "auto exposure must be off: {line}");
         assert!(line.contains("awb-enable=false"), "and auto white balance, or the tint is neutralised");
         assert!(line.contains("exposure-time=20000"));
         assert!(line.contains("analogue-gain=2.000"));
         // Not asked for: the pipeline is exactly as before.
-        let plain = CameraChoice { name: None, capture: None, fps: None, exposure: None };
+        let plain = CameraChoice { name: None, capture: None, fps: None, exposure: None, turn: 0 };
         assert!(!gst_command(&plain, 240, 320).join(" ").contains("ae-enable"));
     }
 
@@ -820,5 +865,58 @@ mod live_tests {
         let mut p = CaptureProbe::default();
         assert!(p.observe(3).unwrap().contains("works"));
         assert_eq!(p.request(), Some((640, 480)));
+    }
+
+    // ---- upright: the picture turned the right way, cheaply ----
+
+    fn flip_of(turn: u32) -> Vec<String> {
+        gst_command(&CameraChoice { turn, ..CameraChoice::default() }, 240, 320)
+    }
+    fn at(cmd: &[String], needle: &str) -> Option<usize> { cmd.iter().position(|a| a.contains(needle)) }
+
+    #[test]
+    fn a_quarter_turn_scales_to_the_transposed_size_then_flips() {
+        let cmd = flip_of(270);
+        let scale = at(&cmd, "format=RGBA").expect("RGBA caps");
+        assert!(cmd[scale].contains("width=320,height=240"), "scales to the LANDSCAPE size first: {}", cmd[scale]);
+        let flip = at(&cmd, "videoflip").expect("a flip element");
+        assert!(flip > scale, "the flip runs AFTER the scale down, on the small frame");
+        assert_eq!(cmd[flip + 1], "method=counterclockwise");
+        assert!(at(&cmd, "fdsink").unwrap() > flip);
+    }
+
+    #[test]
+    fn each_turn_picks_its_method_and_half_turn_keeps_the_axes() {
+        assert_eq!(flip_of(90)[at(&flip_of(90), "videoflip").unwrap() + 1], "method=clockwise");
+        let half = flip_of(180);
+        assert_eq!(half[at(&half, "videoflip").unwrap() + 1], "method=rotate-180");
+        assert!(half[at(&half, "format=RGBA").unwrap()].contains("width=240,height=320"), "a half turn does not swap axes");
+    }
+
+    #[test]
+    fn upright_means_no_flip_and_the_pane_size_unchanged() {
+        for turn in [0, 45, 360] {
+            let cmd = flip_of(turn);
+            assert!(at(&cmd, "videoflip").is_none(), "turn {turn}");
+            assert!(cmd[at(&cmd, "format=RGBA").unwrap()].contains("width=240,height=320"), "turn {turn}");
+        }
+    }
+
+    fn fp5() -> Vec<(String, String)> {
+        [("/dev/v4l-subdev27", "s5kjn1 19-0010"), ("/dev/v4l-subdev28", "imx800 16-001a"),
+         ("/dev/v4l-subdev29", "imx858 17-0029"), ("/dev/v4l-subdev30", "dw9719 17-000e")]
+            .iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    #[test]
+    fn a_camera_id_becomes_the_turn_its_sensor_asks_for() {
+        use capture_kit::orient::{Facing, Mounting};
+        let mount = |_: &str| Some(Mounting { rotation_degrees: 270, facing: Some(Facing::Back) });
+        for id in ["/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a", "/base/soc@0/cci@ac4a000/i2c-bus@1/camera@29"] {
+            assert_eq!(upright_turn_from(id, &fp5(), mount), 270, "{id}");
+        }
+        assert_eq!(upright_turn_from("/base/soc@0/cci@ac4a000/i2c-bus@1/camera@0e", &fp5(), mount), 0, "the lens motor is not a camera");
+        assert_eq!(upright_turn_from("/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a", &fp5(), |_| None), 0, "an unreadable sensor leaves the picture alone");
+        assert_eq!(upright_turn_from("garbage", &fp5(), mount), 0);
     }
 }
