@@ -9,6 +9,10 @@
 Description=tideshell touch shell (edge gestures, switcher, control center)
 PartOf=graphical-session.target
 After=graphical-session.target
+# A crash loop must not spin: stop after 5 failures in 60 s. These belong in [Unit];
+# under [Service] systemd ignores them ("Unknown key") and the limit never applied.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 ExecStart=%h/.local/bin/tideshell
@@ -20,9 +24,6 @@ Environment=TIDESHELL_TRACE=stderr
 EnvironmentFile=-%h/.config/tideshell/env
 Restart=on-failure
 RestartSec=3
-# A crash loop must not spin: stop after 5 failures in 60 s.
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 [Install]
 WantedBy=graphical-session.target
