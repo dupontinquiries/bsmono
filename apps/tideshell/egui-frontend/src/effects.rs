@@ -753,20 +753,50 @@ pub fn flashlight_led(base: &std::path::Path) -> Option<PathBuf> {
     })
 }
 
-/// Light or darken the flashlight: `max_brightness` for on, 0 for off. The FP5's `white:flash` LED is
-/// writable by the logged-in user, so no privilege is needed.
+/// Where a lit flashlight starts, as a fraction of the LED's maximum: soft, so switching it on in a
+/// dark room does not blind. (Raising it is the next gesture to build; tap-and-hold turns it off.)
+pub const FLASH_SOFT: f32 = 0.12;
+const FLASH_IN_MS: u64 = 700;
+const FLASH_OUT_MS: u64 = 450;
+const FLASH_STEP_MS: u64 = 25;
+
+/// Brightness steps from `from` to `to` (raw LED units), eased in perceived brightness: the eye
+/// reads roughly the square root of light, so equal steps in sqrt look like an even fade.
+pub fn flash_steps(from: u32, to: u32, n: usize) -> Vec<u32> {
+    let (a, b) = ((from as f32).sqrt(), (to as f32).sqrt());
+    (1..=n).map(|i| { let v = a + (b - a) * i as f32 / n as f32; (v * v).round() as u32 }).collect()
+}
+
+static FLASH_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Fade the flashlight to `on` (soft level) or off, on a thread; a newer request cancels an older
+/// fade. The FP5's `white:flash` LED is writable by the logged-in user, so no privilege is needed.
 pub fn set_flashlight(base: &std::path::Path, on: bool) -> Outcome {
+    use std::sync::atomic::Ordering;
     let Some(led) = flashlight_led(base) else { return Outcome::Failed(format!("no flash/torch LED under {}", base.display())) };
-    let level = if on {
-        match std::fs::read_to_string(led.join("max_brightness")).ok().and_then(|s| s.trim().parse::<u32>().ok()) {
-            Some(m) if m > 0 => m,
-            _ => return Outcome::Failed(format!("{}: unreadable max_brightness", led.display())),
-        }
-    } else { 0 };
-    match std::fs::write(led.join("brightness"), level.to_string()) {
-        Ok(()) => Outcome::Done(format!("{} -> {level}", led.display())),
-        Err(e) => Outcome::Failed(format!("{}: {e}", led.join("brightness").display())),
+    let max = match std::fs::read_to_string(led.join("max_brightness")).ok().and_then(|s| s.trim().parse::<u32>().ok()) {
+        Some(m) if m > 0 => m,
+        _ if !on => 0,
+        _ => return Outcome::Failed(format!("{}: unreadable max_brightness", led.display())),
+    };
+    let node = led.join("brightness");
+    let from = std::fs::read_to_string(&node).ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(0);
+    let to = if on { ((max as f32 * FLASH_SOFT).round() as u32).max(1) } else { 0 };
+    if let Err(e) = std::fs::OpenOptions::new().write(true).open(&node) {
+        return Outcome::Failed(format!("{}: {e}", node.display()));
     }
+    let gen = FLASH_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let ms = if on { FLASH_IN_MS } else { FLASH_OUT_MS };
+    let steps = flash_steps(from, to, (ms / FLASH_STEP_MS) as usize);
+    std::thread::spawn(move || {
+        for v in steps {
+            if FLASH_GEN.load(Ordering::SeqCst) != gen { return; }
+            let _ = std::fs::write(&node, v.to_string());
+            std::thread::sleep(std::time::Duration::from_millis(FLASH_STEP_MS));
+        }
+        if FLASH_GEN.load(Ordering::SeqCst) == gen { let _ = std::fs::write(&node, to.to_string()); }
+    });
+    Outcome::Done(format!("{} fading {from} -> {to} of {max}", led.display()))
 }
 
 fn apply_quick(kind: tideshell_core::control_center::QuickKind, on: bool) -> Outcome {
@@ -1285,15 +1315,35 @@ mod tests {
         base
     }
 
+    fn settled(path: &std::path::Path, want: &str) -> bool {
+        for _ in 0..80 {
+            if std::fs::read_to_string(path).map(|s| s == want).unwrap_or(false) { return true; }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        false
+    }
+
     #[test]
-    fn the_flashlight_lights_to_max_and_goes_dark_and_ignores_other_leds() {
+    fn the_flashlight_fades_in_soft_and_out_to_dark_and_ignores_other_leds() {
         // Names as found on the FP5: `mmc2::` (storage activity) and `white:flash`.
         let base = fake_leds("ok", &[("mmc2::", Some("1")), ("white:flash", Some("255"))]);
+        let node = base.join("white:flash/brightness");
         assert!(matches!(set_flashlight(&base, true), Outcome::Done(_)));
-        assert_eq!(std::fs::read_to_string(base.join("white:flash/brightness")).unwrap(), "255");
+        assert!(settled(&node, "31"), "soft = 12% of 255, got {:?}", std::fs::read_to_string(&node));
         assert_eq!(std::fs::read_to_string(base.join("mmc2::/brightness")).unwrap(), "0", "the storage LED is not a torch");
         assert!(matches!(set_flashlight(&base, false), Outcome::Done(_)));
-        assert_eq!(std::fs::read_to_string(base.join("white:flash/brightness")).unwrap(), "0");
+        assert!(settled(&node, "0"));
+    }
+
+    #[test]
+    fn a_fade_is_monotonic_eased_and_lands_exactly() {
+        let up = flash_steps(0, 31, 28);
+        assert_eq!(*up.last().unwrap(), 31);
+        assert!(up.windows(2).all(|w| w[0] <= w[1]), "never dips: {up:?}");
+        assert!(up[0] <= 1 && up[13] < 31 / 2 + 2, "starts imperceptibly: {up:?}");
+        let down = flash_steps(31, 0, 18);
+        assert_eq!(*down.last().unwrap(), 0);
+        assert!(down.windows(2).all(|w| w[0] >= w[1]));
     }
 
     #[test]
