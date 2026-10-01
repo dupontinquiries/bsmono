@@ -380,9 +380,14 @@ impl Shell {
         if streaking && !self.switcher.is_streaking() {
             self.log("quick-switch streak settled");
         }
+        let rotate_blocked = self.lock.is_locked() || self.sleep.captures_input();
+        let mut out = vec![];
+        if let Some(o) = self.rotate.poll(now, rotate_blocked) {
+            self.log(format!("rotate {o:?}"));
+            out.extend(self.emit(vec![Action::Rotate(o.transform_deg(self.prefs.rotate_flip))]));
+        }
         let events = self.recognizer.tick(now);
         self.drain_recognizer_log();
-        let mut out = vec![];
         for a in self.sleep.tick(dt) {
             out.extend(self.on_sleep_action(a));
         }

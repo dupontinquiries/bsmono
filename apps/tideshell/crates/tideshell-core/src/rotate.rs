@@ -70,13 +70,20 @@ impl AutoRotate {
             self.candidate = None;
             return None;
         }
-        let since = match self.candidate {
-            Some((c, t)) if c == o => t,
-            _ => {
-                self.candidate = Some((o, now));
-                now
-            }
-        };
+        if !matches!(self.candidate, Some((c, _)) if c == o) {
+            self.candidate = Some((o, now));
+        }
+        self.poll(now, blocked)
+    }
+
+    /// Apply the candidate if it has held long enough. iio-sensor-proxy only
+    /// reports CHANGES, so a single reading is all that ever arrives: the hold
+    /// has to be judged by the clock (the shell's tick), not by a second reading.
+    pub fn poll(&mut self, now: Millis, blocked: bool) -> Option<Orientation> {
+        if !self.enabled {
+            return None;
+        }
+        let Some((o, since)) = self.candidate else { return None };
         if now.saturating_sub(since) < HOLD_MS {
             return None;
         }
@@ -113,6 +120,16 @@ mod tests {
         assert_eq!(r.on_reading("left-up", 500, false), None, "restarted the hold");
         assert_eq!(r.on_reading("left-up", 500 + HOLD_MS, false), Some(Orientation::LeftUp));
         assert_eq!(r.on_reading("left-up", 2000, false), None, "no repeat while it holds");
+    }
+
+    #[test]
+    fn a_single_reading_applies_once_the_clock_passes_the_hold() {
+        // The proxy reports changes only: one "left-up", then silence.
+        let mut r = AutoRotate::default();
+        assert_eq!(r.on_reading("left-up", 0, false), None);
+        assert_eq!(r.poll(HOLD_MS - 1, false), None);
+        assert_eq!(r.poll(HOLD_MS, false), Some(Orientation::LeftUp));
+        assert_eq!(r.poll(HOLD_MS * 4, false), None, "applied once");
     }
 
     #[test]
