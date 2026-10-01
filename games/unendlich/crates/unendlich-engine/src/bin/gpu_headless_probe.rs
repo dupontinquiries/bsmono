@@ -594,7 +594,7 @@ fn main() {
                 }
             }
             if n > 0 {
-                println!("GPU mesh headless: {n} chunks, avg {} us/chunk (lavapipe)", tot_us / n as u128);
+                println!("GPU mesh headless: {n} chunks, avg {} us/chunk ({})", tot_us / n as u128, info.driver_name);
             }
         }
         Err(e) => eprintln!("SparseGpuMesher::new (headless) FAILED: {e}"),

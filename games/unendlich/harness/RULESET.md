@@ -118,6 +118,10 @@ pure-module flow.
 - **R25 (layout parity):** push-constant + UBO/SSBO structs match Rust↔GLSL (ubo_parity.py); reuse
   documented-free UBO slots (R3/R9/R16); kernels use the shared ComputeHarness binding/dispatch shape.
 - **R26 (.spv regen):** any shader edit regenerates the .spv (subsumes R2 for compute kernels).
+- **R27 (hardware tier):** timing and driver behaviour are claimed only from `harness/gpu_hw_check.sh`,
+  which runs the headless probe on a real GPU and goes RED (exit 2) if the device it ran on is a CPU
+  device. lavapipe numbers prove correctness, never speed. On Asahi both Honeykrisp and llvmpipe are
+  enumerated — see docs/agents/APPLE_M2_GPU_STACK.md for the device, the measured numbers and the hazards.
 
 ## Discovery (R0) — run relevant.sh BEFORE touching a topic
 Before starting work on ANY topic — a new system, a fix, or a "does X already exist?" question — run
