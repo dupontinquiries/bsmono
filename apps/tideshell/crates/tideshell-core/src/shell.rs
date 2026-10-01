@@ -464,7 +464,7 @@ impl Shell {
         }
         let events = self.recognizer.tick(now);
         self.drain_recognizer_log();
-        for a in self.sleep.tick(dt) {
+        for a in self.sleep.tick(dt).into_iter().chain(self.sleep.quiet(now)) {
             out.extend(self.on_sleep_action(a));
         }
         self.palette.tick(dt);
@@ -1160,13 +1160,12 @@ impl Shell {
     /// The compositor reported the panel's power (whoever changed it).
     pub fn on_display_reported(&mut self, on: bool, now: Millis) -> Vec<Action> {
         self.now = self.now.max(now);
-        let acts = self.sleep.display_reported(on);
-        if !acts.is_empty() {
-            self.log(if on {
-                "display lit while asleep without a triple tap (cosmic-idle?): turning it off again"
-            } else {
-                "compositor blanked the display: adopted as screen sleep"
-            });
+        let refused = self.sleep.refused_wakes;
+        let acts = self.sleep.display_reported(on, now);
+        if on && self.sleep.refused_wakes != refused {
+            self.log("display lit while asleep without a triple tap: staying black, blanking again when quiet");
+        } else if !on && !acts.is_empty() {
+            self.log("compositor blanked the display: adopted as screen sleep");
         }
         acts.into_iter().flat_map(|a| self.on_sleep_action(a)).collect()
     }

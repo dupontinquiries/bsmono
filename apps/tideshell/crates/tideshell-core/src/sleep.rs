@@ -42,6 +42,11 @@ pub const TAP_SLOP: f32 = 24.0;
 pub const TRIPLE_WINDOW_MS: Millis = 700;
 pub const CLUSTER: f32 = 90.0;
 pub const POCKET_HOLD_MS: Millis = 800;
+/// A panel lit by someone else while we are Off stays lit (black, capturing taps) this long after
+/// its last touch, then is turned off ONCE. Refusing at once made every touch event of a swipe
+/// light and blank the panel again, ~5 ms apart: 132 times in one boot, with a DSI command
+/// timeout in the kernel at the same instant, and the triple tap never got to complete.
+pub const RELIGHT_GRACE_MS: Millis = 5000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -76,6 +81,10 @@ pub struct Sleep {
     pub external_blanks: u32,
     /// Times the panel was lit while Off without a triple tap (turned off again).
     pub refused_wakes: u32,
+    /// The panel was lit by someone else while Off, and the time of the last touch since. While
+    /// `Some`, the panel is on but black (OLED: no light, almost no power) and the wake detector
+    /// keeps running; `quiet` turns it off again after RELIGHT_GRACE_MS.
+    lit_at: Option<Millis>,
     /// The bedside clock is lighting the panel on purpose (nightclock.rs):
     /// a lit report now is ours, not an intruder's.
     pub glance: bool,
@@ -85,7 +94,7 @@ pub struct Sleep {
 
 impl Default for Sleep {
     fn default() -> Self {
-        Sleep { phase: Phase::Awake, black: 0.0, lock_on_sleep: true, taps: Vec::new(), down: None, near: false, near_cleared_at: None, external_blanks: 0, refused_wakes: 0, glance: false, evening: false }
+        Sleep { phase: Phase::Awake, black: 0.0, lock_on_sleep: true, taps: Vec::new(), down: None, near: false, near_cleared_at: None, external_blanks: 0, refused_wakes: 0, lit_at: None, glance: false, evening: false }
     }
 }
 
@@ -131,7 +140,7 @@ impl Sleep {
     /// doc: blanking we did not ask for is adopted as Off; the panel lit while
     /// we are Off (not via `wake`, which moves to FadingIn first) is turned off
     /// again.
-    pub fn display_reported(&mut self, on: bool) -> Vec<SleepAction> {
+    pub fn display_reported(&mut self, on: bool, now: Millis) -> Vec<SleepAction> {
         match (on, self.phase) {
             (false, Phase::Awake | Phase::FadingIn) => {
                 self.phase = Phase::Off;
@@ -145,8 +154,16 @@ impl Sleep {
                 }
             }
             (true, Phase::Off) if !self.glance => {
-                self.refused_wakes += 1;
-                vec![SleepAction::DisplayPower(false)]
+                // Stay black and keep listening; `quiet` blanks the panel once things settle.
+                if self.lit_at.is_none() {
+                    self.refused_wakes += 1;
+                }
+                self.lit_at = Some(now);
+                vec![]
+            }
+            (false, Phase::Off) => {
+                self.lit_at = None;
+                vec![]
             }
             _ => vec![],
         }
@@ -167,7 +184,20 @@ impl Sleep {
         }
     }
 
+    /// Called every tick with the clock: turn off a panel somebody else lit while we are Off,
+    /// once, after RELIGHT_GRACE_MS without a touch (and never mid-touch).
+    pub fn quiet(&mut self, now: Millis) -> Vec<SleepAction> {
+        match (self.phase, self.lit_at) {
+            (Phase::Off, Some(t)) if self.down.is_none() && now.saturating_sub(t) >= RELIGHT_GRACE_MS => {
+                self.lit_at = None;
+                vec![SleepAction::DisplayPower(false)]
+            }
+            _ => vec![],
+        }
+    }
+
     fn wake(&mut self) -> Vec<SleepAction> {
+        self.lit_at = None;
         let was_off = self.phase == Phase::Off;
         self.phase = Phase::FadingIn;
         self.reset_taps();
@@ -208,6 +238,9 @@ impl Sleep {
         if !self.captures_input() || self.is_covered(now) {
             return vec![];
         }
+        if self.lit_at.is_some() {
+            self.lit_at = Some(now); // a touch keeps the lit black panel from being blanked under it
+        }
         // A second finger means "not a deliberate tap sequence".
         if self.down.is_some() {
             self.reset_taps();
@@ -234,6 +267,9 @@ impl Sleep {
             return vec![];
         }
         self.down = None;
+        if self.lit_at.is_some() {
+            self.lit_at = Some(now);
+        }
         let is_tap = !moved && now.saturating_sub(t0) <= TAP_MAX_MS;
         let clustered = self.taps.first().is_none_or(|f| (x - f.1).hypot(y - f.2) <= CLUSTER);
         let in_window = self.taps.first().is_none_or(|f| now.saturating_sub(f.0) <= TRIPLE_WINDOW_MS);
@@ -413,7 +449,7 @@ mod tests {
     #[test]
     fn compositor_blanking_is_adopted_and_still_needs_a_triple_tap() {
         let mut s = Sleep::default();
-        assert_eq!(s.display_reported(false), vec![SleepAction::Lock], "cosmic-idle blanked us: lock, like a sleep");
+        assert_eq!(s.display_reported(false, 0), vec![SleepAction::Lock], "cosmic-idle blanked us: lock, like a sleep");
         assert_eq!((s.phase, s.black), (Phase::Off, 1.0));
         assert!(s.captures_input(), "touches go to the wake detector, not the apps under a dark panel");
         assert!(tap(&mut s, 200.0, 500.0, 0, 80).is_empty());
@@ -424,21 +460,46 @@ mod tests {
     }
 
     #[test]
-    fn a_panel_lit_behind_our_back_while_off_is_turned_off_again() {
+    fn a_panel_lit_behind_our_back_while_off_stays_black_and_is_blanked_once_when_quiet() {
         let mut s = asleep();
-        assert_eq!(s.display_reported(true), vec![SleepAction::DisplayPower(false)], "a single touch woke it via cosmic-idle");
+        // The storm: the compositor reports "on" on every touch event, ~5 ms apart. None of them
+        // may produce a power command.
+        for k in 0..40 {
+            assert!(s.display_reported(true, 1000 + k * 5).is_empty(), "report {k} must not fight the compositor");
+        }
         assert_eq!(s.phase, Phase::Off);
-        assert_eq!(s.refused_wakes, 1);
-        // Our own wake is not refused: it leaves Off before the panel reports on.
-        tap(&mut s, 200.0, 500.0, 0, 80);
-        tap(&mut s, 200.0, 500.0, 150, 80);
-        assert_eq!(tap(&mut s, 200.0, 500.0, 300, 80), vec![SleepAction::DisplayPower(true)]);
-        assert!(s.display_reported(true).is_empty());
+        assert!(s.captures_input(), "still black and still listening for the triple tap");
+        assert_eq!(s.refused_wakes, 1, "one intrusion, not forty");
+        let last = 1000 + 39 * 5; // the last report
+        // Nothing happens before the grace has run from the LAST report.
+        assert!(s.quiet(last + RELIGHT_GRACE_MS - 1).is_empty());
+        // ... then exactly one DisplayPower(false), and not again.
+        assert_eq!(s.quiet(last + RELIGHT_GRACE_MS), vec![SleepAction::DisplayPower(false)]);
+        assert!(s.quiet(last + RELIGHT_GRACE_MS + 10).is_empty());
+        // The panel going off is a report that agrees with us.
+        assert!(s.display_reported(false, 20_000).is_empty());
+    }
+
+    #[test]
+    fn a_touch_keeps_the_lit_panel_from_being_blanked_and_a_triple_tap_still_wakes_it() {
+        let mut s = asleep();
+        s.display_reported(true, 0);
+        // a finger is down at 4 s: the grace is measured from the touch, and never mid-touch
+        s.touch_down(0, 200.0, 500.0, 4000);
+        assert!(s.quiet(4000 + RELIGHT_GRACE_MS + 100).is_empty(), "never blank under a finger");
+        s.touch_up(0, 4060);
+        assert!(s.quiet(4060 + RELIGHT_GRACE_MS - 1).is_empty(), "the touch restarted the grace");
+        // the triple tap completes while the panel is lit
+        tap(&mut s, 200.0, 500.0, 5000, 80);
+        tap(&mut s, 200.0, 500.0, 5150, 80);
+        assert_eq!(tap(&mut s, 200.0, 500.0, 5300, 80), vec![SleepAction::DisplayPower(true)]);
+        assert_eq!(s.phase, Phase::FadingIn);
+        assert!(s.quiet(60_000).is_empty(), "a woken panel is never blanked by the quiet timer");
         // Reports that agree with us are no-ops.
         let mut s = asleep();
-        assert!(s.display_reported(false).is_empty());
+        assert!(s.display_reported(false, 0).is_empty());
         let mut s = Sleep::default();
-        assert!(s.display_reported(true).is_empty());
+        assert!(s.display_reported(true, 0).is_empty());
     }
 
     #[test]
