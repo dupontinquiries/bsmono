@@ -730,6 +730,9 @@ fn main() {
     let mut renderer_noted = false;
     let mut last_frame_hash: HashMap<Role, tideshell_egui::damage::Painted> = HashMap::new();
     let mut last_poll = 0u64;
+    // Power was pressed while volume-down was held (a screenshot): the release that follows is
+    // part of the chord, not a power press, and must not be read as a morse dot or a hold.
+    let mut power_chord = false;
     // comfortgov reads the mtime of this file as "last user input".
     let hint = std::env::var_os("XDG_RUNTIME_DIR").map(|r| std::path::PathBuf::from(r).join("comfortgov.input"));
     let mut last_hint = 0u64;
@@ -1245,8 +1248,17 @@ fn main() {
         let mut intents: Vec<Intent> = Vec::new();
         for e in events {
             match (e.key, e.down) {
+                // Volume-down held, then power: a screenshot, the Android chord. Checked on the
+                // power PRESS because that is when the screen would otherwise go to sleep.
+                (KeyPress::Power, true) if sb.volkeys.is_down(VolKey::Down) => {
+                    sb.volkeys.consume(VolKey::Down);
+                    power_chord = true;
+                    sb.shell.note("power + volume-down: screenshot".to_string());
+                    actions.push(tideshell_core::Action::Screenshot);
+                }
                 (KeyPress::Power, true) => actions.extend(sb.shell.power_key()),
                 (KeyPress::Power, false) => {}
+                (KeyPress::PowerUp(_), _) if power_chord => power_chord = false,
                 (KeyPress::PowerUp(held), _) => actions.extend(sb.shell.power_released(held, now_ms)),
                 (KeyPress::VolumeUp, d) => intents.extend(if d { sb.volkeys.press(VolKey::Up, now_ms) } else { sb.volkeys.release(VolKey::Up, now_ms) }),
                 (KeyPress::VolumeDown, d) => intents.extend(if d { sb.volkeys.press(VolKey::Down, now_ms) } else { sb.volkeys.release(VolKey::Down, now_ms) }),

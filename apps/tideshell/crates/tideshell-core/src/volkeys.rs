@@ -139,6 +139,19 @@ impl VolKeys {
         }
     }
 
+    /// Whether `key` is down right now (pressed, not yet released).
+    pub fn is_down(&self, key: VolKey) -> bool {
+        self.held.is_some_and(|h| h.key == key)
+    }
+
+    /// The held `key` was used by a chord with ANOTHER button (power + volume down is a
+    /// screenshot): its hold and its release must do nothing, in every mode.
+    pub fn consume(&mut self, key: VolKey) {
+        if self.is_down(key) {
+            self.chorded = true;
+        }
+    }
+
     /// In steering mode a held key activates instead of repeating forever.
     /// Called by the shell when the selection should be taken.
     pub fn is_holding(&self) -> bool {
@@ -192,6 +205,30 @@ mod tests {
         assert!(v.tick(1_000 + HOLD_MS + 50).is_empty());
         assert_eq!(v.tick(1_000 + HOLD_MS + REPEAT_MS), vec![Intent::Step(VolKey::Down)], "and repeats");
         assert!(v.is_holding());
+    }
+
+    #[test]
+    fn a_key_used_by_a_chord_with_another_button_stays_silent_until_released() {
+        for steering in [false, true] {
+            let mut v = k();
+            v.steering = steering;
+            assert!(!v.is_down(VolKey::Down));
+            v.press(VolKey::Down, 0);
+            assert!(v.is_down(VolKey::Down) && !v.is_down(VolKey::Up));
+            v.consume(VolKey::Down); // power arrived while it was held
+            assert!(v.tick(HOLD_MS + 10).is_empty(), "no hold fires after a chord");
+            assert!(v.tick(HOLD_MS + 5 * REPEAT_MS).is_empty(), "and no steering repeat either");
+            assert_eq!(v.release(VolKey::Down, 2_000), vec![], "the release is not a volume step");
+            assert!(!v.is_down(VolKey::Down));
+            // the next ordinary press works again
+            v.press(VolKey::Down, 3_000);
+            assert_eq!(v.release(VolKey::Down, 3_050), vec![if steering { Intent::Step(VolKey::Down) } else { Intent::Volume(VolKey::Down) }]);
+        }
+        // consuming a key that is not held does nothing
+        let mut v = k();
+        v.consume(VolKey::Down);
+        v.press(VolKey::Down, 0);
+        assert_eq!(v.release(VolKey::Down, 50), vec![Intent::Volume(VolKey::Down)]);
     }
 
     #[test]
