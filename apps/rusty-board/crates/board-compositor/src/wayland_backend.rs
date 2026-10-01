@@ -1166,17 +1166,14 @@ impl KeymapTable {
 fn build_us_keymap() -> Result<KeymapTable> {
     use xkbcommon::xkb;
 
+    // THE SEAT'S layout, not US: cosmic-comp maps the keycodes we send with its own
+    // layout (Dvorak on the owner's phone), so the character -> keycode table has to
+    // be that layout's, or `c` types `j` and Ctrl+C is Ctrl+J.
+    let (layout, variant) = seat_layout();
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-    let keymap = xkb::Keymap::new_from_names(
-        &context,
-        "",     // rules: default
-        "",     // model: default
-        "us",   // layout
-        "",     // variant
-        None,   // options
-        xkb::COMPILE_NO_FLAGS,
-    )
-    .ok_or_else(|| anyhow!("xkb: failed to compile 'us' keymap"))?;
+    let keymap = xkb::Keymap::new_from_names(&context, "", "", &layout, &variant, None, xkb::COMPILE_NO_FLAGS)
+        .or_else(|| xkb::Keymap::new_from_names(&context, "", "", "us", "", None, xkb::COMPILE_NO_FLAGS))
+        .ok_or_else(|| anyhow!("xkb: failed to compile '{layout}/{variant}' or 'us'"))?;
 
     let keymap_text = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
 
@@ -1276,11 +1273,109 @@ fn build_us_keymap() -> Result<KeymapTable> {
         });
     }
 
+    overlay_layout_chars(&keymap, &mut by_char);
+
     Ok(KeymapTable {
         keymap_text,
         by_char,
         by_name,
     })
+}
+
+/// (layout, variant) the compositor is using: COSMIC's `xkb_config`, else the
+/// `XKB_DEFAULT_*` environment, else plain `us`.
+fn seat_layout() -> (String, String) {
+    let cfg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config")))
+        .map(|d| d.join("cosmic/com.system76.CosmicComp/v1/xkb_config"))
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    if let Some((l, v)) = cfg.as_deref().and_then(layout_from_cosmic_config) {
+        return (l, v);
+    }
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    match env("XKB_DEFAULT_LAYOUT") {
+        Some(l) => (l, env("XKB_DEFAULT_VARIANT").unwrap_or_default()),
+        None => ("us".into(), String::new()),
+    }
+}
+
+/// `layout: "us", variant: "dvorak",` out of COSMIC's RON-ish `xkb_config`. Only the
+/// first layout of a comma list is used (the one a fresh session starts in).
+fn layout_from_cosmic_config(text: &str) -> Option<(String, String)> {
+    let field = |name: &str| -> Option<String> {
+        let line = text.lines().find(|l| l.trim_start().starts_with(&format!("{name}:")))?;
+        let v = line.split_once(':')?.1.trim().trim_end_matches(',').trim();
+        let v = v.strip_prefix("Some(").and_then(|x| x.strip_suffix(')')).unwrap_or(v);
+        Some(v.trim_matches('"').split(',').next().unwrap_or("").trim().to_string())
+    };
+    let layout = field("layout").filter(|l| !l.is_empty())?;
+    Some((layout, field("variant").unwrap_or_default()))
+}
+
+/// Replace the US-guess entries with what `keymap` really produces: for every evdev
+/// key, the character it types plain and with Shift. Plain wins over shifted, the
+/// lower keycode wins a tie (so `a` is never found on a numpad key).
+fn overlay_layout_chars(keymap: &xkbcommon::xkb::Keymap, by_char: &mut std::collections::HashMap<char, KeymapEntry>) {
+    use xkbcommon::xkb;
+    let shift_bit = 1u32 << keymap.mod_get_index("Shift");
+    let mut found: std::collections::HashMap<char, KeymapEntry> = std::collections::HashMap::new();
+    for evdev in 1u32..=88 {
+        for shifted in [false, true] {
+            let mut st = xkb::State::new(keymap);
+            if shifted {
+                st.update_mask(shift_bit, 0, 0, 0, 0, 0);
+            }
+            let Some(c) = char::from_u32(st.key_get_utf32(xkb::Keycode::new(evdev + 8))) else { continue };
+            if c.is_control() || c == '\0' {
+                continue;
+            }
+            let better = match found.get(&c) {
+                None => true,
+                Some(old) => (old.shifted && !shifted) || (old.shifted == shifted && evdev < old.evdev_keycode),
+            };
+            if better {
+                found.insert(c, KeymapEntry { evdev_keycode: evdev, shifted });
+            }
+        }
+    }
+    // The control characters keep their US entries (Tab, Enter): same keys everywhere.
+    by_char.extend(found);
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    fn table(layout: &str, variant: &str) -> std::collections::HashMap<char, KeymapEntry> {
+        use xkbcommon::xkb;
+        let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let km = xkb::Keymap::new_from_names(&ctx, "", "", layout, variant, None, xkb::COMPILE_NO_FLAGS).unwrap();
+        let mut m = std::collections::HashMap::new();
+        overlay_layout_chars(&km, &mut m);
+        m
+    }
+
+    #[test]
+    fn dvorak_finds_c_where_qwerty_has_i_and_us_is_unchanged() {
+        let dv = table("us", "dvorak");
+        assert_eq!(dv[&'c'].evdev_keycode, 23, "dvorak c sits on the QWERTY i key");
+        assert_eq!(dv[&'i'].evdev_keycode, 34, "and i on the QWERTY g key");
+        assert_eq!(dv[&'s'].evdev_keycode, 39, "s on the QWERTY ; key");
+        assert!(dv[&'C'].shifted && !dv[&'c'].shifted);
+        let us = table("us", "");
+        assert_eq!((us[&'c'].evdev_keycode, us[&'a'].evdev_keycode, us[&'i'].evdev_keycode), (46, 30, 23));
+        assert!(us.len() > 90, "the scan found a whole layout: {}", us.len());
+    }
+
+    #[test]
+    fn cosmic_config_text_yields_layout_and_variant() {
+        let t = "(\n    rules: \"\",\n    layout: \"us\",\n    variant: \"dvorak\",\n    options: None,\n)";
+        assert_eq!(layout_from_cosmic_config(t), Some(("us".into(), "dvorak".into())));
+        assert_eq!(layout_from_cosmic_config("(layout: \"\")"), None);
+        let t2 = "(\n layout: \"us,de\",\n variant: \",nodeadkeys\",\n)";
+        assert_eq!(layout_from_cosmic_config(t2), Some(("us".into(), String::new())));
+    }
 }
 
 /// Send the keymap to the compositor via the virtual_keyboard's
