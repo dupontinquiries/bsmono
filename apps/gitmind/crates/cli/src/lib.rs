@@ -98,6 +98,7 @@ pub fn run() -> i32 {
         "fleet" => cmd_fleet(rest),
         "patchset" => cmd_patchset(rest),
         "cosmic" => cmd_cosmic(rest),
+        "fp5" => cmd_fp5(rest),
         "depot" => cmd_depot(rest),
         "eink" => cmd_eink(rest),
         "bridge" => cmd_bridge(rest),
@@ -1518,6 +1519,62 @@ fn cmd_cosmic(rest: &[String]) -> i32 {
     }
 }
 
+/// The parts of `fp5_setup` whose name contains `want` (all of them when `want` is `None`).
+fn fp5_select(parts: Vec<(&'static str, Vec<cockpit::patchset::Step>)>, want: Option<&str>) -> Vec<(&'static str, Vec<cockpit::patchset::Step>)> {
+    parts.into_iter().filter(|(n, _)| want.map_or(true, |w| n.to_lowercase().contains(&w.to_lowercase()))).collect()
+}
+
+/// `gitmind fp5 list | plan [PART] | apply USER@HOST [PART] [--password-stdin]`: replay the
+/// Fairphone 5 customisations (cockpit::fp5_setup) over ssh. `list` and `plan` change nothing.
+/// PART is a substring of a part's name ("watchdog", "video"); no PART means every part.
+fn cmd_fp5(rest: &[String]) -> i32 {
+    use cockpit::cosmic_setup::{run_over_ssh, Root};
+    let password: Option<String> = if rest.iter().any(|a| a == "--password-stdin") {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        Some(line.trim_end_matches(['\n', '\r']).to_string())
+    } else {
+        std::env::var("GITMIND_SUDO_PASSWORD").ok()
+    };
+    let root = if password.is_some() { Root::PasswordOnStdin } else { Root::NoPrompt };
+    let args: Vec<&String> = rest.iter().filter(|a| !a.starts_with("--")).collect();
+    let usage = "usage: gitmind fp5 list | plan [PART] | apply USER@HOST [PART] [--password-stdin]";
+    match args.first().map(|s| s.as_str()) {
+        Some("list") => {
+            for (n, steps) in cockpit::fp5_setup::all_parts(root) {
+                println!("{n}  ({} steps)", steps.len());
+            }
+            0
+        }
+        Some("plan") => {
+            let parts = fp5_select(cockpit::fp5_setup::all_parts(root), args.get(1).map(|s| s.as_str()));
+            if parts.is_empty() { eprintln!("no part matches\n{usage}"); return 2; }
+            for (n, steps) in parts {
+                println!("== {n}");
+                for (i, s) in steps.iter().enumerate() {
+                    println!("{:>2}. {}\n    $ {}\n    gate: {:?}{}", i + 1, s.what, s.cmd, s.gate,
+                        s.rollback.as_ref().map(|r| format!("\n    on failure: {r}")).unwrap_or_default());
+                }
+            }
+            0
+        }
+        Some("apply") => {
+            let Some((user, host)) = args.get(1).and_then(|t| t.split_once('@')) else { eprintln!("{usage}"); return 2 };
+            let parts = fp5_select(cockpit::fp5_setup::all_parts(root), args.get(2).map(|s| s.as_str()));
+            if parts.is_empty() { eprintln!("no part matches\n{usage}"); return 2; }
+            for (n, steps) in parts {
+                println!("== {n}");
+                if let Err(e) = run_over_ssh(&steps, user, host, password.as_deref(), &mut |l| println!("{l}")) {
+                    eprintln!("gitmind fp5 apply: {n}: {e}");
+                    return 1;
+                }
+            }
+            0
+        }
+        _ => { eprintln!("{usage}"); 2 }
+    }
+}
+
 fn cmd_patchset(rest: &[String]) -> i32 {
     use cockpit::patchset::{apkbuild_source, rollout, Freeze, Patchset, Where};
     let usage = "usage: gitmind patchset show <patchset.txt>\n       gitmind patchset apkbuild <patchset.txt> [arch]\n       gitmind patchset freeze <patchset.txt> <repo-url> [more pkgs...]\n       gitmind patchset rollout <patchset.txt> <repo-url> <builder-aports-dir> [--untested]\n       gitmind patchset bump <patchset.txt> <new-version> [base-pkgrel]";
@@ -2583,5 +2640,23 @@ fn cmd_fleet(rest: &[String]) -> i32 {
             }
         }
         other => err(&format!("unknown fleet command: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod fp5_cli_tests {
+    use super::*;
+
+    #[test]
+    fn a_part_is_picked_by_a_substring_of_its_name() {
+        let root = cockpit::cosmic_setup::Root::NoPrompt;
+        let all = cockpit::fp5_setup::all_parts(root);
+        let n = all.len();
+        assert!(n >= 6, "the scan found the parts: {n}");
+        assert_eq!(fp5_select(cockpit::fp5_setup::all_parts(root), None).len(), n);
+        let w = fp5_select(cockpit::fp5_setup::all_parts(root), Some("WATCHDOG"));
+        assert_eq!(w.len(), 1, "case-insensitive, one match");
+        assert!(w[0].0.contains("watchdog"));
+        assert!(fp5_select(cockpit::fp5_setup::all_parts(root), Some("no such part")).is_empty());
     }
 }
