@@ -18,7 +18,7 @@ use crate::edge::Dir;
 use crate::{Action, WindowCard};
 
 /// Width fraction the active window gets; the rest is split into two peeks.
-pub const CENTER_FRAC: f32 = 0.8;
+pub const CENTER_FRAC: f32 = 0.85;
 
 /// Width fraction of one peek strip.
 pub fn peek_frac() -> f32 {
@@ -250,7 +250,7 @@ mod tests {
         c.enter(&[1], &ws[..1]);
         assert_eq!((c.peek(Side::Left), c.peek(Side::Right)), (None, None));
         assert!(c.tap_peek(Side::Right, &ws[..1]).is_empty());
-        assert!((peek_frac() - 0.1).abs() < 1e-6);
+        assert!((peek_frac() - 0.075).abs() < 1e-6);
     }
 
     #[test]
