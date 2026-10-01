@@ -115,8 +115,7 @@ struct BackendInner {
     /// Virtual keyboard object — present in v2 mode for sending keys
     /// to the focused app. Unused in v1 mode (keysyms go on context).
     vkbd: Option<ZwpVirtualKeyboardV1>,
-    /// Input-method-v2 object. Kept alive for backend lifetime.
-    #[allow(dead_code)]
+    /// Input-method-v2 object: `commit_string` for text while a field is focused.
     im: Option<ZwpInputMethodV2>,
     /// Resolved keysym→keycode map (from the keymap we sent the compositor).
     /// Also used in v1 mode for symbolic-keysym name lookup.
@@ -299,6 +298,7 @@ fn finish_setup(
         seat: wl_seat.clone(),
         active: false,
         pending_active: false,
+        im_v2_serial: 0,
         im_callback: im_callback.clone(),
         surrounding_text_callback: surrounding_text_callback.clone(),
     };
@@ -555,6 +555,20 @@ impl WaylandBackend {
 
         match inner.mode {
             BackendMode::V2 => {
+                // TEXT GOES THROUGH THE INPUT METHOD when a field is focused. The key path
+                // below sends QWERTY evdev keycodes, which cosmic-comp maps with the SEAT's
+                // layout, not the keymap we upload: on a Dvorak seat `i` came out `c`.
+                // commit_string is the characters themselves, whatever the layout.
+                if inner.app_data.active {
+                    if let Some(im) = inner.im.as_ref() {
+                        im.commit_string(text.to_string());
+                        im.commit(inner.app_data.im_v2_serial);
+                        let conn = inner._conn.clone();
+                        drop(inner);
+                        let _ = conn.flush();
+                        return Ok(());
+                    }
+                }
                 let vkbd = inner
                     .vkbd
                     .as_ref()
@@ -645,6 +659,17 @@ impl WaylandBackend {
 
         match inner.mode {
             BackendMode::V2 => {
+                // A plain printable character with no modifier: commit it as text (see
+                // `commit_text` -- keycodes are re-mapped by the seat's layout).
+                if mods == 0 && inner.app_data.active {
+                    let mut cs = base_name.chars();
+                    if let (Some(c), None) = (cs.next(), cs.next()) {
+                        if !c.is_control() {
+                            drop(inner);
+                            return self.commit_text(base_name);
+                        }
+                    }
+                }
                 let vkbd = inner
                     .vkbd
                     .as_ref()
@@ -814,6 +839,8 @@ struct AppData {
     active: bool,
     /// Pending state, applied on the next `Done` event.
     pending_active: bool,
+    /// Number of `Done` events seen: the serial a v2 `commit` must carry.
+    im_v2_serial: u32,
     /// Where to call when state actually flips.
     im_callback: InputMethodActiveCallback,
     /// Where to call when the host reports surrounding text. The
@@ -908,6 +935,7 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppData {
                 state.pending_active = false;
             }
             zwp_input_method_v2::Event::Done => {
+                state.im_v2_serial = state.im_v2_serial.wrapping_add(1);
                 if state.pending_active != state.active {
                     state.active = state.pending_active;
                     debug!("input-method state -> active={}", state.active);
