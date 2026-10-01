@@ -267,6 +267,7 @@ pub fn run(title: &str) -> Result<(), LayerError> {
     // We are mapped from the first paint; `Feel` decides from the sink whether we should be,
     // and its first frame will say Visible(false) on a Wayland session with nothing focused.
     let mut mapped = true;
+    let mut map_requested: Option<Instant> = None;
     let start = Instant::now();
     let mut last_frame = Instant::now();
     // When egui next wants a frame regardless of input (animations, request_repaint_after).
@@ -374,9 +375,28 @@ pub fn run(title: &str) -> Result<(), LayerError> {
                 apply_layer_state(&state.layer, state.height);
                 state.layer.wl_surface().commit();
                 mapped = true;
+                map_requested = Some(Instant::now());
                 tracing::debug!("layer: map requested");
             }
             _ => {}
+        }
+        // A re-map is sometimes never answered with a configure (seen on cosmic-comp: the
+        // surface holds its exclusive zone, paints nothing, and the screen keeps a black
+        // band). The commit changed no state the compositor cares about, so change one:
+        // one pixel taller, then back. Both commits are real state; the second wins.
+        if mapped && !state.configured {
+            if let Some(t0) = map_requested {
+                if t0.elapsed() >= Duration::from_millis(250) {
+                    state.layer.set_size(0, state.height + 1);
+                    state.layer.wl_surface().commit();
+                    state.layer.set_size(0, state.height);
+                    state.layer.wl_surface().commit();
+                    map_requested = Some(Instant::now());
+                    tracing::debug!("layer: no configure after map, nudged");
+                }
+            }
+        } else {
+            map_requested = None;
         }
 
         // ---- 2b. the surface is as tall as its content. A fixed 340 left a strip of nothing
