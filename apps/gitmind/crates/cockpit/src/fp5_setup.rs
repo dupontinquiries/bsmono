@@ -155,6 +155,28 @@ pub fn panel_zones_plan() -> Vec<Step> {
     ]
 }
 
+/// The FP5 kernel boots with every core on the `performance` governor (measured 2026-10-01: all 8
+/// cores `performance`, cpu7 at 2.7 GHz with the phone idle, no cpupower service, nothing in
+/// tideshell's prefs), which pins the clocks high and is the first suspect for "hot just browsing
+/// apps". `schedutil` follows the load. Written through systemd-tmpfiles so it survives a reboot.
+pub const CPU_GOVERNOR: &str = "schedutil";
+
+pub fn cpu_governor_plan(root: Root) -> Vec<Step> {
+    let conf = "/etc/tmpfiles.d/fp5-cpu-governor.conf";
+    let put = format!("printf 'w /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor - - - - {CPU_GOVERNOR}\\n' > {conf} && systemd-tmpfiles --create {conf}");
+    let undo = format!("rm -f {conf}; for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > $f; done");
+    vec![
+        Step { on: Where::Device, what: "schedutil is an available governor",
+               cmd: "grep -qw schedutil /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors && echo AVAILABLE".into(),
+               gate: Gate::Contains("AVAILABLE".into()), rollback: None },
+        Step { on: Where::Device, what: "set schedutil now and at every boot",
+               cmd: root_cmd(&put, root), gate: Gate::ExitZero, rollback: Some(root_cmd(&undo, root)) },
+        Step { on: Where::Device, what: "no core is still on performance",
+               cmd: "cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u".into(),
+               gate: Gate::Contains(CPU_GOVERNOR.into()), rollback: None },
+    ]
+}
+
 /// xwaylandvideobridge (KDE) keeps an invisible X11 window and a tray icon for screen-sharing X11
 /// apps. KWin and GNOME hide it; COSMIC shows it. Nothing on the phone shares X11 windows, so it
 /// is not started: a per-user autostart entry with `Hidden=true` shadows the system one.
@@ -387,6 +409,7 @@ pub fn all_parts(root: Root) -> Vec<(&'static str, Vec<Step>)> {
         ("panel and dock zones", panel_zones_plan()),
         ("panel memory watchdog", panel_watchdog_plan()),
         ("hide xwaylandvideobridge", hide_video_bridge_plan()),
+        ("cpu governor", cpu_governor_plan(root)),
         ("emergency USB access", emergency_access_plan(root)),
     ]
 }
@@ -406,6 +429,7 @@ mod tests {
         v.extend(panel_zones_plan());
         v.extend(panel_watchdog_plan());
         v.extend(hide_video_bridge_plan());
+        v.extend(cpu_governor_plan(root));
         v.extend(rescue_console_plan("/tmp/fp5-rescue", root));
         v.extend(autologin_plan("user", root));
         v
@@ -438,6 +462,14 @@ mod tests {
         assert!(p[0].cmd.contains("Hidden=true") && p[0].cmd.contains("org.kde.xwaylandvideobridge.desktop"), "{}", p[0].cmd);
         assert!(p[0].rollback.as_deref().unwrap().contains("rm -f"));
         assert!(p[0].cmd.contains("pkill -x xwaylandvideobr;"), "comm is truncated to 15 chars: {}", p[0].cmd);
+    }
+
+    #[test]
+    fn the_governor_plan_persists_schedutil_and_can_go_back() {
+        let p = cpu_governor_plan(Root::NoPrompt);
+        assert!(p[1].cmd.contains("scaling_governor - - - - schedutil") && p[1].cmd.contains("tmpfiles"), "{}", p[1].cmd);
+        assert!(p[1].rollback.as_deref().unwrap().contains("echo performance"));
+        assert!(p[2].gate == Gate::Contains("schedutil".into()), "the check must name the governor, not just run");
     }
 
     #[test]
