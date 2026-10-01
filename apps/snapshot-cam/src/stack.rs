@@ -301,17 +301,29 @@ pub fn stack_focus(f: &Frames) -> Vec<u8> {
     pyramid_blend(&imgs, &ws).to_rgba()
 }
 
-/// Burst average in linear light.
+/// A pixel that differs from the reference by more than this (display-referred, 0..1, any
+/// channel) is a MOVING subject, not noise: a hand or a spinning room.
+pub const GHOST_DIFF: f32 = 0.10;
+
+/// Burst average in linear light, ghost-rejecting. Frame 0 is the reference and always counts;
+/// another frame contributes at a pixel only where it agrees with the reference there (so noise
+/// averages down on the static parts while a moving subject stays crisp as in the reference
+/// instead of smearing across all frames). Global alignment cannot fix subject motion.
 pub fn average(f: &Frames) -> Vec<u8> {
     let imgs = aligned(f);
-    let n = imgs.len() as f32;
     let (w, h) = (imgs[0].w, imgs[0].h);
     let mut out = Vec::with_capacity(w * h * 4);
     for i in 0..w * h {
-        for c in 0..3 {
-            let s: f32 = imgs.iter().map(|m| to_linear(q(m.px[i][c]))).sum();
-            out.push(to_srgb(s / n));
+        let r = imgs[0].px[i];
+        let mut sum = [0f32; 3];
+        let mut n = 0f32;
+        for m in &imgs {
+            let p = m.px[i];
+            if (0..3).any(|c| (p[c] - r[c]).abs() > GHOST_DIFF) { continue; }
+            for c in 0..3 { sum[c] += to_linear(q(p[c])); }
+            n += 1.0;
         }
+        for c in 0..3 { out.push(to_srgb(sum[c] / n)); }
         out.push(255);
     }
     out
@@ -374,6 +386,28 @@ mod tests {
         assert!(detail(&dark, w, h, false) < 8.0, "dark frame should bury the room");
         let (l, rr) = (detail(&fused, w, h, false), detail(&fused, w, h, true));
         assert!(l > 12.0 && rr > 12.0, "fused keeps both: room {l}, window {rr}");
+    }
+
+    #[test]
+    fn a_moving_subject_does_not_smear_into_the_static_scene() {
+        // Reference: flat grey with a bright block on the left. Others: the block has MOVED right.
+        let (w, h) = (64u32, 32u32);
+        let frame = |bx: u32| -> Vec<u8> {
+            let mut v = Vec::new();
+            for _y in 0..h { for x in 0..w {
+                let on = x >= bx && x < bx + 8;
+                let g = if on { 240u8 } else { 100u8 };
+                v.extend_from_slice(&[g, g, g, 255]);
+            } }
+            v
+        };
+        let frames = [frame(8), frame(30), frame(30), frame(30)];
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let out = average(&Frames { w, h, rgba: refs });
+        let at = |x: usize| out[(10 * w as usize + x) * 4];
+        assert!(at(10) >= 235, "the reference subject stays bright, got {}", at(10));
+        assert!(at(33) <= 105, "where it moved TO stays background, got {}", at(33));
+        assert!(at(50).abs_diff(100) <= 2, "static background unchanged");
     }
 
     #[test]

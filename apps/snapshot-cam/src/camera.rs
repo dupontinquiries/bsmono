@@ -98,7 +98,10 @@ impl Camera {
         }
         for c in &plan { println!("snapshot-cam: capture candidate [{}]: {}", c.label, c.pipeline); }
         self.started = plan.clone();
-        self.rig = Some(Rig::start(plan, WIDTH, HEIGHT));
+        // A phone's sensors are mounted sideways (FP5: 270, so upright = a clockwise quarter turn).
+        // SNAPSHOT_CAM_TURN=90 turns the frames in the pipeline; the size asked for is the UPRIGHT one.
+        let turn: u32 = std::env::var("SNAPSHOT_CAM_TURN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        self.rig = Some(if turn % 180 == 90 { Rig::start_turned(plan, HEIGHT, WIDTH, turn) } else { Rig::start_turned(plan, WIDTH, HEIGHT, turn) });
         self.source = Source::Camera;
         self.status = Status::Trying { label: "camera".into() };
     }
