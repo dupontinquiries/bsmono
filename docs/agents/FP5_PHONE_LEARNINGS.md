@@ -31,7 +31,7 @@ shell's brightness mode was already `Safe` (pmaports#4274).
   owner was using the hatch; cause not identified (cosmic's power dialog is the suspect).
 
 ## Rotation  [measured]
-`iio-sensor-proxy` only reports CHANGES, so tideshell's 450 ms "hold before rotating" never completed
+`iio-sensor-proxy` only reports CHANGES, so tideshell's "hold before rotating" (now 900 ms, was 450: less twitchy; the sensor proxy's own tilt angle is not configurable from the shell) never completed
 (it waited for a second reading). Now judged by the clock (`AutoRotate::poll`). Both landscapes and, after
 the display reboot, portrait work. Sensor mounting: all three cameras report `camera_sensor_rotation = 270`;
 upright = a clockwise quarter turn (owner confirmed "rot was 90 deg clockwise").
@@ -75,6 +75,41 @@ No `tracing` subscriber was installed, so every focus/input-method log line was 
 journal (`RUST_LOG`, warn by default). cosmic sends input-method Activate/Deactivate correctly and the
 layer surface maps/unmaps. The magnifier bubble is replaced by a press pulse. Open: steno multitouch, and
 the bug where switching away from steno leaves the keyboard short.
+
+### Layer surface: unmap is a trap on cosmic-comp  [measured with WAYLAND_DEBUG=1 + RUSTY_BOARD_LOOP_STATS=1]
+Hiding the board with a null-buffer commit (the protocol's "unmap") works once; the NEXT show sends
+`set_anchor/set_size/set_exclusive_zone` + commit and cosmic-comp **never sends a configure**. The board
+then holds its exclusive zone and paints nothing: a black band under the apps and a right bar that stops
+short (a bar anchored top+bottom is laid out inside every other surface's zone). A resize-nudge on the
+unmapped surface got no answer either, 300 ms after 300 ms. A resize of a *mapped* surface is always
+answered, so hide now PARKS (1 px, exclusive zone 0, a transparent 1 px buffer; the EGL config has alpha)
+and show resizes back. Two traps found on the way:
+* a nudge placed after the loop's "is a frame due?" check never runs when nothing is due;
+* egui lays the board out against the surface height it is given and then asks for a surface that tall:
+  tell it the full height while parked or before the configure, or it comes back tiny.
+The loop-stats line prints `mapped / configured / frame_pending`, which names the stuck gate directly.
+Also: `rusty-board.service` has `ProtectSystem=strict`, so `$XDG_RUNTIME_DIR/rusty-board.ctl` could not be
+bound ("Read-only file system") and every ctl command (cold, strip, voice, the new `show`/`hide`) was lost;
+`ReadWritePaths=%t` fixes it (in the unit and in the `fp5_setup` drop-in; printf needs `%%t`).
+Chromium on the phone did not drive the board's input-method focus in one test (address bar focused, no
+Activate logged); GTK apps do. Unresolved: probably needs its Wayland text-input flag.
+
+## Dock and the right bar  [measured]
+A dock with `exclusive_zone: true` shortens the tideshell bar even when autohidden. `exclusive_zone false`
+on both COSMIC panels (live config) lets the bar reach the bottom.
+
+## Palette (tideshell)
+Order is now list, search, then the three mode buttons, hung off the bottom edge. It opens with 4 rows and
+opens in full when a hold reaches the search bar (or the field is tapped); the search does not move under
+the thumb. With no physical keyboard (`/proc/bus/input/devices`: `kbd` handler + LED events; virtual and
+dotool devices do not count) tideshell sends `show`/`hide` on the rusty-board ctl socket, because its search
+field is not a text-input client. All unit-tested; the on-device feel is not yet confirmed.
+
+## Not done (as of 2026-10-01 03:40)
+Pinch-expand animation for the board (patch kept off-tree: scaling the layer also scales pointer positions
+and broke two hold tests; an in-board approach is needed); steno multitouch and the short-keyboard bug;
+camera tap-to-focus and highlights; the phone-to-laptop model path; the unexplained power-offs (two more
+this session: read the previous boot's journal next time it is up).
 
 ## Build and deploy that worked
 * Build for the phone in the arm64 Alpine container (`apps/tideshell/deploy/build-in-podman.sh`, image
