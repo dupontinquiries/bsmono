@@ -228,11 +228,11 @@ impl Executor for System {
                 Outcome::Unwired("zcosmic_toplevel_manager_v1 requests not in systemcompkit yet")
             }
             Action::Pointer(_) => Outcome::Unwired("EI sender not wired (needs cosmic-comp patch 0002 + reis client)"),
-            Action::SetQuick(..) => Outcome::Unwired("no system backend for quick toggles yet"),
+            Action::SetQuick(kind, on) => apply_quick(*kind, *on),
             Action::SetSlider(tideshell_core::control_center::SliderKind::Volume, v) => fade_volume(*v),
             Action::SetSlider(tideshell_core::control_center::SliderKind::Warmth, v) => apply_warmth(*v),
             Action::SetSlider(..) => Outcome::Unwired("brightness is applied by the layer runtime"),
-            Action::SetGovernor(_) => Outcome::Unwired("cpu governor: no system backend for this executor"),
+            Action::SetGovernor(_) => Outcome::Unwired("cpu governor: writing scaling_governor needs root; comfortgov (system/comfortgov) is not installed on this phone"),
             Action::DisplayPower(_) => Outcome::Unwired("display power is handled by the layer runtime"),
             Action::Rotate(deg) => rotate_output(*deg),
             Action::SetVoicing(tone) => apply_voicing(*tone),
@@ -640,29 +640,152 @@ pub fn fade_steps(from: f32, to: f32, n: usize) -> Vec<f32> {
     (1..=n).map(|i| from + (to - from) * i as f32 / n as f32).map(|v| (v * 1000.0).round() / 1000.0).collect()
 }
 
-fn wpctl(args: &[&str]) -> Result<String, String> {
-    let out = Command::new("wpctl").args(args).stdin(Stdio::null()).output().map_err(|e| format!("wpctl: {e}"))?;
+/// The command-line tools that can set the default sink's volume, tried in this order.
+///
+/// `wpctl` talks to WirePlumber/PipeWire and was the only one used — but the Fairphone 5 here runs
+/// PulseAudio (`postmarketos-base-ui-audio-backend-pulseaudio`; WirePlumber and PipeWire are not
+/// running), so every slider and hardware volume key failed at its first call. `pactl` speaks the
+/// PulseAudio protocol that PulseAudio AND pipewire-pulse both serve, so it goes first and
+/// `wpctl` stays as the fallback for a bare PipeWire session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeTool { Pactl, Wpctl }
+
+const VOLUME_TOOLS: [VolumeTool; 2] = [VolumeTool::Pactl, VolumeTool::Wpctl];
+
+pub fn volume_get_cmd(t: VolumeTool) -> (&'static str, Vec<String>) {
+    match t {
+        VolumeTool::Pactl => ("pactl", vec!["get-sink-volume".into(), "@DEFAULT_SINK@".into()]),
+        VolumeTool::Wpctl => ("wpctl", vec!["get-volume".into(), "@DEFAULT_AUDIO_SINK@".into()]),
+    }
+}
+
+pub fn volume_set_cmd(t: VolumeTool, level: f32) -> (&'static str, Vec<String>) {
+    match t {
+        VolumeTool::Pactl => ("pactl", vec!["set-sink-volume".into(), "@DEFAULT_SINK@".into(), format!("{}%", (level.max(0.0) * 100.0).round() as u32)]),
+        VolumeTool::Wpctl => ("wpctl", vec!["set-volume".into(), "@DEFAULT_AUDIO_SINK@".into(), format!("{level:.3}")]),
+    }
+}
+
+/// `pactl get-sink-volume` prints `Volume: front-left: 24904 /  38% / -25.21 dB, front-right: …`;
+/// the first percentage on the `Volume:` line, as a fraction.
+pub fn parse_pactl_volume(s: &str) -> Option<f32> {
+    let line = s.lines().find(|l| l.trim_start().starts_with("Volume:"))?;
+    line.split_whitespace().find_map(|w| w.strip_suffix('%')?.parse::<f32>().ok()).map(|p| p / 100.0)
+}
+
+pub fn parse_volume(t: VolumeTool, s: &str) -> Option<f32> {
+    match t { VolumeTool::Pactl => parse_pactl_volume(s), VolumeTool::Wpctl => parse_wpctl_volume(s) }
+}
+
+type RunTool<'a> = &'a dyn Fn(&str, &[String]) -> Result<String, String>;
+
+/// The current volume and the tool that read it: the first of [`VOLUME_TOOLS`] that answers.
+pub fn read_volume_with(run: RunTool) -> Result<(VolumeTool, f32), String> {
+    let mut errors = Vec::new();
+    for t in VOLUME_TOOLS {
+        let (prog, args) = volume_get_cmd(t);
+        match run(prog, &args) {
+            Ok(out) => match parse_volume(t, &out) {
+                Some(v) => return Ok((t, v)),
+                None => errors.push(format!("{prog}: unreadable output {:?}", out.trim())),
+            },
+            Err(e) => errors.push(e),
+        }
+    }
+    Err(errors.join("; "))
+}
+
+fn run_tool(prog: &str, args: &[String]) -> Result<String, String> {
+    let out = Command::new(prog).args(args).stdin(Stdio::null()).output().map_err(|e| format!("{prog}: {e}"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
-        Err(format!("wpctl {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()))
+        Err(format!("{prog} {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()))
     }
 }
 
 /// Fade the default sink to `to` (0..1) on a thread; returns at once.
 pub fn fade_volume(to: f32) -> Outcome {
     let to = to.clamp(0.0, 1.0);
-    let from = match wpctl(&["get-volume", "@DEFAULT_AUDIO_SINK@"]) {
-        Ok(s) => parse_wpctl_volume(&s).unwrap_or(to),
+    let (tool, from) = match read_volume_with(&run_tool) {
+        Ok(r) => r,
         Err(e) => return Outcome::Failed(e),
     };
     std::thread::spawn(move || {
         for v in fade_steps(from, to, FADE_STEPS) {
-            let _ = wpctl(&["set-volume", "@DEFAULT_AUDIO_SINK@", &format!("{v:.3}")]);
+            let (prog, args) = volume_set_cmd(tool, v);
+            let _ = run_tool(prog, &args);
             std::thread::sleep(std::time::Duration::from_millis(FADE_STEP_MS));
         }
     });
-    Outcome::Done(format!("volume fade {from:.2} -> {to:.2}"))
+    Outcome::Done(format!("volume fade {from:.2} -> {to:.2} via {tool:?}"))
+}
+
+// ---- the quick toggles: wifi, bluetooth, airplane, mobile data, flashlight ------------
+
+/// The commands behind a system quick tile, or `None` when it is not a system call (shell-owned
+/// modes) or has no backend yet. Pure: what to run, not running it.
+///
+/// Bluetooth goes through `bluetoothctl`, not `rfkill`: `/dev/rfkill` is root-write on the phone, so
+/// `rfkill block bluetooth` would fail for the user the shell runs as. NetworkManager's `nmcli radio`
+/// needs no privilege. Airplane means EVERY radio off, so it also powers bluetooth down.
+pub fn quick_commands(kind: tideshell_core::control_center::QuickKind, on: bool) -> Option<Vec<(&'static str, Vec<String>)>> {
+    use tideshell_core::control_center::QuickKind as K;
+    let word = |b: bool| if b { "on" } else { "off" }.to_string();
+    let nm = |what: &str, state: String| ("nmcli", vec!["radio".to_string(), what.to_string(), state]);
+    let bt = |state: String| ("bluetoothctl", vec!["power".to_string(), state]);
+    match kind {
+        K::Wifi => Some(vec![nm("wifi", word(on))]),
+        K::MobileData => Some(vec![nm("wwan", word(on))]),
+        K::Bluetooth => Some(vec![bt(word(on))]),
+        K::Airplane => Some(vec![nm("all", word(!on)), bt(word(!on))]),
+        _ => None,
+    }
+}
+
+/// The flashlight: the first LED under `base` (`/sys/class/leds`) whose name says flash or torch.
+pub fn flashlight_led(base: &std::path::Path) -> Option<PathBuf> {
+    let mut leds: Vec<PathBuf> = std::fs::read_dir(base).ok()?.flatten().map(|e| e.path()).collect();
+    leds.sort();
+    leds.into_iter().find(|p| {
+        let n = p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        (n.contains("flash") || n.contains("torch")) && p.join("brightness").exists()
+    })
+}
+
+/// Light or darken the flashlight: `max_brightness` for on, 0 for off. The FP5's `white:flash` LED is
+/// writable by the logged-in user, so no privilege is needed.
+pub fn set_flashlight(base: &std::path::Path, on: bool) -> Outcome {
+    let Some(led) = flashlight_led(base) else { return Outcome::Failed(format!("no flash/torch LED under {}", base.display())) };
+    let level = if on {
+        match std::fs::read_to_string(led.join("max_brightness")).ok().and_then(|s| s.trim().parse::<u32>().ok()) {
+            Some(m) if m > 0 => m,
+            _ => return Outcome::Failed(format!("{}: unreadable max_brightness", led.display())),
+        }
+    } else { 0 };
+    match std::fs::write(led.join("brightness"), level.to_string()) {
+        Ok(()) => Outcome::Done(format!("{} -> {level}", led.display())),
+        Err(e) => Outcome::Failed(format!("{}: {e}", led.join("brightness").display())),
+    }
+}
+
+fn apply_quick(kind: tideshell_core::control_center::QuickKind, on: bool) -> Outcome {
+    use tideshell_core::control_center::QuickKind as K;
+    if kind == K::Flashlight { return set_flashlight(std::path::Path::new("/sys/class/leds"), on); }
+    let Some(cmds) = quick_commands(kind, on) else {
+        return match kind {
+            K::DoNotDisturb => Outcome::Unwired("do-not-disturb: cosmic has no switch to drive yet"),
+            _ => Outcome::Unwired("this tile is owned by the shell, not a system call"),
+        };
+    };
+    let mut done = Vec::new();
+    for (prog, args) in cmds {
+        match run_tool(prog, &args) {
+            Ok(_) => done.push(format!("{prog} {}", args.join(" "))),
+            Err(e) => return Outcome::Failed(e),
+        }
+    }
+    Outcome::Done(done.join("; "))
 }
 
 // ---- output rotation (wlr-randr for now) ------------------------------------------
@@ -1067,5 +1190,120 @@ mod tests {
         let e = bin_dir("ovr", &["hatch", "hatch-egui"]);
         assert_eq!(pick_launcher(&e, Some("/opt/my-hatch")), "/opt/my-hatch");
         assert_eq!(pick_launcher(&e, Some("  ")), "hatch-egui", "a blank override is no override");
+    }
+
+    // ---- the sidebar and the volume keys: what was dead, and why ----
+
+    use tideshell_core::control_center::QuickKind;
+    use std::cell::RefCell;
+
+    #[test]
+    fn pactl_output_from_the_phone_parses_to_a_fraction() {
+        // Captured from the FP5's live PulseAudio server.
+        let real = "Volume: front-left: 24904 /  38% / -25.21 dB,   front-right: 24904 /  38% / -25.21 dB\n        balance 0.00\n";
+        assert!((parse_pactl_volume(real).unwrap() - 0.38).abs() < 1e-6);
+        assert_eq!(parse_pactl_volume("Volume: mono: 65536 / 100% / 0.00 dB"), Some(1.0));
+        assert!((parse_pactl_volume("Volume: front-left: 78643 / 120% / 4.66 dB").unwrap() - 1.2).abs() < 1e-6, "over 100% is real and must not be clamped away");
+        assert_eq!(parse_pactl_volume("Connection failure: Connection refused"), None);
+        assert_eq!(parse_pactl_volume(""), None);
+        assert_eq!(parse_pactl_volume("balance 50%"), None, "only the Volume: line counts");
+    }
+
+    #[test]
+    fn the_volume_set_commands_are_what_each_tool_expects() {
+        let set = |t, v: f32| { let (p, a) = volume_set_cmd(t, v); format!("{p} {}", a.join(" ")) };
+        assert_eq!(set(VolumeTool::Pactl, 0.55), "pactl set-sink-volume @DEFAULT_SINK@ 55%");
+        assert_eq!(set(VolumeTool::Pactl, 0.0), "pactl set-sink-volume @DEFAULT_SINK@ 0%");
+        assert_eq!(set(VolumeTool::Pactl, 1.0), "pactl set-sink-volume @DEFAULT_SINK@ 100%");
+        assert_eq!(set(VolumeTool::Pactl, 0.555), "pactl set-sink-volume @DEFAULT_SINK@ 56%");
+        assert_eq!(set(VolumeTool::Pactl, -0.2), "pactl set-sink-volume @DEFAULT_SINK@ 0%", "never a negative percentage");
+        assert_eq!(set(VolumeTool::Wpctl, 0.5), "wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.500");
+    }
+
+    #[test]
+    fn pulseaudio_phone_volume_works_when_wpctl_cannot_connect() {
+        // The reported bug: the shell only ever ran wpctl, which needs PipeWire/WirePlumber; this phone
+        // runs PulseAudio, so the slider and the hardware volume keys failed at the first call.
+        let calls = RefCell::new(Vec::new());
+        let run = |prog: &str, _: &[String]| -> Result<String, String> {
+            calls.borrow_mut().push(prog.to_string());
+            match prog {
+                "pactl" => Ok("Volume: front-left: 24904 /  38% / -25.21 dB\n".into()),
+                _ => Err("wpctl: Could not connect to PipeWire".into()),
+            }
+        };
+        let (tool, v) = read_volume_with(&run).expect("must read the volume from pactl");
+        assert_eq!(tool, VolumeTool::Pactl);
+        assert!((v - 0.38).abs() < 1e-6);
+        assert_eq!(*calls.borrow(), vec!["pactl".to_string()], "pactl first, and wpctl is never touched when it works");
+    }
+
+    #[test]
+    fn a_pipewire_only_session_falls_back_to_wpctl_and_a_dead_audio_server_says_why() {
+        let pipewire_only = |prog: &str, _: &[String]| -> Result<String, String> {
+            if prog == "wpctl" { Ok("Volume: 0.45\n".into()) } else { Err("pactl: not found".into()) }
+        };
+        assert_eq!(read_volume_with(&pipewire_only), Ok((VolumeTool::Wpctl, 0.45)));
+        let unreadable = |prog: &str, _: &[String]| -> Result<String, String> {
+            if prog == "pactl" { Ok("garbage".into()) } else { Ok("Volume: 0.2".into()) }
+        };
+        assert_eq!(read_volume_with(&unreadable).map(|(t, _)| t), Ok(VolumeTool::Wpctl), "unparseable output is a failure of that tool");
+        let dead = |prog: &str, _: &[String]| -> Result<String, String> { Err(format!("{prog}: connection refused")) };
+        let e = read_volume_with(&dead).unwrap_err();
+        assert!(e.contains("pactl") && e.contains("wpctl"), "both failures must be reported: {e}");
+    }
+
+    #[test]
+    fn the_quick_tiles_map_to_privilege_free_commands() {
+        let cmd = |k, on| quick_commands(k, on).map(|v| v.into_iter().map(|(p, a)| format!("{p} {}", a.join(" "))).collect::<Vec<_>>());
+        assert_eq!(cmd(QuickKind::Wifi, true), Some(vec!["nmcli radio wifi on".to_string()]));
+        assert_eq!(cmd(QuickKind::Wifi, false), Some(vec!["nmcli radio wifi off".to_string()]));
+        assert_eq!(cmd(QuickKind::MobileData, false), Some(vec!["nmcli radio wwan off".to_string()]));
+        assert_eq!(cmd(QuickKind::Bluetooth, true), Some(vec!["bluetoothctl power on".to_string()]));
+        // /dev/rfkill is root-write on the phone: rfkill would fail for the user the shell runs as.
+        for on in [true, false] {
+            let all = quick_commands(QuickKind::Bluetooth, on).unwrap();
+            assert!(all.iter().all(|(p, _)| *p != "rfkill"), "rfkill needs root here");
+        }
+        // Airplane ON means every radio OFF — the inversion is the whole point of the tile.
+        assert_eq!(cmd(QuickKind::Airplane, true), Some(vec!["nmcli radio all off".to_string(), "bluetoothctl power off".to_string()]));
+        assert_eq!(cmd(QuickKind::Airplane, false), Some(vec!["nmcli radio all on".to_string(), "bluetoothctl power on".to_string()]));
+        for k in [QuickKind::Flashlight, QuickKind::Rotation, QuickKind::DoNotDisturb, QuickKind::Keyboard, QuickKind::CpuGovernor] {
+            assert_eq!(quick_commands(k, true), None, "{k:?} is not a command-line toggle");
+        }
+    }
+
+    fn fake_leds(tag: &str, leds: &[(&str, Option<&str>)]) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("tideshell-leds-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for (name, max) in leds {
+            let d = base.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("brightness"), "0").unwrap();
+            if let Some(m) = max { std::fs::write(d.join("max_brightness"), m).unwrap(); }
+        }
+        base
+    }
+
+    #[test]
+    fn the_flashlight_lights_to_max_and_goes_dark_and_ignores_other_leds() {
+        // Names as found on the FP5: `mmc2::` (storage activity) and `white:flash`.
+        let base = fake_leds("ok", &[("mmc2::", Some("1")), ("white:flash", Some("255"))]);
+        assert!(matches!(set_flashlight(&base, true), Outcome::Done(_)));
+        assert_eq!(std::fs::read_to_string(base.join("white:flash/brightness")).unwrap(), "255");
+        assert_eq!(std::fs::read_to_string(base.join("mmc2::/brightness")).unwrap(), "0", "the storage LED is not a torch");
+        assert!(matches!(set_flashlight(&base, false), Outcome::Done(_)));
+        assert_eq!(std::fs::read_to_string(base.join("white:flash/brightness")).unwrap(), "0");
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_flash_led_is_a_failure_with_a_reason_not_a_silent_no_op() {
+        let none = fake_leds("none", &[("mmc2::", Some("1"))]);
+        assert!(matches!(set_flashlight(&none, true), Outcome::Failed(m) if m.contains("no flash/torch LED")));
+        let bad = fake_leds("bad", &[("white:flash", Some("not-a-number"))]);
+        assert!(matches!(set_flashlight(&bad, true), Outcome::Failed(m) if m.contains("max_brightness")));
+        assert!(matches!(set_flashlight(&bad, false), Outcome::Done(_)), "turning it OFF needs no max_brightness");
+        assert!(matches!(set_flashlight(std::path::Path::new("/nonexistent/leds"), true), Outcome::Failed(_)));
+        assert_eq!(flashlight_led(&fake_leds("torchname", &[("led:torch_0", Some("1"))])).map(|p| p.file_name().unwrap().to_string_lossy().into_owned()), Some("led:torch_0".into()));
     }
 }
