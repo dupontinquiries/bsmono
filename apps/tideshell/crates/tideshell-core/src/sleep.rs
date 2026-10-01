@@ -32,8 +32,11 @@
 
 use crate::Millis;
 
-pub const FADE_OUT_MS: f32 = 250.0;
-pub const FADE_IN_MS: f32 = 180.0;
+/// Screen fades, by day. In the evening and at night each gets EVENING_EXTRA_MS more: a slow
+/// ramp is kinder to dark-adapted eyes (see `Sleep::evening`).
+pub const FADE_OUT_MS: f32 = 1000.0;
+pub const FADE_IN_MS: f32 = 1000.0;
+pub const EVENING_EXTRA_MS: f32 = 1000.0;
 pub const TAP_MAX_MS: Millis = 200;
 pub const TAP_SLOP: f32 = 24.0;
 pub const TRIPLE_WINDOW_MS: Millis = 700;
@@ -76,15 +79,20 @@ pub struct Sleep {
     /// The bedside clock is lighting the panel on purpose (nightclock.rs):
     /// a lit report now is ours, not an intruder's.
     pub glance: bool,
+    /// Evening or night (set by the shell from the clock): the fades are longer.
+    pub evening: bool,
 }
 
 impl Default for Sleep {
     fn default() -> Self {
-        Sleep { phase: Phase::Awake, black: 0.0, lock_on_sleep: true, taps: Vec::new(), down: None, near: false, near_cleared_at: None, external_blanks: 0, refused_wakes: 0, glance: false }
+        Sleep { phase: Phase::Awake, black: 0.0, lock_on_sleep: true, taps: Vec::new(), down: None, near: false, near_cleared_at: None, external_blanks: 0, refused_wakes: 0, glance: false, evening: false }
     }
 }
 
 impl Sleep {
+    pub fn fade_out_ms(&self) -> f32 { FADE_OUT_MS + if self.evening { EVENING_EXTRA_MS } else { 0.0 } }
+    pub fn fade_in_ms(&self) -> f32 { FADE_IN_MS + if self.evening { EVENING_EXTRA_MS } else { 0.0 } }
+
     /// Whether touches must be swallowed (opaque input surface mapped).
     pub fn captures_input(&self) -> bool {
         matches!(self.phase, Phase::FadingOut | Phase::Off)
@@ -178,14 +186,14 @@ impl Sleep {
     pub fn tick(&mut self, dt_ms: f32) -> Vec<SleepAction> {
         match self.phase {
             Phase::FadingOut => {
-                self.black = (self.black + dt_ms / FADE_OUT_MS).min(1.0);
+                self.black = (self.black + dt_ms / self.fade_out_ms()).min(1.0);
                 if self.black >= 1.0 {
                     self.phase = Phase::Off;
                     return vec![SleepAction::DisplayPower(false)];
                 }
             }
             Phase::FadingIn => {
-                self.black = (self.black - dt_ms / FADE_IN_MS).max(0.0);
+                self.black = (self.black - dt_ms / self.fade_in_ms()).max(0.0);
                 if self.black <= 0.0 {
                     self.phase = Phase::Awake;
                 }
@@ -252,7 +260,7 @@ mod tests {
     fn asleep() -> Sleep {
         let mut s = Sleep::default();
         s.power_key();
-        for _ in 0..30 {
+        for _ in 0..100 {
             s.tick(11.1);
         }
         assert_eq!(s.phase, Phase::Off);
@@ -274,11 +282,29 @@ mod tests {
         while s.phase == Phase::FadingOut {
             off.extend(s.tick(11.1));
             t += 11.1;
-            assert!(t < 400.0);
+            assert!(t < 1200.0);
         }
         assert_eq!(off, vec![SleepAction::DisplayPower(false)]);
         assert!((t - FADE_OUT_MS).abs() < 12.0, "fade took {t} ms");
         assert_eq!(s.black, 1.0);
+    }
+
+    #[test]
+    fn evening_fades_take_a_second_longer_both_ways() {
+        let take = |evening: bool| {
+            let mut s = Sleep { evening, ..Sleep::default() };
+            s.power_key();
+            let mut out = 0.0f32;
+            while s.phase == Phase::FadingOut { s.tick(10.0); out += 10.0; }
+            s.power_key(); // wake
+            let mut inn = 0.0f32;
+            while s.phase == Phase::FadingIn { s.tick(10.0); inn += 10.0; }
+            (out, inn)
+        };
+        let (d_out, d_in) = take(false);
+        let (n_out, n_in) = take(true);
+        assert!((d_out - 1000.0).abs() < 20.0 && (d_in - 1000.0).abs() < 20.0, "day {d_out}/{d_in}");
+        assert!((n_out - 2000.0).abs() < 20.0 && (n_in - 2000.0).abs() < 20.0, "night {n_out}/{n_in}");
     }
 
     #[test]
@@ -288,7 +314,7 @@ mod tests {
         assert!(tap(&mut s, 210.0, 505.0, 1200, 80).is_empty());
         assert_eq!(tap(&mut s, 195.0, 498.0, 1400, 80), vec![SleepAction::DisplayPower(true)]);
         assert_eq!(s.phase, Phase::FadingIn);
-        for _ in 0..30 {
+        for _ in 0..100 {
             s.tick(11.1);
         }
         assert_eq!((s.phase, s.black), (Phase::Awake, 0.0));

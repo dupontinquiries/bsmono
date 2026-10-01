@@ -1039,6 +1039,7 @@ impl Shell {
     /// Bedside mode, once per loop: light the panel for a dim clock at each
     /// new minute in sleeping hours, and turn it off again after the pulse.
     pub fn night_tick(&mut self, now: Millis, minute_of_day: u16) -> Vec<Action> {
+        self.sleep.evening = !(7 * 60..19 * 60).contains(&minute_of_day);
         let asleep = self.sleep.phase == crate::sleep::Phase::Off;
         let window = self.night_window && self.night_pulse;
         let out = match self.night.tick(now, minute_of_day, window, asleep) {
@@ -1799,7 +1800,7 @@ mod tests {
         assert!(sh.lock.is_locked() && !sh.switcher.open, "cover engaged, overlays closed");
         let mut t = 1000u64;
         let mut off = vec![];
-        for _ in 0..30 {
+        for _ in 0..100 {
             t += 11;
             off.extend(sh.tick(t));
         }
