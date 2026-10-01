@@ -162,7 +162,7 @@ pub fn hide_video_bridge_plan() -> Vec<Step> {
     let f = "$HOME/.config/autostart/org.kde.xwaylandvideobridge.desktop";
     vec![
         Step { on: Where::Device, what: "xwaylandvideobridge no longer autostarts",
-               cmd: format!("mkdir -p \"$HOME/.config/autostart\" && printf '[Desktop Entry]\\nType=Application\\nName=Xwayland Video Bridge\\nHidden=true\\n' > \"{f}\" && {{ pkill -x xwaylandvideobridge; true; }}"),
+               cmd: format!("mkdir -p \"$HOME/.config/autostart\" && printf '[Desktop Entry]\\nType=Application\\nName=Xwayland Video Bridge\\nHidden=true\\n' > \"{f}\" && {{ pkill -x xwaylandvideobr; true; }}"),
                gate: Gate::ExitZero, rollback: Some(format!("rm -f \"{f}\"")) },
         Step { on: Where::Device, what: "the override says Hidden",
                cmd: format!("grep -x Hidden=true \"{f}\" && echo HIDDEN"),
@@ -436,6 +436,7 @@ mod tests {
         let p = hide_video_bridge_plan();
         assert!(p[0].cmd.contains("Hidden=true") && p[0].cmd.contains("org.kde.xwaylandvideobridge.desktop"), "{}", p[0].cmd);
         assert!(p[0].rollback.as_deref().unwrap().contains("rm -f"));
+        assert!(p[0].cmd.contains("pkill -x xwaylandvideobr;"), "comm is truncated to 15 chars: {}", p[0].cmd);
     }
 
     #[test]
