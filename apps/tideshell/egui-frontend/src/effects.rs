@@ -106,6 +106,22 @@ impl System {
     }
 }
 
+/// The program that summons hatch. The crate's binary is `hatch-egui`, but the gitmind deploy
+/// installs apps under their directory name, so the phone has `hatch` (a symlink to a
+/// `hatch@import-…` file) and NO `hatch-egui` — the apps button spawned a name that did not
+/// exist and the spawn failure only reached the trace. `override_bin` (HATCH_BIN) wins; then
+/// the first of `hatch-egui`, `hatch` found as a file on `path`; else `hatch-egui`, so the
+/// failure names the program the shell was built to expect.
+pub fn pick_launcher(path: &str, override_bin: Option<&str>) -> String {
+    if let Some(b) = override_bin.map(str::trim).filter(|b| !b.is_empty()) { return b.to_string(); }
+    for name in ["hatch-egui", "hatch"] {
+        if path.split(':').filter(|d| !d.is_empty()).any(|d| std::path::Path::new(d).join(name).is_file()) {
+            return name.to_string();
+        }
+    }
+    "hatch-egui".to_string()
+}
+
 impl Default for System {
     fn default() -> Self {
         Self::new()
@@ -189,7 +205,10 @@ impl Executor for System {
             // One instance, poke-file toggle: starts hatch if it is not running.
             // --toggle pokes a running hatch and exits, or BECOMES the
             // resident instance when none runs: treat it as long-running.
-            Action::SummonLauncher => self.start(&["hatch-egui", "--toggle"], true),
+            Action::SummonLauncher => {
+                let prog = pick_launcher(&std::env::var("PATH").unwrap_or_default(), std::env::var("HATCH_BIN").ok().as_deref());
+                self.start(&[prog.as_str(), "--toggle"], true)
+            }
             Action::ShowKeyboard(on) => {
                 let a = keyboard_argv(*on);
                 self.start_with(&a[..7], false, on.then_some(Undo::KeyboardShown))
@@ -1008,5 +1027,45 @@ mod tests {
             o => panic!("{o:?}"),
         }
         assert!(matches!(sys.run(&Action::LaunchApp("missing".into())), Outcome::Failed(_)));
+    }
+
+    // ---- the apps button must find hatch under the name the phone actually has ----
+
+    fn bin_dir(tag: &str, files: &[&str]) -> String {
+        let d = std::env::temp_dir().join(format!("tideshell-launcher-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for f in files { std::fs::write(d.join(f), b"#!/bin/sh\n").unwrap(); }
+        d.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_phone_with_only_hatch_summons_hatch() {
+        // The FP5 as found: ~/.local/bin/hatch, no hatch-egui.
+        let d = bin_dir("only-hatch", &["hatch"]);
+        assert_eq!(pick_launcher(&format!("/nonexistent:{d}"), None), "hatch");
+    }
+
+    #[test]
+    fn hatch_egui_is_preferred_when_both_exist() {
+        let d = bin_dir("both", &["hatch", "hatch-egui"]);
+        assert_eq!(pick_launcher(&d, None), "hatch-egui");
+    }
+
+    #[test]
+    fn neither_found_falls_back_to_the_name_the_shell_expects() {
+        let d = bin_dir("none", &["something-else"]);
+        assert_eq!(pick_launcher(&d, None), "hatch-egui");
+        assert_eq!(pick_launcher("", None), "hatch-egui");
+    }
+
+    #[test]
+    fn a_directory_called_hatch_is_not_a_launcher_and_the_override_wins() {
+        let d = bin_dir("dir", &[]);
+        std::fs::create_dir_all(std::path::Path::new(&d).join("hatch")).unwrap();
+        assert_eq!(pick_launcher(&d, None), "hatch-egui", "a directory is not a program");
+        let e = bin_dir("ovr", &["hatch", "hatch-egui"]);
+        assert_eq!(pick_launcher(&e, Some("/opt/my-hatch")), "/opt/my-hatch");
+        assert_eq!(pick_launcher(&e, Some("  ")), "hatch-egui", "a blank override is no override");
     }
 }
