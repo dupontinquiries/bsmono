@@ -7,7 +7,7 @@
 
 use crate::Millis;
 
-pub const HOLD_MS: Millis = 450;
+pub const HOLD_MS: Millis = 900;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Orientation {
