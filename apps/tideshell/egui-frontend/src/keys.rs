@@ -86,10 +86,10 @@ pub struct Keys {
 impl Keys {
     /// Open the discovered devices and start readers. Only key PRESSES are
     /// reported (value 1); releases and repeats are dropped.
-    /// `via_compositor`: cosmic-comp hands the keys over through the control
-    /// socket (ctl.rs), so the devices are not opened at all (no double
-    /// volume steps), and the logind inhibitor is taken regardless of device
-    /// access: logind reads the key itself and would still power off.
+    /// `via_compositor`: cosmic-comp hands the POWER key over through the control
+    /// socket (ctl.rs), so that node is not opened; the volume keys are still read
+    /// from evdev (they need releases for holds), and the logind inhibitor is taken
+    /// regardless of device access: logind reads the key itself and would power off.
     /// The descriptor to sleep on, if there is a reader thread.
     pub fn wake_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         self.wake.as_ref().map(std::os::fd::AsFd::as_fd)
@@ -104,15 +104,6 @@ impl Keys {
     }
 
     pub fn spawn(devices: Vec<KeyDevice>, bus: Option<&zbus::blocking::Connection>, via_compositor: bool) -> Keys {
-        if via_compositor {
-            let (_tx, rx) = mpsc::channel();
-            let inhibit = bus.and_then(|b| inhibit_power_key(b).ok());
-            let status = format!(
-                "keys: from cosmic-comp via tideshell ctl; {}",
-                if inhibit.is_some() { "logind power-key inhibitor held" } else { "NO logind inhibitor (D-Bus refused): install 50-tideshell-powerkey.conf or logind powers off" }
-            );
-            return Keys { rx, wake: None, status, _inhibit: inhibit };
-        }
         let (tx, rx) = mpsc::channel();
         let mut opened = Vec::new();
         let mut failed = Vec::new();
@@ -128,6 +119,9 @@ impl Keys {
             }
             Err(_) => (None, None),
         };
+        // Through the compositor only the POWER key is routed there; the volume keys stay on
+        // evdev either way (releases exist there, which holds need), so drop the power node.
+        let devices: Vec<KeyDevice> = if via_compositor { devices.into_iter().filter(|d| d.volume && !d.power).collect() } else { devices };
         for d in &devices {
             match std::fs::File::open(&d.node) {
                 Ok(f) => {
@@ -143,9 +137,10 @@ impl Keys {
         // it with the device unreadable left the key doing nothing at all on
         // the FP5 (logind no longer powered off, tideshell never saw the key).
         let power_readable = devices.iter().any(|d| d.power && opened.iter().any(|o| o.contains(&d.node.display().to_string())));
-        let inhibit = if power_readable { bus.and_then(|b| inhibit_power_key(b).ok()) } else { None };
+        let inhibit = if via_compositor { bus.and_then(|b| inhibit_power_key(b).ok()) } else if power_readable { bus.and_then(|b| inhibit_power_key(b).ok()) } else { None };
         let status = format!(
-            "keys: {}{}{}",
+            "keys: {}{}{}{}",
+            if via_compositor { "power from cosmic-comp via tideshell ctl; volume " } else { "" },
             if opened.is_empty() { "no readable power/volume device".to_string() } else { opened.join(", ") },
             if failed.is_empty() { String::new() } else { format!("; cannot open {} (add the user to the input group)", failed.join(", ")) },
             match (&inhibit, devices.iter().any(|d| d.power), power_readable) {
