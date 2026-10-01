@@ -12,6 +12,10 @@ use crate::Action;
 /// Progress at which exactly the first row is visible.
 pub const PEEK: f32 = 0.42;
 
+/// How far past the peek row a pull must go to land on the full sheet. Halfway (0.29) made the
+/// full sheet a long stretch for a thumb; this is a short extra pull.
+pub const RELEASE_PAST_PEEK: f32 = 0.12;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuickKind {
     Wifi,
@@ -211,6 +215,9 @@ pub struct ControlCenter {
     /// Speaker warmth. Lives beside the others so one slider widget serves
     /// all three, but it is only offered where a speaker chain exists.
     pub warmth: f32,
+    /// The screen is turned on its side: the first row is a sliver of a short screen, so an
+    /// opening pull goes straight to the full sheet instead of stopping at the peek detent.
+    pub landscape: bool,
 }
 
 impl Default for ControlCenter {
@@ -230,6 +237,7 @@ impl Default for ControlCenter {
             // should be something a listener turns up deliberately rather
             // than a colouration they find already applied.
             warmth: 0.0,
+            landscape: false,
         }
     }
 }
@@ -267,7 +275,7 @@ impl ControlCenter {
         self.dragging = false;
         self.target = if !open {
             0.0
-        } else if self.progress < (PEEK + 1.0) / 2.0 {
+        } else if !self.landscape && self.progress < PEEK + RELEASE_PAST_PEEK {
             PEEK
         } else {
             1.0
@@ -435,6 +443,25 @@ mod tests {
         assert_eq!(cc.progress, 1.0);
         assert_eq!(cc.stage(), Stage::Full);
         assert_eq!(cc.visible_tiles().len(), QuickKind::ALL.len());
+    }
+
+    #[test]
+    fn a_modest_pull_past_the_peek_row_opens_full_and_landscape_skips_the_detent() {
+        let mut cc = ControlCenter::default();
+        cc.drag(PEEK + RELEASE_PAST_PEEK + 0.02);
+        cc.release(true);
+        settle(&mut cc);
+        assert_eq!(cc.stage(), Stage::Full);
+        let mut cc = ControlCenter::default();
+        cc.drag(PEEK + RELEASE_PAST_PEEK - 0.04);
+        cc.release(true);
+        settle(&mut cc);
+        assert_eq!(cc.stage(), Stage::Peek, "just short still stops at the peek row");
+        let mut cc = ControlCenter { landscape: true, ..ControlCenter::default() };
+        cc.drag(0.1);
+        cc.release(true);
+        settle(&mut cc);
+        assert_eq!(cc.stage(), Stage::Full, "landscape: no detent");
     }
 
     #[test]

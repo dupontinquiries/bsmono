@@ -452,6 +452,7 @@ impl Shell {
                 vec![]
             }
             GestureEvent::DrawerRelease { open } => {
+                self.drawer.landscape = matches!(self.rotate.applied, crate::rotate::Orientation::LeftUp | crate::rotate::Orientation::RightUp);
                 self.drawer.release(open);
                 self.log(format!("drawer release open={open}"));
                 vec![]
