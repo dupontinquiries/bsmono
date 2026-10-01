@@ -837,6 +837,18 @@ impl Shell {
 
     // ---- overlay taps ------------------------------------------------------
 
+    /// A long press on a quick tile: the connection tiles open their settings page, the rest
+    /// do nothing (a long press must never toggle).
+    pub fn long_press_quick(&mut self, kind: QuickKind) -> Vec<Action> {
+        match kind.settings_app() {
+            Some(id) => {
+                self.log(format!("{} held: opening settings", kind.label()));
+                self.emit(vec![Action::LaunchApp(id.to_string())])
+            }
+            None => Vec::new(),
+        }
+    }
+
     pub fn tap_quick(&mut self, kind: QuickKind) -> Vec<Action> {
         match kind {
             QuickKind::Keyboard => self.toggle_mode(HoldOption::Keyboard),
@@ -1594,6 +1606,9 @@ mod tests {
         assert!(sh.drawer.is_visible());
         assert_eq!(sh.tap_quick(QuickKind::Trackpad), vec![Action::ShowTrackpad(true)]);
         assert_eq!(sh.tap_quick(QuickKind::Wifi), vec![Action::SetQuick(QuickKind::Wifi, true)]);
+        assert_eq!(sh.long_press_quick(QuickKind::Wifi), vec![Action::LaunchApp("com.system76.CosmicSettings.Wireless".into())]);
+        assert_eq!(sh.long_press_quick(QuickKind::Bluetooth), vec![Action::LaunchApp("com.system76.CosmicSettings.Bluetooth".into())]);
+        assert!(sh.long_press_quick(QuickKind::Flashlight).is_empty(), "a long press never toggles or launches on the other tiles");
     }
 
     #[test]

@@ -124,6 +124,17 @@ impl QuickKind {
         QuickKind::ALL.into_iter().find(|k| k.token() == s)
     }
 
+    /// The cosmic-settings page (as a desktop-entry id) a long press on this tile opens, for the
+    /// tiles that stand for a connection.
+    pub fn settings_app(self) -> Option<&'static str> {
+        match self {
+            QuickKind::Wifi => Some("com.system76.CosmicSettings.Wireless"),
+            QuickKind::Bluetooth => Some("com.system76.CosmicSettings.Bluetooth"),
+            QuickKind::MobileData => Some("com.system76.CosmicSettings.Network"),
+            _ => None,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             QuickKind::Wifi => "Wi-Fi",

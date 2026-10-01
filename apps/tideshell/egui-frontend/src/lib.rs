@@ -125,6 +125,9 @@ enum Owner {
     Pad,
 }
 
+/// How long a finger rests on a quick tile before it counts as a long press.
+const TILE_HOLD_S: f64 = 0.55;
+
 #[derive(Default)]
 struct SettingsSheet {
     open: bool,
@@ -188,6 +191,10 @@ pub struct ShellView {
     palette_pub: ambient_palette::Publisher,
     /// This frame's dt for the springs (set at the top of `ui`).
     frame_dt: f32,
+    /// The quick tile a finger is holding and since when (egui time), and the tile whose hold
+    /// already fired, so the release that follows is not also a tap.
+    tile_hold: Option<(Id, f64)>,
+    tile_fired: Option<Id>,
     /// The switcher landed (reveal reached 1): kick the cards once.
     switcher_landed: bool,
     /// The mood's spring parameters for this frame.
@@ -314,6 +321,44 @@ impl ShellView {
         s.set_target(if pressed { 0.94 } else { 1.0 });
         s.tick(dt_ms);
         s.value
+    }
+
+    /// Long press on a quick tile. True once, when the finger has been down on `resp` for
+    /// `TILE_HOLD_S`; the release after it is swallowed by `tile_tap`.
+    fn tile_held(&mut self, ui: &egui::Ui, resp: &egui::Response) -> bool {
+        let now = ui.input(|i| i.time);
+        if resp.is_pointer_button_down_on() {
+            match self.tile_hold {
+                Some((id, t0)) if id == resp.id => {
+                    if self.tile_fired != Some(id) && now - t0 >= TILE_HOLD_S {
+                        self.tile_fired = Some(id);
+                        return true;
+                    }
+                }
+                _ => self.tile_hold = Some((resp.id, now)),
+            }
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
+        } else {
+            if matches!(self.tile_hold, Some((id, _)) if id == resp.id) {
+                self.tile_hold = None;
+            }
+            if self.tile_fired == Some(resp.id) && !resp.clicked() {
+                self.tile_fired = None; // dragged off: nothing left to swallow
+            }
+        }
+        false
+    }
+
+    /// A tap on a quick tile, unless that press already became a long press.
+    fn tile_tap(&mut self, resp: &egui::Response) -> bool {
+        if !resp.clicked() {
+            return false;
+        }
+        if self.tile_fired == Some(resp.id) {
+            self.tile_fired = None;
+            return false;
+        }
+        true
     }
 
     /// Draw `r` scaled about its centre for the press feedback of `id`.
@@ -1275,8 +1320,13 @@ impl ShellView {
             // current, not a fixed short name every other tile uses.
             let sub = if *kind == QuickKind::CpuGovernor { shell.drawer.governor.label().to_string() } else { short(kind.label()).to_string() };
             pc.text(r.center_bottom() - Vec2::new(0.0, 13.0), Align2::CENTER_CENTER, sub, FontId::proportional(10.0), if on { pal.bg_base } else { pal.text_weak });
-            if visible && hit.height() > 20.0 && ui.interact(hit, Id::new(("ts-tile", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                out.extend(shell.tap_quick(*kind));
+            if visible && hit.height() > 20.0 {
+                let resp = ui.interact(hit, Id::new(("ts-tile", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                if self.tile_held(ui, &resp) {
+                    out.extend(shell.long_press_quick(*kind));
+                } else if self.tile_tap(&resp) {
+                    out.extend(shell.tap_quick(*kind));
+                }
             }
         }
         let rows = rows_n as f32;
@@ -1400,7 +1450,10 @@ impl ShellView {
                     p.circle_filled(c, unit * 0.36, if on { pal.accent } else { pal.bg_raised });
                     p.text(c, Align2::CENTER_CENTER, initial(k.label()), FontId::proportional(14.0), if on { pal.bg_base } else { pal.text });
                     label(&p, r, k.label());
-                    if ui.interact(r, wid, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    let resp = ui.interact(r, wid, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if self.tile_held(ui, &resp) {
+                        out.extend(shell.long_press_quick(*k));
+                    } else if self.tile_tap(&resp) {
                         out.extend(shell.tap_quick(*k));
                     }
                 }
