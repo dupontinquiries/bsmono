@@ -47,6 +47,7 @@
 //! says SKIPPED where it is not). A real camera device still is not — no
 //! sandbox has one — but everything after the source element is.
 
+pub mod focus;
 pub mod probe;
 
 use std::io::Read;
