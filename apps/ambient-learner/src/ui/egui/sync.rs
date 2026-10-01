@@ -291,7 +291,7 @@ pub fn sync_ui(ui: &mut egui::Ui, p: &mut SyncPage, c: &uikit_egui::PaletteColor
     }
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        ui.add_enabled(st.import, egui::TextEdit::singleline(&mut p.import_path)
+        ui.add_enabled(st.import, egui::TextEdit::singleline(&mut p.import_path).id_salt("ambient-sync-import-path")
             .hint_text("path to a sensors_*.db file").desired_width(220.0));
         let can = st.import && !p.import_path.trim().is_empty();
         if ui.add_enabled(can, egui::Button::new("📥 Import database")).clicked() {

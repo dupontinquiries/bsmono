@@ -227,7 +227,7 @@ pub fn library_ui(ui: &mut egui::Ui, page: &mut LibraryPage, lib: &Library, shar
     let mut out = None;
     ui.colored_label(c.text, egui::RichText::new("Folder").strong());
     ui.horizontal(|ui| {
-        let r = ui.add(egui::TextEdit::singleline(&mut page.root_text).desired_width(260.0).hint_text("~/Pictures"));
+        let r = ui.add(egui::TextEdit::singleline(&mut page.root_text).id_salt("photosync-root-text").desired_width(260.0).hint_text("~/Pictures"));
         let entered = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let changed = page.root_text.trim() != lib.root && !page.root_text.trim().is_empty();
         if ui.add_enabled(changed && !page.status.running, egui::Button::new("Open")).clicked() || (entered && changed) {

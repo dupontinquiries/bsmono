@@ -443,7 +443,7 @@ impl<B: Backend> Companion<B> {
                             ui.painter().rect_filled(r, 6.0, c);
                         }
                     }
-                    let te = egui::TextEdit::singleline(buf)
+                    let te = egui::TextEdit::singleline(buf).id_salt(("companion-text", s.key))
                         .password(s.kind == Kind::Secret)
                         .hint_text(match s.kind {
                             Kind::Color => "#rrggbb, or empty to follow the theme",
@@ -483,7 +483,7 @@ impl<B: Backend> Companion<B> {
             }
         });
         if let Some((filter, fams)) = &mut self.font_picker {
-            ui.add(egui::TextEdit::singleline(filter).hint_text("filter, or a family name / file path").desired_width(f32::INFINITY));
+            ui.add(egui::TextEdit::singleline(filter).id_salt("companion-filter").hint_text("filter, or a family name / file path").desired_width(f32::INFINITY));
             let f = filter.to_lowercase();
             if fams.is_empty() {
                 ui.label(egui::RichText::new("No installed fonts found (is fontconfig installed?). Type a file path above and press Use.").weak());
@@ -743,7 +743,7 @@ impl<B: Backend> Companion<B> {
         });
         ui.horizontal(|ui| {
             ui.label("Name");
-            let r = ui.add(egui::TextEdit::singleline(&mut st.name).desired_width(f32::INFINITY));
+            let r = ui.add(egui::TextEdit::singleline(&mut st.name).id_salt("companion-name").desired_width(f32::INFINITY));
             if r.changed() {
                 st.ed.rename(&st.name);
                 st.confirm_discard = false;
@@ -894,7 +894,7 @@ fn inspector(ui: &mut egui::Ui, st: &mut EditState) -> bool {
 
     let grid = |ui: &mut egui::Ui, name: &str, buf: &mut String, hint: &str| -> bool {
         ui.label(name);
-        ui.add(egui::TextEdit::singleline(buf).hint_text(hint).desired_width(f32::INFINITY)).changed()
+        ui.add(egui::TextEdit::singleline(buf).id_salt(("companion-field", name)).hint_text(hint).desired_width(f32::INFINITY)).changed()
     };
     ui.add_space(6.0);
     if grid(ui, "Label", &mut st.label, "what the key shows") {

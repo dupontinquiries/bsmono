@@ -260,7 +260,7 @@ fn info_ui(ui: &mut egui::Ui, v: &mut Viewer, i: usize, p: &Photo, share: &Photo
         if p.written_tags().is_empty() { ui.colored_label(c.text_weak, egui::RichText::new("none written").small()); }
     });
     ui.horizontal(|ui| {
-        let r = ui.add(egui::TextEdit::singleline(&mut v.tag_text).hint_text("add a tag").desired_width(140.0));
+        let r = ui.add(egui::TextEdit::singleline(&mut v.tag_text).id_salt("photosync-tag-text").hint_text("add a tag").desired_width(140.0));
         let entered = r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter));
         if (ui.small_button("Add").clicked() || entered) && !v.tag_text.trim().is_empty() {
             out.push(ViewerAction::AddTag(i, v.tag_text.trim().to_string()));

@@ -85,7 +85,7 @@ pub fn calibrate_ui(ui: &mut egui::Ui, c: &mut Calibrate,
         egui::RichText::new("Enter the known ambient temperature").small());
     let mut out = None;
     ui.horizontal(|ui| {
-        let edit = egui::TextEdit::singleline(&mut c.text)
+        let edit = egui::TextEdit::singleline(&mut c.text).id_salt("ambient-calibrate-text")
             .desired_width(72.0)
             .hint_text("20");
         let resp = ui.add(edit);

@@ -316,7 +316,7 @@ impl Shell {
 
     fn photos_ui(&mut self, ui: &mut egui::Ui, compact: bool, c: &uikit_egui::PaletteColors) {
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("search names and tags").desired_width(if compact { 180.0 } else { 260.0 }));
+            ui.add(egui::TextEdit::singleline(&mut self.query).id_salt("photosync-query").hint_text("search names and tags").desired_width(if compact { 180.0 } else { 260.0 }));
             if !self.query.is_empty() && ui.small_button("✕").clicked() { self.query.clear(); }
             let status = &self.lib_page.status;
             if status.running {
