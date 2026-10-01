@@ -155,6 +155,21 @@ pub fn panel_zones_plan() -> Vec<Step> {
     ]
 }
 
+/// xwaylandvideobridge (KDE) keeps an invisible X11 window and a tray icon for screen-sharing X11
+/// apps. KWin and GNOME hide it; COSMIC shows it. Nothing on the phone shares X11 windows, so it
+/// is not started: a per-user autostart entry with `Hidden=true` shadows the system one.
+pub fn hide_video_bridge_plan() -> Vec<Step> {
+    let f = "$HOME/.config/autostart/org.kde.xwaylandvideobridge.desktop";
+    vec![
+        Step { on: Where::Device, what: "xwaylandvideobridge no longer autostarts",
+               cmd: format!("mkdir -p \"$HOME/.config/autostart\" && printf '[Desktop Entry]\\nType=Application\\nName=Xwayland Video Bridge\\nHidden=true\\n' > \"{f}\" && {{ pkill -x xwaylandvideobridge; true; }}"),
+               gate: Gate::ExitZero, rollback: Some(format!("rm -f \"{f}\"")) },
+        Step { on: Where::Device, what: "the override says Hidden",
+               cmd: format!("grep -x Hidden=true \"{f}\" && echo HIDDEN"),
+               gate: Gate::Contains("HIDDEN".into()), rollback: None },
+    ]
+}
+
 /// Past this much anonymous memory (kB) cosmic-panel is restarted by the watchdog.
 pub const PANEL_RSS_LIMIT_KB: u32 = 800_000;
 
@@ -370,6 +385,7 @@ pub fn all_parts(root: Root) -> Vec<(&'static str, Vec<Step>)> {
         ("video tools for vidkit-player", video_tools_plan(root)),
         ("panel and dock zones", panel_zones_plan()),
         ("panel memory watchdog", panel_watchdog_plan()),
+        ("hide xwaylandvideobridge", hide_video_bridge_plan()),
         ("emergency USB access", emergency_access_plan(root)),
     ]
 }
@@ -388,6 +404,7 @@ mod tests {
         v.extend(video_tools_plan(root));
         v.extend(panel_zones_plan());
         v.extend(panel_watchdog_plan());
+        v.extend(hide_video_bridge_plan());
         v.extend(rescue_console_plan("/tmp/fp5-rescue", root));
         v.extend(autologin_plan("user", root));
         v
@@ -412,6 +429,13 @@ mod tests {
         assert!(cmd.contains("${kb:-0}"), "an unset reading must not become a syntax error: {cmd}");
         assert!(w[1].cmd.contains("ExecStart=%%h/.local/bin/panel-watchdog"), "{}", w[1].cmd);
         assert!(w.iter().filter(|s| s.rollback.is_some()).count() == 3);
+    }
+
+    #[test]
+    fn the_video_bridge_is_shadowed_by_a_hidden_autostart_entry() {
+        let p = hide_video_bridge_plan();
+        assert!(p[0].cmd.contains("Hidden=true") && p[0].cmd.contains("org.kde.xwaylandvideobridge.desktop"), "{}", p[0].cmd);
+        assert!(p[0].rollback.as_deref().unwrap().contains("rm -f"));
     }
 
     #[test]
