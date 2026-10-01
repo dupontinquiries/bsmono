@@ -308,6 +308,24 @@ pub fn run(title: &str) -> Result<(), LayerError> {
         // configured -- every iteration counted as due, and the loop ran the whole
         // keyboard UI about 20 times a second, forever, queueing each frame's textures:
         // reported as 4+ GB and an overheating phone.
+        // A re-map is sometimes never answered with a configure (seen on cosmic-comp: the
+        // surface holds its exclusive zone, paints nothing, and the screen keeps a black
+        // band). The commit changed no state the compositor cares about, so change one:
+        // one pixel taller, then back. Both commits are real state; the second wins.
+        if mapped && !state.configured {
+            if let Some(t0) = map_requested {
+                if t0.elapsed() >= Duration::from_millis(250) {
+                    state.layer.set_size(0, state.height + 1);
+                    state.layer.wl_surface().commit();
+                    state.layer.set_size(0, state.height);
+                    state.layer.wl_surface().commit();
+                    map_requested = Some(Instant::now());
+                    tracing::debug!("layer: no configure after map, nudged");
+                }
+            }
+        } else {
+            map_requested = None;
+        }
         let can_paint = mapped && state.configured && !state.frame_pending;
         let due = feel.take_needs_frame()
             || !state.events.is_empty()
@@ -386,25 +404,6 @@ pub fn run(title: &str) -> Result<(), LayerError> {
             }
             _ => {}
         }
-        // A re-map is sometimes never answered with a configure (seen on cosmic-comp: the
-        // surface holds its exclusive zone, paints nothing, and the screen keeps a black
-        // band). The commit changed no state the compositor cares about, so change one:
-        // one pixel taller, then back. Both commits are real state; the second wins.
-        if mapped && !state.configured {
-            if let Some(t0) = map_requested {
-                if t0.elapsed() >= Duration::from_millis(250) {
-                    state.layer.set_size(0, state.height + 1);
-                    state.layer.wl_surface().commit();
-                    state.layer.set_size(0, state.height);
-                    state.layer.wl_surface().commit();
-                    map_requested = Some(Instant::now());
-                    tracing::debug!("layer: no configure after map, nudged");
-                }
-            }
-        } else {
-            map_requested = None;
-        }
-
         // ---- 2b. the surface is as tall as its content. A fixed 340 left a strip of nothing
         //          under the keys (and reserved it from the app above, via the exclusive
         //          zone). GTK resizes its layer surface to the computed height on every
