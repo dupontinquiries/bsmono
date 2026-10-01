@@ -143,6 +143,53 @@ pub fn tideshell_swap_plan(staged: &str) -> Vec<Step> {
     ]
 }
 
+/// The camera's rear main sensor (the one with the lens motor), as libcamera names it.
+pub const MAIN_CAMERA: &str = "/base/soc@0/cci@ac4a000/i2c-bus@1/camera@29";
+
+/// Install the snapshot-cam binary already uploaded to `staged`, with its launcher entry. The entry
+/// carries the two settings the phone needs: the rear main camera as the source (PipeWire is not
+/// running, so the probe finds none) and the clockwise quarter turn (the sensors are mounted at 270).
+pub fn camera_app_plan(staged: &str) -> Vec<Step> {
+    let live = format!("{BIN}/snapshot-cam");
+    let prev = format!("{BIN}/snapshot-cam.prev");
+    let entry = "$HOME/.local/share/applications/snapshot-cam.desktop";
+    let exec = format!("env SNAPSHOT_CAM_TURN=90 SNAPSHOT_CAM_SOURCE=\"gst:libcamerasrc camera-name={MAIN_CAMERA}\" $HOME/.local/bin/snapshot-cam");
+    vec![
+        Step { on: Where::Device, what: "the camera build's libraries resolve on this phone",
+               cmd: format!("chmod +x \"{staged}\" && ! ldd \"{staged}\" 2>&1 | grep -q 'not found' && echo LIBS_OK"),
+               gate: Gate::Contains("LIBS_OK".into()), rollback: None },
+        Step { on: Where::Device, what: "keep the installed camera as snapshot-cam.prev",
+               cmd: format!("[ ! -e \"{live}\" ] || cp -p \"{live}\" \"{prev}\""), gate: Gate::ExitZero, rollback: None },
+        Step { on: Where::Device, what: "install the camera app",
+               cmd: format!("mv \"{staged}\" \"{live}\""), gate: Gate::ExitZero,
+               rollback: Some(format!("[ ! -e \"{prev}\" ] || cp -p \"{prev}\" \"{live}\"")) },
+        Step { on: Where::Device, what: "the camera's launcher entry",
+               cmd: format!("mkdir -p \"$(dirname \"{entry}\")\" && printf '[Desktop Entry]\\nType=Application\\nName=Camera\\nComment=Snapshot camera: tap to focus, burst, colour profiles\\nExec=%s\\nIcon=camera-photo\\nTerminal=false\\nCategories=Graphics;Photography;\\nStartupNotify=true\\n' '{exec}' > \"{entry}\""),
+               gate: Gate::ExitZero, rollback: Some(format!("rm -f \"{entry}\"")) },
+        Step { on: Where::Device, what: "the app and its entry are in place",
+               cmd: format!("test -x \"{live}\" && grep -q 'SNAPSHOT_CAM_TURN=90' \"{entry}\" && echo CAMERA_READY"),
+               gate: Gate::Contains("CAMERA_READY".into()), rollback: None },
+    ]
+}
+
+/// Replace hatch with the current build uploaded to `staged`. The September import on the phone was
+/// older than the repo (no resident logic); `hatch-egui` was a symlink to it, which is put back on
+/// rollback.
+pub fn hatch_swap_plan(staged: &str) -> Vec<Step> {
+    let live = format!("{BIN}/hatch-egui");
+    vec![
+        Step { on: Where::Device, what: "the hatch build's libraries resolve on this phone",
+               cmd: format!("chmod +x \"{staged}\" && ! ldd \"{staged}\" 2>&1 | grep -q 'not found' && echo LIBS_OK"),
+               gate: Gate::Contains("LIBS_OK".into()), rollback: None },
+        Step { on: Where::Device, what: "install hatch-egui (replacing the alias to the old import)",
+               cmd: format!("rm -f \"{live}\" && mv \"{staged}\" \"{live}\""), gate: Gate::ExitZero,
+               rollback: Some(format!("rm -f \"{live}\"; ln -s hatch \"{live}\"")) },
+        Step { on: Where::Device, what: "hatch runs",
+               cmd: format!("\"{live}\" --help | grep -q quit-on-hide && echo HATCH_OK"),
+               gate: Gate::Contains("HATCH_OK".into()), rollback: Some(format!("rm -f \"{live}\"; ln -s hatch \"{live}\"")) },
+    ]
+}
+
 /// Every part that can be replayed without arguments, in a sensible order.
 pub fn all_parts(root: Root) -> Vec<(&'static str, Vec<Step>)> {
     vec![
@@ -160,6 +207,8 @@ mod tests {
     fn all_steps(root: Root) -> Vec<Step> {
         let mut v: Vec<Step> = all_parts(root).into_iter().flat_map(|(_, s)| s).collect();
         v.extend(tideshell_swap_plan("/tmp/tideshell.new"));
+        v.extend(camera_app_plan("/tmp/snapshot-cam.new"));
+        v.extend(hatch_swap_plan("/tmp/hatch-egui.new"));
         v
     }
 
@@ -180,7 +229,7 @@ mod tests {
     fn every_step_that_changes_the_phone_can_be_undone_or_says_why_not() {
         // Steps that mutate and have no rollback must be on this short, reviewed list: an upgrade
         // cannot be un-upgraded by a one-liner, and a backup copy is harmless to leave.
-        let allowed = ["align PipeWire with them (camera plugin left alone)", "keep the running build as tideshell.prev"];
+        let allowed = ["align PipeWire with them (camera plugin left alone)", "keep the running build as tideshell.prev", "keep the installed camera as snapshot-cam.prev"];
         for s in all_steps(Root::NoPrompt) {
             let mutates = ["apk add ", "apk upgrade", "mv ", "cp ", "ln -s", "enable", "systemctl --user restart", "printf"]
                 .iter().any(|m| s.cmd.contains(m)) && !s.cmd.contains("apk add -s");
@@ -188,6 +237,28 @@ mod tests {
                 assert!(allowed.contains(&s.what), "`{}` changes the phone and has no rollback: {}", s.what, s.cmd);
             }
         }
+    }
+
+    #[test]
+    fn the_camera_entry_carries_the_turn_and_the_main_camera() {
+        let step = camera_app_plan("/x").into_iter().find(|s| s.what == "the camera's launcher entry").expect("entry step");
+        assert!(step.cmd.contains("SNAPSHOT_CAM_TURN=90") && step.cmd.contains(MAIN_CAMERA) && step.cmd.contains("Name=Camera"), "{}", step.cmd);
+    }
+
+    #[test]
+    fn the_camera_entry_step_really_writes_a_valid_desktop_file() {
+        let home = std::env::temp_dir().join(format!("fp5-entry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let step = camera_app_plan("/x").into_iter().find(|s| s.what == "the camera's launcher entry").unwrap();
+        let out = std::process::Command::new("sh").arg("-c").arg(&step.cmd).env("HOME", &home).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let text = std::fs::read_to_string(home.join(".local/share/applications/snapshot-cam.desktop")).unwrap();
+        let exec = text.lines().find(|l| l.starts_with("Exec=")).expect("an Exec line");
+        assert!(exec.contains("camera-name=/base/soc@0/cci@ac4a000/i2c-bus@1/camera@29") && exec.ends_with("/.local/bin/snapshot-cam"), "{exec}");
+        assert!(text.starts_with("[Desktop Entry]\nType=Application\nName=Camera\n"), "{text}");
+        assert!(text.lines().count() >= 8, "one key per line: {text}");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
