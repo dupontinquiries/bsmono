@@ -822,6 +822,10 @@ impl eframe::App for Player {
         // A whisper model nobody has borrowed for two minutes is let go.
         transcribe::trim_idle_model();
         stats_tick(ctx);
+        // Remember that a finger has touched this window: see the picker's auto-focus.
+        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Touch { .. }))) {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("vidkit-touch-seen"), true));
+        }
         if let Some(wl) = self.wl.as_mut() {
             for o in wl.poll() {
                 self.latency.observe(&o);
@@ -1568,7 +1572,13 @@ impl Player {
                         .desired_width(f32::INFINITY),
                 );
                 if p.just_opened {
-                    edit.request_focus();
+                    // Focus the filter on open only for a pointer-and-keyboard user. On a
+                    // touch screen a focused field raises the on-screen keyboard over the
+                    // file list, and it stays up until something else takes focus.
+                    let touched = ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::new("vidkit-touch-seen")).unwrap_or(false));
+                    if !touched {
+                        edit.request_focus();
+                    }
                     p.just_opened = false;
                 }
                 if edit.changed() {
