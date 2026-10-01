@@ -160,6 +160,35 @@ reboot needed the owner (power button).
   pads at the left and right edges with the middle free, a compact landscape board, or the board beside the bar.
 * `shell.living` is off, and only snapclone reads `tideshell.palette` today: rusty-board and the bars do not.
 
+## More quirks from the same night  [measured unless noted]
+* **Sleep/wake storm.** cosmic reports the output "on" at every touch event while tideshell had it off, and the
+  old rule answered each report with `DisplayPower(false)`: 132 on/off commands in one boot, ~5 ms apart, with
+  a DSI command timeout and a `disp_cc_mdss_pclk0_clk status stuck at 'on'` warning in the kernel at the same
+  instant (`brightness_store` -> `dsi_cmds2buf_tx ... ret=-110`, from logind's `(sd-bright)` helper). The
+  triple tap could not complete through it, so tap-to-wake never worked. Now a lit panel while asleep stays
+  black (OLED: free) and capturing taps, and is blanked ONCE after 5 s without a touch (`Sleep::quiet`).
+  Hardware double-tap-to-wake is not available: the mainline goodix-berlin driver has no gesture knob and the
+  touchscreen's SPI device has no `power/wakeup`; the software triple tap is the substitute.
+* **Carousel flicker.** `reflow_for_zone` ran every loop and sent `SetMaximized(false)` then `(true)` to any
+  maximized window reported wider than the zones leave; during a carousel step the zone total (bar + both
+  peeks) and the window widths are in flux, so it chased the layout through distorted sizes. It now waits for
+  the zone total to hold 700 ms and ignores windows whose state changed within 500 ms. The two carousel
+  peeks are not symmetric when the keyboard is up: same-layer zones are applied in creation order, so the
+  peek created after the board is shortened by it and the other is not (not fixed).
+* **Voice build.** `--features voice` needs `alsa-lib-dev cmake clang clang-dev llvm-dev linux-headers g++
+  make` in the Alpine container (no `c++` otherwise: whisper-rs-sys fails). A build script that copies the
+  binary after a failed build ships the PREVIOUS binary under the new name (same size to the byte): copy only
+  on success. No whisper model exists on the laptop or phone; the engine looks in `$WHISPER_MODELS_DIR`,
+  `~/models`, `~/.local/share/rusty-board/models`, ... and already has a fingerprint corpus
+  (`audio_kit::fingerprint`, remembers committed utterances) that skips whisper for phrases said before.
+* **Slide board** (`slide_board.rs`): a thumb rail per hand, slide for the column, vertical offset from where
+  the finger came down for the row (home / up past 0.5 row = top / down past 0.33 row = bottom), types on
+  lift. `UP_ROWS`, `DOWN_ROWS`, `RAIL_ROWS` are the numbers to tune first.
+* The single-character TextEdit checker flagged 9 more fields in photosync, ambient-learner and the rusty-board
+  companion (fixed); hatch, vidkit-player and tideshell were clean.
+* Kernel process names are cut to 15 characters: `pkill -x xwaylandvideobridge` matches nothing.
+* A fixed-target `sudo`/`systemctl reboot` over ssh now needs a terminal; the owner reboots.
+
 ## Not done (as of 2026-10-01 04:10)
 Who writes the backlight (see above); a raw accelerometer for the rotation margin; apk yt-dlp/ffmpeg (root);
 the `show`/`hide` summon and palette feel on the device; pinch-expand animation for the board (patch kept off-tree: scaling the layer also scales pointer positions
