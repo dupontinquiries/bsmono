@@ -194,12 +194,53 @@ pub fn hatch_swap_plan(staged: &str) -> Vec<Step> {
     ]
 }
 
+/// The address the postmarketOS `usb-moded` developer profile gives the phone on its USB gadget
+/// network (the `usb0` interface); the laptop side is 172.16.42.2.
+pub const USB_ADDR: &str = "172.16.42.1";
+const EMERGENCY_DROPIN: &str = "/etc/ssh/sshd_config.d/60-emergency-usb.conf";
+
+/// The sshd drop-in: password login for the owner, ONLY on the USB address. Everything else keeps
+/// the machine's own rules. The password is the account's existing one (not stored here); a
+/// separate backup key is added when one is staged at /tmp/emergency.pub.
+pub fn emergency_dropin() -> String {
+    format!("# Emergency access over the USB cable (written by gitmind's fp5_setup).\nMatch LocalAddress {USB_ADDR}\n    PasswordAuthentication yes\n    KbdInteractiveAuthentication yes\n    PermitRootLogin no\n    AllowUsers user\n")
+}
+
+/// Reach the phone over a USB cable when wifi, the shell and the compositor are all gone: sshd on
+/// the gadget network, password login on that address only, and an optional backup key.
+pub fn emergency_access_plan(root: Root) -> Vec<Step> {
+    let dropin = emergency_dropin();
+    let write = format!("mkdir -p /etc/ssh/sshd_config.d && printf '%s' {} > {EMERGENCY_DROPIN}", crate::deploy::shell_quote(&dropin));
+    vec![
+        Step { on: Where::Device, what: "sshd starts at boot",
+               cmd: "systemctl list-unit-files sshd.service | grep -q 'sshd.service *enab' && echo SSHD_BOOT".into(),
+               gate: Gate::Contains("SSHD_BOOT".into()), rollback: None },
+        Step { on: Where::Device, what: "the USB gadget network has its address (developer profile)",
+               cmd: format!("ip -4 -o addr show 2>/dev/null | grep -q ' {USB_ADDR}/' && echo USB_NET"),
+               gate: Gate::Contains("USB_NET".into()), rollback: None },
+        Step { on: Where::Device, what: "password login on the USB address only",
+               cmd: root_cmd(&write, root), gate: Gate::ExitZero,
+               rollback: Some(root_cmd(&format!("rm -f {EMERGENCY_DROPIN}"), root)) },
+        Step { on: Where::Device, what: "sshd accepts the configuration",
+               cmd: root_cmd("sshd -t && echo CONFIG_OK", root), gate: Gate::Contains("CONFIG_OK".into()),
+               rollback: Some(root_cmd(&format!("rm -f {EMERGENCY_DROPIN}"), root)) },
+        Step { on: Where::Device, what: "sshd re-reads it",
+               cmd: root_cmd("systemctl reload sshd", root), gate: Gate::ExitZero,
+               rollback: Some(root_cmd(&format!("rm -f {EMERGENCY_DROPIN}; systemctl reload sshd"), root)) },
+        Step { on: Where::Device, what: "the backup key, if one was staged at /tmp/emergency.pub",
+               cmd: "[ ! -s /tmp/emergency.pub ] || grep -qxFf /tmp/emergency.pub \"$HOME/.ssh/authorized_keys\" || cat /tmp/emergency.pub >> \"$HOME/.ssh/authorized_keys\"".into(),
+               gate: Gate::ExitZero,
+               rollback: Some("[ ! -s /tmp/emergency.pub ] || { grep -vxFf /tmp/emergency.pub \"$HOME/.ssh/authorized_keys\" > \"$HOME/.ssh/authorized_keys.new\"; mv \"$HOME/.ssh/authorized_keys.new\" \"$HOME/.ssh/authorized_keys\"; }".into()) },
+    ]
+}
+
 /// Every part that can be replayed without arguments, in a sensible order.
 pub fn all_parts(root: Root) -> Vec<(&'static str, Vec<Step>)> {
     vec![
         ("hatch launcher alias", hatch_launcher_plan()),
         ("keyboard service", rusty_board_service_plan()),
         ("speaker-chain packages", audio_packages_plan(root)),
+        ("emergency USB access", emergency_access_plan(root)),
     ]
 }
 
@@ -213,6 +254,7 @@ mod tests {
         v.extend(tideshell_swap_plan("/tmp/tideshell.new"));
         v.extend(camera_app_plan("/tmp/snapshot-cam.new"));
         v.extend(hatch_swap_plan("/tmp/hatch-egui.new"));
+        v.extend(emergency_access_plan(root));
         v
     }
 
@@ -264,6 +306,31 @@ mod tests {
         assert!(exec.ends_with("/.local/bin/snapshot-cam-phone") && !exec.contains(' '), "a bare path, nothing to quote: {exec}");
         assert!(text.starts_with("[Desktop Entry]\nType=Application\nName=Camera\n"), "{text}");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_emergency_dropin_is_valid_sshd_config_and_limits_passwords_to_usb() {
+        let d = emergency_dropin();
+        assert!(d.contains(&format!("Match LocalAddress {USB_ADDR}\n")) && d.contains("PasswordAuthentication yes"));
+        // Nothing above the Match block: the password rule must be inside it, not global.
+        let before = d.split("Match ").next().unwrap();
+        assert!(!before.contains("PasswordAuthentication"), "global password rule leaked: {before}");
+        // Really parse it: sshd -t on a config that includes it (a host key is needed to start).
+        let dir = std::env::temp_dir().join(format!("fp5-sshd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let keygen = std::process::Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(dir.join("hk")).status().unwrap();
+        assert!(keygen.success(), "ssh-keygen must exist where this test runs");
+        std::fs::write(dir.join("drop.conf"), &d).unwrap();
+        std::fs::write(dir.join("sshd_config"), format!("HostKey {}\nUsePAM no\nInclude {}\n", dir.join("hk").display(), dir.join("drop.conf").display())).unwrap();
+        let sshd = ["/usr/sbin/sshd", "/usr/bin/sshd", "/sbin/sshd"].into_iter().find(|p| std::path::Path::new(p).exists()).expect("sshd must exist where this test runs");
+        let out = std::process::Command::new(sshd).arg("-t").arg("-f").arg(dir.join("sshd_config")).output().unwrap();
+        assert!(out.status.success(), "sshd -t: {}", String::from_utf8_lossy(&out.stderr));
+        // And it rejects a broken one, so the check above can fail.
+        std::fs::write(dir.join("drop.conf"), "Match LocalAddress\n    PasswordAuthentication maybe\n").unwrap();
+        let bad = std::process::Command::new(sshd).arg("-t").arg("-f").arg(dir.join("sshd_config")).output().unwrap();
+        assert!(!bad.status.success(), "sshd -t must refuse a broken drop-in");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
