@@ -1,0 +1,97 @@
+# Fairphone 5 (postmarketOS, COSMIC) — what a session on the real phone learned
+
+Written 2026-10-01 from one long session that ran against the owner's phone
+(`user@192.168.2.231`, ssh key `~/.ssh/id_phone`; laptop is the Asahi M2 Max `montroyal`).
+Tags: **[measured]** = observed on the device, command or log given; **[docs]** = taken from a
+document or upstream source, not re-verified; **[unverified]** = built or reasoned, not seen working.
+
+## Which machine am I on
+`whoami`, `fastfetch` or `ip a` before anything destructive. A plain Bash call is the laptop; a call
+through `ssh … user@192.168.2.231` is the phone. `sudo reboot` on the phone is allowed; never on the
+laptop. The phone needs the owner to log in again afterwards (`printf 'type 147147\nkey enter\n' | sudo dotool`).
+
+## The display wedge — do not blame polling first  [measured]
+After ~20 minutes the phone's frame drawing became unusable. Kernel log: `[dpu error]enc35 frame done
+timeout`, then ~22 lines/s of `ctl start interrupt wait failed` / `wait for commit done returned -22`
+(33,793 in one boot), starting right after a kernel call trace and tideshell's brightness writes timing
+out. `cosmic-comp`'s render thread (`surface-DSI-1`) sat at ~95% of a core. Only a reboot cleared it; the
+next boot had 0 errors and a smooth screen. Check `journalctl -k -b | grep -c "dpu error"` before
+patching cosmic or any poller. Panel is `panel_raydium_rm692e5` (command mode), kernel 7.2.2. The
+shell's brightness mode was already `Safe` (pmaports#4274).
+
+## Keys  [measured]
+* cosmic-comp, tideshell and cosmic-session all hold the power key; cosmic's `XF86PowerOff` shortcut is
+  routed to `tideshell ctl power-key` (press only, no release).
+* Volume keys were **never read** while cosmic routed the power key: tideshell skipped evdev entirely.
+  Fixed: evdev stays open for the volume nodes (`pmic_resin` = down, `gpio-keys` = up) and for the power
+  node in release-only mode (the press length for the morse unlock).
+* Cold mode (`shell.cold = auto`) turns the volume keys into a steering selection; that looks like
+  "volume buttons don't work".
+* A `systemctl poweroff` once came from a process in `user@10000.service` (logind log line) while the
+  owner was using the hatch; cause not identified (cosmic's power dialog is the suspect).
+
+## Rotation  [measured]
+`iio-sensor-proxy` only reports CHANGES, so tideshell's 450 ms "hold before rotating" never completed
+(it waited for a second reading). Now judged by the clock (`AutoRotate::poll`). Both landscapes and, after
+the display reboot, portrait work. Sensor mounting: all three cameras report `camera_sensor_rotation = 270`;
+upright = a clockwise quarter turn (owner confirmed "rot was 90 deg clockwise").
+
+## Camera  [measured unless noted]
+* libcamera's soft ISP debayers on the GPU through EGL: it shares the one GPU with the compositor. A
+  probe once hung the phone; the memory note `fp5-camera-gpu-hang` says ask first.
+* `snapshot-cam` was never on the phone until now. Installed as `~/.local/bin/snapshot-cam` plus a wrapper
+  `snapshot-cam-phone` (sets `SNAPSHOT_CAM_TURN=90` and `SNAPSHOT_CAM_SOURCE=gst:libcamerasrc
+  camera-name=/base/soc@0/cci@ac4a000/i2c-bus@1/camera@29`) because a desktop `Exec=` cannot quote part of
+  an argument. Camera 1 (`camera@29`) is the main sensor with the lens motor.
+* The owner's burst photos were a plain average of 6 frames and smeared moving subjects; `stack::average`
+  now only blends pixels that agree with the reference frame (GHOST_DIFF). The v4l2 controls error in the
+  app comes from reading controls off `/dev/video0` (the video decoder); the real controls are on subdevs.
+  Tap-to-focus is not wired. **[unverified]** whether the rotation and burst changes look right.
+* Volume-button capture worked with the screen off (owner).
+
+## Fingerprint sensor  [measured]
+There is none visible: no node in the device tree mentioning fpc/egis/fingerprint, the only SPI device is
+the touchscreen (`goodix,gt9897`), `fprintd` reports "No devices available". Needs identification of the
+sensor plus a device-tree entry and driver; not a quick fix.
+
+## Emergency access  [docs + unverified]
+postmarketOS's initramfs debug shell (`/usr/share/initramfs/init_functions.sh`): holding volume-down at
+boot (`iskey KEY_LEFTCTRL KEY_VOLUMEDOWN`) drops to a shell with buffyboard (console on-screen keyboard),
+getty, an ACM gadget getty and `telnetd -l /sbin/pmos_getty` on the USB network (172.16.42.1). The hook is
+not installed here (`/etc/mkinitfs/hooks` empty) and it only exists during boot. For a running system:
+`system/fp5-rescue` (hold power, tap volume-down three times → login on tty3 with buffyboard) and the gitmind
+plans `emergency_access_plan` (sshd password login on 172.16.42.1 only) and `rescue_console_plan`.
+`usb0` already carries 172.16.42.1 from `usb-moded`'s developer profile.
+
+## Login  [measured]
+cosmic-greeter's on-screen keyboard did not let the owner in. `autologin_plan` adds greetd's
+`[initial_session]` (user `user`, `start-cosmic`) to `/etc/greetd/cosmic-greeter.toml` (backup
+`.before-autologin`); applied by hand on 2026-10-01 02:31, effective at the next boot, greeter kept as
+`default_session`. Tideshell's lock is a cover (swipe) plus the power-key morse unlock
+(`shell.unlock.morse`); PAM in tideshell is not built.
+
+## Keyboard (rusty-board-egui)  [measured]
+No `tracing` subscriber was installed, so every focus/input-method log line was dropped. Now logs to the
+journal (`RUST_LOG`, warn by default). cosmic sends input-method Activate/Deactivate correctly and the
+layer surface maps/unmaps. The magnifier bubble is replaced by a press pulse. Open: steno multitouch, and
+the bug where switching away from steno leaves the keyboard short.
+
+## Build and deploy that worked
+* Build for the phone in the arm64 Alpine container (`apps/tideshell/deploy/build-in-podman.sh`, image
+  `tideshell-aarch64`); for other crates run `cargo build --release` in that image with the repo copied in.
+* **`pack-src.sh` uses `git archive HEAD`**: uncommitted work is silently not in the build.
+* Copy binaries with `ssh … 'cat > file' < binary`; plain `scp` hung. Under zsh keep ssh options in an array
+  (`K=(-i … -o IdentitiesOnly=yes -o BatchMode=yes); ssh $K …`): an unquoted string is not split.
+* Start test apps with `systemd-run --user --unit=… -E WAYLAND_DISPLAY=wayland-1`; a background `nohup` over
+  ssh dies with the session.
+* Everything above that touches the phone is meant to be replayable from gitmind's `fp5_setup` plans.
+
+## Git hygiene in this repo
+The real index holds the owner's staged work. Commit through a temp index, `export GIT_INDEX_FILE=… &&
+git read-tree HEAD && git add <mine> && git commit` **in one Bash call** (the variable does not survive to
+the next call, and a bare commit sweeps the owner's staging); resync with `git reset -q HEAD -- <paths>`.
+
+## Ornith-1.5-9B on the M2 Max  [measured]
+`kernel-validate --bench` panicked on a hybrid model (raw `new_cache()`); fixed to `new_cache_for`. Result:
+5.08 tok/s at context 544, 6.91 at 40; 190 of 197 ms/token is GPU wait, ~28 GB/s effective (~7% of 400 GB/s),
+the same as the 3B. See `apps/logscope/perf-loop/LEDGER.md`.
