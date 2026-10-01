@@ -209,7 +209,7 @@ impl FocusPolicy {
     pub fn from_config(auto_hide_on_no_focus: Option<bool>) -> FocusPolicy {
         FocusPolicy::new(
             AutoHide::from_config(auto_hide_on_no_focus),
-            grace_from_env(std::env::var(GRACE_ENV).ok().as_deref()),
+            grace_for(std::env::var(GRACE_ENV).ok().as_deref(), std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref()),
         )
     }
 
@@ -294,6 +294,19 @@ impl FocusPolicy {
 /// Parse the grace override. Anything unparseable falls back to the
 /// default rather than to "disabled" — a typo in an env var must not
 /// silently remove a fallback.
+/// The grace window for this session: the env override if one is set, else none on COSMIC and
+/// the default elsewhere. cosmic-comp sends Activate/Deactivate correctly (measured on the FP5)
+/// but, like every v2 compositor, sends NOTHING until a field is focused, so at login the
+/// "no Activate within 45 s, assume the signal is broken" fallback popped the keyboard over an
+/// empty home screen.
+pub fn grace_for(env_raw: Option<&str>, desktop: Option<&str>) -> Option<u64> {
+    let unset = env_raw.map_or(true, |v| v.trim().is_empty());
+    if unset && desktop.is_some_and(|d| d.to_ascii_uppercase().split(':').any(|p| p == "COSMIC")) {
+        return None;
+    }
+    grace_from_env(env_raw)
+}
+
 pub fn grace_from_env(raw: Option<&str>) -> Option<u64> {
     match raw.map(str::trim) {
         None | Some("") => Some(DEFAULT_GRACE_MS),
@@ -308,6 +321,21 @@ pub fn grace_from_env(raw: Option<&str>) -> Option<u64> {
                 Some(DEFAULT_GRACE_MS)
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod grace_for_tests {
+    use super::*;
+
+    #[test]
+    fn cosmic_has_no_grace_fallback_and_everything_else_keeps_it() {
+        assert_eq!(grace_for(None, Some("COSMIC")), None);
+        assert_eq!(grace_for(Some(""), Some("pop:COSMIC")), None);
+        assert_eq!(grace_for(None, Some("GNOME")), Some(DEFAULT_GRACE_MS));
+        assert_eq!(grace_for(None, None), Some(DEFAULT_GRACE_MS));
+        assert_eq!(grace_for(Some("1000"), Some("COSMIC")), Some(1000), "an explicit override wins");
+        assert_eq!(grace_for(None, Some("NOTCOSMIC")), Some(DEFAULT_GRACE_MS), "whole word only");
     }
 }
 
