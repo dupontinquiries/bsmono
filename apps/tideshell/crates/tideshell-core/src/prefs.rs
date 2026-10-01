@@ -399,7 +399,10 @@ impl ShellPrefs {
     pub fn edge_config(&self) -> EdgeConfig {
         EdgeConfig {
             hold_ms: self.hold_ms,
-            top_enabled: self.layout == Layout::PullDown,
+            // Both layouts: the drawer slides down from the top edge, full width. The right bar used to
+            // switch this off (it "owned" the right edge), which left right-bar users with no way to
+            // the quick settings. The bar surface keeps its place under the top strip.
+            top_enabled: true,
             // Off in every layout today. It was on in right-bar, but the bar
             // covers the right edge, so a swipe-in over it competed with the
             // bar's own widgets (a right-edge swipe dragged its slider, seen
@@ -494,7 +497,7 @@ mod tests {
         assert!(c.top_enabled && !c.right_enabled);
         p.layout = Layout::RightBar;
         let c = p.edge_config();
-        assert!(!c.top_enabled && !c.right_enabled, "the bar owns the right edge");
+        assert!(c.top_enabled && !c.right_enabled, "the top edge still pulls the drawer down; the bar owns the right edge");
     }
 }
 

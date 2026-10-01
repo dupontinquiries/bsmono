@@ -1534,16 +1534,23 @@ mod tests {
     }
 
     #[test]
-    fn right_bar_layout_disables_drawer_and_enables_bar_swipe() {
+    fn right_bar_layout_keeps_the_top_pull_down_drawer_and_the_bars_own_right_edge() {
         let mut sh = shell_with_three();
         let mut p = sh.prefs.clone();
         p.layout = Layout::RightBar;
         assert_eq!(sh.set_prefs(p), vec![Action::SavePrefs]);
-        edge_drag(&mut sh, (200.0, 3.0), (200.0, 400.0), 20, 0);
-        assert!(!sh.drawer.is_visible(), "top edge inert in right-bar layout");
+        edge_drag(&mut sh, (200.0, 3.0), (200.0, 420.0), 25, 0);
+        for t in (500..2000).step_by(16) {
+            sh.tick(t);
+        }
+        assert!(sh.drawer.is_visible(), "the top edge pulls the quick settings down in right-bar layout too");
+        sh.dismiss_overlays();
+        for t in (2000..3500).step_by(16) {
+            sh.tick(t);
+        }
         assert!(!sh.bar_widgets().is_empty());
         // The right edge is the bar's, not the recognizer's.
-        let out = edge_drag(&mut sh, (406.0, 450.0), (300.0, 450.0), 10, 2000);
+        let out = edge_drag(&mut sh, (406.0, 450.0), (300.0, 450.0), 10, 4000);
         assert!(out.is_empty() && !sh.bar_expanded, "no edge swipe-in over the bar");
         sh.set_bar_expanded(true);
         assert!(sh.bar_expanded);
