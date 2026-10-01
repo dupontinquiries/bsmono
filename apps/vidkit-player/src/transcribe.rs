@@ -446,6 +446,12 @@ pub fn fetch_text(url: &str, headers: &[(String, String)]) -> Result<String, Str
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
+/// Let go of a whisper model nobody has borrowed for a while. `Player::update` calls this every
+/// frame, but the function never existed (the call site landed without it, so the player did not
+/// compile at all). This build loads a model per transcription (`whisper_source`) and keeps none
+/// between them, so there is nothing idle to release; the hook stays for when a cache exists.
+pub fn trim_idle_model() {}
+
 #[cfg(feature = "whisper")]
 fn whisper_source(prefs: crate::prefs::Prefs) -> Result<Box<dyn CueSource>, String> {
     use crate::prefs::{find_model, model_dirs, LanguageMode};
