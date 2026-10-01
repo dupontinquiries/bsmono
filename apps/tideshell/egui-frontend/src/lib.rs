@@ -73,6 +73,7 @@ pub fn key_events(pressed: bool, keysym: u32, utf8: &str, ctrl: bool, alt: bool,
 #[cfg(feature = "sensors")]
 pub mod sensors;
 /// cpupower's scaling governor, over sysfs. Pure std, no feature gate needed.
+pub mod appinfo_io;
 pub mod cpu_governor;
 /// Hardware keys -- power and volume -- from evdev, with the logind power-key
 /// inhibitor. (Supersedes this branch's `power_key`, which handled power only;
@@ -193,6 +194,8 @@ pub struct ShellView {
     frame_dt: f32,
     /// The quick tile a finger is holding and since when (egui time), and the tile whose hold
     /// already fired, so the release that follows is not also a tap.
+    /// Live CPU / memory / age of the windows the carousel is showing (appinfo_io.rs).
+    appinfo: crate::appinfo_io::Poller,
     tile_hold: Option<(Id, f64)>,
     tile_fired: Option<Id>,
     /// The switcher landed (reveal reached 1): kick the cards once.
@@ -448,6 +451,16 @@ impl ShellView {
 
     /// Draw one carousel peek filling this `Ui` (its own layer surface).
     pub fn peek_ui(&mut self, ui: &mut egui::Ui, shell: &mut Shell, side: tideshell_core::carousel::Side, pal: &PaletteColors) -> Vec<Action> {
+        // One poll per frame for everything the carousel shows (cheap: it re-reads /proc at most
+        // every two seconds, and clears itself when the carousel is closed).
+        let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
+        let shown = [shell.carousel.peek(tideshell_core::carousel::Side::Left), shell.carousel.peek(tideshell_core::carousel::Side::Right), shell.carousel.current()];
+        let wanted: Vec<(u64, String)> = shown
+            .iter()
+            .flatten()
+            .filter_map(|id| shell.windows().iter().find(|w| w.id == *id).map(|w| (*id, w.app_id.clone())))
+            .collect();
+        self.appinfo.poll(now_ms, &wanted);
         let area = ui.max_rect();
         self.peek(ui, shell, side, pal, area)
     }
@@ -473,6 +486,13 @@ impl ShellView {
         let chars: String = title.chars().take(14).collect();
         for (i, ch) in chars.chars().enumerate() {
             p.text(inset.center_top() + Vec2::new(0.0, 58.0 + 16.0 * i as f32), Align2::CENTER_CENTER, ch, FontId::proportional(13.0), with_alpha(Color32::WHITE, 0.9));
+        }
+        // The app's live numbers, stacked above the chevron: CPU, memory, age.
+        if let Some(info) = self.appinfo.info(id) {
+            let base = inset.center_bottom() - Vec2::new(0.0, 84.0);
+            for (i, text) in [tideshell_core::appinfo::fmt_cpu(info.cpu_pct), tideshell_core::appinfo::fmt_mem(info.rss_mb), tideshell_core::appinfo::fmt_age(info.uptime_s)].into_iter().enumerate() {
+                p.text(base + Vec2::new(0.0, 14.0 * i as f32), Align2::CENTER_CENTER, text, FontId::monospace(10.0), with_alpha(Color32::WHITE, 0.85));
+            }
         }
         let c = inset.center_bottom() - Vec2::new(0.0, 22.0);
         let d = if side == Side::Left { -1.0 } else { 1.0 };
