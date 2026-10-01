@@ -1800,6 +1800,10 @@ impl Feel {
 
         let mut board_h = 0.0f32;
         let mut inner_top = 0.0f32;
+        // What the panels above and below take, read BEFORE the central panel: its own rect
+        // overflows a screen shorter than the keys (after a short board), and measuring
+        // against that made `below` negative and the next board ask for less than it needs.
+        let avail_before = ctx.available_rect();
         let central = egui::CentralPanel::default().show(ctx, |ui| {
             inner_top = ui.max_rect().top();
             // THE KEYBOARD'S profile, not the detected one: key height and gap pinned to
@@ -2206,8 +2210,9 @@ impl Feel {
         let panel = central.response.rect;
         let screen = ctx.content_rect();
         let margin = (inner_top - panel.top()).max(0.0);
-        let above = panel.top() - screen.top();
-        let below = screen.bottom() - panel.bottom();
+        let _ = panel;
+        let above = (avail_before.top() - screen.top()).max(0.0);
+        let below = (screen.bottom() - avail_before.bottom()).max(0.0);
         let want = (above + margin + board_h + margin + below).ceil();
         self.desired_h = Some(want);
         // Floating / ruled windows are resized through eframe; the layer-shell host reads
@@ -2556,6 +2561,36 @@ mod hold_tests {
         assert_eq!(f.rail_entries().1, Some(1), "the next KEPT board, skipping the trimmed one");
         f.rail_step(1);
         assert_eq!(f.rail_entries().1, Some(0), "wraps within the kept ones");
+    }
+
+    /// A frame at a given SURFACE height: the layer-shell host feeds egui the surface it has,
+    /// so after a short board the next board is laid out in a short screen.
+    fn frame_h(f: &mut Feel, ctx: &egui::Context, t: f64, h: f32) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(432.0, h))),
+            time: Some(t),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| f.frame(ctx));
+    }
+
+    #[test]
+    fn the_height_comes_back_after_a_short_board() {
+        let (mut f, ctx) = setup();
+        let (list, _) = f.rail_entries();
+        let q = list.iter().position(|e| e.name.to_lowercase().contains("qwerty")).unwrap();
+        let st = list.iter().position(|e| e.name.to_lowercase().contains("steno")).unwrap();
+        let tall = f.desired_height().unwrap();
+        f.select_rail(st);
+        let mut t = 1.0;
+        for _ in 0..4 { frame_h(&mut f, &ctx, t, tall); t += 0.1; }
+        let short = f.desired_height().unwrap();
+        // The host now gives egui the short surface, as it does after the resize.
+        for _ in 0..4 { frame_h(&mut f, &ctx, t, short); t += 0.1; }
+        f.select_rail(q);
+        for _ in 0..6 { frame_h(&mut f, &ctx, t, short); t += 0.1; }
+        let back = f.desired_height().unwrap();
+        assert!((back - tall).abs() < 1.0, "qwerty {tall} -> steno {short} -> qwerty {back}");
     }
 
     #[test]
