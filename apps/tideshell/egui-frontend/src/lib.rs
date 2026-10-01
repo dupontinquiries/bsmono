@@ -112,6 +112,7 @@ pub struct FrameInfo<'a> {
     /// Local time; the clock's style and fuzziness come from the prefs.
     pub time: tideshell_core::clock::LocalTime,
     pub battery: Option<f32>,
+    pub charging: bool,
     /// Why the trackpad cannot work right now (EI failed), shown on the pad.
     pub trackpad_note: Option<&'a str>,
     /// Seconds since the shell started, for the breathing.
@@ -1199,6 +1200,32 @@ impl ShellView {
         40.0 + rows as f32 * 82.0 + 6.0 + 50.0 + 106.0 + 4.0 + 36.0 + 16.0
     }
 
+    /// A battery glyph centred at `c`, `w` wide: outline, terminal nub, a fill whose width is the
+    /// charge (red at or under 15% when not charging), a bolt when charging, a dash when unknown.
+    fn battery_icon(p: &egui::Painter, c: Pos2, w: f32, level: Option<f32>, charging: bool, pal: &PaletteColors) {
+        let h = w * 0.5;
+        let body = Rect::from_center_size(c - Vec2::new(w * 0.04, 0.0), Vec2::new(w, h));
+        p.rect_stroke(body, cr(3), Stroke::new(1.6, pal.text), egui::StrokeKind::Inside);
+        p.rect_filled(Rect::from_center_size(Pos2::new(body.right() + w * 0.06, c.y), Vec2::new(w * 0.1, h * 0.4)), cr(1), pal.text);
+        match level {
+            Some(l) => {
+                let l = l.clamp(0.0, 1.0);
+                let inner = body.shrink(2.5);
+                let fill = Rect::from_min_size(inner.min, Vec2::new(inner.width() * l, inner.height()));
+                let col = if l <= 0.15 && !charging { Color32::from_rgb(220, 70, 60) } else { pal.accent };
+                p.rect_filled(fill, cr(2), col);
+                if charging {
+                    let (x, y, s) = (body.center().x, body.center().y, h * 0.34);
+                    let bolt = vec![Pos2::new(x + s * 0.2, y - s * 1.3), Pos2::new(x - s * 0.7, y + s * 0.15), Pos2::new(x - s * 0.05, y + s * 0.15), Pos2::new(x - s * 0.2, y + s * 1.3), Pos2::new(x + s * 0.7, y - s * 0.15), Pos2::new(x + s * 0.05, y - s * 0.15)];
+                    p.add(egui::Shape::convex_polygon(bolt, pal.bg_base, Stroke::NONE));
+                }
+            }
+            None => {
+                p.line_segment([body.center() - Vec2::new(w * 0.15, 0.0), body.center() + Vec2::new(w * 0.15, 0.0)], Stroke::new(2.0, pal.text_weak));
+            }
+        }
+    }
+
     fn drawer(&mut self, ui: &mut egui::Ui, shell: &mut Shell, pal: &PaletteColors, origin: Pos2, size: Vec2) -> Vec<Action> {
         let mut out = vec![];
         // The sheet is as tall as its content (header, tile rows, brightness, the volume pad, the
@@ -1355,8 +1382,14 @@ impl ShellView {
                     p.text(r.center(), Align2::CENTER_CENTER, txt, FontId::proportional(if expanded { 22.0 } else { 15.0 }), pal.text);
                 }
                 BarWidget::Battery => {
-                    let s = info.battery.map(|b| format!("{:.0}%", b * 100.0)).unwrap_or_else(|| "--".into());
-                    p.text(r.center(), Align2::CENTER_CENTER, s, FontId::proportional(12.0), pal.text_weak);
+                    // A drawn battery (body, terminal, level fill, bolt while charging), not a number:
+                    // legible at a glance in a 64 px bar, and it keeps the percentage when expanded.
+                    let c = icon_c(r);
+                    Self::battery_icon(&p, c, unit * 0.55, info.battery, info.charging, pal);
+                    if expanded {
+                        let s = info.battery.map(|b| format!("{:.0}%", b * 100.0)).unwrap_or_else(|| "--".into());
+                        p.text(Pos2::new(r.left() + unit + 6.0, r.center().y), Align2::LEFT_CENTER, s, FontId::proportional(16.0), pal.text);
+                    }
                 }
                 BarWidget::Toggle(k) => {
                     let on = shell.quick_state(*k);
@@ -1800,7 +1833,7 @@ mod tests {
         let mut view = ShellView::default();
         view.pointer_pad = pointer_pad;
         let pal = uikit_egui::palette_colors("night");
-        let info = FrameInfo { apps: &[], time: tideshell_core::clock::LocalTime { hour: 12, minute: 0, weekday: 1 }, battery: None, trackpad_note: None, t_secs: 0.0 };
+        let info = FrameInfo { apps: &[], time: tideshell_core::clock::LocalTime { hour: 12, minute: 0, weekday: 1 }, battery: None, charging: false, trackpad_note: None, t_secs: 0.0 };
         let ctx = egui::Context::default();
         let mut out = Vec::new();
         let frames = [

@@ -1678,3 +1678,59 @@ mod gate_tests {
         assert!(t.join().unwrap(), "it waited");
     }
 }
+
+/// Battery charge (0..1) and whether it is charging, from one `power_supply` directory's
+/// `capacity` and `status` text. `None` when the capacity is not a 0..100 number.
+pub fn parse_battery(capacity: &str, status: &str) -> Option<(f32, bool)> {
+    let pct: f32 = capacity.trim().parse().ok()?;
+    if !(0.0..=100.0).contains(&pct) {
+        return None;
+    }
+    Some((pct / 100.0, status.trim().eq_ignore_ascii_case("charging")))
+}
+
+/// The first `type = Battery` supply under `root` (`/sys/class/power_supply`).
+pub fn read_battery(root: &std::path::Path) -> Option<(f32, bool)> {
+    let mut dirs: Vec<_> = std::fs::read_dir(root).ok()?.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    for d in dirs {
+        if std::fs::read_to_string(d.join("type")).is_ok_and(|t| t.trim() == "Battery") {
+            let cap = std::fs::read_to_string(d.join("capacity")).unwrap_or_default();
+            let st = std::fs::read_to_string(d.join("status")).unwrap_or_default();
+            if let Some(b) = parse_battery(&cap, &st) {
+                return Some(b);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod battery_tests {
+    use super::*;
+
+    #[test]
+    fn capacity_and_status_parse_and_junk_does_not() {
+        assert_eq!(parse_battery("63\n", "Discharging\n"), Some((0.63, false)));
+        assert_eq!(parse_battery("100", "Charging"), Some((1.0, true)));
+        assert_eq!(parse_battery("101", "Charging"), None);
+        assert_eq!(parse_battery("", "Charging"), None);
+        assert_eq!(parse_battery("-1", ""), None);
+    }
+
+    #[test]
+    fn the_battery_supply_is_found_among_usb_and_wireless_ones() {
+        let root = std::env::temp_dir().join(format!("ts-ps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (name, ty, cap, st) in [("a-usb", "USB", "", ""), ("qcom-battmgr-bat", "Battery", "63", "Charging"), ("z-wls", "Wireless", "", "")] {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("type"), ty).unwrap();
+            if !cap.is_empty() { std::fs::write(d.join("capacity"), cap).unwrap(); }
+            std::fs::write(d.join("status"), st).unwrap();
+        }
+        assert_eq!(read_battery(&root), Some((0.63, true)));
+        assert_eq!(read_battery(&root.join("nonexistent")), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

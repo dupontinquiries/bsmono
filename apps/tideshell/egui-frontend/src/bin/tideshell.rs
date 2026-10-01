@@ -75,6 +75,9 @@ struct Shellbox {
     keys: Option<tideshell_egui::keys::Keys>,
     orientation: tideshell_egui::sensors::OrientationFeed,
     orientation_status: String,
+    /// Battery charge and charging, re-read every 20 s (the sysfs files are cheap but not free).
+    battery: Option<(f32, bool)>,
+    battery_at: Option<std::time::Instant>,
     foreground_written: String,
     proximity: tideshell_egui::sensors::ProximityFeed,
     proximity_status: String,
@@ -594,6 +597,8 @@ fn main() {
         keys: None,
         orientation: tideshell_egui::sensors::OrientationFeed::spawn_gated(zbus::blocking::Connection::system().ok(), sensor_gate.clone()),
         orientation_status: String::new(),
+        battery: None,
+        battery_at: None,
         foreground_written: String::new(),
         proximity: tideshell_egui::sensors::ProximityFeed::spawn(zbus::blocking::Connection::system().ok()),
         proximity_status: String::new(),
@@ -1037,6 +1042,10 @@ fn main() {
         for n in nears {
             sb.shell.on_proximity(n, now_ms);
         }
+        if sb.battery_at.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(20)) {
+            sb.battery = tideshell_egui::sensors::read_battery(std::path::Path::new("/sys/class/power_supply"));
+            sb.battery_at = Some(std::time::Instant::now());
+        }
         let readings: Vec<String> = sb.orientation.rx.try_iter().collect();
         for o in &readings {
             // No raw accelerometer? iio-sensor-proxy's strings are enough for the ratchet.
@@ -1364,7 +1373,7 @@ fn main() {
                 ..Default::default()
             };
             raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(t.scale);
-            let info = FrameInfo { apps: &apps, time: tideshell_egui::sensors::local_time(), battery: None, trackpad_note: sb.trackpad_note(), t_secs: t0.elapsed().as_secs_f32() };
+            let info = FrameInfo { apps: &apps, time: tideshell_egui::sensors::local_time(), battery: sb.battery.map(|b| b.0), charging: sb.battery.is_some_and(|b| b.1), trackpad_note: sb.trackpad_note(), t_secs: t0.elapsed().as_secs_f32() };
             let mut actions = Vec::new();
             let ctx_side = side_ctx.entry(role).or_insert_with(|| {
                 let c = egui::Context::default();
@@ -1465,7 +1474,7 @@ fn main() {
             ..Default::default()
         };
         raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(t.scale);
-        let info = FrameInfo { apps: &apps, time: tideshell_egui::sensors::local_time(), battery: None, trackpad_note: sb.trackpad_note(), t_secs: t0.elapsed().as_secs_f32() };
+        let info = FrameInfo { apps: &apps, time: tideshell_egui::sensors::local_time(), battery: sb.battery.map(|b| b.0), charging: sb.battery.is_some_and(|b| b.1), trackpad_note: sb.trackpad_note(), t_secs: t0.elapsed().as_secs_f32() };
         let mut frame_actions = Vec::new();
         let out = ctx.run_ui(raw, |ui| {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {

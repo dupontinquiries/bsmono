@@ -449,7 +449,7 @@ impl eframe::App for App {
                     ctx.request_repaint();
                 }
             }
-            let info = FrameInfo { apps: &self.apps, time: sim_time(self.fake_clock), battery: battery(), trackpad_note: None, t_secs: now as f32 };
+            let info = FrameInfo { apps: &self.apps, time: sim_time(self.fake_clock), battery: battery(), charging: false, trackpad_note: None, t_secs: now as f32 };
             let actions = self.view.ui(ui, &mut self.shell, &self.palette, &info);
             self.execute(actions, now);
         });

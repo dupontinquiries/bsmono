@@ -21,7 +21,7 @@ fn measure(name: &str, setup: impl Fn(&mut Shell)) {
     let (mut verts, mut prims) = (0usize, 0usize);
     let frames: usize = std::env::var("FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(220);
     for i in 0..frames {
-        let info = FrameInfo { apps: &[], time: tideshell_core::clock::LocalTime { hour: 12, minute: 34, weekday: 3 }, battery: Some(0.7), trackpad_note: None, t_secs: i as f32 / 60.0 };
+        let info = FrameInfo { apps: &[], time: tideshell_core::clock::LocalTime { hour: 12, minute: 34, weekday: 3 }, battery: Some(0.7), charging: false, trackpad_note: None, t_secs: i as f32 / 60.0 };
         let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(408.0, 900.0))), time: Some(i as f64 / 60.0), ..Default::default() };
         let t0 = std::time::Instant::now();
         let out = ctx.run_ui(raw, |ui| { let _ = view.ui(ui, &mut sh, &pal, &info); });
