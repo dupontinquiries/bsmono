@@ -336,7 +336,7 @@ impl Shell {
         self.log("power key");
         // With a morse unlock set and the cover up on a lit screen, a press is the START of a
         // symbol, not "sleep": its length arrives with the release (`power_released`).
-        if self.morse.enabled() && self.lock.is_locked() && self.sleep.phase == crate::sleep::Phase::Awake {
+        if self.morse.enabled() && self.lock.is_locked() && matches!(self.sleep.phase, crate::sleep::Phase::Awake | crate::sleep::Phase::FadingIn) {
             return vec![];
         }
         if matches!(self.sleep.phase, crate::sleep::Phase::Off | crate::sleep::Phase::FadingOut) {
@@ -1934,6 +1934,29 @@ mod tests {
         assert!(sh.lock.is_locked());
         sh.power_released(crate::morse::SLEEP_MS, 9000);
         assert_eq!(sh.sleep.phase, crate::sleep::Phase::FadingOut, "a long hold puts it to sleep");
+    }
+
+    #[test]
+    fn presses_during_the_wake_fade_are_symbols_not_sleep() {
+        // Black screen, dot-dot-dash straight away: the first press wakes, the next two land in the
+        // (slow, evening) fade-in and must not put the screen back to sleep.
+        let mut sh = morse_shell("..-");
+        sh.power_released(crate::morse::SLEEP_MS, 1000);
+        let mut t = 1000u64;
+        for _ in 0..400 { t += 11; sh.tick(t); }
+        assert_eq!(sh.sleep.phase, crate::sleep::Phase::Off);
+        sh.sleep.evening = true;
+        sh.now = t;
+        sh.power_key(); // press 1 wakes
+        assert_eq!(sh.sleep.phase, crate::sleep::Phase::FadingIn);
+        sh.power_released(100, t + 100); // its release: not a symbol
+        sh.power_key(); // press 2, mid-fade
+        assert_eq!(sh.sleep.phase, crate::sleep::Phase::FadingIn, "must not sleep again");
+        sh.power_released(100, t + 600);
+        sh.power_key();
+        assert_eq!(sh.sleep.phase, crate::sleep::Phase::FadingIn);
+        sh.power_released(100, t + 1100);
+        assert_eq!(sh.morse.entered(), 2, "two dots counted, the wake press not");
     }
 
     #[test]
