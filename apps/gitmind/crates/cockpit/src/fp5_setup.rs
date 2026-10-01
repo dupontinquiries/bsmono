@@ -155,6 +155,34 @@ pub fn panel_zones_plan() -> Vec<Step> {
     ]
 }
 
+/// Past this much anonymous memory (kB) cosmic-panel is restarted by the watchdog.
+pub const PANEL_RSS_LIMIT_KB: u32 = 800_000;
+
+/// `cosmic-panel` on the FP5 (cosmic 1.9.0) can hit a Wayland protocol error on its
+/// `cosmic_corner_radius_layer_v1` object right after the session starts and then spin on the dead
+/// connection: ~7 MB/s leaked and a core burned until the phone runs out of memory (5 GB seen).
+/// Measured: 0 such errors in the boot before the first autologin boot, 460k and 1M in the next
+/// two. Not caused by the panel/dock config (zones, autohide, outputs and radius were each
+/// changed and the leak stayed). This does not fix it; it bounds it.
+pub fn panel_watchdog_plan() -> Vec<Step> {
+    let script = format!("{BIN}/panel-watchdog");
+    let unit = format!("{UNIT_DIR}/panel-watchdog.service");
+    vec![
+        Step { on: Where::Device, what: "the watchdog script (restarts cosmic-panel past its memory limit)",
+               cmd: format!("mkdir -p \"{BIN}\" && printf '#!/bin/sh\\nwhile sleep 20; do p=$(pidof -s cosmic-panel) || continue; kb=$(grep RssAnon /proc/$p/status | tr -dc 0-9); [ \"${{kb:-0}}\" -gt {PANEL_RSS_LIMIT_KB} ] && pkill -x cosmic-panel; done\\n' > \"{script}\" && chmod +x \"{script}\""),
+               gate: Gate::ExitZero, rollback: Some(format!("rm -f \"{script}\"")) },
+        Step { on: Where::Device, what: "its user unit",
+               cmd: format!("mkdir -p \"{UNIT_DIR}\" && printf '[Unit]\\nDescription=Restart cosmic-panel when it leaks\\n[Service]\\nExecStart=%%h/.local/bin/panel-watchdog\\nRestart=always\\n[Install]\\nWantedBy=default.target\\n' > \"{unit}\" && systemctl --user daemon-reload"),
+               gate: Gate::ExitZero, rollback: Some(format!("rm -f \"{unit}\"; systemctl --user daemon-reload")) },
+        Step { on: Where::Device, what: "the watchdog is enabled and started",
+               cmd: "systemctl --user enable --now panel-watchdog.service".into(),
+               gate: Gate::ExitZero, rollback: Some("systemctl --user disable --now panel-watchdog.service".into()) },
+        Step { on: Where::Device, what: "the watchdog is running",
+               cmd: "sleep 1; systemctl --user is-active --quiet panel-watchdog.service && echo RUNNING".into(),
+               gate: Gate::Contains("RUNNING".into()), rollback: None },
+    ]
+}
+
 /// Replace the running tideshell with the binary already uploaded to `staged` on the device.
 pub fn tideshell_swap_plan(staged: &str) -> Vec<Step> {
     let live = format!("{BIN}/tideshell");
@@ -341,6 +369,7 @@ pub fn all_parts(root: Root) -> Vec<(&'static str, Vec<Step>)> {
         ("speaker-chain packages", audio_packages_plan(root)),
         ("video tools for vidkit-player", video_tools_plan(root)),
         ("panel and dock zones", panel_zones_plan()),
+        ("panel memory watchdog", panel_watchdog_plan()),
         ("emergency USB access", emergency_access_plan(root)),
     ]
 }
@@ -358,6 +387,7 @@ mod tests {
         v.extend(emergency_access_plan(root));
         v.extend(video_tools_plan(root));
         v.extend(panel_zones_plan());
+        v.extend(panel_watchdog_plan());
         v.extend(rescue_console_plan("/tmp/fp5-rescue", root));
         v.extend(autologin_plan("user", root));
         v
@@ -371,6 +401,17 @@ mod tests {
         assert!(z[0].cmd.contains("CosmicPanel.$n/v1") && z[0].cmd.contains("printf 'false'"));
         assert!(z[0].rollback.as_deref().unwrap().contains("printf 'true'"), "undo restores the zone");
         assert!(all_parts(Root::NoPrompt).iter().any(|(n, _)| n.contains("panel and dock")));
+    }
+
+    #[test]
+    fn the_watchdog_script_is_a_runnable_loop_with_the_limit_in_it() {
+        let w = panel_watchdog_plan();
+        let cmd = &w[0].cmd;
+        assert!(cmd.contains("pidof -s cosmic-panel") && cmd.contains("pkill -x cosmic-panel"), "{cmd}");
+        assert!(cmd.contains(&format!("-gt {PANEL_RSS_LIMIT_KB}")), "{cmd}");
+        assert!(cmd.contains("${kb:-0}"), "an unset reading must not become a syntax error: {cmd}");
+        assert!(w[1].cmd.contains("ExecStart=%%h/.local/bin/panel-watchdog"), "{}", w[1].cmd);
+        assert!(w.iter().filter(|s| s.rollback.is_some()).count() == 3);
     }
 
     #[test]
