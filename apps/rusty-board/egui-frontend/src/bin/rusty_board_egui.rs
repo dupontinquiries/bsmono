@@ -6,6 +6,12 @@
 //! Run:  cargo run --bin rusty-board-egui --features app   (from apps/rusty-board/egui-frontend)
 
 fn main() -> eframe::Result<()> {
+    // Without a subscriber every `tracing` line in the keyboard (focus decisions, input-method
+    // health) was dropped, and the journal said nothing. RUST_LOG picks the level; warn by default.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")))
+        .with_writer(std::io::stderr)
+        .try_init();
     // FIRST, before eframe/winit touch Wayland: KWin hands the input-method socket over as
     // WAYLAND_SOCKET, and a toolkit that sees it connects to the wrong socket for rendering.
     rusty_board_egui::platform::capture_inherited_socket();
