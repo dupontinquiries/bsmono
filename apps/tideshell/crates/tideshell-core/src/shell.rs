@@ -1076,6 +1076,7 @@ impl Shell {
             }
         }
         self.world.accel(accel);
+        self.rotate.on_accel(accel);
         let was = self.flat.is_flat();
         self.flat.on_accel(accel, now);
         if was != self.flat.is_flat() {

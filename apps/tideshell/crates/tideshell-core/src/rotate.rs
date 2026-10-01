@@ -9,6 +9,12 @@ use crate::Millis;
 
 pub const HOLD_MS: Millis = 900;
 
+/// Degrees the device must turn IN THE SCREEN PLANE past the point where
+/// iio-sensor-proxy first reported the new orientation (its own switch is ~45
+/// degrees and not configurable) before the shell applies it. Needs accelerometer
+/// samples (`on_accel`); without any, the hold alone decides.
+pub const PAST_DEG: f32 = 25.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Orientation {
     Normal,
@@ -44,17 +50,27 @@ impl Orientation {
     }
 }
 
+/// Smallest angle between two directions, radians.
+fn angle_between(a: f32, b: f32) -> f32 {
+    let d = (a - b).rem_euclid(std::f32::consts::TAU);
+    d.min(std::f32::consts::TAU - d)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AutoRotate {
     pub enabled: bool,
     pub locked: Orientation,
     pub applied: Orientation,
     candidate: Option<(Orientation, Millis)>,
+    /// Gravity direction in the screen plane (radians), latest sample and the one
+    /// current when the candidate was first reported.
+    angle: Option<f32>,
+    cand_angle: Option<f32>,
 }
 
 impl Default for AutoRotate {
     fn default() -> Self {
-        AutoRotate { enabled: true, locked: Orientation::Normal, applied: Orientation::Normal, candidate: None }
+        AutoRotate { enabled: true, locked: Orientation::Normal, applied: Orientation::Normal, candidate: None, angle: None, cand_angle: None }
     }
 }
 
@@ -68,12 +84,23 @@ impl AutoRotate {
         let Some(o) = Orientation::parse(s) else { return None };
         if o == self.locked {
             self.candidate = None;
+            self.cand_angle = None;
             return None;
         }
         if !matches!(self.candidate, Some((c, _)) if c == o) {
             self.candidate = Some((o, now));
+            self.cand_angle = self.angle;
         }
         self.poll(now, blocked)
+    }
+
+    /// An accelerometer sample (m/s2, device axes: x right, y up, z out of the
+    /// screen). Tracks where gravity points in the screen plane; flat or face-down
+    /// (no in-plane component) leaves the last direction alone.
+    pub fn on_accel(&mut self, a: [f32; 3]) {
+        if a[0].hypot(a[1]) > 3.0 {
+            self.angle = Some(a[1].atan2(a[0]));
+        }
     }
 
     /// Apply the candidate if it has held long enough. iio-sensor-proxy only
@@ -86,6 +113,11 @@ impl AutoRotate {
         let Some((o, since)) = self.candidate else { return None };
         if now.saturating_sub(since) < HOLD_MS {
             return None;
+        }
+        if let (Some(a0), Some(a1)) = (self.cand_angle, self.angle) {
+            if angle_between(a0, a1).to_degrees() < PAST_DEG {
+                return None; // reported, but not turned far enough past the switch point
+            }
         }
         self.locked = o;
         self.candidate = None;
@@ -120,6 +152,36 @@ mod tests {
         assert_eq!(r.on_reading("left-up", 500, false), None, "restarted the hold");
         assert_eq!(r.on_reading("left-up", 500 + HOLD_MS, false), Some(Orientation::LeftUp));
         assert_eq!(r.on_reading("left-up", 2000, false), None, "no repeat while it holds");
+    }
+
+    fn tilt(deg: f32) -> [f32; 3] {
+        let r = deg.to_radians();
+        [9.8 * r.cos(), 9.8 * r.sin(), 0.0]
+    }
+
+    #[test]
+    fn the_device_must_turn_past_the_switch_point_before_it_rotates() {
+        let mut r = AutoRotate::default();
+        r.on_accel(tilt(0.0));
+        assert_eq!(r.on_reading("left-up", 0, false), None);
+        r.on_accel(tilt(10.0)); // held long, but only 10 degrees past the proxy's switch
+        assert_eq!(r.poll(HOLD_MS * 3, false), None, "not far enough");
+        r.on_accel(tilt(PAST_DEG + 5.0));
+        assert_eq!(r.poll(HOLD_MS * 3, false), Some(Orientation::LeftUp));
+    }
+
+    #[test]
+    fn turning_back_the_other_way_is_not_progress_and_flat_is_ignored() {
+        let mut r = AutoRotate::default();
+        r.on_accel(tilt(0.0));
+        r.on_reading("left-up", 0, false);
+        r.on_accel(tilt(-(PAST_DEG + 5.0)));
+        assert_eq!(r.poll(HOLD_MS * 3, false), Some(Orientation::LeftUp), "distance, either way, is the test");
+        let mut r = AutoRotate::default();
+        r.on_accel(tilt(0.0));
+        r.on_reading("left-up", 0, false);
+        r.on_accel([0.1, 0.1, 9.8]); // lying flat: no in-plane direction, keeps the last
+        assert_eq!(r.poll(HOLD_MS * 3, false), None);
     }
 
     #[test]
