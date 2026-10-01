@@ -35,6 +35,10 @@ driver faults that bite (`vec4<u32>` byte reads, absent submit callbacks, the
 subgroup-matvec hang), and the three harness tiers for GPU work including the
 real-hardware gate. Read it before writing or timing anything GPU-side.
 
+[**FP5_PHONE_LEARNINGS.md**](FP5_PHONE_LEARNINGS.md) — the Fairphone 5 under postmarketOS/COSMIC:
+the display-controller wedge, key routing, rotation, camera and GPU hazards, emergency access, build and
+deploy that worked. Read before touching the phone.
+
 ## Catalog (≈40 docs)
 
 ### Domain guides — what the user actually does
