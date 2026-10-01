@@ -1212,6 +1212,7 @@ fn main() {
             match (e.key, e.down) {
                 (KeyPress::Power, true) => actions.extend(sb.shell.power_key()),
                 (KeyPress::Power, false) => {}
+                (KeyPress::PowerUp(held), _) => actions.extend(sb.shell.power_released(held, now_ms)),
                 (KeyPress::VolumeUp, d) => intents.extend(if d { sb.volkeys.press(VolKey::Up, now_ms) } else { sb.volkeys.release(VolKey::Up, now_ms) }),
                 (KeyPress::VolumeDown, d) => intents.extend(if d { sb.volkeys.press(VolKey::Down, now_ms) } else { sb.volkeys.release(VolKey::Down, now_ms) }),
             }

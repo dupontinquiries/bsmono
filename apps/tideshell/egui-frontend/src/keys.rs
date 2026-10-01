@@ -70,6 +70,8 @@ pub enum KeyPress {
     Power,
     VolumeUp,
     VolumeDown,
+    /// The power key came back up after this many ms (the morse unlock's symbol length).
+    PowerUp(u64),
 }
 
 pub struct Keys {
@@ -121,14 +123,15 @@ impl Keys {
         };
         // Through the compositor only the POWER key is routed there; the volume keys stay on
         // evdev either way (releases exist there, which holds need), so drop the power node.
-        let devices: Vec<KeyDevice> = if via_compositor { devices.into_iter().filter(|d| d.volume && !d.power).collect() } else { devices };
+        let devices: Vec<KeyDevice> = if via_compositor { devices.into_iter().filter(|d| d.volume || d.power).collect() } else { devices };
         for d in &devices {
             match std::fs::File::open(&d.node) {
                 Ok(f) => {
                     opened.push(format!("{} ({})", d.name, d.node.display()));
                     let tx: Sender<KeyEvent> = tx.clone();
                     let wake = wake_reader.as_ref().and_then(|w| w.try_clone().ok());
-                    std::thread::Builder::new().name("tideshell-keys".into()).spawn(move || reader(f, tx, wake)).expect("spawn key reader");
+                    let release_only = via_compositor && d.power;
+                    std::thread::Builder::new().name("tideshell-keys".into()).spawn(move || reader(f, tx, wake, release_only)).expect("spawn key reader");
                 }
                 Err(e) => failed.push(format!("{}: {e}", d.node.display())),
             }
@@ -164,7 +167,8 @@ pub struct KeyEvent {
     pub down: bool,
 }
 
-fn reader(mut f: std::fs::File, tx: Sender<KeyEvent>, wake: Option<UnixDatagram>) {
+fn reader(mut f: std::fs::File, tx: Sender<KeyEvent>, wake: Option<UnixDatagram>, release_only: bool) {
+    let mut power_down: Option<std::time::Instant> = None;
     let mut buf = [0u8; 24 * 16];
     loop {
         let n = match f.read(&mut buf) {
@@ -176,6 +180,22 @@ fn reader(mut f: std::fs::File, tx: Sender<KeyEvent>, wake: Option<UnixDatagram>
             // one this shell wants: holds are timed against the shell's
             // clock so they behave the same however the key repeat is set.
             if let Some((EV_KEY, code, v @ (0 | 1))) = decode_event(chunk) {
+                if code == KEY_POWER {
+                    // The compositor route reports a press only; the length of the press (for the
+                    // morse unlock) comes from here. `release_only`: the press itself is NOT sent,
+                    // cosmic already delivered it.
+                    let ev = if v == 1 {
+                        power_down = Some(std::time::Instant::now());
+                        (!release_only).then_some(KeyEvent { key: KeyPress::Power, down: true })
+                    } else {
+                        power_down.take().map(|t| KeyEvent { key: KeyPress::PowerUp(t.elapsed().as_millis() as u64), down: false })
+                    };
+                    if let Some(ev) = ev {
+                        if tx.send(ev).is_err() { return; }
+                        if let Some(w) = &wake { let _ = w.send(b"k"); }
+                    }
+                    continue;
+                }
                 let key = match code {
                     KEY_POWER => KeyPress::Power,
                     KEY_VOLUMEUP => KeyPress::VolumeUp,

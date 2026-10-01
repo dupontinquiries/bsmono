@@ -91,6 +91,11 @@ pub struct ShellPrefs {
     /// Autorotation on/off, and whether landscape is mirrored on this panel.
     pub autorotate: bool,
     pub rotate_flip: bool,
+    /// The morse unlock for the cover: `.` short and `-` long power-key presses (3+ symbols), or
+    /// empty for none. See morse.rs.
+    pub unlock_morse: String,
+    /// What the home screen shows where the clock is; a tap cycles clock -> snapclone -> temperature.
+    pub home_widget: HomeWidget,
     /// Cover clock: digital or analog, and how fuzzy.
     pub clock_style: crate::clock::ClockStyle,
     pub clock_fuzzy: crate::clock::Fuzzy,
@@ -130,6 +135,8 @@ impl Default for ShellPrefs {
             audio_tone: 0.0,
             autorotate: true,
             rotate_flip: false,
+            unlock_morse: String::new(),
+            home_widget: HomeWidget::Clock,
             clock_style: crate::clock::ClockStyle::Digital,
             clock_fuzzy: crate::clock::Fuzzy::Exact,
             sleep_idle_s: 60,
@@ -147,7 +154,28 @@ pub fn parse_scale(v: &str) -> Option<f32> {
     v.parse::<f32>().ok().filter(|f| f.is_finite()).map(|f| f.clamp(0.7, 2.0))
 }
 
-pub const KEYS: [&str; 30] = [
+/// The home screen's one-slot widget. A tap steps to the next and the choice is a pref, so it
+/// survives restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeWidget {
+    Clock,
+    Snapclone,
+    Temperature,
+}
+
+impl HomeWidget {
+    pub fn token(self) -> &'static str {
+        match self { HomeWidget::Clock => "clock", HomeWidget::Snapclone => "snapclone", HomeWidget::Temperature => "temperature" }
+    }
+    pub fn from_token(s: &str) -> Option<HomeWidget> {
+        match s { "clock" => Some(HomeWidget::Clock), "snapclone" => Some(HomeWidget::Snapclone), "temperature" => Some(HomeWidget::Temperature), _ => None }
+    }
+    pub fn next(self) -> HomeWidget {
+        match self { HomeWidget::Clock => HomeWidget::Snapclone, HomeWidget::Snapclone => HomeWidget::Temperature, HomeWidget::Temperature => HomeWidget::Clock }
+    }
+}
+
+pub const KEYS: [&str; 32] = [
     "shell.layout",
     "shell.bar.widgets",
     "shell.bar.width",
@@ -173,6 +201,8 @@ pub const KEYS: [&str; 30] = [
     "shell.audio.tone",
     "shell.rotate.auto",
     "shell.rotate.flip",
+    "shell.unlock.morse",
+    "shell.home.widget",
     "shell.clock.style",
     "shell.clock.fuzzy",
     "shell.sleep.idle_s",
@@ -215,6 +245,8 @@ impl ShellPrefs {
             ("shell.audio.tone".into(), format!("{:.3}", self.audio_tone)),
             ("shell.rotate.auto".into(), if self.autorotate { "on" } else { "off" }.into()),
             ("shell.rotate.flip".into(), if self.rotate_flip { "on" } else { "off" }.into()),
+            ("shell.unlock.morse".into(), self.unlock_morse.clone()),
+            ("shell.home.widget".into(), self.home_widget.token().into()),
             (
                 "shell.clock.style".into(),
                 match self.clock_style {
@@ -305,6 +337,15 @@ impl ShellPrefs {
             "shell.audio.tone" => self.audio_tone = parse_range(key, v, -1.0, 1.0)?,
             "shell.rotate.auto" => self.autorotate = parse_on_off(key, v)?,
             "shell.rotate.flip" => self.rotate_flip = parse_on_off(key, v)?,
+            "shell.home.widget" => {
+                self.home_widget = HomeWidget::from_token(v).ok_or_else(|| format!("shell.home.widget: '{v}' is not clock|snapclone|temperature"))?
+            }
+            "shell.unlock.morse" => {
+                if !v.is_empty() && crate::morse::parse(v).is_none() {
+                    return Err(format!("shell.unlock.morse: '{v}' needs 3+ of '.' and '-' (or empty for none)"));
+                }
+                self.unlock_morse = v.trim().to_string();
+            }
             "shell.theme" => {
                 if v.is_empty() || !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
                     return Err(format!("shell.theme: '{v}' is not a palette id"));
@@ -412,6 +453,8 @@ mod tests {
         p.brightness_mode = "stepped".into();
         p.living = false;
         p.rotate_flip = true;
+        p.home_widget = HomeWidget::Temperature;
+        p.unlock_morse = ".-.".into();
         p.clock_fuzzy = crate::clock::Fuzzy::Quarter;
         p.bar_widgets = bar::parse_widgets("clock,toggle:trackpad,app:org.gnome.Console").0;
         let kv = p.to_kv();

@@ -126,6 +126,16 @@ impl LockScreen {
         }
     }
 
+    /// Dismiss the cover without a swipe (the morse unlock). Cover mode only: with a PIN the cover
+    /// opens through authentication, never through this.
+    pub fn open_cover(&mut self) -> bool {
+        if self.phase == LockPhase::Locked && !self.require_auth {
+            self.reveal.animate_to(1.0);
+            return true;
+        }
+        false
+    }
+
     pub fn release_reveal(&mut self) {
         if self.phase == LockPhase::Locked {
             if self.reveal.release() < 1.0 {

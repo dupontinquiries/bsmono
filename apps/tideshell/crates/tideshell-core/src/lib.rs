@@ -44,6 +44,7 @@ pub mod hold;
 pub mod paintrate;
 pub mod palette;
 pub mod lock;
+pub mod morse;
 pub mod prefs;
 pub mod rotate;
 pub mod season;

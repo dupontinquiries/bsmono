@@ -63,6 +63,10 @@ pub struct Shell {
     pub night_window: bool,
     pub night_pulse: bool,
     pub rotate: crate::rotate::AutoRotate,
+    /// The morse unlock, and when the power key last woke the screen (that press's release is not
+    /// a symbol).
+    pub morse: crate::morse::Morse,
+    morse_wake_ms: Option<Millis>,
     /// The camera pane's world (gyro/gravity/compass) and its anchors.
     pub world: crate::world::World,
     /// Ambient loudness -> notification gain.
@@ -119,6 +123,8 @@ impl Shell {
         cold.force = cold_force;
         let mut rotate = crate::rotate::AutoRotate::default();
         rotate.enabled = prefs.autorotate;
+        let mut morse = crate::morse::Morse::default();
+        morse.set_pattern(&prefs.unlock_morse);
         let mut ambient = AutoBrightness::default();
         ambient.enabled = prefs.auto_brightness;
         ambient.user = prefs.brightness_offset;
@@ -146,6 +152,8 @@ impl Shell {
             night_window: false,
             night_pulse: true,
             rotate,
+            morse,
+            morse_wake_ms: None,
             world: crate::world::World::new(screen.0 * 0.9),
             sound: crate::ambient_sound::AmbientSound::default(),
             last_imu: None,
@@ -246,6 +254,9 @@ impl Shell {
         self.ambient.user = prefs.brightness_offset;
         self.ambient.night = prefs.night;
         self.rotate.enabled = prefs.autorotate;
+        if prefs.unlock_morse != self.prefs.unlock_morse {
+            self.morse.set_pattern(&prefs.unlock_morse);
+        }
         self.cold.set_force(match prefs.cold.as_str() {
             "on" => Some(true),
             "off" => Some(false),
@@ -323,9 +334,58 @@ impl Shell {
     /// The power key: awake -> sleep (and cover); asleep -> wake.
     pub fn power_key(&mut self) -> Vec<Action> {
         self.log("power key");
+        // With a morse unlock set and the cover up on a lit screen, a press is the START of a
+        // symbol, not "sleep": its length arrives with the release (`power_released`).
+        if self.morse.enabled() && self.lock.is_locked() && self.sleep.phase == crate::sleep::Phase::Awake {
+            return vec![];
+        }
+        if matches!(self.sleep.phase, crate::sleep::Phase::Off | crate::sleep::Phase::FadingOut) {
+            self.morse_wake_ms = Some(self.now);
+        }
         let acts = self.sleep.power_key();
         let out: Vec<Action> = acts.into_iter().flat_map(|a| self.on_sleep_action(a)).collect();
         self.emit(out)
+    }
+
+    /// The power key came back up after `held_ms` (evdev: the compositor route only reports the
+    /// press). Under a morse unlock this is the symbol; a hold past the symbol range sleeps the
+    /// screen instead, so a pocket cannot sit "inside" the code.
+    pub fn power_released(&mut self, held_ms: Millis, now: Millis) -> Vec<Action> {
+        self.now = self.now.max(now);
+        if !self.morse.enabled() || !self.lock.is_locked() {
+            return vec![];
+        }
+        if !matches!(self.sleep.phase, crate::sleep::Phase::Awake | crate::sleep::Phase::FadingIn) {
+            return vec![];
+        }
+        // The press that woke the screen is not a symbol.
+        let started = now.saturating_sub(held_ms);
+        if self.morse_wake_ms.is_some_and(|w| started <= w + 300 && now.saturating_sub(w) < 2500) {
+            return vec![];
+        }
+        if held_ms >= crate::morse::SLEEP_MS {
+            self.log("morse: long hold, sleeping");
+            let acts = self.sleep.power_key();
+            let out: Vec<Action> = acts.into_iter().flat_map(|a| self.on_sleep_action(a)).collect();
+            return self.emit(out);
+        }
+        match self.morse.press(held_ms, now) {
+            crate::morse::Outcome::Unlocked => {
+                self.log("morse: unlocked");
+                self.lock.open_cover();
+            }
+            crate::morse::Outcome::Progress(n) => self.log(format!("morse: {n}/{}", self.morse.len())),
+            crate::morse::Outcome::Wrong => self.log("morse: wrong, start over"),
+            crate::morse::Outcome::Ignored => {}
+        }
+        vec![]
+    }
+
+    /// A tap on the home widget: clock -> snapclone id -> temperature -> clock, remembered.
+    pub fn cycle_home_widget(&mut self) -> Vec<Action> {
+        self.prefs.home_widget = self.prefs.home_widget.next();
+        self.log(format!("home widget: {}", self.prefs.home_widget.token()));
+        vec![Action::SavePrefs]
     }
 
     /// A touch while the screen sleeps (all touches go here then).
@@ -1824,6 +1884,72 @@ mod tests {
         sh.open_switcher();
         assert_eq!(sh.launch("org.gnome.Console"), vec![Action::LaunchApp("org.gnome.Console".into())]);
         assert!(!sh.switcher.open);
+    }
+
+    #[test]
+    fn the_home_widget_cycles_in_three_and_asks_to_be_saved() {
+        use crate::prefs::HomeWidget as H;
+        let mut sh = shell_with_three();
+        assert_eq!(sh.prefs.home_widget, H::Clock);
+        for want in [H::Snapclone, H::Temperature, H::Clock] {
+            assert_eq!(sh.cycle_home_widget(), vec![Action::SavePrefs]);
+            assert_eq!(sh.prefs.home_widget, want);
+        }
+    }
+
+    fn morse_shell(pattern: &str) -> Shell {
+        let mut sh = shell_with_three();
+        let mut p = sh.prefs.clone();
+        p.unlock_morse = pattern.into();
+        sh.set_prefs(p);
+        sh.lock.lock();
+        sh
+    }
+
+    #[test]
+    fn under_a_morse_unlock_a_press_does_not_sleep_and_the_pattern_opens_the_cover() {
+        let mut sh = morse_shell(".-.");
+        assert!(sh.power_key().is_empty());
+        assert_eq!(sh.sleep.phase, crate::sleep::Phase::Awake, "a press on the lit cover is a symbol, not sleep");
+        assert!(sh.power_released(100, 1000).is_empty());
+        assert!(sh.power_released(600, 1600).is_empty());
+        assert!(sh.lock.is_locked());
+        sh.power_released(100, 2200);
+        let mut unlocked = false;
+        for i in 0..400u64 {
+            if sh.lock.tick(11.0, 2300 + i * 11).contains(&crate::lock::LockAction::Unlock) { unlocked = true; break; }
+        }
+        assert!(unlocked, "the right code slid the cover away");
+    }
+
+    #[test]
+    fn a_wrong_code_leaves_the_cover_up_and_a_long_hold_sleeps_the_screen() {
+        let mut sh = morse_shell(".-.");
+        sh.power_released(600, 1000);
+        sh.power_released(600, 1600);
+        sh.power_released(600, 2200);
+        for i in 0..400u64 {
+            assert!(!sh.lock.tick(11.0, 3000 + i * 11).contains(&crate::lock::LockAction::Unlock));
+        }
+        assert!(sh.lock.is_locked());
+        sh.power_released(crate::morse::SLEEP_MS, 9000);
+        assert_eq!(sh.sleep.phase, crate::sleep::Phase::FadingOut, "a long hold puts it to sleep");
+    }
+
+    #[test]
+    fn the_press_that_wakes_the_screen_is_not_a_symbol() {
+        let mut sh = morse_shell(".-.");
+        sh.power_key(); // awake + morse: consumed
+        sh.power_released(crate::morse::SLEEP_MS, 1000); // long hold: asleep
+        for _ in 0..400 { sh.tick(5000 + 11); }
+        let mut t = 6000u64;
+        for _ in 0..200 { t += 11; sh.tick(t); }
+        assert_eq!(sh.sleep.phase, crate::sleep::Phase::Off);
+        sh.now = 8000;
+        sh.power_key(); // wakes
+        assert_eq!(sh.sleep.phase, crate::sleep::Phase::FadingIn);
+        sh.power_released(120, 8130); // the wake press's own release
+        assert_eq!(sh.morse.entered(), 0, "that release is not the first dot");
     }
 }
 
