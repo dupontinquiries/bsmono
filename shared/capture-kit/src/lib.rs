@@ -48,6 +48,7 @@
 //! sandbox has one — but everything after the source element is.
 
 pub mod focus;
+pub mod orient;
 pub mod probe;
 
 use std::io::Read;
