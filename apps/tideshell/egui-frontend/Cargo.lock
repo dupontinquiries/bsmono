@@ -385,6 +385,7 @@ dependencies = [
 name = "capture-kit"
 version = "0.1.0"
 dependencies = [
+ "config-kit",
  "device-kit",
 ]
 
