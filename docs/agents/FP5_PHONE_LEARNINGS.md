@@ -36,6 +36,14 @@ shell's brightness mode was already `Safe` (pmaports#4274).
 the display reboot, portrait work. Sensor mounting: all three cameras report `camera_sensor_rotation = 270`;
 upright = a clockwise quarter turn (owner confirmed "rot was 90 deg clockwise").
 
+Boot race: after a reboot tideshell asked iio-sensor-proxy `HasAccelerometer` at login, got `false`, and
+the orientation thread returned; the proxy found the sensor 17 s later (journal 03:53:39 vs 03:53:56), so
+rotation was dead until a restart. It now asks every 3 s. The accelerometer is NOT an IIO sysfs device here
+(`/sys/bus/iio` has only the PMIC ADCs): only the proxy sees it, and the proxy gives orientation, not the
+gravity vector. So `PAST_DEG` (extra turn past the switch point, needs `on_accel`) is inert on this phone;
+the 900 ms hold is the only thing making rotation less twitchy. Making it real needs a raw-accelerometer
+source (or a longer hold).
+
 ## Camera  [measured unless noted]
 * libcamera's soft ISP debayers on the GPU through EGL: it shares the one GPU with the compositor. A
   probe once hung the phone; the memory note `fp5-camera-gpu-hang` says ask first.
@@ -94,6 +102,21 @@ bound ("Read-only file system") and every ctl command (cold, strip, voice, the n
 Chromium on the phone did not drive the board's input-method focus in one test (address bar focused, no
 Activate logged); GTK apps do. Unresolved: probably needs its Wayland text-input flag.
 
+### Typing came out as Dvorak  [measured, fix unverified on device]
+The phone's COSMIC layout is `us`/`dvorak` (`~/.config/cosmic/com.system76.CosmicComp/v1/xkb_config`; the
+console keymap too). On the input-method-v2 path the board typed every character as a QWERTY evdev keycode
+through `zwp_virtual_keyboard_v1`, and cosmic-comp maps keycodes with the SEAT's layout, ignoring the keymap
+the client uploads: `i` -> `c`, `s` -> `o`, and Ctrl+C was Ctrl+J. Plasma Mobile used the v1 keysym path,
+which is layout independent, which is why it "worked there". Now: text goes through
+`zwp_input_method_v2.commit_string` while a field is active, and the char -> keycode table (chords, no-focus
+fallback) is generated from the layout in COSMIC's `xkb_config` via xkbcommon. Named keys (BackSpace,
+Return, arrows) are the same keycodes in every layout and are unchanged.
+
+### Height after a short board  [measured]
+steno -> qwerty stayed short: the wanted surface height subtracted the central panel's bottom from the screen
+bottom, and on a screen shorter than the keys that goes negative (-100), so the board asked for the short
+height again. Panel space is now read from `ctx.available_rect()` before the central panel.
+
 ## Dock and the right bar  [measured]
 A dock with `exclusive_zone: true` shortens the tideshell bar even when autohidden. `exclusive_zone false`
 on both COSMIC panels (live config) lets the bar reach the bottom.
@@ -105,8 +128,23 @@ the thumb. With no physical keyboard (`/proc/bus/input/devices`: `kbd` handler +
 dotool devices do not count) tideshell sends `show`/`hide` on the rusty-board ctl socket, because its search
 field is not a text-input client. All unit-tested; the on-device feel is not yet confirmed.
 
-## Not done (as of 2026-10-01 03:40)
-Pinch-expand animation for the board (patch kept off-tree: scaling the layer also scales pointer positions
+## Video player on the phone  [measured]
+vidkit-player is installed, but the phone has no `yt-dlp` and no `ffmpeg` (`apk search` has both), so a
+pasted PAGE link cannot resolve; `wl-paste` itself works (data-control is exposed). Plan:
+`fp5_setup::video_tools_plan` (needs root). The picker's filter field auto-focused on open and held the
+on-screen keyboard up; it now only auto-focuses if no touch has been seen.
+
+## Display wedge, second occurrence  [measured]
+Trace before the first `[dpu error]`: `brightness_store` -> `rm692e5_bl_update_status` ->
+`mipi_dsi_dcs_set_display_brightness_large` -> `dsi_link_clk_set_rate` -> `_set_opp`, i.e. a sysfs backlight
+write while a frame was in flight; ~22 errors/s followed, `cosmic-panel` grew ~6 MB/s (2.6 GB) and the UI
+crawled. Reboot cleared it (0 errors after). The writer is not identified (tideshell's `Safe` path or
+COSMIC's own control). `sudo`/`systemctl reboot` over ssh now ask for interactive authentication, so the
+reboot needed the owner (power button).
+
+## Not done (as of 2026-10-01 04:10)
+Who writes the backlight (see above); a raw accelerometer for the rotation margin; apk yt-dlp/ffmpeg (root);
+the `show`/`hide` summon and palette feel on the device; pinch-expand animation for the board (patch kept off-tree: scaling the layer also scales pointer positions
 and broke two hold tests; an in-board approach is needed); steno multitouch and the short-keyboard bug;
 camera tap-to-focus and highlights; the phone-to-laptop model path; the unexplained power-offs (two more
 this session: read the previous boot's journal next time it is up).
