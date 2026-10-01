@@ -1,0 +1,17 @@
+[package]
+name = "speaker-dsp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A small-speaker audio chain in pure Rust: psychoacoustic virtual bass (bankstown's idea, placed where the speaker can radiate), a protective high-pass sized to the speaker, volume-dependent loudness compensation, gentle compression and a lookahead limiter. Built on studio-fx's Biquad / Saturator / Compressor / Limiter; measured with audio-kit's Goertzel. No LV2, no C."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# TODO: hoist Biquad/Compressor/Limiter/Saturator out of an app crate into a kit; until then this
+# is a shared crate depending on apps/studio/crates/studio-fx (which needs only serde + core-kit).
+studio-fx = { path = "../../apps/studio/crates/studio-fx" }
+
+[dev-dependencies]
+audio-kit = { path = "../audio-kit" }
