@@ -152,8 +152,8 @@ pub const MAIN_CAMERA: &str = "/base/soc@0/cci@ac4a000/i2c-bus@1/camera@29";
 pub fn camera_app_plan(staged: &str) -> Vec<Step> {
     let live = format!("{BIN}/snapshot-cam");
     let prev = format!("{BIN}/snapshot-cam.prev");
+    let wrapper = format!("{BIN}/snapshot-cam-phone");
     let entry = "$HOME/.local/share/applications/snapshot-cam.desktop";
-    let exec = format!("env SNAPSHOT_CAM_TURN=90 SNAPSHOT_CAM_SOURCE=\"gst:libcamerasrc camera-name={MAIN_CAMERA}\" $HOME/.local/bin/snapshot-cam");
     vec![
         Step { on: Where::Device, what: "the camera build's libraries resolve on this phone",
                cmd: format!("chmod +x \"{staged}\" && ! ldd \"{staged}\" 2>&1 | grep -q 'not found' && echo LIBS_OK"),
@@ -163,11 +163,15 @@ pub fn camera_app_plan(staged: &str) -> Vec<Step> {
         Step { on: Where::Device, what: "install the camera app",
                cmd: format!("mv \"{staged}\" \"{live}\""), gate: Gate::ExitZero,
                rollback: Some(format!("[ ! -e \"{prev}\" ] || cp -p \"{prev}\" \"{live}\"")) },
+        // A wrapper, not `Exec=env VAR="a b" ...`: the desktop spec cannot quote part of an argument.
+        Step { on: Where::Device, what: "the camera's launcher wrapper",
+               cmd: format!("printf '#!/bin/sh\\nexport SNAPSHOT_CAM_TURN=90\\nexport SNAPSHOT_CAM_SOURCE=\"gst:libcamerasrc camera-name={MAIN_CAMERA}\"\\nexec \"$HOME/.local/bin/snapshot-cam\" \"$@\"\\n' > \"{wrapper}\" && chmod +x \"{wrapper}\""),
+               gate: Gate::ExitZero, rollback: Some(format!("rm -f \"{wrapper}\"")) },
         Step { on: Where::Device, what: "the camera's launcher entry",
-               cmd: format!("mkdir -p \"$(dirname \"{entry}\")\" && printf '[Desktop Entry]\\nType=Application\\nName=Camera\\nComment=Snapshot camera: tap to focus, burst, colour profiles\\nExec=%s\\nIcon=camera-photo\\nTerminal=false\\nCategories=Graphics;Photography;\\nStartupNotify=true\\n' '{exec}' > \"{entry}\""),
+               cmd: format!("mkdir -p \"$(dirname \"{entry}\")\" && printf '[Desktop Entry]\\nType=Application\\nName=Camera\\nComment=Snapshot camera: tap to focus, burst, colour profiles\\nExec=%s\\nIcon=camera-photo\\nTerminal=false\\nCategories=Graphics;Photography;\\nStartupNotify=true\\n' \"{wrapper}\" > \"{entry}\""),
                gate: Gate::ExitZero, rollback: Some(format!("rm -f \"{entry}\"")) },
-        Step { on: Where::Device, what: "the app and its entry are in place",
-               cmd: format!("test -x \"{live}\" && grep -q 'SNAPSHOT_CAM_TURN=90' \"{entry}\" && echo CAMERA_READY"),
+        Step { on: Where::Device, what: "the app, its wrapper and its entry are in place",
+               cmd: format!("test -x \"{live}\" && grep -q 'SNAPSHOT_CAM_TURN=90' \"{wrapper}\" && grep -q 'snapshot-cam-phone' \"{entry}\" && echo CAMERA_READY"),
                gate: Gate::Contains("CAMERA_READY".into()), rollback: None },
     ]
 }
@@ -240,24 +244,25 @@ mod tests {
     }
 
     #[test]
-    fn the_camera_entry_carries_the_turn_and_the_main_camera() {
-        let step = camera_app_plan("/x").into_iter().find(|s| s.what == "the camera's launcher entry").expect("entry step");
-        assert!(step.cmd.contains("SNAPSHOT_CAM_TURN=90") && step.cmd.contains(MAIN_CAMERA) && step.cmd.contains("Name=Camera"), "{}", step.cmd);
-    }
-
-    #[test]
-    fn the_camera_entry_step_really_writes_a_valid_desktop_file() {
+    fn the_camera_steps_really_write_a_runnable_wrapper_and_a_valid_entry() {
         let home = std::env::temp_dir().join(format!("fp5-entry-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
-        let step = camera_app_plan("/x").into_iter().find(|s| s.what == "the camera's launcher entry").unwrap();
-        let out = std::process::Command::new("sh").arg("-c").arg(&step.cmd).env("HOME", &home).output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        for what in ["the camera's launcher wrapper", "the camera's launcher entry"] {
+            let step = camera_app_plan("/x").into_iter().find(|s| s.what == what).unwrap();
+            let out = std::process::Command::new("sh").arg("-c").arg(&step.cmd).env("HOME", &home).output().unwrap();
+            assert!(out.status.success(), "{what}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        let wrapper = std::fs::read_to_string(home.join(".local/bin/snapshot-cam-phone")).unwrap();
+        assert!(wrapper.starts_with("#!/bin/sh\n") && wrapper.contains("SNAPSHOT_CAM_TURN=90\n"), "{wrapper}");
+        assert!(wrapper.contains(&format!("SNAPSHOT_CAM_SOURCE=\"gst:libcamerasrc camera-name={MAIN_CAMERA}\"")), "{wrapper}");
+        assert!(wrapper.contains("exec \"$HOME/.local/bin/snapshot-cam\" \"$@\""), "$HOME and $@ must survive unexpanded: {wrapper}");
+        use std::os::unix::fs::PermissionsExt;
+        assert!(std::fs::metadata(home.join(".local/bin/snapshot-cam-phone")).unwrap().permissions().mode() & 0o111 != 0);
         let text = std::fs::read_to_string(home.join(".local/share/applications/snapshot-cam.desktop")).unwrap();
         let exec = text.lines().find(|l| l.starts_with("Exec=")).expect("an Exec line");
-        assert!(exec.contains("camera-name=/base/soc@0/cci@ac4a000/i2c-bus@1/camera@29") && exec.ends_with("/.local/bin/snapshot-cam"), "{exec}");
+        assert!(exec.ends_with("/.local/bin/snapshot-cam-phone") && !exec.contains(' '), "a bare path, nothing to quote: {exec}");
         assert!(text.starts_with("[Desktop Entry]\nType=Application\nName=Camera\n"), "{text}");
-        assert!(text.lines().count() >= 8, "one key per line: {text}");
         let _ = std::fs::remove_dir_all(&home);
     }
 
