@@ -13,18 +13,25 @@
 //! This is the one place that knows how to turn it right, so the three apps
 //! share a fix instead of each growing a rotate button.
 //!
-//! # The sign, settled by looking
+//! # The sign, and how it was got wrong once
 //!
-//! The V4L2 control gives a number of degrees, and the kernel docs and libcamera
-//! state differently which way that is. On the Fairphone 5 it was settled by
-//! observation: with the frame drawn as received, the picture was turned **90°
-//! clockwise** on screen (reported by the phone's owner, 2026-09-30), and all three
-//! sensors report `camera_sensor_rotation = 270` (front `s5kjn1`, rear `imx800` and
-//! `imx858`). Upright is therefore 90° COUNTER-clockwise = 270° clockwise, i.e. the
-//! sensor's number applied as a CLOCKWISE turn — which is what
-//! [`Rotation::upright_for_sensor`] does and what `fp5_270_means_a_counter_clockwise_quarter_turn`
-//! pins. Another device with a different mounting is not covered by this one
-//! observation; the person-set override (`quarter turns clockwise`) is the escape.
+//! The V4L2 control gives a number of degrees; which way to turn is a convention. Evidence, in
+//! order of weight:
+//!
+//! 1. A hands-on measurement already in the tree: tideshell's device table
+//!    (`apps/tideshell/egui-frontend/src/devices.rs`) records, for the Fairphone 5, that the camera
+//!    preview "arrived turned a quarter ANTICLOCKWISE, so it is drawn back CLOCKWISE" (2026-09).
+//! 2. All three FP5 sensors report `camera_sensor_rotation = 270`, and the Android convention for
+//!    the same number is "rotate 90° clockwise to be upright" (360 − 270).
+//! 3. The owner's answer to "which way is it turned?" was "rot was 90 deg clockwise" — ambiguous
+//!    (the picture IS turned clockwise, or it NEEDED turning clockwise).
+//!
+//! The first version of this module read (3) as "the picture is turned clockwise" and so turned it
+//! COUNTER-clockwise, contradicting (1) and (2), and shipped that to a phone where the shell
+//! already rotates the pane itself — a double rotation. (1) and (2) agree, so the sign is:
+//! upright = `360 − rotation` clockwise, i.e. 270 → a CLOCKWISE quarter turn. The owner is asked
+//! to confirm with an unambiguous question; [`Rotation::upright_for_sensor`] is the one place to
+//! flip, and `fp5_270_means_a_clockwise_quarter_turn` pins it.
 
 use crate::RawFrame;
 use std::sync::Arc;
@@ -47,12 +54,12 @@ impl Rotation {
     pub fn then(self, other: Rotation) -> Rotation { Rotation::from_degrees((self.degrees() + other.degrees()) as i64) }
     pub fn inverse(self) -> Rotation { Rotation::from_degrees(-(self.degrees() as i64)) }
 
-    /// The turn that makes a sensor's output upright, given the mounting
-    /// rotation the driver reports: the number is applied as a CLOCKWISE turn.
-    /// Confirmed on the FP5 (270 -> counter-clockwise quarter; see the module doc).
-    /// The one place to change if another device proves the opposite.
+    /// The turn that makes a sensor's output upright, given the mounting rotation the driver
+    /// reports: `360 - rotation`, clockwise (Android's convention, and what tideshell's device
+    /// table measured on the FP5: 270 -> a clockwise quarter). See the module doc for the evidence
+    /// and for the earlier mistake. The one place to change if a device proves the opposite.
     pub fn upright_for_sensor(sensor_rotation_degrees: i64) -> Rotation {
-        Rotation::from_degrees(sensor_rotation_degrees)
+        Rotation::from_degrees(-sensor_rotation_degrees)
     }
 }
 
@@ -194,17 +201,23 @@ mod tests {
         assert_eq!(parse_mounting(front).unwrap().facing, Some(Facing::Front));
     }
 
-    /// The FP5 observation, as a test: the frame showed 90 deg clockwise-rotated, the sensor
-    /// says 270, and the fix is a counter-clockwise quarter turn. Applied to a frame that IS
-    /// rotated 90 deg clockwise, it must give back the original.
+    /// The FP5 measurement, as a test: tideshell's device table recorded that the preview arrives
+    /// turned a quarter ANTICLOCKWISE and is drawn back clockwise; the sensor says 270. A frame that
+    /// is turned anticlockwise must be restored by the sensor-derived turn.
     #[test]
-    fn fp5_270_means_a_counter_clockwise_quarter_turn() {
-        assert_eq!(Rotation::upright_for_sensor(270), Rotation::Ccw90);
+    fn fp5_270_means_a_clockwise_quarter_turn() {
+        assert_eq!(Rotation::upright_for_sensor(270), Rotation::Cw90);
         let upright = abc();
-        let as_seen = upright.rotated(Rotation::Cw90); // what the person saw: turned 90 deg clockwise
-        assert_eq!(as_seen.rotated(Rotation::upright_for_sensor(270)), upright);
-        // And the front camera reports the same number, so it gets the same turn.
-        assert_eq!(turn_for(None, Some(Mounting { rotation_degrees: 270, facing: Some(Facing::Front) })), Rotation::Ccw90);
+        let as_arrives = upright.rotated(Rotation::Ccw90); // a quarter anticlockwise, per devices.rs
+        assert_eq!(as_arrives.rotated(Rotation::upright_for_sensor(270)), upright);
+        assert_eq!(turn_for(None, Some(Mounting { rotation_degrees: 270, facing: Some(Facing::Front) })), Rotation::Cw90, "front reports the same number");
+    }
+
+    #[test]
+    fn the_whole_mounting_table_is_360_minus_the_rotation() {
+        for (reported, want) in [(0, Rotation::None), (90, Rotation::Ccw90), (180, Rotation::Half), (270, Rotation::Cw90), (360, Rotation::None), (-90, Rotation::Cw90)] {
+            assert_eq!(Rotation::upright_for_sensor(reported), want, "sensor rotation {reported}");
+        }
     }
 
     #[test]
