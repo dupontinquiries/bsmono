@@ -1,0 +1,10 @@
+[Unit]
+Description=Rescue console: login prompt + on-screen keyboard on a spare virtual terminal
+Conflicts=getty@tty3.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/fp5-rescue/console.sh
+# Hand the screen back to whatever owned it, even if the console dies.
+ExecStopPost=/usr/local/lib/fp5-rescue/console.sh --restore
+KillMode=control-group

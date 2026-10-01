@@ -1,0 +1,15 @@
+[Unit]
+Description=Rescue chord watcher (hold power, tap volume-down three times)
+Documentation=file:///usr/local/share/doc/fp5-rescue/README.md
+
+[Service]
+ExecStart=/usr/local/bin/fp5-rescued
+Restart=always
+RestartSec=2
+# It only reads key events and starts one named unit.
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

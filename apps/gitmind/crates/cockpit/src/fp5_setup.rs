@@ -234,6 +234,35 @@ pub fn emergency_access_plan(root: Root) -> Vec<Step> {
     ]
 }
 
+/// Install the rescue chord watcher and its console from `staged` (a directory on the phone holding
+/// `fp5-rescued`, `console.sh`, `fp5-rescue.service` and `fp5-rescue-console.service`; see
+/// `system/fp5-rescue`). Root.
+pub fn rescue_console_plan(staged: &str, root: Root) -> Vec<Step> {
+    let install = format!(
+        "install -D -m 755 {staged}/fp5-rescued /usr/local/bin/fp5-rescued && \
+         install -D -m 755 {staged}/console.sh /usr/local/lib/fp5-rescue/console.sh && \
+         install -D -m 644 {staged}/fp5-rescue.service /etc/systemd/system/fp5-rescue.service && \
+         install -D -m 644 {staged}/fp5-rescue-console.service /etc/systemd/system/fp5-rescue-console.service && \
+         systemctl daemon-reload");
+    let undo = "systemctl disable --now fp5-rescue.service; rm -f /usr/local/bin/fp5-rescued /usr/local/lib/fp5-rescue/console.sh /etc/systemd/system/fp5-rescue.service /etc/systemd/system/fp5-rescue-console.service; systemctl daemon-reload";
+    vec![
+        Step { on: Where::Device, what: "the console tools exist (chvt, agetty, buffyboard)",
+               cmd: "command -v chvt && command -v agetty && command -v buffyboard && echo TOOLS".into(),
+               gate: Gate::Contains("TOOLS".into()), rollback: None },
+        Step { on: Where::Device, what: "the watcher sees the power and volume-down keys",
+               cmd: root_cmd(&format!("chmod +x {staged}/fp5-rescued && {staged}/fp5-rescued --probe"), root),
+               gate: Gate::Contains("/dev/input/event".into()), rollback: None },
+        Step { on: Where::Device, what: "install the rescue watcher and console",
+               cmd: root_cmd(&install, root), gate: Gate::ExitZero, rollback: Some(root_cmd(undo, root)) },
+        Step { on: Where::Device, what: "start the watcher at boot",
+               cmd: root_cmd("systemctl enable --now fp5-rescue.service", root), gate: Gate::ExitZero,
+               rollback: Some(root_cmd(undo, root)) },
+        Step { on: Where::Device, what: "the watcher is running",
+               cmd: root_cmd("sleep 2; systemctl is-active --quiet fp5-rescue.service && echo WATCHING", root),
+               gate: Gate::Contains("WATCHING".into()), rollback: Some(root_cmd(undo, root)) },
+    ]
+}
+
 /// Every part that can be replayed without arguments, in a sensible order.
 pub fn all_parts(root: Root) -> Vec<(&'static str, Vec<Step>)> {
     vec![
@@ -255,6 +284,7 @@ mod tests {
         v.extend(camera_app_plan("/tmp/snapshot-cam.new"));
         v.extend(hatch_swap_plan("/tmp/hatch-egui.new"));
         v.extend(emergency_access_plan(root));
+        v.extend(rescue_console_plan("/tmp/fp5-rescue", root));
         v
     }
 

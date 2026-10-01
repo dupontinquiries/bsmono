@@ -1,0 +1,14 @@
+[package]
+name = "fp5-rescue"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The last-resort console for a phone whose shell, compositor and network are all gone. A tiny root daemon (std only, no GUI, no D-Bus) watches the hardware keys for one chord - hold power, tap volume-down three times - and answers with a login prompt on a virtual terminal plus an on-screen keyboard, the way postmarketOS's initramfs debug shell does. Independent of tideshell on purpose."
+
+[[bin]]
+name = "fp5-rescued"
+path = "src/main.rs"
+
+[dependencies]
+
+[workspace]
