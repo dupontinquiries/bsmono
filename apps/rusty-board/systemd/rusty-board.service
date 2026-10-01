@@ -45,7 +45,10 @@ ConfigurationDirectory=rusty-board
 # normal path work; the `-` means a user who deletes the directory, or installs
 # by some route these scripts do not cover, gets a keyboard that starts rather
 # than a namespace error.
-ReadWritePaths=-%h/.config/rusty-board -%h/.local/share/rusty-board
+# %t is $XDG_RUNTIME_DIR: the control socket (rusty-board.ctl) lives there, and under
+# ProtectSystem=strict it cannot be bound without this ("Read-only file system"), which
+# silently cut the shell, the companion app and the strip off from the keyboard.
+ReadWritePaths=-%h/.config/rusty-board -%h/.local/share/rusty-board %t
 
 [Install]
 WantedBy=graphical-session.target

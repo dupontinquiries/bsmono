@@ -74,7 +74,7 @@ pub fn rusty_board_service_plan() -> Vec<Step> {
         Step { on: Where::Device, what: "the egui keyboard binary is installed",
                cmd: format!("test -x \"{BIN}/rusty-board-egui\""), gate: Gate::ExitZero, rollback: None },
         Step { on: Where::Device, what: "a restartable unit override (Restart=always)",
-               cmd: format!("mkdir -p \"{UNIT_DIR}/rusty-board.service.d\" && printf '[Service]\\nExecStart=\\nExecStart={BIN}/rusty-board-egui\\nRestart=always\\nRestartSec=1\\n' > \"{dropin}\" && systemctl --user daemon-reload"),
+               cmd: format!("mkdir -p \"{UNIT_DIR}/rusty-board.service.d\" && printf '[Service]\\nExecStart=\\nExecStart={BIN}/rusty-board-egui\\nRestart=always\\nRestartSec=1\\nReadWritePaths=%%t\\n' > \"{dropin}\" && systemctl --user daemon-reload"),
                gate: Gate::ExitZero,
                rollback: Some(format!("rm -f \"{dropin}\"; systemctl --user daemon-reload")) },
         Step { on: Where::Device, what: "the autostart launcher (no restart policy) is retired",

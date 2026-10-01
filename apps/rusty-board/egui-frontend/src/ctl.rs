@@ -31,6 +31,10 @@ pub enum Cmd {
     Cold(bool),
     ReloadSettings,
     ReloadLayouts,
+    /// Bring the board up whether or not a text field has focus (the shell's own search
+    /// field is not a text-input client), and put it away again.
+    Show,
+    Hide,
     /// An app's command strip (`keyboard_strip`): show it, or clear it.
     Strip(keyboard_strip::Msg),
 }
@@ -45,6 +49,8 @@ pub fn parse(s: &str) -> Option<Cmd> {
         "cold off" => Some(Cmd::Cold(false)),
         "reload-settings" => Some(Cmd::ReloadSettings),
         "reload-layouts" => Some(Cmd::ReloadLayouts),
+        "show" => Some(Cmd::Show),
+        "hide" => Some(Cmd::Hide),
         other => keyboard_strip::decode(other).map(Cmd::Strip),
     }
 }
@@ -146,5 +152,8 @@ mod tests {
         let show = keyboard_strip::Msg::Show { app: "aperture".into(), pid: 7, actions: vec![keyboard_strip::Action::new("Back", "Alt+Left", "")] };
         assert_eq!(parse(&keyboard_strip::encode(&show)), Some(Cmd::Strip(show)));
         assert_eq!(parse("reload-settings\n"), Some(Cmd::ReloadSettings));
+        assert_eq!(parse("show\n"), Some(Cmd::Show));
+        assert_eq!(parse("hide"), Some(Cmd::Hide));
+        assert_eq!(parse("shown"), None);
     }
 }

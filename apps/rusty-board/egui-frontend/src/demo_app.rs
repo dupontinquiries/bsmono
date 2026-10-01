@@ -42,6 +42,8 @@ pub struct Feel {
     /// whose size never changes: one map, one relayout, no per-frame resize storm on a tiling
     /// compositor (a sliding WINDOW does exactly that).
     reveal: crate::animations::OneShot,
+    /// The shell asked for the board over ctl (`show`) and has not said `hide`.
+    summoned: bool,
     /// Last frame's visibility, to detect the hidden→shown edge that starts the reveal.
     was_visible: bool,
     /// The last `Visible` command sent, so it is sent on change only (see `frame`).
@@ -430,6 +432,8 @@ impl Feel {
                 Cmd::VoiceCancel => self.cancel_dictation(),
                 Cmd::VoiceToggle => self.toggle_dictation(),
                 Cmd::Cold(on) => self.cold = on,
+                Cmd::Show => self.summoned = true,
+                Cmd::Hide => self.summoned = false,
                 Cmd::Strip(keyboard_strip::Msg::Show { app, pid, actions }) => {
                     self.app_strip = (!actions.is_empty()).then_some((app, pid, actions));
                 }
@@ -548,6 +552,7 @@ impl Feel {
             last_touch: None,
             placement: crate::platform::placement(),
             reveal: Default::default(),
+            summoned: false,
             was_visible: false,
             sent_visible: None,
             rail_collapsed: false,
@@ -1243,7 +1248,7 @@ impl Feel {
         // test runs behave exactly as before. What the policy adds over
         // reading the sink directly is the cases where the signal exists
         // but is not to be believed — see `focus_policy`.
-        let should_show = self.decide_visibility();
+        let should_show = self.decide_visibility() || self.summoned;
         // ONLY ON CHANGE. egui's `send_viewport_cmd` requests a repaint of the viewport
         // every time it is called (egui 0.34 context.rs, `send_viewport_cmd_to`), so sending
         // this every frame made every frame schedule the next: measured on a headless
@@ -2377,6 +2382,16 @@ mod hold_tests {
         }
         let (pl, tl) = *path.last().unwrap();
         frame(f, ctx, tl + 0.016, vec![btn(pl, false)]);
+    }
+
+    #[test]
+    fn ctl_show_summons_the_board_and_hide_puts_it_away() {
+        let (mut f, _ctx) = setup();
+        assert!(!f.summoned);
+        f.apply_ctl(crate::ctl::Cmd::Show);
+        assert!(f.summoned, "show must summon");
+        f.apply_ctl(crate::ctl::Cmd::Hide);
+        assert!(!f.summoned, "hide must release it");
     }
 
     #[test]
