@@ -354,8 +354,22 @@ pub fn gst_opener(width: u32, height: u32, kill: KillSwitch)
 /// same protocol: bytes on stdout, words on stderr.
 pub fn shell_opener(launcher: String, width: u32, height: u32, kill: KillSwitch)
     -> impl FnMut(&SourceCandidate) -> Result<Box<dyn FrameStream>, String> {
+    shell_opener_turned(launcher, width, height, 0, kill)
+}
+
+/// [`gst_opener`] that also turns the picture `turn_cw` degrees clockwise (0/90/180/270), so a
+/// sideways phone sensor arrives upright (see [`orient`]). `width` x `height` is the UPRIGHT
+/// size the reader gets, so a portrait phone passes 720x1280.
+pub fn gst_opener_turned(width: u32, height: u32, turn_cw: u32, kill: KillSwitch)
+    -> impl FnMut(&SourceCandidate) -> Result<Box<dyn FrameStream>, String> {
+    shell_opener_turned("gst-launch-1.0".to_string(), width, height, turn_cw, kill)
+}
+
+/// [`shell_opener`] with an upright turn. `turn_cw == 0` is exactly [`shell_opener`].
+pub fn shell_opener_turned(launcher: String, width: u32, height: u32, turn_cw: u32, kill: KillSwitch)
+    -> impl FnMut(&SourceCandidate) -> Result<Box<dyn FrameStream>, String> {
     move |cand| {
-        let fd = device_kit::source_plan::to_fdsink(&cand.pipeline, width, height)
+        let fd = device_kit::source_plan::to_fdsink_turned(&cand.pipeline, width, height, turn_cw)
             .ok_or_else(|| "not a retargetable pipeline".to_string())?;
         let mut child = std::process::Command::new("sh")
             .arg("-c")
@@ -412,6 +426,14 @@ impl Rig {
     pub fn start(plan: Vec<SourceCandidate>, width: u32, height: u32) -> Rig {
         let kill = KillSwitch::new();
         let opener = gst_opener(width, height, kill.clone());
+        Self::start_with(plan, width, height, kill, opener)
+    }
+
+    /// [`Rig::start`] with the picture turned `turn_cw` degrees clockwise. `width` x `height` is
+    /// the upright size of the frames the host receives.
+    pub fn start_turned(plan: Vec<SourceCandidate>, width: u32, height: u32, turn_cw: u32) -> Rig {
+        let kill = KillSwitch::new();
+        let opener = gst_opener_turned(width, height, turn_cw, kill.clone());
         Self::start_with(plan, width, height, kill, opener)
     }
 
@@ -592,6 +614,37 @@ mod tests {
             }
             other => panic!("expected Exhausted, got {other:?}"),
         }
+    }
+
+    /// The turn must reach the command line the subprocess is given — a stand-in launcher
+    /// records its arguments, so this proves the plumbing rather than the pipeline string
+    /// (device-kit tests that) and does not need gst-launch on the machine.
+    #[test]
+    #[cfg(unix)]
+    fn the_turn_reaches_the_launchers_command_line() {
+        let args = std::env::temp_dir().join(format!("capture-kit-args-{}", std::process::id()));
+        let _ = std::fs::remove_file(&args);
+        let launcher = fake_launcher("args", &format!("echo \"$*\" > {}; head -c 32 /dev/zero", args.display()));
+        let cand = SourceCandidate {
+            kind: device_kit::source_plan::SourceKind::PipewireLibcamera,
+            label: "n".into(),
+            pipeline: device_kit::source_plan::pipewire_pipeline("n", None),
+        };
+        // Upright size 4x2; a quarter turn means the camera is scaled to 2x4 first.
+        let mut open = shell_opener_turned(launcher.display().to_string(), 4, 2, 270, KillSwitch::new());
+        let mut stream = open(&cand).expect("opens");
+        let mut buf = vec![0u8; 32];
+        stream.read_frame(&mut buf).expect("one frame");
+        let line = std::fs::read_to_string(&args).unwrap();
+        assert!(line.contains("videoflip method=counterclockwise"), "{line}");
+        assert!(line.contains("width=2,height=4"), "scaled to the transposed size first: {line}");
+        // And the unturned opener is untouched.
+        let _ = std::fs::remove_file(&args);
+        let mut plain = shell_opener(launcher.display().to_string(), 4, 2, KillSwitch::new());
+        let mut s2 = plain(&cand).expect("opens");
+        s2.read_frame(&mut buf).expect("one frame");
+        let line = std::fs::read_to_string(&args).unwrap();
+        assert!(!line.contains("videoflip") && line.contains("width=4,height=2"), "{line}");
     }
 
     #[test]
