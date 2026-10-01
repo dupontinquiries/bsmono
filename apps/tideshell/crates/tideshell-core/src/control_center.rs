@@ -144,7 +144,7 @@ impl QuickKind {
     /// Shell-mode tiles are owned by `Shell::modes`, not by this drawer.
     pub fn is_mode(self) -> bool {
         matches!(self, QuickKind::Keyboard | QuickKind::Trackpad | QuickKind::Carousel
-                     | QuickKind::AutoBrightness | QuickKind::CpuGovernor)
+                     | QuickKind::AutoBrightness | QuickKind::CpuGovernor | QuickKind::Rotation)
     }
 }
 
@@ -499,6 +499,16 @@ mod tests {
         assert!(cc.system_state(QuickKind::Wifi));
         assert_eq!(cc.toggle_system(QuickKind::Wifi), Some(Action::SetQuick(QuickKind::Wifi, false)));
         assert_eq!(cc.toggle_system(QuickKind::Keyboard), None);
+    }
+
+    #[test]
+    fn rotation_is_a_mode_tile_the_shell_owns_not_a_system_toggle() {
+        // The Auto-rotate tile used to go through toggle_system -> SetQuick(Rotation), which the executor
+        // answers 'no system backend' and which never touched the shell's AutoRotate: the tile could
+        // flip its own light and nothing else. The setting lives in the shell (AutoRotate + prefs).
+        assert!(QuickKind::Rotation.is_mode());
+        let mut cc = ControlCenter::default();
+        assert_eq!(cc.toggle_system(QuickKind::Rotation), None, "the drawer must not claim it");
     }
 
     #[test]

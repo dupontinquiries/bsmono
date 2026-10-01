@@ -286,6 +286,7 @@ impl Shell {
             QuickKind::Trackpad => self.modes.trackpad,
             QuickKind::Carousel => self.carousel.is_active(),
             QuickKind::AutoBrightness => self.ambient.enabled,
+            QuickKind::Rotation => self.rotate.enabled,
             // Always "on": there is no off state to distinguish, only which
             // of the three modes is current -- the tile's own label carries
             // that (see the drawer's rendering).
@@ -764,6 +765,14 @@ impl Shell {
                 self.ambient.enabled = !self.ambient.enabled;
                 self.prefs.auto_brightness = self.ambient.enabled;
                 self.log(format!("auto brightness {}", if self.ambient.enabled { "on" } else { "off" }));
+                self.emit(vec![Action::SavePrefs])
+            }
+            QuickKind::Rotation => {
+                // Auto-rotate on/off IS the shell's own setting. Off keeps the screen where it is (a
+                // rotation LOCK), it does not snap back to portrait.
+                self.rotate.enabled = !self.rotate.enabled;
+                self.prefs.autorotate = self.rotate.enabled;
+                self.log(format!("auto-rotate {}", if self.rotate.enabled { "on" } else { "off" }));
                 self.emit(vec![Action::SavePrefs])
             }
             QuickKind::CpuGovernor => {
@@ -1468,6 +1477,22 @@ mod tests {
         assert!(sh.drawer.is_visible());
         assert_eq!(sh.tap_quick(QuickKind::Trackpad), vec![Action::ShowTrackpad(true)]);
         assert_eq!(sh.tap_quick(QuickKind::Wifi), vec![Action::SetQuick(QuickKind::Wifi, true)]);
+    }
+
+    #[test]
+    fn the_auto_rotate_tile_toggles_the_setting_saves_it_and_reports_the_real_state() {
+        let mut sh = shell_with_three();
+        assert!(sh.quick_state(QuickKind::Rotation), "on by default, read from AutoRotate");
+        assert_eq!(sh.tap_quick(QuickKind::Rotation), vec![Action::SavePrefs]);
+        assert!(!sh.rotate.enabled && !sh.prefs.autorotate && !sh.quick_state(QuickKind::Rotation));
+        // Off means a rotation lock: a sideways reading, held, applies nothing.
+        for t in (0..3000).step_by(100) { assert_eq!(sh.rotate.on_reading("left-up", t, false), None, "locked at {t}"); }
+        assert_eq!(sh.tap_quick(QuickKind::Rotation), vec![Action::SavePrefs]);
+        assert!(sh.rotate.enabled && sh.prefs.autorotate && sh.quick_state(QuickKind::Rotation));
+        // On again: the same held reading now applies.
+        let mut applied = None;
+        for t in (0..3000).step_by(100) { if let Some(o) = sh.rotate.on_reading("left-up", t, false) { applied = Some(o); } }
+        assert!(applied.is_some(), "auto-rotate must work again once re-enabled");
     }
 
     #[test]
