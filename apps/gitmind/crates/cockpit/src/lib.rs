@@ -60,6 +60,8 @@ pub mod packaging;
 pub mod patchset;
 /// COSMIC session onto a postmarketOS phone over ssh, beside its UI, gated, with rollback.
 pub mod cosmic_setup;
+/// The owner's Fairphone 5 customisations, as gated plans gitmind can replay after a reset.
+pub mod fp5_setup;
 pub mod places;
 pub mod preview;
 pub mod rendezvous;
