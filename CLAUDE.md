@@ -127,6 +127,17 @@ recorded as blocked on rustc >= 1.76, which expired when the toolchain moved to
 1.96 — and it was BROKEN for a while because two merged menu commands had no
 `app.rs` arms, which no default-feature test could see (`7427ba3a4`).
 
+## 3b. The GPU is an M2 on Asahi — read the stack doc before GPU work
+
+Vulkan here is **Honeykrisp (Mesa) on an Apple M2 Max**, plus llvmpipe, which is
+also enumerated. Rust reaches it through `ash` (unendlich) and `wgpu`
+(logscope/gpu-gemm). What was measured, the driver faults, the hazards (a hung
+dispatch needs a reboot; `bench.sh` refuses while `ollama serve` runs) and the
+harness tiers are in [docs/agents/APPLE_M2_GPU_STACK.md](docs/agents/APPLE_M2_GPU_STACK.md).
+A GPU timing is only a hardware result if it came from
+`games/unendlich/harness/gpu_hw_check.sh` or perf-loop's `bench.sh`; a lavapipe
+number proves correctness, not speed.
+
 ## 4. Check `git status` after every build
 
 Some build scripts write into the source tree. `snapclone-crypto`'s used to

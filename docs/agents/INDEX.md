@@ -26,6 +26,15 @@ that a software-GL app keeps up, and `import` + the image viewer to actually
 look at the result. Also the two ways the measuring instrument produced a
 false alarm, and the rule that follows: probe before patching.
 
+## The GPU on the author's machine
+
+[**APPLE_M2_GPU_STACK.md**](APPLE_M2_GPU_STACK.md) — the M2 Max under Asahi:
+Honeykrisp / Mesa 26.1.8 / Vulkan 1.4, the `ash` and `wgpu` crates that sit on it,
+what has been MEASURED there (and what is still only an older doc's claim), the
+driver faults that bite (`vec4<u32>` byte reads, absent submit callbacks, the
+subgroup-matvec hang), and the three harness tiers for GPU work including the
+real-hardware gate. Read it before writing or timing anything GPU-side.
+
 ## Catalog (≈40 docs)
 
 ### Domain guides — what the user actually does
