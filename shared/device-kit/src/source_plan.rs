@@ -84,6 +84,20 @@ fn tail(flip_method: Option<&str>) -> String {
 /// so a fixed size IS the framing. `None` when the pipeline does not end in
 /// the appsink tail this module wrote, which means it is not one of ours.
 pub fn to_fdsink(pipeline: &str, width: u32, height: u32) -> Option<String> {
+    to_fdsink_turned(pipeline, width, height, 0)
+}
+
+/// [`to_fdsink`] with the picture turned `turn_cw` degrees clockwise (0, 90, 180, 270;
+/// anything else is no turn) so a phone's sideways sensor arrives upright.
+///
+/// `width` x `height` is the size of the frames the READER gets — the UPRIGHT size, so a
+/// portrait phone asks for 720x1280 and receives exactly that. A quarter turn swaps the
+/// axes, so the frame is scaled to the transposed size FIRST and turned after: rotating the
+/// sensor's full frame to throw most of it away would cost far more. The front camera's
+/// mirror is applied AFTER the turn, in the upright frame, where "horizontal" means what the
+/// person sees. With `turn_cw == 0` the output is byte-for-byte what [`to_fdsink`] always
+/// produced.
+pub fn to_fdsink_turned(pipeline: &str, width: u32, height: u32, turn_cw: u32) -> Option<String> {
     // Must mirror `tail` exactly; the round-trip test holds them together.
     let appsink = "videoconvert ! ";
     let idx = pipeline.rfind(appsink)?;
@@ -99,10 +113,19 @@ pub fn to_fdsink(pipeline: &str, width: u32, height: u32) -> Option<String> {
     } else {
         ""
     };
+    let method = match turn_cw % 360 { 90 => Some("clockwise"), 180 => Some("rotate-180"), 270 => Some("counterclockwise"), _ => None };
+    let Some(m) = method else {
+        return Some(format!(
+            "{head}videoconvert ! {flip}videoscale ! \
+             video/x-raw,format=RGBA,width={width},height={height} ! \
+             fdsink fd=1"
+        ));
+    };
+    let (sw, sh) = if matches!(turn_cw % 360, 90 | 270) { (height, width) } else { (width, height) };
     Some(format!(
-        "{head}videoconvert ! {flip}videoscale ! \
-         video/x-raw,format=RGBA,width={width},height={height} ! \
-         fdsink fd=1"
+        "{head}videoconvert ! videoscale ! \
+         video/x-raw,format=RGBA,width={sw},height={sh} ! \
+         videoflip method={m} ! {flip}fdsink fd=1"
     ))
 }
 
@@ -300,5 +323,64 @@ Dummy video device (0x0000) (platform:v4l2loopback-000):\n\
                 "label {:?} and pipeline {:?} disagree on the device path",
                 c.label, c.pipeline);
         }
+    }
+
+    // ---- the upright turn ----
+
+    #[test]
+    fn turn_zero_is_byte_for_byte_the_old_fdsink() {
+        for flip in [None, Some("horizontal-flip")] {
+            let p = pipewire_pipeline("n", flip);
+            assert_eq!(to_fdsink_turned(&p, 640, 480, 0), to_fdsink(&p, 640, 480));
+            for odd in [45, 360, 1] {
+                assert_eq!(to_fdsink_turned(&p, 640, 480, odd), to_fdsink(&p, 640, 480), "turn {odd} is no turn");
+            }
+        }
+    }
+
+    /// The literal strings `to_fdsink` produced before the turn existed. Comparing the turned
+    /// function with a wrapper of itself (the test above) cannot notice the shared branch
+    /// changing; these can.
+    #[test]
+    fn turn_zero_matches_the_pre_turn_literals() {
+        assert_eq!(
+            to_fdsink(&pipewire_pipeline("n", None), 640, 480).unwrap(),
+            "pipewiresrc target-object=\"n\" ! videoconvert ! videoscale ! video/x-raw,format=RGBA,width=640,height=480 ! fdsink fd=1"
+        );
+        assert_eq!(
+            to_fdsink(&pipewire_pipeline("n", Some("horizontal-flip")), 640, 480).unwrap(),
+            "pipewiresrc target-object=\"n\" ! videoconvert ! videoflip method=horizontal-flip ! videoscale ! video/x-raw,format=RGBA,width=640,height=480 ! fdsink fd=1"
+        );
+    }
+
+    #[test]
+    fn a_quarter_turn_scales_transposed_then_turns() {
+        let fd = to_fdsink_turned(&pipewire_pipeline("n", None), 720, 1280, 270).unwrap();
+        let caps = fd.find("width=1280,height=720").expect("scaled to the transposed (sensor) size");
+        let flip = fd.find("videoflip method=counterclockwise").expect("turned");
+        assert!(caps < flip, "scale first, then rotate the small frame: {fd}");
+        assert!(fd.find("fdsink").unwrap() > flip);
+        let cw = to_fdsink_turned(&pipewire_pipeline("n", None), 720, 1280, 90).unwrap();
+        assert!(cw.contains("videoflip method=clockwise") && cw.contains("width=1280,height=720"), "{cw}");
+    }
+
+    #[test]
+    fn a_half_turn_keeps_the_size() {
+        let fd = to_fdsink_turned(&v4l2_pipeline("/dev/video0", None), 640, 360, 180).unwrap();
+        assert!(fd.contains("width=640,height=360") && fd.contains("videoflip method=rotate-180"), "{fd}");
+    }
+
+    #[test]
+    fn the_front_mirror_is_applied_after_the_turn_in_the_upright_frame() {
+        let fd = to_fdsink_turned(&pipewire_pipeline("n", Some("horizontal-flip")), 720, 1280, 270).unwrap();
+        let rot = fd.find("videoflip method=counterclockwise").unwrap();
+        let mirror = fd.find("videoflip method=horizontal-flip").expect("the mirror survives the turn");
+        assert!(rot < mirror, "turn upright first, then mirror what the person sees: {fd}");
+        assert_eq!(fd.matches("videoflip").count(), 2);
+    }
+
+    #[test]
+    fn a_pipeline_that_is_not_ours_is_still_refused_when_turned() {
+        assert_eq!(to_fdsink_turned("videotestsrc ! autovideosink", 640, 480, 270), None);
     }
 }
