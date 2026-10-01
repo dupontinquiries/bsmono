@@ -53,9 +53,10 @@ pub fn image_attribs(p: &PlaneImport, fd: i32, modifier: u64) -> Vec<i32> {
     a
 }
 
-type GetProc = unsafe extern "C" fn(*const i8) -> *mut c_void;
+// c_char, not i8: it is u8 on aarch64 Linux (the phone AND the Asahi laptop), i8 on x86.
+type GetProc = unsafe extern "C" fn(*const std::ffi::c_char) -> *mut c_void;
 type GetCurrentDisplay = unsafe extern "C" fn() -> *mut c_void;
-type QueryString = unsafe extern "C" fn(*mut c_void, i32) -> *const i8;
+type QueryString = unsafe extern "C" fn(*mut c_void, i32) -> *const std::ffi::c_char;
 type GetError = unsafe extern "C" fn() -> i32;
 type CreateImage = unsafe extern "C" fn(*mut c_void, *mut c_void, u32, *mut c_void, *const i32) -> *mut c_void;
 type DestroyImage = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32;
