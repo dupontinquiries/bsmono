@@ -287,7 +287,7 @@ impl App {
                 let o = self.shell.on_edge_touch(TouchEvent::Down { slot: 9, x: w / 2.0, y: h - 6.0, t: 0 });
                 // tick() past hold_ms opens the palette; slide onto Keyboard.
                 self.shell.tick(1000);
-                let g = tideshell_core::palette::Geom::new((w, h));
+                let g = tideshell_core::palette::Geom::new((w, h), true);
                 let (x, y, mw, mh) = g.mode_rect(1);
                 self.shell.on_edge_touch(TouchEvent::Move { slot: 9, x: x + mw / 2.0, y: y + mh / 2.0, t: 1100 });
                 o

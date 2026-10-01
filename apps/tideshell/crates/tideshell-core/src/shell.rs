@@ -584,13 +584,13 @@ impl Shell {
                 vec![]
             }
             GestureEvent::HoldMove { x, y } => {
-                let g = Geom::new(self.screen);
+                let g = self.palette.geom(self.screen);
                 let from = self.recognizer.start();
                 self.palette.hold_move_banded(&g, from, x, y);
                 vec![]
             }
             GestureEvent::HoldRelease { x, y } => {
-                let g = Geom::new(self.screen);
+                let g = self.palette.geom(self.screen);
                 let from = self.recognizer.start();
                 let (pick, leave) = self.palette.hold_release_banded(&g, from, x, y);
                 self.palette.end_hold();
@@ -764,7 +764,7 @@ impl Shell {
 
     /// A tap on the open palette at screen coordinates.
     pub fn palette_tap(&mut self, x: f32, y: f32) -> Vec<Action> {
-        let g = Geom::new(self.screen);
+        let g = self.palette.geom(self.screen);
         match self.palette.tap(&g, x, y) {
             Some(a) => self.palette_action(a),
             None => vec![],
@@ -1437,7 +1437,7 @@ mod tests {
         sh.on_edge_touch(TouchEvent::Down { slot: 0, x: 204.0, y: 895.0, t: 0 });
         assert!(sh.tick(500).is_empty());
         assert!(sh.palette.open, "the hold opens the palette");
-        let g = Geom::new(S);
+        let g = sh.palette.geom(S);
         let (x, y, w, h) = g.mode_rect(1);
         sh.on_edge_touch(TouchEvent::Move { slot: 0, x: x + w / 2.0, y: y + h / 2.0, t: 600 });
         assert_eq!(sh.palette.hover, Some(crate::palette::Hit::Mode(1)));
@@ -1457,7 +1457,7 @@ mod tests {
         sh.on_edge_touch(TouchEvent::Down { slot: 0, x: 204.0, y: 895.0, t: 0 });
         sh.tick(500);
         assert!(sh.palette.open);
-        let g = Geom::new(S);
+        let g = sh.palette.geom(S);
         // Onto a mode first, so there IS something selected to discard.
         let (x, y, w, h) = g.mode_rect(1);
         sh.on_edge_touch(TouchEvent::Move { slot: 0, x: x + w / 2.0, y: y + h / 2.0, t: 600 });
@@ -1472,6 +1472,33 @@ mod tests {
         assert!(out.is_empty(), "{out:?}");
         assert!(!sh.palette.open, "dismissed, not left open");
         assert_eq!(sh.modes, Modes::default(), "and no mode was toggled on the way out");
+    }
+
+    #[test]
+    fn the_sheet_opens_short_and_the_list_opens_in_full_when_the_thumb_reaches_the_search() {
+        let mut sh = shell_with_three();
+        sh.on_edge_touch(TouchEvent::Down { slot: 0, x: 204.0, y: 895.0, t: 0 });
+        sh.tick(500);
+        let short = sh.palette.geom(S);
+        assert!(!sh.palette.expanded);
+        assert!(short.rows_visible() <= crate::palette::COLLAPSED_ROWS, "{}", short.rows_visible());
+        // Controls hang off the bottom: list, then search, then the three modes.
+        let (_, my, _, _) = short.mode_rect(0);
+        assert!(short.row_y(0) < short.search_y() && short.search_y() < my);
+        // Sliding a thumb onto a mode button leaves it short.
+        let (x, y, w, h) = short.mode_rect(1);
+        sh.on_edge_touch(TouchEvent::Move { slot: 0, x: x + w / 2.0, y: y + h / 2.0, t: 600 });
+        assert!(!sh.palette.expanded, "a mode button is not the search");
+        // Onto the search bar: the list opens in full, the search stays where the thumb is.
+        let sy = short.search_y() + crate::palette::SEARCH_H / 2.0;
+        sh.on_edge_touch(TouchEvent::Move { slot: 0, x: 204.0, y: sy, t: 700 });
+        assert!(sh.palette.expanded);
+        let full = sh.palette.geom(S);
+        assert!(full.rows_visible() > short.rows_visible());
+        assert_eq!(full.search_y(), short.search_y(), "the search does not move under the thumb");
+        // Closing resets it.
+        sh.palette.close();
+        assert!(!sh.palette.expanded);
     }
 
     #[test]
@@ -1497,7 +1524,7 @@ mod tests {
         assert_eq!(sh.modes, Modes::default());
         assert!(sh.palette.open);
         // Palette lists the running windows; tapping one activates it.
-        let g = Geom::new(S);
+        let g = sh.palette.geom(S);
         let row = sh.palette.rows().position(|r| r.label == "w1").expect("window row");
         let out = sh.palette_tap(200.0, g.row_y(row) + 5.0);
         assert!(out.contains(&Action::Activate(1)), "{out:?}");
@@ -1818,7 +1845,7 @@ mod tests {
         }
         assert!(matches!(sh.palette.hover, Some(crate::palette::Hit::Row(_))), "{:?}", sh.palette.hover);
         // Lift: the hovered row is activated through the normal release path.
-        let g = crate::palette::Geom::new(S);
+        let g = sh.palette.geom(S);
         let _ = g;
     }
 

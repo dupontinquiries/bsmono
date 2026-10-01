@@ -103,26 +103,37 @@ pub struct Geom {
     pub sheet_top: f32,
 }
 
+/// Rows the sheet shows before the thumb asks for more.
+pub const COLLAPSED_ROWS: usize = 4;
+/// Space above the first row: the grab handle.
+const HANDLE_H: f32 = 6.0;
+
 impl Geom {
-    pub fn new(screen: (f32, f32)) -> Geom {
-        Geom { screen, sheet_top: screen.1 * (1.0 - SHEET_FRAC) }
+    /// Top to bottom: the list, the search field, the three mode buttons. Everything hangs off the
+    /// bottom edge so the controls stay where the thumb lands, and expanding only grows the list
+    /// upward. `expanded` = the full sheet (`SHEET_FRAC` of the screen).
+    pub fn new(screen: (f32, f32), expanded: bool) -> Geom {
+        let list_bottom = screen.1 - PAD - MODE_ROW_H - PAD - SEARCH_H - PAD;
+        let full_top = screen.1 * (1.0 - SHEET_FRAC);
+        let short_top = list_bottom - COLLAPSED_ROWS as f32 * ROW_H - PAD - HANDLE_H;
+        Geom { screen, sheet_top: if expanded { full_top } else { short_top.max(full_top) } }
     }
 
     pub fn mode_rect(&self, i: usize) -> (f32, f32, f32, f32) {
         let w = (self.screen.0 - PAD * 4.0) / 3.0;
-        (PAD + i as f32 * (w + PAD), self.sheet_top + PAD, w, MODE_ROW_H)
+        (PAD + i as f32 * (w + PAD), self.screen.1 - PAD - MODE_ROW_H, w, MODE_ROW_H)
     }
 
     pub fn search_y(&self) -> f32 {
-        self.sheet_top + PAD * 2.0 + MODE_ROW_H
+        self.screen.1 - PAD * 2.0 - MODE_ROW_H - SEARCH_H
     }
 
     pub fn row_y(&self, i: usize) -> f32 {
-        self.search_y() + SEARCH_H + PAD + i as f32 * ROW_H
+        self.sheet_top + PAD + HANDLE_H + i as f32 * ROW_H
     }
 
     pub fn rows_visible(&self) -> usize {
-        ((self.screen.1 - self.row_y(0) - PAD) / ROW_H).max(0.0) as usize
+        ((self.search_y() - PAD - self.row_y(0)) / ROW_H).max(0.0) as usize
     }
 
     pub fn hit(&self, x: f32, y: f32, rows: usize) -> Hit {
@@ -215,6 +226,9 @@ pub struct Palette {
     recents: Vec<String>,
     /// Set by `open_by_hold`; a lift on nothing leaves the palette open.
     by_hold: bool,
+    /// The list is showing in full: the thumb reached the search field (or it took focus).
+    /// Until then the sheet is short, so the buttons and search sit under the thumb.
+    pub expanded: bool,
 }
 
 impl Default for Palette {
@@ -231,6 +245,7 @@ impl Default for Palette {
             filtered: Vec::new(),
             recents: Vec::new(),
             by_hold: false,
+            expanded: false,
         }
     }
 }
@@ -282,9 +297,15 @@ impl Palette {
         self.recents.iter().position(|k| k == key).unwrap_or(MAX_RECENTS)
     }
 
+    /// The sheet's geometry for the current state (short until the thumb reaches the search).
+    pub fn geom(&self, screen: (f32, f32)) -> Geom {
+        Geom::new(screen, self.expanded)
+    }
+
     pub fn open_by_hold(&mut self) {
         self.open = true;
         self.by_hold = true;
+        self.expanded = false;
         self.query.clear();
         self.hover = None;
         self.reveal = DragTransition::default();
@@ -299,6 +320,7 @@ impl Palette {
 
     pub fn close(&mut self) {
         self.open = false;
+        self.expanded = false;
         self.hover = None;
         self.reveal.animate_to(0.0);
     }
@@ -355,6 +377,9 @@ impl Palette {
     /// the sheet should be.
     pub fn hold_move_banded(&mut self, geom: &Geom, from: (f32, f32), x: f32, y: f32) -> Band {
         let band = self.hold_band(geom, from, x, y);
+        if band == Band::Search {
+            self.expanded = true;
+        }
         self.hold_fade = match band {
             Band::Dismissing(t) => 1.0 - t,
             _ => 1.0,
@@ -538,7 +563,7 @@ mod tests {
         let mut p = Palette::default();
         p.set_items(items());
         p.open_by_hold();
-        (p, Geom::new((408.0, 900.0)))
+        (p, Geom::new((408.0, 900.0), true))
     }
 
     #[test]
@@ -622,7 +647,7 @@ mod tests {
 
     #[test]
     fn geometry_hits_the_right_things() {
-        let g = Geom::new((408.0, 900.0));
+        let g = Geom::new((408.0, 900.0), true);
         assert_eq!(g.hit(10.0, 10.0, 5), Hit::Outside);
         let (x, y, ..) = g.mode_rect(2);
         assert_eq!(g.hit(x + 1.0, y + 1.0, 5), Hit::Mode(2));
@@ -661,7 +686,7 @@ mod band_tests {
             PaletteItem::new("b", "Beta", "", PaletteAction::ToggleFatCursor),
         ]);
         p.open_by_hold();
-        (p, Geom::new(SCREEN))
+        (p, Geom::new(SCREEN, true))
     }
 
     /// Press near the bottom edge, where a hold starts.

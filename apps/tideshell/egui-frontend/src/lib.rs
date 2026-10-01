@@ -1085,7 +1085,7 @@ impl ShellView {
         use tideshell_core::hold::HoldOption;
         use tideshell_core::palette::{Geom, Hit, MODE_ROW_H, PAD, ROW_H, SEARCH_H};
         let mut out = vec![];
-        let g = Geom::new((size.x, size.y));
+        let g = shell.palette.geom((size.x, size.y));
         // Two separate opacities, and they multiply. `reveal` is the sheet
         // arriving, a spring the shell drives; `hold_fade` is a held thumb
         // carrying it back off the top, which follows the finger exactly so
@@ -1132,9 +1132,12 @@ impl ShellView {
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(sr.shrink2(Vec2::new(12.0, 8.0))));
         let te = egui::TextEdit::singleline(&mut q).id_salt("ts-palette-search").hint_text("Search").frame(egui::Frame::NONE).desired_width(f32::INFINITY);
         let resp = child.add(te);
-        // Focus the field when the palette opens (a hold that lifted on
-        // nothing, or a tap-open): typing filters at once, no second tap.
-        if shell.palette.open && !self.palette_focused {
+        // The sheet opens short; the field takes focus (and the list opens in full) once the
+        // thumb slides into the search bar or taps it.
+        if resp.gained_focus() {
+            shell.palette.expanded = true;
+        }
+        if shell.palette.open && shell.palette.expanded && !self.palette_focused {
             self.palette_focused = true;
             resp.request_focus();
         }
