@@ -1192,9 +1192,23 @@ impl ShellView {
 
     // ---- drawer ------------------------------------------------------------------
 
+    /// Height of the quick-settings sheet for `rows` rows of tiles: 40 header + rows of 72 (+10 gap)
+    /// + 6, brightness 40 (+10), the volume pad 96 (+10), the settings entry 36 (+4 above), 16 foot.
+    /// Mirrors the layout in `drawer`, which is what keeps the last control on the sheet.
+    pub fn drawer_content_height(rows: usize) -> f32 {
+        40.0 + rows as f32 * 82.0 + 6.0 + 50.0 + 106.0 + 4.0 + 36.0 + 16.0
+    }
+
     fn drawer(&mut self, ui: &mut egui::Ui, shell: &mut Shell, pal: &PaletteColors, origin: Pos2, size: Vec2) -> Vec<Action> {
         let mut out = vec![];
-        let full_h = (size.y * 0.66).min(620.0);
+        // The sheet is as tall as its content (header, tile rows, brightness, the volume pad, the
+        // settings entry) so every control is reachable, but never taller than the screen: a wide
+        // (landscape) screen packs the tiles into more columns instead of more rows.
+        let cols_n = if size.x > 800.0 { 8usize } else { 5usize };
+        let n_tiles = shell.drawer.tiles.len();
+        let rows_n = n_tiles.div_ceil(cols_n);
+        let need = Self::drawer_content_height(rows_n);
+        let full_h = need.min((size.y - 16.0).max(120.0));
         let panel_h = shell.drawer.progress * full_h;
         let panel = Rect::from_min_size(origin, Vec2::new(size.x, panel_h));
         // Backdrop below the panel: tap closes.
@@ -1209,14 +1223,14 @@ impl ShellView {
         pc.text(origin + Vec2::new(18.0, 22.0), Align2::LEFT_CENTER, &String::from("Quick settings"), FontId::proportional(13.0), pal.text_weak);
 
         let pad = 14.0;
-        let cols = 5.0;
+        let cols = cols_n as f32;
         let gap = 10.0;
         let tw = (size.x - pad * 2.0 - gap * (cols - 1.0)) / cols;
         let th = 72.0;
         let tiles: Vec<QuickKind> = shell.drawer.tiles.clone();
         let visible = shell.drawer.stage() != Stage::Closed;
         for (i, kind) in tiles.iter().enumerate() {
-            let (col, row) = ((i % 5) as f32, (i / 5) as f32);
+            let (col, row) = ((i % cols_n) as f32, (i / cols_n) as f32);
             let r = Rect::from_min_size(origin + Vec2::new(pad + col * (tw + gap), 40.0 + row * (th + gap)), Vec2::new(tw, th));
             if r.top() > panel.bottom() {
                 continue;
@@ -1235,7 +1249,7 @@ impl ShellView {
                 out.extend(shell.tap_quick(*kind));
             }
         }
-        let rows = (tiles.len() as f32 / 5.0).ceil();
+        let rows = rows_n as f32;
         let mut y = 40.0 + rows * (th + gap) + 6.0;
         for kind in [SliderKind::Brightness, SliderKind::Volume] {
             // Volume is a pad: x = level, y = voicing (up: cut through a loud
@@ -1703,6 +1717,19 @@ fn app_button(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, id: Id, name: &str,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_whole_quick_settings_sheet_fits_the_short_landscape_screen() {
+        // 1224x2700 at 2.25x: 544 x 1200 logical. Landscape is 1200 x 544.
+        let n = QuickKind::ALL.len();
+        let rows = |cols: usize| n.div_ceil(cols);
+        let portrait = ShellView::drawer_content_height(rows(5));
+        let landscape = ShellView::drawer_content_height(rows(8));
+        assert!(portrait <= 1200.0 - 16.0, "portrait sheet {portrait}");
+        assert!(landscape <= 544.0 - 16.0, "landscape sheet {landscape} must fit a 544 high screen with its settings entry");
+        // The old cap (66% of the height) is what hid the settings entry in landscape.
+        assert!(landscape > 544.0 * 0.66, "the test is only meaningful if the old 66% cap cut the sheet short ({landscape} vs {})", 544.0 * 0.66);
+    }
+
     use super::*;
 
     #[test]
