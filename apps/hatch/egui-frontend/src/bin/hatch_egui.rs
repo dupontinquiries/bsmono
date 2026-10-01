@@ -36,6 +36,9 @@ struct App {
     /// keeps "hide on focus loss" from firing on the initial unfocused frame
     /// some compositors deliver before the first focus.
     was_focused: bool,
+    /// When the window was created or last shown: the grid animates in from here and must be
+    /// repainted every frame while it does.
+    shown_at: std::time::Instant,
 }
 
 impl App {
@@ -46,6 +49,7 @@ impl App {
         self.visible = v;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(v));
         if v {
+            self.shown_at = std::time::Instant::now();
             self.ui.on_shown();
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         } else if self.quit_on_hide {
@@ -103,6 +107,12 @@ impl eframe::App for App {
         match event {
             UiEvent::None => {}
             UiEvent::Launched | UiEvent::Dismiss => self.set_visible(ctx, false),
+        }
+        // The entrance animation needs every frame for its first moments: a fresh process
+        // (Wayland hides by quitting) otherwise sat on an unfinished first frame, invisible,
+        // until a touch forced a redraw.
+        if self.shown_at.elapsed() < std::time::Duration::from_millis(1500) {
+            ctx.request_repaint();
         }
         // Keep the poke poll alive even on idle visible frames.
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -185,6 +195,7 @@ fn main() -> eframe::Result<()> {
                 quit_on_hide,
                 opacity,
                 was_focused: true,
+                shown_at: std::time::Instant::now(),
             }))
         }),
     );
