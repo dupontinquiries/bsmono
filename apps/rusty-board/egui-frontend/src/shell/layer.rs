@@ -286,6 +286,9 @@ pub fn run(title: &str) -> Result<(), LayerError> {
     let mut stats = LoopStats::from_env();
     while !state.closed {
         stats.report_if_due();
+        if stats.on {
+            stats.gates = format!("mapped={mapped} configured={} frame_pending={}", state.configured, state.frame_pending);
+        }
         // ---- 0. the sink first: Activate/Deactivate are seen on every wake, and a change of
         //         wish is itself a reason to run a frame (which is what emits `Visible`).
         let wanted = feel.pump_sink();
@@ -318,6 +321,9 @@ pub fn run(title: &str) -> Result<(), LayerError> {
         if !due {
             let sink_fd = feel.sink_wake_fd().filter(|_| !state.sink_fd_dead);
             let timeout = deadline_timeout(repaint_at, &state, sink_fd.is_some());
+            // Waiting for a configure that may never come: wake to run the nudge, or the loop
+            // sleeps until the next input and the board stays unpainted.
+            let timeout = if mapped && !state.configured { timeout.min(Duration::from_millis(300)) } else { timeout };
             wait_for_socket(&conn, &mut queue, &mut state, timeout, sink_fd, feel.ctl_fd())?;
             continue;
         }
@@ -454,6 +460,9 @@ pub fn run(title: &str) -> Result<(), LayerError> {
         // ---- 4. sleep until the socket is readable or egui's next deadline.
         let sink_fd = feel.sink_wake_fd().filter(|_| !state.sink_fd_dead);
         let timeout = deadline_timeout(repaint_at, &state, sink_fd.is_some());
+            // Waiting for a configure that may never come: wake to run the nudge, or the loop
+            // sleeps until the next input and the board stays unpainted.
+            let timeout = if mapped && !state.configured { timeout.min(Duration::from_millis(300)) } else { timeout };
         wait_for_socket(&conn, &mut queue, &mut state, timeout, sink_fd, feel.ctl_fd())?;
         let _ = repaint_delay;
     }
@@ -481,6 +490,8 @@ struct LoopStats {
     configure: u32,
     wish: u32,
     egui: u32,
+    /// The paint gates at the last wake: why a mapped surface is not painting.
+    gates: String,
 }
 
 impl LoopStats {
@@ -501,8 +512,8 @@ impl LoopStats {
         }
         let frames = self.input.max(self.configure).max(self.wish).max(self.egui);
         eprintln!(
-            "[rusty-board] loop/5s: wakes {} paints {} | frames due to: input {} configure {} show/hide {} egui-repaint {}{}",
-            self.wakes, self.paints, self.input, self.configure, self.wish, self.egui,
+            "[rusty-board] loop/5s: wakes {} paints {} | frames due to: input {} configure {} show/hide {} egui-repaint {} | {}{}",
+            self.wakes, self.paints, self.input, self.configure, self.wish, self.egui, self.gates,
             if frames == 0 { " (idle)" } else { "" },
         );
         *self = LoopStats { on: true, since: Some(Instant::now()), ..Default::default() };
