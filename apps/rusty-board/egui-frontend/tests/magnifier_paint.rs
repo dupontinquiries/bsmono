@@ -37,18 +37,28 @@ fn a_pressed_key_paints_its_magnifier_above_the_board() {
         });
     });
 
-    // The magnified glyph is drawn at a size no cap label uses.
+    // The popup is gone: nothing is drawn at the old magnifier size, so no neighbouring key or
+    // swipe label is covered. The press shows as a pulse ON the key instead.
     let texts = uikit_egui::layout_probe::texts(&out.shapes);
     let big: Vec<_> = texts.iter().filter(|t| (t.font_pt - MAGNIFIER_PT).abs() < 2.0).collect();
-    assert_eq!(
-        big.len(),
-        1,
-        "expected exactly one magnified glyph, saw {:?}",
-        big.iter().map(|t| (t.text.clone(), t.font_pt)).collect::<Vec<_>>()
-    );
-    let m = big[0].rect;
-    assert!(m.center().y < at.y, "the magnifier is not above the press: {m:?}");
-    assert!(m.left() >= -1.0 && m.right() <= size.x + 1.0, "{m:?} left the board");
+    assert!(big.is_empty(), "a magnifier bubble is back: {:?}", big.iter().map(|t| (t.text.clone(), t.font_pt)).collect::<Vec<_>>());
+    // The pulse animates in over a few frames, so run a few more with the pointer still down.
+    let mut last = out;
+    for k in 1..=6 {
+        let mut held = input.clone();
+        held.time = Some(1000.0 + k as f64 * 0.03);
+        last = ctx.run(held, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = keyboard_ui(ui, board.current(), &uikit_egui::Adaptive::detect(ctx), "system");
+            });
+        });
+    }
+    let rings = last
+        .shapes
+        .iter()
+        .filter(|s| matches!(&s.shape, egui::epaint::Shape::Rect(r) if r.stroke.width >= 1.4 && r.stroke.width <= 1.6))
+        .count();
+    assert!(rings >= 1, "no pulse ring drawn on the pressed key");
 }
 
 /// One-handed compaction must actually move the keys, and to the side asked for. The
