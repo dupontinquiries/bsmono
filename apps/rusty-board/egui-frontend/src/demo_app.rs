@@ -14,6 +14,8 @@ use crate::{apply_theme, keyboard_ui_styled, Board};
 use uikit_egui::Adaptive;
 
 pub struct Feel {
+    /// The landscape slide board's finger state (`slide_board.rs`).
+    slide: crate::slide_board::SlideBoard,
     /// The thumb-reach calibration, while it is open.
     ///
     /// `Some` puts the overlay over the board and takes the input. Opened by
@@ -553,6 +555,7 @@ impl Feel {
             placement: crate::platform::placement(),
             reveal: Default::default(),
             summoned: false,
+            slide: Default::default(),
             was_visible: false,
             sent_visible: None,
             rail_collapsed: false,
@@ -1860,7 +1863,20 @@ impl Feel {
                     // Whether a KEY produced something this frame. A space zone must never
                     // fire on the same release as a key -- see the zone tap below.
                     let mut key_fired = false;
-                    if self.real_active {
+                    // The slide board draws and reads its own fingers (two thumbs at once); the
+                    // key widgets and the swipe overlay stay out of its way.
+                    let slide_on = !self.real_active && self.board.current().name == crate::SLIDE_NAME;
+                    if slide_on {
+                        let rect = egui::Rect::from_min_size(board_top, egui::vec2(keys_full.width(), board_h));
+                        let colors = uikit_egui::palette_colors(self.board.palette());
+                        for out in self.slide.show(ui, rect, &colors) {
+                            key_fired = true;
+                            match out {
+                                crate::slide_board::Out::Text(t) => self.emit_text(&t),
+                                crate::slide_board::Out::Key(k) => self.emit_key(k),
+                            }
+                        }
+                    } else if self.real_active {
                         // the real layout files: render via the projection, feed emissions through
                         // the board's state machine (shift/symbols absorbed), act on the rest
                         let render = self.real.render_rc();
@@ -2001,7 +2017,7 @@ impl Feel {
                         // the borrow ends keeps both without a clone of the layout.
                         top_edge = Some(crate::topedge::classify(press, release, len, ms, col, m));
                     }
-                    let swipe_done = self.swipe.update_half(ui, render, board_rect, &adaptive, self.style.half).is_some();
+                    let swipe_done = !slide_on && self.swipe.update_half(ui, render, board_rect, &adaptive, self.style.half).is_some();
                     // The voice line, in the top row's place (see `voice_trim`).
                     self.paint_voice_line(ui, keys_full, &adaptive);
                     if swipe_done && swallow {

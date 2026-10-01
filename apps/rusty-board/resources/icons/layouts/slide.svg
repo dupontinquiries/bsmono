@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+  <!-- two letter grids, each over its own thumb rail with the thumb on it -->
+  <rect x="2.5" y="3.5" width="8" height="8" rx="1.5"/>
+  <rect x="13.5" y="3.5" width="8" height="8" rx="1.5"/>
+  <rect x="2.5" y="15" width="8" height="5" rx="2.5"/>
+  <rect x="13.5" y="15" width="8" height="5" rx="2.5"/>
+  <circle cx="7" cy="17.5" r="1.5" fill="currentColor"/>
+  <circle cx="18" cy="17.5" r="1.5" fill="currentColor"/>
+</svg>

@@ -35,6 +35,7 @@ pub mod modlatch;
 pub mod sheet_throw;
 pub mod edit_actions;
 pub mod rail_boards;
+pub mod slide_board;
 pub mod morse;
 pub mod haptics;
 pub mod key_hold;
@@ -511,6 +512,14 @@ impl Layout {
     /// "that, with a dash in front", RIGHT is "that, inverted". Few targets,
     /// all large, and none of them needs looking at: the half-board style
     /// (`layout.one_handed`) makes it a one-thumb pad.
+    /// The landscape slide board (`slide_board.rs`). The layout is a PLACEHOLDER: four blank rows
+    /// so the board is the height of the others and sits on the rail by name; the keys are
+    /// drawn and read by `SlideBoard`, never by `keyboard_ui`.
+    pub fn slide() -> Layout {
+        let blank = || Row { keys: vec![Key::emitting("", "", 1.0)], weight: 1.0 };
+        Layout { hints: false, name: SLIDE_NAME.into(), rows: vec![blank(), blank(), blank(), blank()] }
+    }
+
     pub fn morse() -> Layout {
         use real_layout::{morse_emit, MorseKey};
         let side = |label: &str, k: MorseKey| {
@@ -583,6 +592,9 @@ impl Layout {
     }
 }
 
+/// The code-built slide board's layout name.
+pub const SLIDE_NAME: &str = "slide";
+
 /// Render-layout names of user layouts start with this.
 pub const USER_PREFIX: &str = "user:";
 
@@ -612,7 +624,7 @@ pub struct Board {
 impl Board {
     /// Default board: qwerty + symbols.
     pub fn new() -> Board {
-        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8(), Layout::stenotype(), Layout::morse()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0), voice_active: false,
+        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8(), Layout::stenotype(), Layout::morse(), Layout::slide()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0), voice_active: false,
             shift: real_layout::Shift::Off, before_symbols: None, palette: "system".to_string() }
     }
     pub fn current(&self) -> &Layout {
@@ -1903,10 +1915,12 @@ mod tests {
         assert_eq!(b.current().name, "Stenotype", "the steno board joined the rotation");
         b.swipe(1);
         assert_eq!(b.current().name, "morse");
+        b.swipe(1);
+        assert_eq!(b.current().name, "slide", "the landscape slide board is last in the rotation");
         b.swipe(1); // wraps back
         assert_eq!(b.current().name, "en_us_qwerty");
         b.swipe(-1); // wraps backward to the last layout
-        assert_eq!(b.current().name, "morse");
+        assert_eq!(b.current().name, "slide");
     }
 
     #[test]

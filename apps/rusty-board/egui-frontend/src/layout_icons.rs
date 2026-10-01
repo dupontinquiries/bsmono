@@ -49,13 +49,14 @@ pub enum Kind {
     Cardinal8,
     Steno,
     Morse,
+    Slide,
     /// Anything unrecognised: an outline with the layout's initial painted inside.
     Generic,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 8] = [
-        Kind::Qwerty, Kind::Ortho, Kind::Symbols, Kind::Cardinal, Kind::Cardinal8, Kind::Steno, Kind::Morse, Kind::Generic,
+    pub const ALL: [Kind; 9] = [
+        Kind::Qwerty, Kind::Ortho, Kind::Symbols, Kind::Cardinal, Kind::Cardinal8, Kind::Steno, Kind::Morse, Kind::Slide, Kind::Generic,
     ];
 
     /// The icon's SVG source, compiled in -- a keyboard must not fail to draw its switcher
@@ -69,6 +70,7 @@ impl Kind {
             Kind::Cardinal8 => include_str!("../../resources/icons/layouts/cardinal8.svg"),
             Kind::Steno => include_str!("../../resources/icons/layouts/steno.svg"),
             Kind::Morse => include_str!("../../resources/icons/layouts/morse.svg"),
+            Kind::Slide => include_str!("../../resources/icons/layouts/slide.svg"),
             Kind::Generic => include_str!("../../resources/icons/layouts/generic.svg"),
         }
     }
@@ -85,6 +87,8 @@ impl Kind {
             Kind::Steno
         } else if n.contains("morse") {
             Kind::Morse
+        } else if n.contains("slide") {
+            Kind::Slide
         } else if n.contains("symbol") {
             Kind::Symbols
         } else if n.contains("ortho") || n.contains("dvorak") || n.contains("colemak") {
@@ -419,6 +423,7 @@ mod tests {
         assert_eq!(Kind::for_layout("English (Cardinal Grid)"), Kind::Cardinal);
         assert_eq!(Kind::for_layout("Stenotype"), Kind::Steno);
         assert_eq!(Kind::for_layout("morse"), Kind::Morse);
+        assert_eq!(Kind::for_layout("slide"), Kind::Slide);
         assert_eq!(Kind::for_layout("Klingon"), Kind::Generic);
         // And the demo boards' own names, from the code, not from memory.
         let b = crate::Board::new();
