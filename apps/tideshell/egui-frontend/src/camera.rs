@@ -395,25 +395,34 @@ pub fn gst_command(choice: &CameraChoice, w: usize, h: usize) -> Vec<String> {
     v
 }
 
-/// Clockwise degrees to turn the picture of libcamera camera `camera_id` upright.
+/// Clockwise degrees to turn the picture in the PIPELINE, from `TIDESHELL_CAMERA_TURN`.
 ///
-/// `TIDESHELL_CAMERA_TURN` (0/90/180/270) wins — the person's say over the sensor's.
-/// Otherwise the sensor behind the id is found by its I2C address
-/// (`capture_kit::focus::sensor_for_camera_id`) and its `camera_sensor_rotation` read.
-/// No id, an unknown sensor or a failed read is 0: leave the picture alone rather than
-/// guess a turn. Cached per id — `Start` runs every duty cycle and the answer does not change.
+/// Unset means 0, and that is deliberate: the shell already rotates the camera pane itself
+/// (`devices.rs`: Cw90 on the Fairphone 5, measured on the lock-screen pane). A pipeline turn on
+/// top of it rotates the picture TWICE — which is what the first version of this did, by defaulting
+/// to the sensor's own rotation. `0/90/180/270` sets it; `auto` reads the sensor behind the chosen
+/// camera (`capture_kit::focus::sensor_for_camera_id`, then its `camera_sensor_rotation`), for a
+/// build whose UI does not rotate. Cached per id: `Start` runs every duty cycle and the answer
+/// does not change.
 pub fn upright_turn(camera_id: Option<&str>) -> u32 {
-    if let Some(n) = std::env::var("TIDESHELL_CAMERA_TURN").ok().and_then(|v| v.trim().parse::<i64>().ok()) {
-        return capture_kit::orient::Rotation::from_degrees(n).degrees();
+    turn_setting(std::env::var("TIDESHELL_CAMERA_TURN").ok().as_deref(), camera_id, |id| {
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(Default::default);
+        if let Some(v) = cache.lock().ok().and_then(|c| c.get(id).copied()) { return v; }
+        let v = upright_turn_from(id, &capture_kit::focus::list_subdevs(),
+            |dev| capture_kit::orient::read_mounting("v4l2-ctl", dev).ok());
+        if let Ok(mut c) = cache.lock() { c.insert(id.to_string(), v); }
+        v
+    })
+}
+
+/// [`upright_turn`] with the environment value and the sensor lookup passed in, so it is tested.
+pub fn turn_setting(env: Option<&str>, camera_id: Option<&str>, auto: impl FnOnce(&str) -> u32) -> u32 {
+    match env.map(str::trim) {
+        Some("auto") => camera_id.map(auto).unwrap_or(0),
+        Some(n) => n.parse::<i64>().map(|n| capture_kit::orient::Rotation::from_degrees(n).degrees()).unwrap_or(0),
+        None => 0,
     }
-    let Some(id) = camera_id else { return 0 };
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    if let Some(v) = cache.lock().ok().and_then(|c| c.get(id).copied()) { return v; }
-    let v = upright_turn_from(id, &capture_kit::focus::list_subdevs(),
-        |dev| capture_kit::orient::read_mounting("v4l2-ctl", dev).ok());
-    if let Ok(mut c) = cache.lock() { c.insert(id.to_string(), v); }
-    v
 }
 
 /// [`upright_turn`] with the world passed in, so it is tested without a camera.
@@ -909,11 +918,25 @@ mod live_tests {
     }
 
     #[test]
+    fn the_pipeline_turn_defaults_to_zero_because_the_ui_already_rotates() {
+        // The shipped regression: defaulting to the sensor's rotation turned the picture in the
+        // pipeline AND the shell turned it again (devices.rs, Cw90). Unset must be 0.
+        let never = |_: &str| -> u32 { panic!("the sensor must not be consulted unless asked") };
+        assert_eq!(turn_setting(None, Some("/base/x/camera@29"), never), 0);
+        assert_eq!(turn_setting(Some(""), Some("id"), never), 0, "an empty setting is not a request");
+        assert_eq!(turn_setting(Some("junk"), Some("id"), never), 0);
+        assert_eq!(turn_setting(Some("90"), None, never), 90);
+        assert_eq!(turn_setting(Some(" -90 "), None, never), 270, "wraps");
+        assert_eq!(turn_setting(Some("auto"), Some("id"), |id| if id == "id" { 90 } else { 0 }), 90, "auto asks the sensor lookup");
+        assert_eq!(turn_setting(Some("auto"), None, never), 0, "auto with no camera id has nothing to ask");
+    }
+
+    #[test]
     fn a_camera_id_becomes_the_turn_its_sensor_asks_for() {
         use capture_kit::orient::{Facing, Mounting};
         let mount = |_: &str| Some(Mounting { rotation_degrees: 270, facing: Some(Facing::Back) });
         for id in ["/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a", "/base/soc@0/cci@ac4a000/i2c-bus@1/camera@29"] {
-            assert_eq!(upright_turn_from(id, &fp5(), mount), 270, "{id}");
+            assert_eq!(upright_turn_from(id, &fp5(), mount), 90, "{id}: 270 -> a clockwise quarter");
         }
         assert_eq!(upright_turn_from("/base/soc@0/cci@ac4a000/i2c-bus@1/camera@0e", &fp5(), mount), 0, "the lens motor is not a camera");
         assert_eq!(upright_turn_from("/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a", &fp5(), |_| None), 0, "an unreadable sensor leaves the picture alone");
