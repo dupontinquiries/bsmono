@@ -52,6 +52,11 @@ struct Shellbox {
     escaped: bool,
     told_keyboard_cold: Option<bool>,
     told_keyboard_at: u64,
+    /// A physical keyboard is attached (re-read every few seconds), so the on-screen one stays down.
+    hw_keyboard: bool,
+    hw_checked_at: u64,
+    /// What the on-screen keyboard was last told: `show` for the palette's search field.
+    told_board_show: bool,
     /// Sleeping hours from bsettings (settingsd's file) and that file's mtime.
     fleet_sleep: settings_kit::SleepPrefs,
     fleet_sleep_seen: Option<std::time::SystemTime>,
@@ -576,6 +581,9 @@ fn main() {
         escaped: false,
         told_keyboard_cold: None,
         told_keyboard_at: 0,
+        hw_keyboard: false,
+        hw_checked_at: 0,
+        told_board_show: false,
         fleet_sleep: settings_kit::SleepPrefs::default(),
         fleet_sleep_seen: None,
         cam_probe: tideshell_egui::camera::CaptureProbe::default(),
@@ -861,6 +869,19 @@ fn main() {
             let _ = tideshell_egui::effects::send_keyboard_command(cmd);
             sb.told_keyboard_cold = Some(sb.shell.cold.on);
             sb.told_keyboard_at = now_ms;
+        }
+        // The palette's search field is the shell's own text field, not a text-input client, so
+        // the on-screen keyboard never hears about its focus. Summon it explicitly when the list
+        // is open in full (the thumb reached the search) and no physical keyboard is attached.
+        if now_ms.saturating_sub(sb.hw_checked_at) >= 3_000 {
+            sb.hw_checked_at = now_ms;
+            let text = std::fs::read_to_string("/proc/bus/input/devices").unwrap_or_default();
+            sb.hw_keyboard = tideshell_egui::sensors::parse_hw_input(&text).0;
+        }
+        let want_board = sb.shell.palette.open && sb.shell.palette.expanded && !sb.hw_keyboard;
+        if want_board != sb.told_board_show {
+            let _ = tideshell_egui::effects::send_keyboard_command(if want_board { "show" } else { "hide" });
+            sb.told_board_show = want_board;
         }
         for h in sb.compass.rx.try_iter().collect::<Vec<_>>() {
             sb.shell.on_heading(h);

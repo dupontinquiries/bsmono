@@ -1679,6 +1679,34 @@ mod gate_tests {
     }
 }
 
+/// Which physical input devices are attached, from `/proc/bus/input/devices`: a real keyboard has
+/// the LED event type (`EV` bit 17) and a `kbd` handler, which the phone's power and volume keys
+/// do not; a pointer has a `mouse` handler. Virtual devices (dotool, uinput, ei) are not counted:
+/// they are how text gets typed, not hardware that spares the on-screen keyboard.
+pub fn parse_hw_input(devices: &str) -> (bool, bool) {
+    let (mut kb, mut mouse) = (false, false);
+    for block in devices.split("\n\n") {
+        let name = block.lines().find_map(|l| l.strip_prefix("N: Name=")).unwrap_or("").to_lowercase();
+        if name.contains("virtual") || name.contains("dotool") || name.contains("uinput") {
+            continue;
+        }
+        let handlers = block.lines().find_map(|l| l.strip_prefix("H: Handlers=")).unwrap_or("");
+        let ev = block
+            .lines()
+            .find_map(|l| l.strip_prefix("B: EV="))
+            .and_then(|h| u64::from_str_radix(h.trim(), 16).ok())
+            .unwrap_or(0);
+        let has = |w: &str| handlers.split_whitespace().any(|h| h == w);
+        if has("kbd") && ev & (1 << 17) != 0 {
+            kb = true;
+        }
+        if handlers.split_whitespace().any(|h| h.starts_with("mouse")) {
+            mouse = true;
+        }
+    }
+    (kb, mouse)
+}
+
 /// Battery charge (0..1) and whether it is charging, from one `power_supply` directory's
 /// `capacity` and `status` text. `None` when the capacity is not a 0..100 number.
 pub fn parse_battery(capacity: &str, status: &str) -> Option<(f32, bool)> {
@@ -1732,5 +1760,32 @@ mod battery_tests {
         assert_eq!(read_battery(&root), Some((0.63, true)));
         assert_eq!(read_battery(&root.join("nonexistent")), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod hw_input_tests {
+    use super::parse_hw_input;
+
+    const PHONE: &str = "I: Bus=0019 Vendor=0001 Product=0001 Version=0100\nN: Name=\"pmic_pwrkey\"\nH: Handlers=kbd event0\nB: EV=3\n\nI: Bus=0019\nN: Name=\"gpio-keys\"\nH: Handlers=kbd event2\nB: EV=3\n\nI: Bus=0000\nN: Name=\"touchscreen\"\nH: Handlers=event3\nB: EV=b\n";
+    const KB: &str = "I: Bus=0003\nN: Name=\"Logitech K380\"\nH: Handlers=sysrq kbd leds event7\nB: EV=120013\n";
+    const MOUSE: &str = "I: Bus=0003\nN: Name=\"Logitech M720\"\nH: Handlers=mouse0 event8\nB: EV=17\n";
+
+    #[test]
+    fn the_phones_own_keys_are_not_a_keyboard() {
+        assert_eq!(parse_hw_input(PHONE), (false, false));
+    }
+
+    #[test]
+    fn a_real_keyboard_and_a_mouse_are_seen_separately() {
+        assert_eq!(parse_hw_input(&format!("{PHONE}\n{KB}")), (true, false));
+        assert_eq!(parse_hw_input(&format!("{PHONE}\n{MOUSE}")), (false, true));
+        assert_eq!(parse_hw_input(&format!("{KB}\n{MOUSE}")), (true, true));
+    }
+
+    #[test]
+    fn a_virtual_keyboard_is_how_text_arrives_not_hardware() {
+        let v = KB.replace("Logitech K380", "dotool virtual keyboard");
+        assert_eq!(parse_hw_input(&v), (false, false));
     }
 }
