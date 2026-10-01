@@ -1493,41 +1493,18 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, top_row: bool,
             c.text
         };
         paint_cap_label(painter, rect, &key.label, morph, font.clone(), text_color);
-        // THE MAGNIFIER. On a phone the thumb covers the key it is pressing, so this bubble
-        // is the only way to see what went in — `.key-magnifier` in the GTK stylesheet, and
-        // absent from this port entirely. Drawn on a FOREGROUND layer: at board scale it
-        // overlaps the row above, and a magnifier a neighbouring key can paint over is a
-        // magnifier that vanishes exactly when the board is busiest.
-        if pressed && style.magnifier && wants_magnifier(key) {
-            let bounds = ui.clip_rect();
-            let bub = magnifier_rect(rect, bounds, ppp);
-            let top = ui.ctx().layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                ui.id().with("magnifier"),
-            ));
-            // `box-shadow: 0 4px 12px alpha(black, 0.25)` — painted directly rather than
-            // through egui's popup shadow, which belongs to a Window and this is not one.
-            let shadow = egui::epaint::Shadow {
-                offset: [0, 4],
-                blur: 12,
-                spread: 0,
-                color: egui::Color32::from_black_alpha(64),
-            };
-            top.add(shadow.as_shape(bub, CornerRadius::same(12)));
-            top.rect(
-                bub,
-                CornerRadius::same(12),
-                c.bg_card,
-                Stroke::new(1.0, uikit_egui::key_border(c.border).color),
-                egui::StrokeKind::Inside,
-            );
-            top.text(
-                bub.center(),
-                egui::Align2::CENTER_CENTER,
-                &key.label,
-                FontId::proportional(uikit_egui::crisp::snap_font_pt(MAGNIFIER_PT, ppp)),
-                c.text,
-            );
+        // THE PRESS PULSE (was a magnifier bubble). The bubble floated over the neighbouring
+        // keys and their swipe labels, which on a board that is hard to learn is the one thing it
+        // must not cover. A pulse stays ON the key: a thin accent ring and a faint wash that ramp
+        // up with the press and fade after it, drawn over the cap but under nothing else, and
+        // never wider than the key's own rectangle plus a pixel or two.
+        if style.magnifier && wants_magnifier(key) {
+            let t = ui.ctx().animate_bool_with_time(ui.id().with(("press-pulse", rect.min.x as i32, rect.min.y as i32)), pressed, 0.16);
+            if t > 0.01 {
+                let ring = rect.expand(t * 1.5);
+                painter.rect_filled(rect, rounding, c.accent.gamma_multiply(0.14 * t));
+                painter.rect_stroke(ring, rounding, Stroke::new(1.5, c.accent.gamma_multiply(0.7 * t)), egui::StrokeKind::Outside);
+            }
         }
     } else {
         // Rest→hover→press glides (120ms) instead of snapping — the QML key ColorAnimation feel.
