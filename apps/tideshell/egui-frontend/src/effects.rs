@@ -757,6 +757,33 @@ pub fn quick_commands(kind: tideshell_core::control_center::QuickKind, on: bool)
     }
 }
 
+/// Which radios are on, from rfkill under `base` (`/sys/class/rfkill`): a radio is on when neither its
+/// soft nor hard block is set. Airplane is on when radios exist and every one is off. Read from sysfs, so
+/// the tiles show what the system is doing even when something else (Settings, a key) changed it.
+pub fn probe_radios(base: &std::path::Path) -> Vec<(tideshell_core::control_center::QuickKind, bool)> {
+    use tideshell_core::control_center::QuickKind as K;
+    let (mut wifi, mut bt, mut wwan): (Option<bool>, Option<bool>, Option<bool>) = (None, None, None);
+    for e in std::fs::read_dir(base).into_iter().flatten().flatten() {
+        let rd = |f: &str| std::fs::read_to_string(e.path().join(f)).ok().map(|t| t.trim().to_string());
+        let (Some(kind), Some(soft), Some(hard)) = (rd("type"), rd("soft"), rd("hard")) else { continue };
+        let on = soft == "0" && hard == "0";
+        let slot = match kind.as_str() {
+            "wlan" => &mut wifi,
+            "bluetooth" => &mut bt,
+            "wwan" => &mut wwan,
+            _ => continue,
+        };
+        *slot = Some(slot.unwrap_or(false) || on);
+    }
+    let found: Vec<bool> = [wifi, bt, wwan].into_iter().flatten().collect();
+    let mut out = Vec::new();
+    if let Some(v) = wifi { out.push((K::Wifi, v)); }
+    if let Some(v) = bt { out.push((K::Bluetooth, v)); }
+    if let Some(v) = wwan { out.push((K::MobileData, v)); }
+    if !found.is_empty() { out.push((K::Airplane, found.iter().all(|on| !on))); }
+    out
+}
+
 /// The flashlight: the first LED under `base` (`/sys/class/leds`) whose name says flash or torch.
 pub fn flashlight_led(base: &std::path::Path) -> Option<PathBuf> {
     let mut leds: Vec<PathBuf> = std::fs::read_dir(base).ok()?.flatten().map(|e| e.path()).collect();
@@ -1006,6 +1033,31 @@ mod fleet_sleep_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn radios_are_read_from_rfkill_and_airplane_means_all_off() {
+        use tideshell_core::control_center::QuickKind as K;
+        let d = std::env::temp_dir().join(format!("rfk{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let mk = |n: &str, ty: &str, soft: &str, hard: &str| {
+            let r = d.join(n);
+            std::fs::create_dir_all(&r).unwrap();
+            for (f, v) in [("type", ty), ("soft", soft), ("hard", hard)] {
+                std::fs::write(r.join(f), format!("{v}\n")).unwrap();
+            }
+        };
+        mk("rfkill0", "bluetooth", "0", "0");
+        mk("rfkill1", "wlan", "1", "0");
+        let got = probe_radios(&d);
+        assert!(got.contains(&(K::Bluetooth, true)) && got.contains(&(K::Wifi, false)), "{got:?}");
+        assert!(got.contains(&(K::Airplane, false)), "one radio is on, so not airplane");
+        mk("rfkill0", "bluetooth", "0", "1");
+        let got = probe_radios(&d);
+        assert!(got.contains(&(K::Bluetooth, false)), "a hard block is off too: {got:?}");
+        assert!(got.contains(&(K::Airplane, true)), "every radio off is airplane");
+        assert!(probe_radios(&d.join("missing")).is_empty(), "no rfkill, no claims");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn the_keyboard_geometry_line_parses_and_garbage_is_zero() {
         assert_eq!(parse_keyboard_inset("312\n"), 312.0);
