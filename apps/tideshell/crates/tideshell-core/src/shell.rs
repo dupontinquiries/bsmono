@@ -566,6 +566,8 @@ impl Shell {
         if streaking && !self.switcher.is_streaking() {
             self.log("quick-switch streak settled");
         }
+        // lying on a table (face up or down): the orientation string is noise, nothing rotates
+        self.rotate.set_flat_hint(self.flat.is_flat());
         let rotate_blocked = self.lock.is_locked() || self.sleep.captures_input();
         let mut out = vec![];
         if let Some(o) = self.rotate.poll(now, rotate_blocked) {
@@ -1330,6 +1332,7 @@ impl Shell {
         if was != self.flat.is_flat() {
             self.log(if self.flat.is_flat() { "lying flat (orientation undefined)" } else { "picked up" });
         }
+        self.rotate.set_flat_hint(self.flat.is_flat());
         let blocked = self.lock.is_locked() || self.sleep.captures_input();
         match self.rotate.on_reading(s, now, blocked) {
             Some(o) => {
@@ -1551,6 +1554,31 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
+    /// Set down on a table: a transient orientation on the way down, then "undefined". Nothing rotates,
+    /// however long the shell then ticks, and it still rotates once picked up and turned.
+    #[test]
+    fn setting_the_phone_on_a_table_does_not_rotate_the_screen() {
+        let mut sh = Shell::new(ShellPrefs::default(), S);
+        let mut rotated = Vec::new();
+        let mut t = 1000;
+        let rot = |acts: Vec<Action>| acts.into_iter().filter_map(|a| if let Action::Rotate(d) = a { Some(d) } else { None }).collect::<Vec<_>>();
+        rotated.extend(rot(sh.on_orientation("left-up", t))); // the phone tips as it is set down
+        t += 300;
+        rotated.extend(rot(sh.on_orientation("undefined", t))); // and settles flat
+        for _ in 0..80 {
+            t += 100;
+            rotated.extend(rot(sh.tick(t)));
+        }
+        assert!(rotated.is_empty(), "nothing rotated on the table: {rotated:?}");
+        // picked up and held sideways: it rotates again
+        rotated.extend(rot(sh.on_orientation("right-up", t)));
+        for _ in 0..30 {
+            t += 100;
+            rotated.extend(rot(sh.tick(t)));
+        }
+        assert_eq!(rotated.len(), 1, "one rotation once picked up: {rotated:?}");
+    }
+
     #[test]
     fn a_new_place_colour_fades_in_over_a_second_or_two_not_at_once() {
         let mut sh = Shell::new(ShellPrefs::default(), S);
