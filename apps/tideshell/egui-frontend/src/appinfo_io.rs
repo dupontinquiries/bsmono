@@ -30,6 +30,16 @@ pub fn parse_statm_rss_kb(text: &str, page_kb: u64) -> Option<u64> {
     Some(text.split_whitespace().nth(1)?.parse::<u64>().ok()? * page_kb)
 }
 
+/// The memory an app really owns, in kB, from `/proc/<pid>/status`: anonymous plus shared-memory pages.
+/// NOT `VmRSS`: on this phone ~150 MB of every GL app's "resident" size is `RssFile`, the Mesa/GL
+/// libraries every such app maps identically, so each app read as ~170 MB whatever it was doing.
+pub fn parse_private_kb(status: &str) -> Option<u64> {
+    let field = |name: &str| -> Option<u64> {
+        status.lines().find_map(|l| l.strip_prefix(name)).and_then(|v| v.split_whitespace().next()).and_then(|n| n.parse().ok())
+    };
+    Some(field("RssAnon:")? + field("RssShmem:").unwrap_or(0))
+}
+
 /// Seconds since boot from `/proc/uptime`.
 pub fn parse_uptime(text: &str) -> Option<f32> {
     text.split_whitespace().next()?.parse().ok()
@@ -139,7 +149,18 @@ impl Poller {
         for (id, app_id) in wanted {
             let key = AppKey { app_id: app_id.clone(), exec_hint: exec_hint(app_id, &mut self.hints) };
             let pids = appinfo::match_pids(&key, &procs);
-            let after: Vec<Proc> = procs.iter().filter(|p| pids.contains(&p.pid)).cloned().collect();
+            // Private memory is read only for the processes that matched: one small file each.
+            let after: Vec<Proc> = procs
+                .iter()
+                .filter(|p| pids.contains(&p.pid))
+                .cloned()
+                .map(|mut p| {
+                    if let Some(kb) = read(format!("/proc/{}/status", p.pid)).and_then(|t| parse_private_kb(&t)) {
+                        p.rss_kb = kb;
+                    }
+                    p
+                })
+                .collect();
             let before: Vec<Proc> = after.iter().filter_map(|p| self.before.get(&p.pid).cloned()).collect();
             if !after.is_empty() {
                 infos.insert(*id, appinfo::sample(&before, &after, dt, hz, boot));
@@ -165,6 +186,19 @@ mod tests {
         assert_eq!(parse_stat(nasty), Some((15, 555)), "a name with spaces and parens");
         assert_eq!(parse_stat("garbage"), None);
         assert_eq!(parse_stat("1 (x) S 1 1"), None, "truncated");
+    }
+
+    #[test]
+    fn private_memory_is_anon_plus_shmem_not_the_shared_library_mappings() {
+        // The real numbers from the phone (kB): VmRSS 175924, of which RssFile 154256 is shared libs.
+        let st = "Name:\tvidkit-player\nVmRSS:\t  175924 kB\nRssAnon:\t   21664 kB\nRssFile:\t  154256 kB\nRssShmem:\t       4 kB\n";
+        assert_eq!(parse_private_kb(st), Some(21_668));
+        assert_eq!(parse_private_kb("RssAnon:\t 100 kB\n"), Some(100), "no shmem line is zero shmem");
+        assert_eq!(parse_private_kb("VmRSS: 5 kB"), None, "no anon line: unknown, not zero");
+        // two apps with ~identical VmRSS but different private use must read differently
+        let a = "RssAnon: 21664 kB\nRssFile: 154256 kB\nRssShmem: 4 kB";
+        let b = "RssAnon: 44160 kB\nRssFile: 152560 kB\nRssShmem: 8 kB";
+        assert_ne!(parse_private_kb(a), parse_private_kb(b));
     }
 
     #[test]
