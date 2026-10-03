@@ -96,8 +96,34 @@ pub fn noise_tile(size: usize, seed: u32, amount: u8) -> Vec<u8> {
     out
 }
 
+/// A black point for an OLED panel: everything at or under `floor` becomes exactly 0 (an OLED pixel at
+/// (20, 20, 22) is a lit grey, at 0 it is off), and the rest is stretched back over 0..255 so
+/// highlights keep their full value. Per channel, so hue survives: a dark red stays red, a dark neutral
+/// goes black. The lock screen's wash is the room's colour, which is usually dark and desaturated,
+/// and without this it reads as a flat mid-grey.
+pub fn black_point(c: [u8; 3], floor: u8) -> [u8; 3] {
+    let f = floor.min(254) as f32;
+    let m = |v: u8| ((v as f32 - f).max(0.0) * 255.0 / (255.0 - f)).round() as u8;
+    [m(c[0]), m(c[1]), m(c[2])]
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_black_point_turns_a_dark_neutral_black_and_keeps_hue_and_highlights() {
+        assert_eq!(black_point([20, 20, 22], 24), [0, 0, 0], "the lifted grey of a dark room is off");
+        assert_eq!(black_point([0, 0, 0], 24), [0, 0, 0]);
+        assert_eq!(black_point([255, 255, 255], 24), [255, 255, 255], "white stays white");
+        let red = black_point([60, 20, 20], 24);
+        assert!(red[0] > 0 && red[1] == 0 && red[2] == 0, "a dark red is still red: {red:?}");
+        // monotonic: a brighter input never comes out darker
+        for v in 0..255u8 {
+            assert!(black_point([v + 1, 0, 0], 24)[0] >= black_point([v, 0, 0], 24)[0], "at {v}");
+        }
+        // a floor of zero changes nothing
+        assert_eq!(black_point([20, 40, 90], 0), [20, 40, 90]);
+    }
+
     use super::*;
 
     #[test]

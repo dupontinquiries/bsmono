@@ -196,6 +196,9 @@ pub struct ShellView {
     /// already fired, so the release that follows is not also a tap.
     /// Live CPU / memory / age of the windows the carousel is showing (appinfo_io.rs).
     appinfo: crate::appinfo_io::Poller,
+    /// True black for an OLED panel (uikit's `oled_enabled`), read once: the ground of every surface
+    /// tideshell draws and publishes goes to (0, 0, 0) instead of a lit dark grey.
+    oled: Option<bool>,
     tile_hold: Option<(Id, f64)>,
     tile_fired: Option<Id>,
     /// The switcher landed (reveal reached 1): kick the cards once.
@@ -630,6 +633,8 @@ impl ShellView {
         // warmth on the surfaces, its brightness, and its springs.
         let mood = shell.mood();
         let living = Self::living_palette(pal, &mood, shell.accent(), contrast);
+        let oled = *self.oled.get_or_insert_with(uikit_egui::theme_bridge::oled_enabled);
+        let living = if oled { uikit_egui::theme_bridge::oled_black(&living) } else { living };
         // Share it: apps reading $XDG_RUNTIME_DIR/tideshell.palette dress to
         // match (deploy/AMBIENCE-API.md). The publisher throttles; this frame
         // usually writes nothing.
@@ -962,6 +967,7 @@ impl ShellView {
             for gy in 0..=rows {
                 for gx in 0..=cols {
                     let c = corners[gy * (cols + 1) + gx];
+                    let c = if self.oled == Some(true) { crate::wash::black_point(c, 24) } else { c };
                     let p = Pos2::new(r.left() + r.width() * gx as f32 / cols as f32, r.top() + r.height() * gy as f32 / rows as f32);
                     mesh.vertices.push(egui::epaint::Vertex {
                         pos: p,
