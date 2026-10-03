@@ -416,6 +416,11 @@ impl Layout {
     /// the flagship user of the shared `slide_menu::show_cardinal` gesture. Reached like any other
     /// layout (swipe the board sideways to cycle to it).
     pub fn cardinal() -> Layout {
+        Layout::cardinal_with(BottomRow::Standard)
+    }
+
+    /// The cardinal board with the chosen bottom row (`layout.cardinal_bottom_row`).
+    pub fn cardinal_with(bottom: BottomRow) -> Layout {
         use uikit_egui::slide_menu::Dir8::{E, N, S, W};
         fn k(center: &str, dirs: &[(uikit_egui::slide_menu::Dir8, &str)]) -> Key {
             Key::new(center).with_cardinal(dirs)
@@ -441,7 +446,7 @@ impl Layout {
                     k("r", &[(N, "R"), (E, ",")]),
                 ]),
                 Row {
-                    keys: vec![
+                    keys: bottom.keys(vec![
                         Key::emitting("⌫", "\u{8}", 1.5),
                         // Dictation reachable from the cardinal board. The GTK build only ever
                         // put the mic on the qwerty row, so the two best input modes could not
@@ -455,10 +460,10 @@ impl Layout {
                         // correction key most, and it was the one without it.
                         Key::emitting("⌫", "\u{8}", 1.0),
                         Key::emitting("⏎", "\n", 1.5),
-                    ],
+                    ]),
                     weight: 1.0,
                 },
-            ],
+            ].into_iter().filter(|r: &Row| !r.keys.is_empty()).collect(),
         }
     }
 
@@ -468,6 +473,10 @@ impl Layout {
     /// whole alphabet plus numbers fit in nine keys. Swiping north is always the uppercase. Exercises
     /// the widget's full `Dir8`.
     pub fn cardinal8() -> Layout {
+        Layout::cardinal8_with(BottomRow::Standard)
+    }
+
+    pub fn cardinal8_with(bottom: BottomRow) -> Layout {
         use uikit_egui::slide_menu::Dir8::{E, N, NE, S, SE, SW, W};
         fn k(center: &str, dirs: &[(uikit_egui::slide_menu::Dir8, &str)]) -> Key {
             Key::new(center).with_cardinal(dirs)
@@ -494,15 +503,15 @@ impl Layout {
                     k("r", &[(N, "R"), (E, ":"), (S, "@"), (W, "/")]),
                 ]),
                 Row {
-                    keys: vec![
+                    keys: bottom.keys(vec![
                         Key::emitting("🎤", &real_layout::voice_emit(), 1.0),
                         Key::emitting("space", " ", 2.0),
                         Key::emitting("⌫", "\u{8}", 1.0),
                         Key::emitting("⏎", "\n", 1.0),
-                    ],
+                    ]),
                     weight: 1.0,
                 },
-            ],
+            ].into_iter().filter(|r: &Row| !r.keys.is_empty()).collect(),
         }
     }
 
@@ -592,6 +601,44 @@ impl Layout {
     }
 }
 
+/// What sits under the cardinal boards' nine swipe keys (`layout.cardinal_bottom_row`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BottomRow {
+    /// The row as it has always been. The default, and what a missing or unknown setting means.
+    #[default]
+    Standard,
+    /// The standard row with a tilde on one side of space and a minus on the other.
+    Full,
+    /// No row at all: just the swipe keys.
+    None,
+}
+
+impl BottomRow {
+    pub fn from_value(v: &str) -> BottomRow {
+        match v.trim() {
+            "full" => BottomRow::Full,
+            "none" => BottomRow::None,
+            _ => BottomRow::Standard,
+        }
+    }
+
+    /// The row's keys for this choice, from the standard ones. `Full` puts `~` before and `-`
+    /// after the space key (the widest key, found by weight).
+    fn keys(self, standard: Vec<Key>) -> Vec<Key> {
+        match self {
+            BottomRow::Standard => standard,
+            BottomRow::None => Vec::new(),
+            BottomRow::Full => {
+                let mut keys = standard;
+                let space = keys.iter().position(|k| k.emit == " ").unwrap_or(keys.len() / 2);
+                keys.insert(space + 1, Key::emitting("-", "-", 1.0));
+                keys.insert(space, Key::emitting("~", "~", 1.0));
+                keys
+            }
+        }
+    }
+}
+
 /// The code-built slide board's layout name.
 pub const SLIDE_NAME: &str = "slide";
 
@@ -619,16 +666,34 @@ pub struct Board {
     /// Where the symbols toggle came from, so `?123` and `ABC` are the same key going both
     /// ways rather than a one-way trip.
     before_symbols: Option<usize>,
+    bottom_row: BottomRow,
 }
 
 impl Board {
     /// Default board: qwerty + symbols.
     pub fn new() -> Board {
         Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8(), Layout::stenotype(), Layout::morse(), Layout::slide()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0), voice_active: false,
-            shift: real_layout::Shift::Off, before_symbols: None, palette: "system".to_string() }
+            shift: real_layout::Shift::Off, before_symbols: None, bottom_row: BottomRow::Standard, palette: "system".to_string() }
     }
     pub fn current(&self) -> &Layout {
         &self.layouts[self.idx]
+    }
+
+    /// Choose the bottom row of both cardinal boards, in place (they keep their rail position).
+    /// Returns whether anything changed.
+    pub fn set_bottom_row(&mut self, row: BottomRow) -> bool {
+        if row == self.bottom_row {
+            return false;
+        }
+        self.bottom_row = row;
+        for l in &mut self.layouts {
+            match l.name.as_str() {
+                "cardinal" => *l = Layout::cardinal_with(row),
+                "cardinal8" => *l = Layout::cardinal8_with(row),
+                _ => {}
+            }
+        }
+        true
     }
 
     /// Select the board the SETTINGS ask for.
@@ -1899,6 +1964,61 @@ mod tests {
         for ch in 'a'..='z' {
             assert!(reachable.contains(&ch), "letter '{ch}' should be reachable on cardinal8");
         }
+    }
+
+    fn bottom_emits(l: &Layout) -> Vec<String> {
+        l.rows.last().unwrap().keys.iter().map(|k| k.emit.clone()).collect()
+    }
+
+    #[test]
+    fn the_cardinal_bottom_row_is_unchanged_by_default_and_can_gain_tilde_and_minus_or_go() {
+        // THE DEFAULT IS THE ROW AS IT WAS: the owner asked to leave it how it is.
+        let voice = real_layout::voice_emit();
+        let std8 = Layout::cardinal8();
+        assert_eq!(std8.rows.len(), 4);
+        assert_eq!(bottom_emits(&std8), vec![voice.clone(), " ".to_string(), "\u{8}".to_string(), "\n".to_string()]);
+        assert_eq!(bottom_emits(&Layout::cardinal8_with(BottomRow::Standard)), bottom_emits(&std8));
+        let std9 = Layout::cardinal();
+        assert_eq!(bottom_emits(&std9), vec!["\u{8}".to_string(), voice.clone(), " ".to_string(), "\u{8}".to_string(), "\n".to_string()]);
+        assert_eq!(BottomRow::from_value("anything else"), BottomRow::Standard, "unknown means standard");
+        assert_eq!(BottomRow::from_value(""), BottomRow::Standard);
+
+        // FULL: the same row, plus ~ before space and - after it, nothing removed
+        let full8 = bottom_emits(&Layout::cardinal8_with(BottomRow::Full));
+        assert_eq!(full8, vec![voice.clone(), "~".to_string(), " ".to_string(), "-".to_string(), "\u{8}".to_string(), "\n".to_string()]);
+        let full9 = bottom_emits(&Layout::cardinal_with(BottomRow::Full));
+        let sp = full9.iter().position(|e| e == " ").unwrap();
+        assert_eq!((full9[sp - 1].as_str(), full9[sp + 1].as_str()), ("~", "-"), "{full9:?}");
+        assert_eq!(full9.len(), bottom_emits(&std9).len() + 2);
+
+        // NONE: just the three rows of swipe keys, and a shorter board
+        for l in [Layout::cardinal8_with(BottomRow::None), Layout::cardinal_with(BottomRow::None)] {
+            assert_eq!(l.rows.len(), 3, "{}", l.name);
+            assert!(l.rows.iter().all(|r| r.keys.len() == 3), "only the nine swipe keys remain");
+        }
+    }
+
+    #[test]
+    fn choosing_the_bottom_row_rebuilds_both_cardinal_boards_in_place() {
+        let mut b = Board::new();
+        let names: Vec<String> = b.layout_names().iter().map(|n| n.to_string()).collect();
+        assert!(!b.set_bottom_row(BottomRow::Standard), "already standard: nothing to do");
+        assert!(b.set_bottom_row(BottomRow::Full));
+        assert_eq!(b.layout_names().iter().map(|n| n.to_string()).collect::<Vec<_>>(), names, "same boards, same order");
+        for name in ["cardinal", "cardinal8"] {
+            let i = b.layout_names().iter().position(|n| *n == name).unwrap();
+            b.set_layout(i);
+            assert!(bottom_emits(b.current()).contains(&"~".to_string()), "{name} has the tilde");
+        }
+        assert!(b.set_bottom_row(BottomRow::None));
+        b.set_layout(b.layout_names().iter().position(|n| *n == "cardinal8").unwrap());
+        assert_eq!(b.current().rows.len(), 3);
+        // the other boards are untouched
+        b.set_layout(0);
+        assert_eq!(b.current().name, "en_us_qwerty");
+        assert!(b.set_bottom_row(BottomRow::Standard));
+        b.set_layout(b.layout_names().iter().position(|n| *n == "cardinal8").unwrap());
+        assert_eq!(b.current().rows.len(), 4, "and back to the original row");
     }
 
     #[test]

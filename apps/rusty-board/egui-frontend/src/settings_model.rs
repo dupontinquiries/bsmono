@@ -179,6 +179,16 @@ pub const SETTINGS: &[Setting] = &[
         options: &["Off", "Cardinal", "Stenotype", "Words", "Morse"],
         values: &["off", "cardinal", "stenotype", "words", "morse"],
     },
+    Setting {
+        key: "layout.cardinal_bottom_row", label: "Cardinal bottom row",
+        help: "The row under the cardinal boards. Standard = as it has always been (voice, \
+               space, backspace, enter). Add ~ and - = the same row with a tilde and a minus \
+               key beside space. Hidden = no bottom row: only the nine swipe keys.",
+        group: Group::Experimental,
+        kind: Kind::Choice,
+        options: &["Standard", "Add ~ and -", "Hidden"],
+        values: &["standard", "full", "none"],
+    },
     // ── Typing: ported from the GTK panel, help text verbatim ───────────
     //
     // DECLARATION ORDER IS THE DEFAULT. `Setting::next` cycles from
@@ -378,6 +388,14 @@ pub fn toggle(setting: &Setting, current: &str) -> Change {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_cardinal_bottom_row_setting_defaults_to_the_row_as_it_was() {
+        let s = find("layout.cardinal_bottom_row");
+        assert_eq!(s.values[0], "standard", "declaration order is the default, and the owner asked for no change");
+        assert_eq!(s.values, &["standard", "full", "none"]);
+        assert_eq!(s.options.len(), s.values.len());
+    }
+
     use super::*;
 
     fn find(key: &str) -> &'static Setting {

@@ -668,6 +668,7 @@ impl Feel {
         self.setting_values = vals.into_iter().collect();
         let mode = self.setting_values.get("layout.experimental_mode").cloned().unwrap_or_default();
         self.board.apply_mode(&mode);
+        self.apply_bottom_row();
         let user = self.setting_values.get(crate::settings_store::USER_LAYOUT_KEY).cloned().unwrap_or_default();
         if !user.is_empty() && !self.board.select_user_layout(&user) {
             tracing::warn!("settings: layout.user = {user:?} is not in the user layouts directory");
@@ -676,6 +677,12 @@ impl Feel {
         self.apply_repeat();
         self.apply_morse_settings();
         self.needs_frame = true;
+    }
+
+    /// `layout.cardinal_bottom_row` onto the two cardinal boards.
+    fn apply_bottom_row(&mut self) {
+        let v = self.setting_values.get("layout.cardinal_bottom_row").map(String::as_str).unwrap_or("standard");
+        self.board.set_bottom_row(crate::BottomRow::from_value(v));
     }
 
     /// `typing.key_repeat` / `typing.repeat_speed` over config.toml's values.
@@ -1713,6 +1720,7 @@ impl Feel {
                             if setting.key == "layout.experimental_mode" {
                                 self.board.apply_mode(&change.value);
                             }
+                            self.apply_bottom_row();
                             self.style = self.base_style.with_settings(&self.setting_values);
                             self.apply_repeat();
                             self.apply_morse_settings();
