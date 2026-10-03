@@ -41,13 +41,16 @@ pub struct Pro {
     /// Develop each saved photo with `autotone` (black point, white balance, exposure bias). On by
     /// default: this phone's frames need it. The preview is not changed by it.
     pub auto_tone: bool,
+    /// Also blend virtual brackets of each saved photo (`fusion`): shadows and subjects come up. Off by
+    /// default: it can leave a faint halo at hard edges.
+    pub fusion: bool,
 }
 
 impl Default for Pro {
     fn default() -> Self {
         Pro { lenses: lens::builtins(), lens: 0, measured_crop: None, ev: 0.0, wb: WhiteBalance::AsShot,
               auto_gains: [1.0; 3], overlays: Overlays::default(), load_errors: vec![],
-              cover: crate::cover::CoverProfile::none(), cover_on: false, auto_tone: true }
+              cover: crate::cover::CoverProfile::none(), cover_on: false, auto_tone: true, fusion: false }
     }
 }
 
@@ -225,8 +228,8 @@ impl Pro {
     /// Settings-file lines.
     pub fn conf(&self) -> String {
         let o = self.overlays;
-        format!("lens = {}\nev = {:.4}\nwb = {}\nhistogram = {}\nzebra = {}\npeaking = {}\ngrid = {}\ncover = {}\nauto_tone = {}\n",
-                self.profile().name, self.ev, self.wb.to_conf(), o.histogram, o.zebra, o.peaking, o.grid, self.cover_on, self.auto_tone)
+        format!("lens = {}\nev = {:.4}\nwb = {}\nhistogram = {}\nzebra = {}\npeaking = {}\ngrid = {}\ncover = {}\nauto_tone = {}\nfusion = {}\n",
+                self.profile().name, self.ev, self.wb.to_conf(), o.histogram, o.zebra, o.peaking, o.grid, self.cover_on, self.auto_tone, self.fusion)
     }
 
     /// Read what `conf` wrote; anything missing keeps its default.
@@ -244,6 +247,7 @@ impl Pro {
         self.cover_on = b("cover");
         // absent (an older settings file) keeps it on
         if let Some(v) = get("auto_tone") { self.auto_tone = v == "true"; }
+        self.fusion = get("fusion").is_some_and(|v| v == "true");
     }
 }
 

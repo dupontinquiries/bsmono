@@ -329,6 +329,7 @@ impl Cam {
         // window at native pixels: what the viewfinder showed is what the
         // file holds, and nothing is upscaled to pretend otherwise.
         let tone = self.pro.auto_tone.then(|| crate::autotone::measure(&full.rgba, full.width, full.height));
+        let scene = crate::fusion::stats(&full.rgba, full.width, full.height).map(|s| crate::fusion::judge(&s).label());
         let developed = self.pro.develops() || gains.is_some() || tone.is_some();
         let f = if developed {
             let mut p = self.pro.params(self.zoom.window(), full.width, full.height, None);
@@ -340,8 +341,9 @@ impl Cam {
                 let g = if gains.is_some() { [2f32.powf(t.ev); 3] } else { t.total_gains() };
                 p.gains = [p.gains[0] * g[0], p.gains[1] * g[1], p.gains[2] * g[2]];
             }
-            capture_kit::RawFrame { width: p.out_w, height: p.out_h, captured_ms: full.captured_ms, seq: full.seq,
-                                    rgba: develop::render(&full.rgba, full.width, full.height, &p).into() }
+            let mut px = develop::render(&full.rgba, full.width, full.height, &p);
+            if self.pro.fusion && gains.is_none() { px = crate::fusion::fuse_brackets(&px, p.out_w, p.out_h); }
+            capture_kit::RawFrame { width: p.out_w, height: p.out_h, captured_ms: full.captured_ms, seq: full.seq, rgba: px.into() }
         } else if self.zoom.is_zoomed() { full.crop(self.zoom.window()) } else { full };
         let now = now_ms();
         let name = store::free_name(&self.capture_dir, &capture_filename(now, self.camera.shown_facing().label(), "jpg"));
@@ -358,7 +360,7 @@ impl Cam {
                 self.dirty = true;
                 let what = what.map(|w| format!("{w}; ")).unwrap_or_default();
                 self.note = if developed {
-                    format!("saved {} ({what}{}, {}×{})", path.display(), self.pro.readout(None), f.width, f.height)
+                    format!("saved {} ({what}{}{}, {}×{})", path.display(), self.pro.readout(None), scene.map(|s| format!(" · scene: {s}")).unwrap_or_default(), f.width, f.height)
                 } else if self.zoom.is_zoomed() {
                     format!("saved {} ({what}{} crop, {}×{})", path.display(), self.zoom.label(), f.width, f.height)
                 } else if !what.is_empty() {
@@ -1381,6 +1383,39 @@ mod tests {
         assert!(!cam.focus.is_searching(), "no motor: nothing is searching");
         assert!(cam.note.contains("focus"), "it said why: {}", cam.note);
         assert!(cam.zoom.factor == 1.0 && cam.roll.shots().is_empty(), "and the tap did nothing else");
+    }
+
+    #[test]
+    fn fusion_lifts_a_dim_subject_in_a_saved_photo_and_is_off_by_default() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let size = egui::vec2(360.0, 720.0);
+        let (mut cam, _t) = live_pattern(d.path(), &ctx, size);
+        assert!(!cam.pro.fusion, "off by default");
+        // dim textured left half, bright textured right half
+        let (w, h) = (96u32, 64u32);
+        let mut px = Vec::new();
+        for y in 0..h { for x in 0..w {
+            let tex = if (x / 2 + y / 2) % 2 == 0 { 1.0 } else { 0.7 };
+            let l = if x < w / 2 { 0.03 * tex } else { (0.5f32 * tex).min(1.0) };
+            let v = crate::develop::to_srgb(l);
+            px.extend_from_slice(&[v, v, v, 255]);
+        } }
+        let frame = || capture_kit::RawFrame { width: w, height: h, captured_ms: 0, seq: 1, rgba: px.clone().into() };
+        let left_mean = |f: &str| {
+            let img = image::open(d.path().join(f)).unwrap().to_luma8();
+            let mut s = 0u64; let mut n = 0u64;
+            for y in 0..h { for x in 4..(w / 2 - 4) { s += img.get_pixel(x, y).0[0] as u64; n += 1; } }
+            s as f64 / n as f64
+        };
+        cam.save_frame(&ctx, frame(), None, None);
+        let plain = cam.roll.shots()[0].clone();
+        cam.pro.fusion = true;
+        cam.save_frame(&ctx, frame(), None, None);
+        let fused = cam.roll.shots()[0].clone();
+        assert!(left_mean(&fused.file) > left_mean(&plain.file) + 4.0, "the dim half came up: {} -> {}", left_mean(&plain.file), left_mean(&fused.file));
+        assert!(cam.note.contains("scene:"), "the note names the scene: {}", cam.note);
+        assert!(cam.pro.conf().contains("fusion = true"));
     }
 
     #[test]

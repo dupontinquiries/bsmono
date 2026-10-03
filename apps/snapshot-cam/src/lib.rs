@@ -58,6 +58,7 @@ pub mod contacts;
 /// measurements the viewfinder draws.
 pub mod develop;
 pub mod autotone;
+pub mod fusion;
 pub mod tapfocus;
 pub mod autofocus;
 /// Clip-on lens profiles (Moment and others) and the black-border autocrop.
