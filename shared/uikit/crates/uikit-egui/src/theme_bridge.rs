@@ -62,6 +62,55 @@ impl PaletteColors {
     }
 }
 
+/// Perceived luminance, 0..255.
+fn luma(c: Color32) -> f32 {
+    0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32
+}
+
+fn scaled(c: Color32, k: f32, floor: u8) -> Color32 {
+    let f = |v: u8| ((v as f32 * k).round() as u8).max(floor);
+    Color32::from_rgba_unmultiplied(f(c.r()), f(c.g()), f(c.b()), c.a())
+}
+
+/// True black for an OLED panel. A "dark" theme's ground is typically (20, 20, 25): on an OLED that is
+/// a visibly lit grey over the whole screen, every pixel burning, when black is OFF. This maps a DARK
+/// palette's layers down so the ground (`bg_base`) is exactly (0, 0, 0) and the layers above it step
+/// up from there in the same order (card < raised < hover), still separable from the ground and from
+/// each other; text, accents and borders are untouched (the border is what outlines a card that is
+/// now nearly the colour of the ground). A LIGHT palette is returned unchanged: a light theme
+/// is light on purpose and has nothing to save.
+pub fn oled_black(c: &PaletteColors) -> PaletteColors {
+    if luma(c.bg_base) > 110.0 {
+        return *c;
+    }
+    PaletteColors {
+        bg_base: Color32::from_rgba_unmultiplied(0, 0, 0, c.bg_base.a()),
+        bg_card: scaled(c.bg_card, 0.45, 6),
+        bg_raised: scaled(c.bg_raised, 0.7, 14),
+        bg_hover: scaled(c.bg_hover, 0.85, 22),
+        ..*c
+    }
+}
+
+/// Whether this user wants true black: `UIKIT_OLED=1|on|true` in the environment, or a
+/// `~/.config/uikit/oled` file saying `on`. Opt-in per user, because a laptop LCD gains nothing from it.
+/// Read by `apply_palette` (every themed app) and by tideshell's published palette.
+pub fn oled_enabled() -> bool {
+    let base = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config")));
+    let file = base.and_then(|b| std::fs::read_to_string(b.join("uikit/oled")).ok());
+    oled_switch(std::env::var("UIKIT_OLED").ok().as_deref(), file.as_deref())
+}
+
+/// The decision, pure: the environment wins over the file, so a process can be forced either way.
+pub fn oled_switch(env: Option<&str>, file: Option<&str>) -> bool {
+    let on = |v: &str| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes");
+    match (env, file) {
+        (Some(v), _) => on(v),
+        (None, Some(f)) => on(f),
+        (None, None) => false,
+    }
+}
+
 /// Apply a palette to the whole context: base Visuals + the app's token radius
 /// and spacing. Call when the user picks a theme in Settings ▸ Look.
 /// Touch-sized controls, without touching a single colour.
@@ -88,12 +137,18 @@ pub fn touch_targets(ctx: &Context) {
 }
 
 pub fn apply_palette(ctx: &Context, p: &Palette) -> PaletteColors {
+    apply_palette_oled(ctx, p, oled_enabled())
+}
+
+/// `apply_palette` with the OLED choice made by the caller (tests, and anyone with their own switch).
+pub fn apply_palette_oled(ctx: &Context, p: &Palette, oled: bool) -> PaletteColors {
     // The symbol fallbacks, here rather than in every app's startup, because
     // this is the one function a themed app already calls and a font nobody
     // installs is how 132 characters came to render as boxes fleet-wide.
     // Idempotent — see `fonts::install`.
     crate::fonts::install(ctx);
     let c = PaletteColors::from_palette(p);
+    let c = if oled { oled_black(&c) } else { c };
     ctx.set_visuals(build_visuals(&c));
     ctx.global_style_mut(|s| {
         s.spacing.item_spacing = egui::vec2(tokens::SPACE_SM as f32, tokens::SPACE_SM as f32);
@@ -190,6 +245,63 @@ pub(crate) fn filter_palette_colors(c: &PaletteColors, d: &settings_kit::Display
 
 #[cfg(test)]
 mod tests {
+    fn lum(c: Color32) -> f32 {
+        super::luma(c)
+    }
+
+    #[test]
+    fn oled_black_makes_the_ground_exactly_black_and_keeps_the_layers_in_order_on_every_dark_palette() {
+        let mut dark = 0;
+        for id in snapclone_theme::PaletteId::all() {
+            let c = PaletteColors::from_palette(snapclone_theme::palette_for(*id));
+            if lum(c.bg_base) > 110.0 {
+                continue; // a light palette: covered by its own test below
+            }
+            dark += 1;
+            let o = oled_black(&c);
+            assert_eq!((o.bg_base.r(), o.bg_base.g(), o.bg_base.b()), (0, 0, 0), "{id:?} ground is black");
+            assert!(lum(o.bg_base) < lum(o.bg_card), "{id:?}: the card is still above the ground");
+            assert!(lum(o.bg_card) < lum(o.bg_raised), "{id:?}: raised above card");
+            assert!(lum(o.bg_raised) < lum(o.bg_hover), "{id:?}: hover above raised");
+            assert!(lum(o.bg_hover) <= lum(c.bg_hover), "{id:?}: never brighter than it was");
+            // what is read on the surfaces is untouched
+            assert_eq!((o.text, o.accent, o.border, o.danger), (c.text, c.accent, c.border, c.danger), "{id:?}");
+        }
+        assert!(dark >= 10, "the scan found the dark palettes: {dark}");
+    }
+
+    #[test]
+    fn a_light_palette_is_left_light() {
+        let c = PaletteColors::from_palette(snapclone_theme::palette_by_id("paper"));
+        assert!(lum(c.bg_base) > 110.0, "paper is a light palette");
+        let o = oled_black(&c);
+        assert_eq!(o.bg_base, c.bg_base);
+        assert_eq!(o.bg_card, c.bg_card);
+    }
+
+    #[test]
+    fn the_oled_switch_prefers_the_environment_to_the_file_and_defaults_off() {
+        assert!(!oled_switch(None, None), "off by default: a laptop LCD gains nothing");
+        assert!(oled_switch(Some("1"), None));
+        assert!(oled_switch(Some(" On\n"), None), "case and whitespace do not matter");
+        assert!(oled_switch(None, Some("on\n")), "the per-user file");
+        assert!(!oled_switch(Some("0"), Some("on")), "the environment forces it off over the file");
+        assert!(oled_switch(Some("true"), Some("off")), "and on over the file");
+        assert!(!oled_switch(Some("maybe"), None), "anything unrecognised is off");
+    }
+
+    #[test]
+    fn apply_palette_follows_the_flag_in_the_egui_visuals_too() {
+        let ctx = Context::default();
+        let p = snapclone_theme::palette_by_id("dark");
+        let plain = apply_palette_oled(&ctx, p, false);
+        assert_ne!((plain.bg_base.r(), plain.bg_base.g(), plain.bg_base.b()), (0, 0, 0), "dark's ground is not black");
+        assert_ne!(ctx.global_style().visuals.panel_fill.r(), 0);
+        let black = apply_palette_oled(&ctx, p, true);
+        assert_eq!((black.bg_base.r(), black.bg_base.g(), black.bg_base.b()), (0, 0, 0));
+        assert_eq!(ctx.global_style().visuals.panel_fill.r(), 0, "the panels the apps paint are black");
+    }
+
     use super::*;
 
     /// The finish is glass: panels and widgets are high-alpha tints, never opaque slabs, and
