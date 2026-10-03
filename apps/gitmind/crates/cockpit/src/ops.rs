@@ -549,7 +549,7 @@ pub fn build_locally_cancellable(
                 }
                 on_line(&format!(
                     "✗ {app}: cargo succeeded but no binary at {}", bin.display()));
-                on_line("   the bin name may differ from the crate name, or sit behind a feature");
+                on_line("   the bin name may differ from the crate name, or sit behind a feature: cargo SKIPS a [[bin]] whose `required-features` are not all on, and still finishes successfully (tideshell needs layer + ei)");
                 Err(format!(
                     "build produced no artifact for {app} (looked for {})", bin.display()))
             }

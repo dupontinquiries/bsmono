@@ -316,7 +316,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     if app.push.selected.as_ref().is_some_and(|s| s.name.contains("tideshell")) {
         let mut on = cockpit::buildflags::is_cosmic_tideshell(
             app.push.selected.as_ref().map(|s| s.features.as_slice()).unwrap_or(&[]));
-        if ui.checkbox(&mut on, "COSMIC + tideshell (wayland + layer)").changed() {
+        if ui.checkbox(&mut on, "COSMIC + tideshell (wayland + layer + ei)").changed() {
             if let Some(sel) = &mut app.push.selected {
                 sel.features = if on {
                     cockpit::buildflags::with_cosmic_tideshell(sel.features.clone())

@@ -49,9 +49,7 @@ fn parse_inline_array(s: &str) -> Vec<String> {
 
 /// Scan a Cargo.toml's `[features]` table. Pure — unit-tested. (Single-line feature
 /// definitions, which is the overwhelmingly common form.)
-/// tideshell's `Cargo.toml` for reference: `layer` does NOT imply `wayland`
-/// (they gate different subsystems -- the docked panel vs. the toplevel/input
-/// method connection), so ticking only `layer` in the Push page's feature grid
+/// tideshell's `Cargo.toml` for reference: ticking only `layer` in the Push page's feature grid
 /// silently builds a keyboard that shows and never hides, or a shell with no
 /// window focus tracking. That exact gap shipped once already (the fleet
 /// store's own tideshell/rusty-board entries had it, fixed separately) -- this
@@ -61,7 +59,13 @@ fn parse_inline_array(s: &str) -> Vec<String> {
 /// "COSMIC + tideshell" in the UI is this pair, named for what it is for
 /// rather than what it does technically -- the person picking it should not
 /// need to already know these two features interact.
-pub const COSMIC_TIDESHELL_FEATURES: [&str; 2] = ["wayland", "layer"];
+///
+/// `ei` is in the set because the `tideshell` binary declares
+/// `required-features = ["layer", "ei"]`: a build with `wayland,layer` and no `ei` compiles the
+/// library, SKIPS the binary without a word, and finishes "successfully" with nothing to install
+/// (the Push page's "no binary at .../target/release/tideshell", then a misleading cross-compile
+/// fallback). `the_set_satisfies_tideshells_own_required_features` reads the real manifest.
+pub const COSMIC_TIDESHELL_FEATURES: [&str; 3] = ["wayland", "layer", "ei"];
 
 /// Turn a feature selection into one with `COSMIC_TIDESHELL_FEATURES` present,
 /// preserving every other feature and their relative order, and never
@@ -1037,19 +1041,37 @@ mod tests {
     #[test]
     fn cosmic_tideshell_adds_both_features_without_duplicating() {
         use super::{with_cosmic_tideshell, is_cosmic_tideshell};
-        assert_eq!(with_cosmic_tideshell(vec![]), vec!["wayland", "layer"]);
+        assert_eq!(with_cosmic_tideshell(vec![]), vec!["wayland", "layer", "ei"]);
         // Already-present features are kept, in their original order, and not doubled.
         assert_eq!(with_cosmic_tideshell(vec!["voice".into(), "wayland".into()]),
-                   vec!["voice", "wayland", "layer"]);
-        assert_eq!(with_cosmic_tideshell(vec!["wayland".into(), "layer".into()]),
-                   vec!["wayland", "layer"], "already the pair: unchanged");
+                   vec!["voice", "wayland", "layer", "ei"]);
+        assert_eq!(with_cosmic_tideshell(vec!["wayland".into(), "layer".into(), "ei".into()]),
+                   vec!["wayland", "layer", "ei"], "already the set: unchanged");
+    }
+
+    /// The set must switch on every feature the `tideshell` binary REQUIRES, or cargo builds the library, skips
+    /// the binary and reports success. Read from the real manifest so it cannot drift.
+    #[test]
+    fn the_set_satisfies_tideshells_own_required_features() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tideshell/egui-frontend/Cargo.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap_or_else(|e| panic!("{manifest:?}: {e}"));
+        let at = text.find("name = \"tideshell\"\n").expect("the tideshell [[bin]]");
+        let block = &text[at..text[at..].find("\n[").map(|n| at + n).unwrap_or(text.len())];
+        let line = block.lines().find(|l| l.trim_start().starts_with("required-features")).expect("tideshell declares required-features");
+        let required: Vec<String> = line.split('[').nth(1).unwrap().split(']').next().unwrap().split(',').map(|t| t.trim().trim_matches('"').to_string()).filter(|t| !t.is_empty()).collect();
+        assert!(required.len() >= 2, "the scan found them: {required:?}");
+        let set: Vec<String> = super::COSMIC_TIDESHELL_FEATURES.iter().map(|s| s.to_string()).collect();
+        for r in &required {
+            assert!(set.contains(r), "the preset must enable {r}, which the tideshell binary requires: {set:?}");
+        }
     }
 
     #[test]
     fn is_cosmic_tideshell_ignores_order_and_extras() {
         use super::is_cosmic_tideshell;
-        assert!(is_cosmic_tideshell(&["layer".into(), "wayland".into()]), "order-independent");
-        assert!(is_cosmic_tideshell(&["wayland".into(), "voice".into(), "layer".into()]), "extras don't disqualify it");
+        assert!(is_cosmic_tideshell(&["ei".into(), "layer".into(), "wayland".into()]), "order-independent");
+        assert!(is_cosmic_tideshell(&["wayland".into(), "voice".into(), "layer".into(), "ei".into()]), "extras don't disqualify it");
+        assert!(!is_cosmic_tideshell(&["layer".into(), "wayland".into()]), "missing ei: the binary would be skipped");
         assert!(!is_cosmic_tideshell(&["layer".into()]), "missing wayland");
         assert!(!is_cosmic_tideshell(&["wayland".into()]), "missing layer");
         assert!(!is_cosmic_tideshell(&[]));
