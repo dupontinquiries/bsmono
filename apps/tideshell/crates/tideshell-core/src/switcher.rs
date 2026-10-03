@@ -161,9 +161,15 @@ impl Switcher {
         }
     }
 
+    /// Closing, the switcher is gone (not drawn, not blocking) below this reveal.
+    pub const GONE_BELOW: f32 = 0.04;
+
     /// Drawn while sliding in or out, not only while open.
     pub fn is_visible(&self) -> bool {
-        self.open || self.reveal.progress > 0.001
+        // Sliding out, the critically damped spring takes ~0.65 s to fall under 0.001, and for that
+        // tail nothing is visible but the full-screen layer still swallows every touch. Stop
+        // counting it once it is a sliver.
+        self.open || self.reveal.progress > Self::GONE_BELOW
     }
 
     pub fn is_animating(&self) -> bool {
@@ -353,6 +359,22 @@ mod tests {
         assert_eq!(s.release_card(), vec![Action::Close(2)]);
         s.drag_card(2, 300.0);
         assert!(s.release_card().is_empty(), "downward drag never closes");
+    }
+
+    #[test]
+    fn closing_stops_blocking_input_well_before_the_spring_tail_ends() {
+        let mut s = three();
+        s.show();
+        for _ in 0..100 {
+            s.tick_anim(11.1);
+        }
+        s.hide();
+        let mut ms = 0.0;
+        while s.is_visible() && ms < 3000.0 {
+            s.tick_anim(11.1);
+            ms += 11.1;
+        }
+        assert!((100.0..=450.0).contains(&ms), "gone after {ms} ms (was ~650 with the 0.001 tail)");
     }
 
     #[test]
