@@ -881,7 +881,13 @@ fn main() {
         if now_ms.saturating_sub(sb.hw_checked_at) >= 3_000 {
             sb.hw_checked_at = now_ms;
             let text = std::fs::read_to_string("/proc/bus/input/devices").unwrap_or_default();
-            sb.hw_keyboard = tideshell_egui::sensors::parse_hw_input(&text).0;
+            let (kb, ptr) = tideshell_egui::sensors::parse_hw_input(&text);
+            sb.hw_keyboard = kb;
+            // No real mouse or trackpad: hide the lone system cursor; one plugged in brings it back.
+            let acts = sb.shell.set_hw_pointer(ptr);
+            if !acts.is_empty() {
+                sb.execute(acts);
+            }
         }
         let want_board = sb.shell.palette.open && sb.shell.palette.expanded && !sb.hw_keyboard;
         if want_board != sb.told_board_show {
@@ -1477,6 +1483,10 @@ fn main() {
             continue;
         }
         io.ensure_overlay(true);
+        // The compositor blurs the running apps behind the switcher and the palette sheet, so the overlay reads
+        // as a layer over them rather than a hole in them (ext-background-effect; a no-op without it).
+        io.set_blur(Role::Overlay, sb.shell.switcher.is_visible() || sb.shell.palette.is_visible());
+        sb.view.backdrop_blur = io.blur_supported();
         let region = sb.view.input_rects(&sb.shell);
         if last_region.as_ref() != Some(&region) {
             let rects: Option<Vec<(i32, i32, i32, i32)>> =

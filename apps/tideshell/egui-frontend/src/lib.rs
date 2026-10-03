@@ -199,6 +199,9 @@ pub struct ShellView {
     /// True black for an OLED panel (uikit's `oled_enabled`), read once: the ground of every surface
     /// tideshell draws and publishes goes to (0, 0, 0) instead of a lit dark grey.
     oled: Option<bool>,
+    /// The compositor blurs behind the overlay (set by the runtime each frame): the switcher's backdrop is
+    /// then a light veil over the blurred apps instead of an almost opaque sheet that hides them.
+    pub backdrop_blur: bool,
     tile_hold: Option<(Id, f64)>,
     tile_fired: Option<Id>,
     /// The switcher landed (reveal reached 1): kick the cards once.
@@ -1573,7 +1576,7 @@ impl ShellView {
         if rv < 0.5 {
             self.switcher_landed = false;
         }
-        p.rect_filled(full, cr(0), with_alpha(pal.bg_base, 0.94 * rv));
+        p.rect_filled(full, cr(0), with_alpha(pal.bg_base, if self.backdrop_blur { 0.5 } else { 0.94 } * rv));
         let rise = (1.0 - rv) * size.y * 0.35;
         let scale = 0.86 + 0.14 * rv;
         if live && ui.interact(full, Id::new("ts-sw-back"), Sense::click()).clicked() {
@@ -1599,7 +1602,9 @@ impl ShellView {
         let cards: Vec<(u64, String, String, bool)> =
             shell.switcher.cards().iter().map(|c| (c.id, c.title.clone(), c.app_id.clone(), c.activated)).collect();
         if cards.is_empty() {
-            p.text(full.center(), Align2::CENTER_CENTER, "No open windows", FontId::proportional(16.0), pal.text_weak);
+            // Fades with the reveal (and later than the backdrop, rv squared) instead of popping in and out
+            // at full strength while the backdrop is still fading; rises a little with the cards.
+            p.text(full.center() + Vec2::new(0.0, rise * 0.25), Align2::CENTER_CENTER, "No open windows", FontId::proportional(16.0), with_alpha(pal.text_weak, rv * rv));
         }
         let dragging = shell.switcher.dragging;
         for ((id, title, app, active), r) in cards.iter().zip(rects) {

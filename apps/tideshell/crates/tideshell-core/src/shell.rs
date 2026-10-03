@@ -55,6 +55,11 @@ pub struct Shell {
     pub modes: Modes,
     /// The fat cursor, present while it is in charge of the pointer.
     pub fat: Option<FatCursor>,
+    /// A real pointing device (a USB mouse or trackpad, not a touchscreen or a virtual one) is attached.
+    /// Unknown at start means "yes", so the cursor is never hidden on a guess.
+    hw_pointer: bool,
+    /// What the system cursor was last told, so it is only told on a change.
+    cursor_hidden: bool,
     /// Ambient light + time of day brightness.
     pub ambient: AutoBrightness,
     /// The command palette (press-and-hold on the bottom edge).
@@ -161,6 +166,8 @@ impl Shell {
             trackpad,
             modes: Modes::default(),
             fat: None,
+            hw_pointer: true,
+            cursor_hidden: false,
             ambient,
             palette: Palette::default(),
             apps: Vec::new(),
@@ -255,15 +262,37 @@ impl Shell {
             (true, false) => {
                 self.fat = Some(FatCursor::new(self.screen, self.now));
                 self.log("fat cursor on");
-                vec![Action::HideSystemCursor(true)]
             }
             (false, true) => {
                 self.fat = None;
                 self.log("fat cursor off");
-                vec![Action::HideSystemCursor(false)]
             }
-            _ => vec![],
+            _ => {}
         }
+        self.sync_system_cursor()
+    }
+
+    /// The system cursor is hidden while the fat cursor stands in for it OR while no real pointing device
+    /// is attached (a phone's pointer sat at the top-left corner with nothing to move it). Told only on a change.
+    fn sync_system_cursor(&mut self) -> Vec<Action> {
+        let hide = self.fat.is_some() || !self.hw_pointer;
+        if hide == self.cursor_hidden {
+            return vec![];
+        }
+        self.cursor_hidden = hide;
+        vec![Action::HideSystemCursor(hide)]
+    }
+
+    /// The runtime's report of whether a real pointing device is attached. Hides the system cursor when
+    /// none is, and gives it back the moment one is.
+    pub fn set_hw_pointer(&mut self, present: bool) -> Vec<Action> {
+        if present == self.hw_pointer {
+            return vec![];
+        }
+        self.hw_pointer = present;
+        self.log(if present { "pointing device attached: system cursor on" } else { "no pointing device: system cursor hidden" });
+        let out = self.sync_system_cursor();
+        self.emit(out)
     }
 
     pub fn set_prefs(&mut self, prefs: ShellPrefs) -> Vec<Action> {
@@ -1787,6 +1816,37 @@ mod tests {
         let mut p = sh.prefs.clone();
         p.fat_cursor = false;
         assert!(sh.set_prefs(p).contains(&Action::HideSystemCursor(false)));
+    }
+
+    #[test]
+    fn the_system_cursor_is_hidden_without_a_real_pointer_and_back_when_one_is_plugged_in() {
+        let mut sh = shell_with_three();
+        assert!(sh.set_hw_pointer(true).is_empty(), "unknown/yes at start: nothing to do");
+        assert_eq!(sh.set_hw_pointer(false), vec![Action::HideSystemCursor(true)], "no mouse: hide the lone cursor");
+        assert!(sh.set_hw_pointer(false).is_empty(), "told once");
+        assert_eq!(sh.set_hw_pointer(true), vec![Action::HideSystemCursor(false)], "a mouse arrives: the cursor is back");
+    }
+
+    #[test]
+    fn the_fat_cursor_and_the_missing_pointer_each_keep_the_system_cursor_hidden() {
+        let mut sh = shell_with_three();
+        sh.set_hw_pointer(false);
+        // the fat cursor turns on while no pointer: already hidden, no second command
+        let mut p = sh.prefs.clone();
+        p.fat_cursor = true;
+        sh.set_prefs(p);
+        let acts = sh.toggle_mode(crate::hold::HoldOption::Trackpad);
+        assert!(!acts.contains(&Action::HideSystemCursor(true)) && !acts.contains(&Action::HideSystemCursor(false)), "{acts:?}");
+        // and turning the trackpad off must NOT restore the cursor while there is still no pointer
+        let acts = sh.toggle_mode(crate::hold::HoldOption::Trackpad);
+        assert!(!acts.contains(&Action::HideSystemCursor(false)), "no pointer: the cursor stays hidden: {acts:?}");
+        // plug a mouse in with the fat cursor OFF: cursor shows
+        assert_eq!(sh.set_hw_pointer(true), vec![Action::HideSystemCursor(false)]);
+        // fat cursor ON with a mouse attached: hidden (the fat cursor draws instead), and back when it ends
+        let acts = sh.toggle_mode(crate::hold::HoldOption::Trackpad);
+        assert!(acts.contains(&Action::HideSystemCursor(true)));
+        let acts = sh.toggle_mode(crate::hold::HoldOption::Trackpad);
+        assert!(acts.contains(&Action::HideSystemCursor(false)));
     }
 
     #[test]

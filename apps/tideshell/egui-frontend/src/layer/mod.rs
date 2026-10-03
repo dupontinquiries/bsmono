@@ -52,6 +52,10 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_v1::{self, WpFractionalScaleV1},
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
+use wayland_protocols::ext::background_effect::v1::client::{
+    ext_background_effect_manager_v1::{self, ExtBackgroundEffectManagerV1},
+    ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
+};
 use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1},
     wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
@@ -175,6 +179,10 @@ struct Surf {
     /// prepare() only emits requests when something changed (it was
     /// sending set_destination on every frame, seen in WAYLAND_DEBUG).
     sent: Option<(i32, (u32, u32))>,
+    /// ext-background-effect: the compositor blurs what is BEHIND this surface over the region set.
+    /// Created on first use; `blur_for` is the surface size the region was set for (None = no blur).
+    blur: Option<ExtBackgroundEffectSurfaceV1>,
+    blur_for: Option<(u32, u32)>,
 }
 
 impl Surf {
@@ -294,6 +302,8 @@ pub struct State {
     /// tideshell did not ask for and otherwise would not know about.
     power_modes: Vec<Option<bool>>,
     pub power_status: String,
+    /// The compositor said it can blur behind surfaces (ext-background-effect `capabilities`).
+    blur_caps: bool,
     /// ext-idle-notify: an edge the loop has not consumed yet (true = the user
     /// went idle for the configured time, false = input resumed).
     idle_edge: Option<bool>,
@@ -352,6 +362,7 @@ pub struct Io {
     _seat: Option<WlSeat>,
     frac_mgr: Option<WpFractionalScaleManagerV1>,
     viewporter: Option<WpViewporter>,
+    blur_mgr: Option<ExtBackgroundEffectManagerV1>,
     pub strip_px: u32,
     /// Tint the strips so they can be seen (`TIDESHELL_SHOW_STRIPS=1`).
     pub show_strips: bool,
@@ -385,6 +396,8 @@ impl Io {
             list.iter().filter(|g| g.interface == "wl_output").map(|g| globals.registry().bind::<WlOutput, _, _>(g.name, g.version.min(4), &qh, ())).collect()
         });
         let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
+        // The compositor's own backdrop blur, for the switcher and palette sheets.
+        let blur_mgr: Option<ExtBackgroundEffectManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
         // Idle, as the compositor measures it: v1's get_idle_notification HONOURS idle
         // inhibitors, so a playing video (vidkit's wakelock) keeps the screen up.
         let idle_notifier: Option<ExtIdleNotifierV1> = globals.bind(&qh, 1..=1, ()).ok();
@@ -404,6 +417,7 @@ impl Io {
             powers: Vec::new(),
             power_modes: Vec::new(),
             power_status: String::new(),
+            blur_caps: false,
             idle_edge: None,
             out_mgr: None,
             heads: Vec::new(),
@@ -415,7 +429,7 @@ impl Io {
             overlay_cursor: CursorWant::Shape(Shape::Default),
             applied: None,
         };
-        let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, frac_mgr, viewporter, strip_px, show_strips, right_enabled: false, side_sizes: HashMap::new(), _outputs: outputs, overlay_keyboard: false, idle_notifier, idle_note: None, idle_ms: 0 };
+        let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, frac_mgr, viewporter, blur_mgr, strip_px, show_strips, right_enabled: false, side_sizes: HashMap::new(), _outputs: outputs, overlay_keyboard: false, idle_notifier, idle_note: None, idle_ms: 0 };
         io.st.out_mgr = out_mgr;
         if let Some(m) = &power_mgr {
             io.st.powers = io._outputs.iter().enumerate().map(|(i, o)| m.get_output_power(o, &io.qh, i)).collect();
@@ -473,7 +487,7 @@ impl Io {
             (None, None)
         };
         wl.commit();
-        self.st.surfs.push(Surf { role, wl, layer, size: (0, 0), configured: false, fresh: false, scale: 1, closed: false, frac, frac_scale: None, viewport, sent: None });
+        self.st.surfs.push(Surf { role, wl, layer, size: (0, 0), configured: false, fresh: false, scale: 1, closed: false, frac, frac_scale: None, viewport, sent: None, blur: None, blur_for: None });
         if role == Role::Right && !self.right_enabled {
             self.set_input_region(Role::Right, Some(&[]));
         }
@@ -539,10 +553,49 @@ impl Io {
                 if let Some(v) = &s.viewport {
                     v.destroy();
                 }
+                if let Some(b) = &s.blur {
+                    b.destroy();
+                }
                 s.layer.destroy();
                 s.wl.destroy();
             }
         }
+    }
+
+    /// Whether the compositor blurs behind surfaces on request. False until its capabilities event has
+    /// arrived, and on a compositor without the protocol.
+    pub fn blur_supported(&self) -> bool {
+        self.blur_mgr.is_some() && self.st.blur_caps
+    }
+
+    /// Ask the compositor to blur what is behind `role`'s surface (all of it), or stop. Cheap to call every
+    /// loop: it acts only when the wish or the surface size changed.
+    pub fn set_blur(&mut self, role: Role, on: bool) {
+        let Some(mgr) = self.blur_mgr.clone().filter(|_| self.st.blur_caps) else { return };
+        let Some(i) = self.st.surfs.iter().position(|s| s.role == role) else { return };
+        let size = self.st.surfs[i].size;
+        let want = on.then_some(size).filter(|s| s.0 > 0 && s.1 > 0);
+        if self.st.surfs[i].blur_for == want {
+            return;
+        }
+        if self.st.surfs[i].blur.is_none() {
+            let obj = mgr.get_background_effect(&self.st.surfs[i].wl, &self.qh, ());
+            self.st.surfs[i].blur = Some(obj);
+        }
+        let wl = self.st.surfs[i].wl.clone();
+        let obj = self.st.surfs[i].blur.clone().expect("just created");
+        match want {
+            Some((w, h)) => {
+                let region = self.compositor.create_region(&self.qh, ());
+                region.add(0, 0, w as i32, h as i32);
+                obj.set_blur_region(Some(&region));
+                region.destroy();
+            }
+            None => obj.set_blur_region(None),
+        }
+        // Double-buffered state: applied at the next commit; a frame may not be due for a while.
+        wl.commit();
+        self.st.surfs[i].blur_for = want;
     }
 
     fn side_size(&self, role: Role) -> (u32, i32) {
@@ -961,6 +1014,15 @@ impl Dispatch<WlKeyboard, ()> for State {
     }
 }
 noop!(WpFractionalScaleManagerV1);
+noop!(ExtBackgroundEffectSurfaceV1);
+
+impl Dispatch<ExtBackgroundEffectManagerV1, ()> for State {
+    fn event(st: &mut Self, _: &ExtBackgroundEffectManagerV1, e: ext_background_effect_manager_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        if let ext_background_effect_manager_v1::Event::Capabilities { flags } = e {
+            st.blur_caps = matches!(flags, WEnum::Value(f) if f.contains(ext_background_effect_manager_v1::Capability::Blur));
+        }
+    }
+}
 noop!(WpViewporter);
 noop!(WpViewport);
 
