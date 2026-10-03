@@ -45,6 +45,11 @@ struct Pending {
     child: std::process::Child,
     /// What the shell should undo if this fails.
     on_fail: Option<Undo>,
+    /// A resident program (hatch): tracked ONLY so it is reaped when it exits. Its exit is not a result
+    /// anyone wants reported, but an unreaped child stays a zombie with a live-looking pid, and hatch's
+    /// single-instance lock named that pid: every later launch decided "already running", poked a corpse,
+    /// and exited, so hatch never reappeared after it hid.
+    quiet: bool,
 }
 
 /// A state change the engine made optimistically that a failed command
@@ -135,15 +140,13 @@ impl System {
     }
 
     fn start_with(&mut self, argv: &[&str], long_running: bool, on_fail: Option<Undo>) -> Outcome {
-        // A long-running program (hatch-egui staying resident) is never
-        // reaped; only short calls whose exit status IS the result are.
+        // A long-running program (hatch-egui staying resident) is tracked QUIETLY: reaped when it exits,
+        // never reported. Short calls whose exit status IS the result are reported by `reap`.
         match spawn_child(argv, !long_running) {
             Ok(child) => {
                 let label = argv.iter().filter(|a| !a.is_empty()).cloned().collect::<Vec<_>>().join(" ");
                 let msg = format!("started {label} (pid {})", child.id());
-                if !long_running {
-                    self.pending.push(Pending { label, child, on_fail });
-                }
+                self.pending.push(Pending { label, child, on_fail, quiet: long_running });
                 Outcome::Done(msg)
             }
             Err(o) => o,
@@ -154,7 +157,12 @@ impl System {
     /// last call. Call once per loop iteration and put them in the trace.
     pub fn reap(&mut self) -> Vec<(Outcome, Option<Undo>)> {
         let mut out = Vec::new();
-        self.pending.retain_mut(|p| match p.child.try_wait() {
+        self.pending.retain_mut(|p| {
+            if p.quiet {
+                // Reap it, say nothing: `try_wait` collecting the status is what ends the zombie.
+                return !matches!(p.child.try_wait(), Ok(Some(_)) | Err(_));
+            }
+            match p.child.try_wait() {
             Ok(Some(status)) if status.success() => {
                 out.push((Outcome::Done(format!("{} succeeded", p.label)), None));
                 false
@@ -173,6 +181,7 @@ impl System {
             Err(e) => {
                 out.push((Outcome::Failed(format!("{}: {e}", p.label)), p.on_fail));
                 false
+            }
             }
         });
         out
@@ -1098,10 +1107,26 @@ mod tests {
     }
 
     #[test]
-    fn long_running_commands_are_not_tracked() {
+    fn a_resident_program_is_reaped_when_it_exits_and_never_reported() {
         let mut sys = System { launcher: None, pending: Vec::new(), session_bus: None };
-        sys.start(&["sleep", "5"], true);
-        assert!(sys.pending.is_empty());
+        // one that exits at once (hatch hiding on Wayland), one that stays
+        sys.start(&["true"], true);
+        sys.start(&["sleep", "30"], true);
+        assert_eq!(sys.pending.len(), 2, "both are tracked, so both can be reaped");
+        let pids: Vec<u32> = sys.pending.iter().map(|p| p.child.id()).collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut reported = Vec::new();
+        while sys.pending.len() > 1 && std::time::Instant::now() < deadline {
+            reported.extend(sys.reap());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(reported.is_empty(), "a resident program's exit is not a result: {reported:?}");
+        assert_eq!(sys.pending.len(), 1, "the one that exited is gone, the sleeper is still watched");
+        assert!(!std::path::Path::new(&format!("/proc/{}", pids[0])).exists(), "and NOT left as a zombie with a live-looking pid");
+        for p in &mut sys.pending {
+            let _ = p.child.kill();
+            let _ = p.child.wait();
+        }
     }
 
     #[test]
