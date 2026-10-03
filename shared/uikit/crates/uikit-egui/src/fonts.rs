@@ -68,16 +68,11 @@ const INSTALLED: &str = "uikit-egui/fonts-installed";
 /// Idempotent: rebuilding the font atlas is not free, and this is called from
 /// [`crate::apply_palette`], which an app may call on every settings change.
 pub fn install(ctx: &Context) {
-    // THE ON-SCREEN KEYBOARD, from the same hook.
-    //
-    // Every app in the fleet reaches this function — that is what
-    // `font_install_check.py` enforces — which makes it the one place a
-    // window-level setting can be applied without twenty-three apps
-    // remembering to. See `crate::ime` for why IME needs asking for at all.
-    //
-    // It is its own idempotent flag, not this one: a context that already had
-    // fonts installed by an earlier version must still get the IME request.
-    crate::ime::allow_ime(ctx);
+    // NOT `ime::allow_ime` any more. It was called from here, and because every app reaches this
+    // function that made EVERY window ask the compositor for text input permanently at startup: the
+    // on-screen keyboard came up on vidkit-player (and any other app) with no field focused. egui-winit
+    // already enables IME when a text field gains focus and drops it when none has, and the one
+    // character bug it was aimed at was a different fault (`ime::ImeRepair`). See `crate::ime`.
     if ctx.data(|d| d.get_temp::<bool>(egui::Id::new(INSTALLED))).unwrap_or(false) {
         return;
     }
@@ -130,25 +125,18 @@ mod ime_hook_tests {
     use super::*;
 
     #[test]
-    fn installing_the_fonts_also_asks_for_ime() {
-        // The WIRING, not the mechanism. `ime`'s own tests cover the request;
-        // this covers the fact that `fonts::install` makes it — which is the
-        // whole distribution strategy, because every app in the fleet reaches
-        // this function (font_install_check.py enforces that) and none of them
-        // would remember a second call.
-        //
-        // Written because deleting the call from `install` failed no test,
-        // exactly like the unendlich consent seed in 62474b370. The mechanism
-        // and its wiring need separate assertions; a test of the mechanism
-        // passes perfectly with nothing calling it.
+    fn installing_the_fonts_does_not_make_the_window_claim_text_input() {
+        // THE OPPOSITE of what this test used to say. `install` used to ask for IME (every app reaches it,
+        // so that was "the distribution strategy"), and that made every window claim text input at
+        // startup and for good: on the phone the on-screen keyboard rose over apps with no field focused
+        // (vidkit-player, an empty home screen). The one-character bug it was aimed at was a different
+        // fault, fixed by `ime::ImeRepair`; egui-winit enables IME by itself when a field has focus.
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput::default());
-        assert!(!crate::ime::ime_requested(&ctx));
         install(&ctx);
         assert!(
-            crate::ime::ime_requested(&ctx),
-            "fonts::install no longer asks for IME — on-screen keyboards will \
-             not reach a text field until it already has focus"
+            !crate::ime::ime_requested(&ctx),
+            "fonts::install must not enable IME: the on-screen keyboard would open over every app"
         );
         let _ = ctx.end_pass();
     }

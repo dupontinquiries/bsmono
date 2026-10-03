@@ -34,6 +34,15 @@
 //! fleet calls `set_ime_allowed` or sends `ViewportCommand::IMEAllowed`
 //! proactively; the grep is empty across `apps/`, `shared/` and `system/`.
 //!
+//! # RETRACTED: do not call `allow_ime` from a shared hook
+//!
+//! It was called from `fonts::install`, which every themed app reaches, so every window asked the
+//! compositor for text input at startup and for good. On the Fairphone that raised the on-screen
+//! keyboard over apps with NO field focused (seen: vidkit-player, an empty home screen). The premise
+//! below ("the window spends the first frame of every focus with IME disabled") costs nothing in
+//! practice: the keyboard appears a frame after the tap and nobody types in that frame. The function
+//! stays for an app that really wants IME on from the start (a terminal), and it is not called by default.
+//!
 //! # What this module does, and what it does not claim
 //!
 //! [`allow_ime`] sends `ViewportCommand::IMEAllowed(true)` once at startup, so
