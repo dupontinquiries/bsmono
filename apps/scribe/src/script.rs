@@ -39,8 +39,12 @@ pub enum Item {
     /// A line, optionally spoken. A continuing line of the same speech has `speaker: None`.
     /// `text` may hold `\n` (a Fountain paragraph's own line breaks).
     Line { speaker: Option<String>, text: String },
-    /// A parenthetical, a transition, a stage direction.
+    /// A parenthetical or a stage direction: set with the dialogue.
     Direction(String),
+    /// Description: what is seen and done (Fountain "action"). Left-aligned by default.
+    Action(String),
+    /// `CUT TO:` and the like.
+    Transition(String),
     /// A section heading (`#` in Fountain): an outline level and its title.
     Section { level: usize, text: String },
     PageBreak,
@@ -60,11 +64,12 @@ pub enum Dialect {
 
 impl Script {
     pub fn scenes(&self) -> usize { self.items.iter().filter(|i| matches!(i, Item::Scene(_))).count() }
+    pub fn actions(&self) -> usize { self.items.iter().filter(|i| matches!(i, Item::Action(_))).count() }
     pub fn lines(&self) -> usize { self.items.iter().filter(|i| matches!(i, Item::Line { .. })).count() }
     pub fn words(&self) -> usize {
         self.items.iter().map(|i| match i {
             Item::Line { text, .. } => text.split_whitespace().count(),
-            Item::Scene(t) | Item::Direction(t) => t.split_whitespace().count(),
+            Item::Scene(t) | Item::Direction(t) | Item::Action(t) | Item::Transition(t) => t.split_whitespace().count(),
             _ => 0,
         }).sum()
     }
@@ -227,7 +232,7 @@ pub fn parse(text: &str, dialect: Dialect) -> Script {
             continue;
         }
         if is_transition(t) {
-            s.items.push(Item::Direction(t.trim_start_matches('>').trim().to_string()));
+            s.items.push(Item::Transition(t.trim_start_matches('>').trim().to_string()));
             i += 1;
             continue;
         }
@@ -253,7 +258,7 @@ pub fn parse(text: &str, dialect: Dialect) -> Script {
             Dialect::Fountain => {
                 // forced action / lyrics
                 if let Some(a) = t.strip_prefix('!') {
-                    s.items.push(Item::Line { speaker: None, text: a.trim().to_string() });
+                    s.items.push(Item::Action(a.trim().to_string()));
                     i += 1;
                     continue;
                 }
@@ -291,7 +296,7 @@ pub fn parse(text: &str, dialect: Dialect) -> Script {
                     i += 1;
                 }
                 last_blank = !(i < n && !lines[i].trim().is_empty());
-                s.items.push(Item::Line { speaker: None, text: para.join("\n") });
+                s.items.push(Item::Action(para.join("\n")));
             }
         }
     }
@@ -343,16 +348,16 @@ mod tests {
         assert_eq!(s.meta.draft_date.as_deref(), Some("2026-10-03"));
         assert_eq!(s.meta.notes.as_deref(), Some("Running time approx. 20 minutes"));
         // the title page's own break is dropped; the character list lines are action, not cues (lowercase in them)
-        assert!(matches!(&s.items[0], Item::Line { text, .. } if text == "**CHARACTERS**"), "{:?}", s.items[0]);
+        assert!(matches!(&s.items[0], Item::Action(text) if text == "**CHARACTERS**"), "{:?}", s.items[0]);
         let has = |it: &Item| s.items.contains(it);
-        assert!(has(&Item::Line { speaker: None, text: "DETECTIVE CAROL DAVIS (30s)\nJASMINE (20s), a prostitute. Victim #1".into() }), "{:#?}", s.items);
+        assert!(has(&Item::Action("DETECTIVE CAROL DAVIS (30s)\nJASMINE (20s), a prostitute. Victim #1".into())), "{:#?}", s.items);
         assert!(has(&Item::PageBreak));
         assert!(has(&Item::Scene("EXT. ALLEYWAY - NIGHT".into())));
-        assert!(has(&Item::Line { speaker: None, text: "A single streetlamp buzzes. Flies circle it.\nA second line of the same paragraph.".into() }), "an action paragraph keeps its line breaks");
+        assert!(has(&Item::Action("A single streetlamp buzzes. Flies circle it.\nA second line of the same paragraph.".into())), "an action paragraph keeps its line breaks");
         assert!(has(&Item::Line { speaker: Some("JASMINE".into()), text: "Hello sweetie, this is a first.".into() }));
         assert!(has(&Item::Direction("(softly)".into())));
         assert!(has(&Item::Line { speaker: None, text: "For the right price.".into() }), "a continuing line has no speaker");
-        assert!(has(&Item::Direction("CUT TO:".into())));
+        assert!(has(&Item::Transition("CUT TO:".into())));
         assert!(has(&Item::Scene("FLASHBACK".into())), "a leading dot forces a scene");
         assert!(has(&Item::Line { speaker: None, text: "THE END".into() }), "centred text");
         assert!(has(&Item::Line { speaker: Some("CAROL (V.O.)".into()), text: "It was cold.".into() }), "notes and boneyard are gone, the cue after them is found");
@@ -375,9 +380,9 @@ mod tests {
     #[test]
     fn a_heading_with_no_blank_line_before_it_still_starts_a_scene() {
         let s = parse("SCENE 1\n    EXT. ALLEYWAY- NIGHT\nA streetlamp buzzes.\n\nJASMINE\nHello.", Dialect::Fountain);
-        assert_eq!(s.items[0], Item::Line { speaker: None, text: "SCENE 1".into() });
+        assert_eq!(s.items[0], Item::Action("SCENE 1".into()));
         assert_eq!(s.items[1], Item::Scene("EXT. ALLEYWAY- NIGHT".into()));
-        assert_eq!(s.items[2], Item::Line { speaker: None, text: "A streetlamp buzzes.".into() });
+        assert_eq!(s.items[2], Item::Action("A streetlamp buzzes.".into()));
         assert_eq!(s.items[3], Item::Line { speaker: Some("JASMINE".into()), text: "Hello.".into() });
     }
 

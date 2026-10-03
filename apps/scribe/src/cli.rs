@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 pub const USAGE: &str = "scribe -- type scenes and lines, export a centred page for printing
 
   scribe export <file> [-o out.html] [--style NAME] [--font \"Georgia, serif\"] [--size PT]
-                       [--paper letter|a4] [--numbers] [--no-page-numbers] [--no-title]
+                       [--paper letter|a4] [--numbers] [--center-all] [--no-page-numbers] [--no-title]
   scribe styles
   scribe info <file>
 
@@ -43,6 +43,7 @@ pub fn parse_export(args: &[String]) -> Result<Export, String> {
             "--size" => o.size_pt = Some(val("--size")?.parse::<f32>().map_err(|_| "--size wants a number of points".to_string())?),
             "--paper" => { let v = val("--paper")?; o.paper = Paper::parse(&v).ok_or(format!("paper is letter or a4, not {v:?}"))?; }
             "--numbers" => o.scene_numbers = true,
+            "--center-all" => o.center_all = true,
             "--no-page-numbers" => o.page_numbers = false,
             "--no-title" => o.title_page = false,
             f if f.starts_with('-') => return Err(format!("unknown option {f}")),
@@ -62,7 +63,7 @@ pub fn export(e: &Export) -> Result<String, String> {
     let s = script::parse_any(name, &text);
     let page = html::render(&s, &e.options);
     std::fs::write(&e.output, page).map_err(|err| format!("{}: {err}", e.output.display()))?;
-    Ok(format!("{}: {} scenes, {} lines, {} words -> {} ({})", e.input.display(), s.scenes(), s.lines(), s.words(), e.output.display(), e.options.style.name))
+    Ok(format!("{}: {} scenes, {} lines, {} action, {} words -> {} ({})", e.input.display(), s.scenes(), s.lines(), s.actions(), s.words(), e.output.display(), e.options.style.name))
 }
 
 pub fn styles_text() -> String {
@@ -74,7 +75,7 @@ pub fn info(path: &Path) -> Result<String, String> {
     let name = path.file_name().and_then(|n| n.to_str());
     let d = script::detect(name, &text);
     let s = script::parse(&text, d);
-    Ok(format!("{}: {:?}, {} scenes, {} lines, {} words{}", path.display(), d, s.scenes(), s.lines(), s.words(),
+    Ok(format!("{}: {:?}, {} scenes, {} lines, {} action, {} words{}", path.display(), d, s.scenes(), s.lines(), s.actions(), s.words(),
         s.meta.title.as_ref().map(|t| format!(", titled {t:?}")).unwrap_or_default()))
 }
 
@@ -97,7 +98,8 @@ mod tests {
 
     #[test]
     fn export_arguments_are_checked() {
-        let e = parse_export(&a(&["s.txt", "--style", "noir", "--paper", "a4", "--numbers", "--size", "13"])).unwrap();
+        let e = parse_export(&a(&["s.txt", "--style", "noir", "--paper", "a4", "--numbers", "--size", "13", "--center-all"])).unwrap();
+        assert!(e.options.center_all);
         assert_eq!(e.options.style.name, "noir");
         assert_eq!(e.options.paper, Paper::A4);
         assert!(e.options.scene_numbers);
@@ -114,7 +116,7 @@ mod tests {
         let src = d.path().join("film.fountain");
         std::fs::write(&src, "Title: HEAT\nAuthor: A\n\nINT. ROOM - DAY\n\nMARA\nWait.\n\nShe waits.\n").unwrap();
         let out = run(&a(&["export", src.to_str().unwrap(), "--style", "marquee"])).unwrap();
-        assert!(out.contains("1 scenes, 2 lines"), "{out}");
+        assert!(out.contains("1 scenes, 1 lines, 1 action"), "{out}");
         let html = std::fs::read_to_string(d.path().join("film.html")).unwrap();
         assert!(html.contains("<h1>HEAT</h1>") && html.contains("INT. ROOM - DAY") && html.contains("Playfair"));
         let info = run(&a(&["info", src.to_str().unwrap()])).unwrap();

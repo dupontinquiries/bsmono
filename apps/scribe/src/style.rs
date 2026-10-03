@@ -115,11 +115,14 @@ pub struct Options {
     pub page_numbers: bool,
     /// A title page from the script's Title/Author lines (when it has any).
     pub title_page: bool,
+    /// Centre the scene headings, the action and the transitions too (by default they sit at the left of the
+    /// column and only the dialogue is centred, as on a screenplay page).
+    pub center_all: bool,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { style: STYLES[0], font: None, size_pt: None, paper: Paper::Letter, scene_numbers: false, page_numbers: true, title_page: true }
+        Options { style: STYLES[0], font: None, size_pt: None, paper: Paper::Letter, scene_numbers: false, page_numbers: true, title_page: true, center_all: false }
     }
 }
 

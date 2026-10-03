@@ -124,6 +124,7 @@ impl Editor {
             let mut a4 = o.paper == Paper::A4;
             if ui.checkbox(&mut a4, "A4").changed() { o.paper = if a4 { Paper::A4 } else { Paper::Letter }; changed = true; }
             changed |= ui.checkbox(&mut o.scene_numbers, "scene numbers").changed();
+            changed |= ui.checkbox(&mut o.center_all, "centre everything").on_hover_text("also centre scene headings, action and transitions (by default only the dialogue is centred)").changed();
         });
         if changed { self.settings.save(); }
     }
@@ -141,13 +142,19 @@ impl Editor {
             // the text column, centred in the page (never an indent)
             let col = (o.style.column_in * 96.0).min(width);
             ui.set_width(width);
-            let mut centred = |ui: &mut egui::Ui, text: &str, sz: f32, c: egui::Color32, gap: f32| {
+            let mut put = |ui: &mut egui::Ui, text: &str, sz: f32, c: egui::Color32, gap: f32, left: bool| {
                 let mut job = egui::text::LayoutJob::simple(text.to_string(), egui::FontId::new(sz, family.clone()), c, col);
-                job.halign = egui::Align::Center;
+                job.halign = if left { egui::Align::LEFT } else { egui::Align::Center };
                 let galley = ui.painter().layout_job(job);
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(width, galley.size().y + gap), egui::Sense::hover());
-                ui.painter().galley(egui::pos2(rect.center().x, rect.top()), galley, c);
+                // the column is centred on the page; a left block starts at the column's left edge, a centred one is
+                // centred on the column's axis (no indent either way)
+                let x = if left { rect.center().x - col / 2.0 } else { rect.center().x };
+                ui.painter().galley(egui::pos2(x, rect.top()), galley, c);
             };
+            let block_left = !o.center_all;
+            let mut centred = |ui: &mut egui::Ui, text: &str, sz: f32, c: egui::Color32, gap: f32| put(ui, text, sz, c, gap, false);
+            let mut leftward = |ui: &mut egui::Ui, text: &str, sz: f32, c: egui::Color32, gap: f32| put(ui, text, sz, c, gap, block_left);
             let m = &script.meta;
             if o.title_page && !m.is_empty() {
                 ui.add_space(10.0);
@@ -165,9 +172,9 @@ impl Editor {
                         let t = if o.style.scene.uppercase { t.to_uppercase() } else { t };
                         let t = if o.scene_numbers { format!("{scene_no}.  {t}") } else { t };
                         ui.add_space(size * 1.2);
-                        centred(ui, &t, size, ink, 6.0);
+                        leftward(ui, &t, size, ink, 6.0);
                         let r = ui.cursor();
-                        if o.style.scene.rule { ui.painter().hline(egui::Rangef::new(r.center().x - col * 0.3, r.center().x + col * 0.3), r.top() - 3.0, egui::Stroke::new(1.0_f32, accent)); }
+                        if o.style.scene.rule { ui.painter().hline(egui::Rangef::new(r.center().x - col / 2.0, r.center().x + col / 2.0), r.top() - 3.0, egui::Stroke::new(1.0_f32, accent)); }
                     }
                     Item::Line { speaker, text } => {
                         if let Some(n) = speaker {
@@ -180,6 +187,8 @@ impl Editor {
                         }
                     }
                     Item::Direction(t) => centred(ui, &html::plain(t), size * 0.95, accent, size * 0.5),
+                    Item::Action(t) => leftward(ui, &html::plain(t), size, ink, size * 0.5),
+                    Item::Transition(t) => leftward(ui, &html::plain(t).to_uppercase(), size * 0.95, accent, size * 0.5),
                     Item::Section { text, .. } => centred(ui, &html::plain(text).to_uppercase(), size * 0.8, accent, 4.0),
                     Item::PageBreak => { ui.add_space(8.0); let r = ui.cursor(); ui.painter().hline(egui::Rangef::new(r.left() + 20.0, r.right() - 20.0), r.top(), egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.5))); ui.add_space(12.0); }
                 }
@@ -228,7 +237,7 @@ impl Editor {
                 });
             }
         }
-        let script_line = { let s = self.script(); format!("{} scenes · {} lines · {} words", s.scenes(), s.lines(), s.words()) };
+        let script_line = { let s = self.script(); format!("{} scenes · {} lines · {} action · {} words", s.scenes(), s.lines(), s.actions(), s.words()) };
         ui.separator();
         ui.add(egui::Label::new(egui::RichText::new(format!("{script_line} — {}", self.report)).small().weak()).truncate());
         // autosave a moment after the last keystroke
@@ -278,7 +287,7 @@ mod tests {
                 assert!(all.contains(want), "{size:?}: `{want}` not drawn in {all}");
             }
         }
-        assert_eq!((e.script().scenes(), e.script().lines()), (1, 2));
+        assert_eq!((e.script().scenes(), e.script().lines(), e.script().actions()), (1, 1, 1));
     }
 
     #[test]

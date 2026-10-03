@@ -1,8 +1,10 @@
 //! html -- a script as one self-contained page for printing: no scripts, no external fonts or files.
 //!
-//! Everything is centred, and TRULY centred: the text column is centred on the page (`margin: 0 auto`) and
-//! every line is `text-align: center` inside it, so a wrapped line stays centred about the same axis. No
-//! rule anywhere uses an indent, a left margin or left padding (a test holds the CSS to that).
+//! The text column is centred on the page (`margin: 0 auto`). Spoken lines (and their speakers, directions
+//! and sections) are `text-align: center` inside it, TRULY centred, so a wrapped line stays centred about the
+//! same axis; scene headings, action and transitions sit at the left of the column as on a screenplay page
+//! (`Options::center_all` centres those too). No rule anywhere uses an indent, a left margin or left padding
+//! (a test holds the CSS to that).
 
 use crate::script::{Item, Meta, Script};
 use crate::style::Options;
@@ -122,12 +124,15 @@ fn css(o: &Options) -> String {
 html{{background:var(--paper);color:var(--ink)}}
 body{{margin:0;padding:2.5rem 1rem;font-family:var(--font);font-size:{size}pt;line-height:{leading};text-align:center;-webkit-print-color-adjust:exact;print-color-adjust:exact}}
 main{{width:min(100%,{column}in);margin:0 auto;text-align:center}}
-.line,.direction,.scene,.section,.titlepage *{{text-align:center}}
+.line,.direction,.section,.titlepage *{{text-align:center}}
+.scene,.action,.transition{{text-align:{block_align}}}
 .line{{margin:0 0 .85em}}
 .line.cont{{margin-top:-.45em}}
 .speaker{{display:block;margin:1.3em 0 .15em;letter-spacing:{sp_ls}em;{sp_caps}{sp_sc}{sp_b}}}
 .said{{display:block}}
 .direction{{margin:0 0 .85em;font-style:italic}}
+.action{{margin:0 0 .85em}}
+.transition{{margin:0 0 .85em;text-transform:uppercase}}
 .scene{{margin:2.4em 0 1.1em;letter-spacing:{sc_ls}em;{scene_caps}{scene_sc}{scene_b}{rule}break-after:avoid;font-size:1em}}
 .scene .num{{margin-right:.7em;color:var(--accent)}}
 .section{{margin:2em 0 .6em;font-size:.85em;letter-spacing:.2em;text-transform:uppercase;color:var(--accent);break-after:avoid}}
@@ -139,6 +144,7 @@ main{{width:min(100%,{column}in);margin:0 auto;text-align:center}}
 .titlepage .small{{margin-top:3em;font-size:.8em;opacity:.75;white-space:pre-line}}
 @media print{{html{{background:#fff;color:#000}}body{{padding:0}}{print_ink}}}
 ",
+        block_align = if o.center_all { "center" } else { "left" },
         paper = o.paper.css(), page_numbers = page_numbers, font = o.font_stack(), ink = s.ink, paper_bg = s.paper, accent = s.accent,
         size = size, leading = s.leading, column = s.column_in,
         sp_ls = s.speaker.spacing_em, sc_ls = s.scene.spacing_em,
@@ -186,6 +192,8 @@ pub fn render(script: &Script, o: &Options) -> String {
                 }
             }
             Item::Direction(t) => { body.push_str(&format!("<p class=\"direction\">{}</p>\n", inline(t))); prev_speaker_line = false; }
+            Item::Action(t) => { body.push_str(&format!("<p class=\"action\">{}</p>\n", inline(t))); prev_speaker_line = false; }
+            Item::Transition(t) => { body.push_str(&format!("<p class=\"transition\">{}</p>\n", inline(t))); prev_speaker_line = false; }
             Item::Section { text, level } => { body.push_str(&format!("<h3 class=\"section l{level}\">{}</h3>\n", inline(text))); prev_speaker_line = false; }
             Item::PageBreak => { body.push_str("<div class=\"pagebreak\"></div>\n"); prev_speaker_line = false; }
         }
@@ -204,17 +212,30 @@ mod tests {
     fn page(text: &str, o: &Options) -> String { render(&parse(text, Dialect::Quick), o) }
 
     #[test]
-    fn every_line_is_centred_and_nothing_is_indented() {
+    fn dialogue_is_truly_centred_scenes_and_action_sit_left_and_nothing_is_indented() {
         for style in STYLES {
             let h = page("# a\nmara: hi\nplain line that is long enough to wrap onto a second line when it needs to\n(beat)", &Options { style, ..Options::default() });
             let css = &h[h.find("<style>").unwrap()..h.find("</style>").unwrap()];
-            assert!(css.contains(".line,.direction,.scene,.section,.titlepage *{text-align:center}"), "{}: lines are centred", style.name);
+            assert!(css.contains(".line,.direction,.section,.titlepage *{text-align:center}"), "{}: spoken lines are centred", style.name);
+            assert!(css.contains(".scene,.action,.transition{text-align:left}"), "{}: scenes and action are left by default", style.name);
             assert!(css.contains("main{width:min(100%,") && css.contains("margin:0 auto;text-align:center}"), "{}: the column is centred on the page", style.name);
-            for banned in ["text-indent", "padding-left", "margin-left", "text-align:left", "text-align:right", "text-align:justify", "float:"] {
+            for banned in ["text-indent", "padding-left", "margin-left", "text-align:right", "text-align:justify", "float:"] {
                 assert!(!css.contains(banned), "{}: the CSS must not use {banned}", style.name);
             }
             assert!(h.contains("<p class=\"line\">") && h.contains("<h2 class=\"scene\">"), "{}", style.name);
+            // the owner's switch: centre everything
+            let all = page("# a", &Options { style, center_all: true, ..Options::default() });
+            assert!(all.contains(".scene,.action,.transition{text-align:center}"), "{}: centre-all centres them too", style.name);
         }
+    }
+
+    #[test]
+    fn fountain_action_and_transitions_get_their_own_classes() {
+        let h = render(&parse("EXT. ALLEY - NIGHT\n\nA lamp buzzes.\nFlies circle it.\n\nJASMINE\nHello.\n\nCUT TO:\n", Dialect::Fountain), &Options::default());
+        assert!(h.contains("<h2 class=\"scene\">EXT. ALLEY - NIGHT</h2>"));
+        assert!(h.contains("<p class=\"action\">A lamp buzzes.<br>Flies circle it.</p>"), "{h}");
+        assert!(h.contains("<span class=\"speaker\">JASMINE</span><span class=\"said\">Hello.</span>"));
+        assert!(h.contains("<p class=\"transition\">CUT TO:</p>"));
     }
 
     #[test]

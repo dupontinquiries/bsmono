@@ -25,9 +25,9 @@ impl Default for Settings {
 impl Settings {
     pub fn to_text(&self) -> String {
         let o = &self.options;
-        format!("style = {}\nfont = {}\nsize = {}\npaper = {}\nscene_numbers = {}\npage_numbers = {}\ntitle_page = {}\nview = {}\n",
+        format!("style = {}\nfont = {}\nsize = {}\npaper = {}\nscene_numbers = {}\npage_numbers = {}\ntitle_page = {}\ncenter_all = {}\nview = {}\n",
             o.style.name, o.font.clone().unwrap_or_default(), o.size_pt.map(|s| s.to_string()).unwrap_or_default(),
-            o.paper.css().to_ascii_lowercase(), o.scene_numbers, o.page_numbers, o.title_page, self.view)
+            o.paper.css().to_ascii_lowercase(), o.scene_numbers, o.page_numbers, o.title_page, o.center_all, self.view)
     }
 
     /// Anything missing or unreadable keeps its default; nothing here can fail.
@@ -44,6 +44,7 @@ impl Settings {
                 "scene_numbers" => s.options.scene_numbers = v == "true",
                 "page_numbers" => s.options.page_numbers = v != "false",
                 "title_page" => s.options.title_page = v != "false",
+                "center_all" => s.options.center_all = v == "true",
                 "view" if ["type", "page", "both"].contains(&v) => s.view = v.to_string(),
                 _ => {}
             }
@@ -81,6 +82,7 @@ mod tests {
         s.options.paper = Paper::A4;
         s.options.scene_numbers = true;
         s.options.page_numbers = false;
+        s.options.center_all = true;
         s.view = "page".into();
         assert_eq!(Settings::parse(&s.to_text()), s);
         let bad = Settings::parse("style = nope\nfont = x;}\nsize = NaN\npaper = legal\nview = sideways\ngarbage\nscene_numbers = maybe");

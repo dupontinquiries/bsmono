@@ -19,7 +19,11 @@ impl eframe::App for Host {
 
 fn main() -> eframe::Result<()> {
     const APP_ID: &str = "org.scribe.Scribe";
-    let path = std::env::args().nth(1).map(std::path::PathBuf::from);
+    // No file named (a launcher entry, a phone): keep the work in ~/Documents/scribe/untitled.fountain, which is
+    // reloaded next time, so typing is never lost.
+    let path = std::env::args().nth(1).map(std::path::PathBuf::from).or_else(|| {
+        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Documents").join("scribe").join("untitled.fountain"))
+    });
     eframe::run_native(
         "scribe",
         eframe::NativeOptions {
