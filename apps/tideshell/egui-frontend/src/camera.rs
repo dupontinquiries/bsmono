@@ -168,13 +168,28 @@ impl Default for Duty {
 /// what the pane shows: a change too small to alter the tint is, for this
 /// purpose, not a change. `threshold` is mean absolute difference per
 /// channel, 0..255.
+///
+/// The threshold is a floor for a BRIGHT scene and is raised in the dark. With the exposure frozen
+/// (see [`Exposure`]) a dark room sits at a few levels of an 8-bit range, where the sensor's own noise
+/// and quantisation swing the grid mean by 5-7 levels between two frames of the same wall. On the
+/// phone (log of 2026-10-02) the means read 15, 22, 15, 15, 20, 18, 15: every one of those counted as
+/// "the room changed", the backoff never started, and the camera was spawned every 30 s for as long as
+/// the cover was up. A real change in the dark (a light coming on) is tens of levels, so the
+/// allowance rises with the previous reading up to a cap and a genuine change still clears it.
 pub fn scene_changed(a: &[[u8; 3]], b: &[[u8; 3]], threshold: f32) -> bool {
     if a.len() != b.len() || a.is_empty() {
         return true;
     }
     let total: u32 = a.iter().zip(b).map(|(p, q)| p.iter().zip(q).map(|(x, y)| x.abs_diff(*y) as u32).sum::<u32>()).sum();
-    total as f32 / (a.len() * 3) as f32 > threshold
+    let mean_prev = a.iter().map(|p| p.iter().map(|v| *v as f32).sum::<f32>()).sum::<f32>() / (a.len() * 3) as f32;
+    let allowance = threshold + DARK_NOISE_GAIN * mean_prev.min(DARK_NOISE_CAP);
+    total as f32 / (a.len() * 3) as f32 > allowance
 }
+
+/// Extra tolerance per level of scene brightness, up to `DARK_NOISE_CAP` levels of it: at a mean of 15 the
+/// allowance is the base 4.0 + 6.0 = 10, at 30 or more it is 4.0 + 12.0 = 16.
+const DARK_NOISE_GAIN: f32 = 0.4;
+const DARK_NOISE_CAP: f32 = 30.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DutyAction {
@@ -736,6 +751,29 @@ Available cameras:
         // silently starting in the backed-off state.
         assert!(scene_changed(&[], &[], 4.0));
         assert!(scene_changed(&a, &a[..1], 4.0));
+    }
+
+    #[test]
+    fn low_light_sensor_noise_is_not_a_change_but_a_light_coming_on_is() {
+        // Dark room, frozen exposure: means of 15 / 20 / 22 / 18 are the same wall seen through noise.
+        let grid = |level: u8, wobble: [i16; 4]| -> Vec<[u8; 3]> {
+            (0..20).map(|i| { let v = (level as i16 + wobble[i % 4]).clamp(0, 255) as u8; [v, v, v] }).collect()
+        };
+        let dark = grid(15, [0, 0, 0, 0]);
+        for noisy in [grid(15, [3, -3, 2, -2]), grid(20, [0, 0, 0, 0]), grid(22, [2, -2, 1, -1]), grid(18, [4, -4, 0, 0])] {
+            assert!(!scene_changed(&dark, &noisy, 4.0), "noise at a mean of 15 must not reset the backoff");
+        }
+        // A lamp switched on in the dark room, a hand over the lens, a door opening: tens of levels.
+        assert!(scene_changed(&dark, &grid(60, [0, 0, 0, 0]), 4.0), "a light coming on");
+        assert!(scene_changed(&dark, &grid(0, [0, 0, 0, 0]), 4.0), "a hand over the lens, or the lights going out, is a change");
+        // Bright scenes keep the old sensitivity: the allowance is capped.
+        let day = grid(120, [0, 0, 0, 0]);
+        assert!(!scene_changed(&day, &grid(125, [0, 0, 0, 0]), 4.0), "a few levels in daylight is nothing");
+        assert!(scene_changed(&day, &grid(150, [0, 0, 0, 0]), 4.0), "30 levels in daylight is a change");
+        // A hue shift at constant brightness (warm lamp to daylight) is still a change.
+        let warm: Vec<[u8; 3]> = (0..20).map(|_| [150u8, 100, 50]).collect();
+        let cool: Vec<[u8; 3]> = (0..20).map(|_| [50u8, 100, 150]).collect();
+        assert!(scene_changed(&warm, &cool, 4.0), "the colour of the room changed");
     }
 
     #[test]
