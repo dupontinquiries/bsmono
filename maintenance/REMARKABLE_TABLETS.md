@@ -144,3 +144,45 @@ SoC + panel size.
   (stoat-egui registered but not in `store_groups()`). studio's
   `tcp_carrier_tests::a_word_crosses_the_socket_and_comes_out_of_the_far_sink` is
   timing-sensitive and failed once under full-suite load (passed alone 5/5).
+
+## Probe of 2026-10-02 (Paper Pro at 192.168.2.185, OS 3.20.0.92) and the COSMIC question
+
+Read-only, over ssh as root on the LAN (Wi-Fi ssh was already on). **Seen** unless marked.
+
+* Hardware/OS: `imx8mm-ferrari`, Linux 6.6.52 (Codex Linux 5.0.57, scarthgap), 4 cores, 1.9 GB RAM
+  (1.4 GB available), up 11 days. `/` is 514 MB and 100% full; `/home` is a 46 GB encrypted volume
+  with 41 GB free. DRM has `card0` and `card0-LVDS-1` only: **no render node, no `/dev/fb*`** (so no
+  GPU for a Wayland compositor; software rendering is the only option). Internet works (the Alpine
+  CDN answers).
+* xochitl runs as `xochitl --system` with `LD_PRELOAD=/home/root/xovi/xovi.so`. xovi extensions:
+  appload, fileman, framebuffer-spy, literm, qt-command-executor, qt-resource-rebuilder,
+  random-suspend-screen, webserver-remote, xovi-message-broker. AppLoad apps registered:
+  ambient-learner-egui, eink-demo, **hatch-egui**, koreader, paperbound-eink, **rusty-board-egui**,
+  snapclone-egui, stoat-egui, tomescope-eink, unendlich-eink. Their manifests use `EINK_BACKEND=qtfb`,
+  `EINK_PROFILE=fast-color`.
+* Left on the device from earlier work: `vnsee` + `vnsee-gui` (a VNC client for the panel),
+  an ArchLinuxARM tarball (543 MB), KOReader, `qtfb-shim`, `eink-perf/` and `perf-track/` samplers,
+  rustup/cargo, nix. There is no `gcc`, `git` or `apk` on the device itself (python3, curl, rsync, tar,
+  `chroot` only).
+
+### Can COSMIC run on it?
+
+Two routes, with different honesty levels:
+
+1. **Remote COSMIC, local glass (feasible now, uses parts that exist).** Run the session where it
+   already runs (the Fairphone) and show it on the tablet through VNC with `vnsee`. cosmic-comp on the
+   phone advertises `ext_image_copy_capture` and `ext_output_image_capture_source`, and `wayvnc 0.10` /
+   `neatvnc` are in the phone's repos, so a VNC server can capture the output. **Gap:** cosmic-comp does
+   not advertise `zwlr_virtual_pointer`, which wayvnc uses for touch/mouse, so the picture arrives but
+   taps do not (the same missing-injection problem as tideshell's EI patch). Needs either a pointer path
+   (EI once cosmic-comp has the patch, or uinput) or a different VNC server. **Unverified:** latency and
+   how the e-ink refresh policy copes with a full desktop.
+2. **Local COSMIC on the tablet (unproven).** Needs cosmic-comp in an Alpine root under `/home`
+   (`cockpit::alpine_root`; the packages exist for aarch64 on the phone's Alpine-based distro, whether
+   Alpine's own repos carry them is **unchecked**), a software GLES renderer, and a bridge from the
+   compositor's output to qtfb (AppLoad window) plus touch back in. With 1.4 GB free, no GPU and a
+   compositor that expects one, expect this to be heavy; nothing about it has been tried.
+
+Either way the unit of work is the same missing piece: **a Wayland-output to qtfb bridge** (route 2) or
+**pointer injection into cosmic-comp** (route 1). Route 1 first: it needs no changes on the tablet.
+
