@@ -98,6 +98,25 @@ pub const HEIGHT: u32 = 340;
 /// The layer height for a content height in points: whole points, never below a floor a
 /// thumb can use (GTK's own minimum is 120) and never absurd. Pure so the rounding and the
 /// clamp are testable without a compositor.
+/// What the keyboard tells the shell about where it is: the height of the strip it covers at the bottom
+/// of the screen (logical px), 0 while it is hidden. One line, in `$XDG_RUNTIME_DIR/rusty-board.geom`,
+/// rewritten only when it changes. tideshell reads it so its sheets sit ABOVE the keyboard instead of
+/// under it.
+pub fn geom_line(mapped: bool, configured: bool, height: u32) -> String {
+    format!("{}\n", if mapped && configured { height } else { 0 })
+}
+
+fn publish_geom(line: &str) {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let path = std::path::Path::new(&dir).join("rusty-board.geom");
+        let tmp = path.with_extension("geom.tmp");
+        // Written aside and renamed, so a reader never sees half a line.
+        if std::fs::write(&tmp, line).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
 pub fn surface_height(content: f32) -> u32 {
     if !content.is_finite() {
         return HEIGHT;
@@ -268,6 +287,7 @@ pub fn run(title: &str) -> Result<(), LayerError> {
     // and its first frame will say Visible(false) on a Wayland session with nothing focused.
     let mut mapped = true;
     let mut map_requested: Option<Instant> = None;
+    let mut last_geom = String::new();
     // Hidden by parking (1 px, no zone), and the transparent parked buffer is still owed.
     let mut park_paint_owed = false;
     let start = Instant::now();
@@ -437,6 +457,13 @@ pub fn run(title: &str) -> Result<(), LayerError> {
                     tracing::debug!(height = h, "layer: resized to content");
                 }
             }
+        }
+
+        // ---- 2c. tell the shell where the keyboard is (see `geom_line`), when that changed.
+        let line = geom_line(mapped, state.configured, state.height);
+        if line != last_geom {
+            publish_geom(&line);
+            last_geom = line;
         }
 
         // ---- 3. paint if the compositor has said we may. Every frame that ran is painted
@@ -956,6 +983,13 @@ impl ProvidesRegistryState for State {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_geom_line_is_the_height_only_while_the_keyboard_is_up() {
+        assert_eq!(super::geom_line(true, true, 312), "312\n");
+        assert_eq!(super::geom_line(false, true, 312), "0\n", "hidden (parked)");
+        assert_eq!(super::geom_line(true, false, 312), "0\n", "not configured yet: it covers nothing");
+    }
+
     /// A frame that runs but is not painted must hand its texture uploads to the next one.
     ///
     /// `TexturesDelta` is an instruction egui issues ONCE. The font atlas goes up in the
