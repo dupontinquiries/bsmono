@@ -702,10 +702,21 @@ pub fn timeline(
             }
         }
     }
+    // A drag that starts on empty space pans time, the way a finger moves any horizontal strip; before this
+    // only the wheel did, so on a touchscreen the timeline could not be scrolled at all.
+    let pan_id = resp.id.with("empty-space-pan");
     if resp.drag_started() {
         if let Some(p) = resp.interact_pointer_pos() {
             view.drag = grab(&doc.project, view, p, origin, trim_side);
+            let pans = pans_on_press(p, rect, view.drag.is_some());
+            ui.data_mut(|d| d.insert_temp(pan_id, pans));
         }
+    }
+    if resp.dragged() && ui.data(|d| d.get_temp::<bool>(pan_id)).unwrap_or(false) {
+        view.pan(-resp.drag_delta().x);
+    }
+    if resp.drag_stopped() {
+        ui.data_mut(|d| d.insert_temp(pan_id, false));
     }
     if let Some(drag) = view.drag {
         // The clip can vanish mid-drag — a peer's RemoveClip is not obliged
@@ -1209,6 +1220,26 @@ mod tests {
 /// different id between frames), and telling them apart is the next step.
 /// `egui_kittest` exists for precisely this and is probably the shorter road
 /// than hand-rolling the frames.
+/// Whether a press at `p` on the timeline starts a pan: not on a clip (that is a move or a trim), not in
+/// the ruler band (that seeks), and not in the track-name gutter.
+fn pans_on_press(p: Pos2, rect: Rect, grabbed_clip: bool) -> bool {
+    !grabbed_clip && p.y > rect.top() + RULER_H && rect.contains(p)
+}
+
+#[cfg(test)]
+mod pan_tests {
+    use super::*;
+
+    #[test]
+    fn empty_space_pans_but_a_clip_the_ruler_and_the_outside_do_not() {
+        let rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(400.0, 300.0));
+        assert!(pans_on_press(Pos2::new(200.0, RULER_H + 40.0), rect, false), "empty lane");
+        assert!(!pans_on_press(Pos2::new(200.0, RULER_H + 40.0), rect, true), "a clip is dragged, not the view");
+        assert!(!pans_on_press(Pos2::new(200.0, RULER_H - 4.0), rect, false), "the ruler seeks");
+        assert!(!pans_on_press(Pos2::new(500.0, RULER_H + 40.0), rect, false), "outside the timeline");
+    }
+}
+
 #[cfg(test)]
 mod drag_lifecycle_tests {
     use super::*;
