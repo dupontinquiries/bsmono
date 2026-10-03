@@ -172,6 +172,11 @@ pub struct Cam {
     /// stays true even on frames that draw the viewer.
     touch: TouchSource,
     gestures: GestureRecognizer,
+    /// Tap to focus: the search, where it was tapped on screen, and the lens it drives (found on the
+    /// first tap, for the camera that is live).
+    pub focus: crate::tapfocus::TapFocus,
+    focus_screen: Option<egui::Pos2>,
+    focus_lens: Option<(String, Box<dyn crate::tapfocus::Lens>, crate::tapfocus::Actuator)>,
     /// Where the picture was drawn last frame — what a pinch is measured
     /// against, and what the tests aim at.
     pub picture_rect: egui::Rect,
@@ -255,6 +260,9 @@ impl Cam {
             zoom: Zoom::default(),
             touch: TouchSource::new(),
             gestures: GestureRecognizer::default(),
+            focus: crate::tapfocus::TapFocus::default(),
+            focus_screen: None,
+            focus_lens: None,
             picture_rect: egui::Rect::NOTHING,
             pro: Pro::default(),
             pro_open: false,
@@ -496,6 +504,7 @@ impl Cam {
         // THE VIEWFINDER: real frames, mirrored for the front camera, the
         // zoom window of them when zoomed.
         let live = if self.camera.is_live() { self.frame.as_ref() } else { None };
+        let has_live = live.is_some();
         let uv = if self.developed { preview::frame_uv(&self.preview, &Zoom::default()) } else { preview::frame_uv(&self.preview, &self.zoom) };
         let (shown, visible) = preview::show(ui, &self.preview, &self.camera.status_line(), live, uv, vf_h);
         self.picture_rect = shown;
@@ -507,6 +516,15 @@ impl Cam {
         // one-finger way back to 1×. The gestures are this frame's, from
         // the bridge polled in `ui`.
         if self.zoom_input(ctx, gestures, shown) { ctx.request_repaint(); }
+        // TAP TO FOCUS: a tap on the picture (not a pinch, not a drag) focuses there
+        for g in gestures {
+            if let uikit_egui::touch::Gesture::Tap(p) = g {
+                let at = egui::pos2(p.x, p.y);
+                if shown.contains(at) && has_live && self.viewer.is_none() { self.tap_focus(at, shown); }
+            }
+        }
+        self.drive_focus(ctx);
+        self.draw_focus_ring(ui, ctx);
         uikit_egui::zoom::chip_ui(ui, &mut self.zoom, visible, ui.id().with("zoom-chip"));
         if let Some(cd) = self.countdown {
             // The count, big, in the middle of the picture — where the eye
@@ -752,6 +770,60 @@ impl Cam {
                 Err(e) => self.hw.error = Some(e),
             }
         }
+    }
+
+    /// A tap at `at` on the picture drawn in `shown`: find the lens for the live camera (once) and
+    /// start a search on the tapped region.
+    fn tap_focus(&mut self, at: egui::Pos2, shown: egui::Rect) {
+        let id = self.camera.camera_id();
+        let fresh = !matches!(&self.focus_lens, Some((cached, _, _)) if Some(cached) == id.as_ref());
+        if fresh {
+            self.focus_lens = None;
+            let Some(id) = id else { self.note = "no focus motor known for this camera source".into(); return };
+            let subdevs = capture_kit::focus::list_subdevs();
+            let Some(dev) = crate::tapfocus::actuator_for(&id, &subdevs) else {
+                self.note = "this camera has a fixed focus (no lens motor)".into();
+                return;
+            };
+            match capture_kit::focus::read_range(&hwctl::program(), &dev) {
+                Ok(range) => {
+                    let lens = crate::tapfocus::V4l2Lens::new(hwctl::program(), dev.clone());
+                    self.focus_lens = Some((id, Box::new(lens), crate::tapfocus::Actuator { device: dev, range }));
+                }
+                Err(e) => { self.note = format!("focus: {e}"); return; }
+            }
+        }
+        let window = crate::pro::compose(self.pro.base_window(), self.zoom.window());
+        let (roi, tapped) = crate::tapfocus::roi_for_tap(self.preview.picture_frac(at, shown), window);
+        if let Some((_, lens, act)) = &mut self.focus_lens {
+            self.focus.begin(roi, tapped, act, lens.as_mut(), now_ms());
+            self.focus_screen = Some(at);
+            self.note = "focusing…".into();
+        }
+    }
+
+    /// Feed the newest frame to a running search.
+    fn drive_focus(&mut self, ctx: &egui::Context) {
+        if !self.focus.is_searching() { return; }
+        ctx.request_repaint();
+        let (Some(f), Some((_, lens, _))) = (self.camera.snapshot(), self.focus_lens.as_mut()) else { return };
+        if self.focus.on_frame(&f, now_ms(), lens.as_mut()).is_some() {
+            if let Some(m) = self.focus.message() { self.note = m; }
+        }
+    }
+
+    /// The square over the tap: white and pulsing while searching, then green / red and fading.
+    fn draw_focus_ring(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let (Some(at), Some((ring, a))) = (self.focus_screen, self.focus.ring(now_ms())) else { return };
+        let (col, pulse) = match ring {
+            crate::tapfocus::Ring::Searching => (egui::Color32::WHITE, 0.6 + 0.4 * ((now_ms() % 600) as f32 / 600.0 * std::f32::consts::TAU).sin()),
+            crate::tapfocus::Ring::Locked => (egui::Color32::from_rgb(90, 220, 110), 1.0),
+            crate::tapfocus::Ring::Refused => (egui::Color32::from_rgb(240, 180, 60), 1.0),
+            crate::tapfocus::Ring::Failed => (egui::Color32::from_rgb(230, 80, 70), 1.0),
+        };
+        let col = egui::Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (255.0 * a * pulse) as u8);
+        ui.painter().rect_stroke(egui::Rect::from_center_size(at, egui::vec2(64.0, 64.0)), 6.0, egui::Stroke::new(2.5, col), egui::StrokeKind::Middle);
+        ctx.request_repaint();
     }
 
     /// Fold this frame's zoom input in: the bridge's gestures over the
@@ -1212,6 +1284,27 @@ mod tests {
         let (a, b) = (darkest(&raw.file), darkest(&toned.file));
         assert!(a >= 60, "the veiled frame is saved as it is: darkest {a}");
         assert!(b + 25 < a, "with auto tone its blacks come back: {a} -> {b}");
+    }
+
+    #[test]
+    fn a_tap_on_the_picture_with_no_lens_motor_says_so_and_does_nothing_else() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let size = egui::vec2(360.0, 720.0);
+        let (mut cam, mut t) = live_pattern(d.path(), &ctx, size);
+        let at = cam.picture_rect.center();
+        let tap = |t: f64| vec![
+            (t, vec![egui::Event::PointerMoved(at)]),
+            (t + 0.016, vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }]),
+            (t + 0.060, vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }]),
+            (t + 0.120, vec![]),
+        ];
+        drive(&mut cam, &ctx, size, tap(t));
+        t += 0.3;
+        drive(&mut cam, &ctx, size, vec![(t, vec![])]);
+        assert!(!cam.focus.is_searching(), "no motor: nothing is searching");
+        assert!(cam.note.contains("focus"), "it said why: {}", cam.note);
+        assert!(cam.zoom.factor == 1.0 && cam.roll.shots().is_empty(), "and the tap did nothing else");
     }
 
     #[test]

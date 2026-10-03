@@ -181,6 +181,13 @@ impl Camera {
         }
     }
 
+    /// The libcamera id of the camera that is open (`.../camera@29`), from the named source for the
+    /// facing, else from the pipeline that was started: what tap-to-focus needs to find the lens motor.
+    pub fn camera_id(&self) -> Option<String> {
+        self.sources.for_facing(self.facing).and_then(crate::tapfocus::camera_id_in)
+            .or_else(|| self.started.iter().find_map(|c| crate::tapfocus::camera_id_in(&c.pipeline)))
+    }
+
     /// Does this machine have a second camera to switch to?
     pub fn can_switch(&self) -> bool {
         self.sources.can_switch() || self.probe.pw.iter().filter(|c| c.front.is_some()).map(|c| c.front).collect::<std::collections::HashSet<_>>().len() > 1
