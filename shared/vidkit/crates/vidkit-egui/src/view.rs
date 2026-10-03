@@ -275,6 +275,24 @@ impl VideoView {
             }
         }
 
+        self.input(ui, &response, surface, transport, &mut action);
+        self.paint_hud(ui, surface);
+
+        (response, action)
+    }
+
+    /// Gestures on `surface`: drag, tap and pinch become [`ViewAction`]s. `show` calls this after
+    /// painting; a caller that presents the picture itself (the GPU path, which paints through a
+    /// callback and never reaches `show`) calls it directly, or no finger ever scrubs.
+    pub fn handle_gestures(&mut self, ui: &mut Ui, surface: Rect, transport: &mut Transport) -> ViewAction {
+        let response = ui.allocate_rect(surface, Sense::click_and_drag());
+        let mut action = ViewAction::default();
+        self.input(ui, &response, surface, transport, &mut action);
+        self.paint_hud(ui, surface);
+        action
+    }
+
+    fn input(&mut self, ui: &mut Ui, response: &Response, surface: Rect, transport: &mut Transport, action: &mut ViewAction) {
         // --- input ------------------------------------------------------
         let mut flash: Option<String> = None;
 
@@ -286,7 +304,7 @@ impl VideoView {
         if response.dragged() {
             if let Some(p) = response.interact_pointer_pos() {
                 for intent in self.router.drag_to(p, surface) {
-                    if let Some(f) = self.apply(intent, transport, &mut action) {
+                    if let Some(f) = self.apply(intent, transport, action) {
                         flash = Some(f);
                     }
                 }
@@ -294,7 +312,7 @@ impl VideoView {
         }
         if response.drag_stopped() {
             for intent in self.router.release() {
-                if let Some(f) = self.apply(intent, transport, &mut action) {
+                if let Some(f) = self.apply(intent, transport, action) {
                     flash = Some(f);
                 }
             }
@@ -308,7 +326,7 @@ impl VideoView {
                 surface,
             );
             for intent in self.router.tap() {
-                if let Some(f) = self.apply(intent, transport, &mut action) {
+                if let Some(f) = self.apply(intent, transport, action) {
                     flash = Some(f);
                 }
             }
@@ -318,7 +336,7 @@ impl VideoView {
         let zoom_delta = ui.ctx().input(|i| i.zoom_delta());
         if (zoom_delta - 1.0).abs() > f32::EPSILON && response.hovered() {
             for intent in self.router.pinch(zoom_delta) {
-                if let Some(f) = self.apply(intent, transport, &mut action) {
+                if let Some(f) = self.apply(intent, transport, action) {
                     flash = Some(f);
                 }
             }
@@ -327,9 +345,6 @@ impl VideoView {
         if let Some(f) = flash {
             self.flash(ui.ctx(), f);
         }
-        self.paint_hud(ui, surface);
-
-        (response, action)
     }
 
     fn paint_hud(&mut self, ui: &Ui, surface: Rect) {

@@ -1170,6 +1170,16 @@ impl eframe::App for Player {
                         ui.painter().add(vidkit_egui::glow_present::callback(r, gpu));
                     }
                 }
+                // This path paints through a callback and never reaches `view.show`, so the
+                // gestures (scrub, volume, speed, pinch, tap) were never read on any device that
+                // has the GPU renderer -- the phone.
+                let action = self.view.handle_gestures(ui, surface, &mut self.transport);
+                if action.toggle_play && !tap_only_reveals {
+                    self.transport.playing = !self.transport.playing;
+                }
+                if let Some(to) = action.seek_to {
+                    self.seek_to(to);
+                }
                 return;
             }
             let (_r, action) = self.view.show(ui, &self.presenter, &mut self.transport);
@@ -1671,7 +1681,9 @@ impl Player {
 
 fn main() -> eframe::Result<()> {
     let mut args = std::env::args().skip(1);
-    let first = args.next();
+    // `VIDKIT_URI=<link or path>` stands in for the first argument, so a launcher or a test
+    // script can start something playing without touching the clipboard.
+    let first = args.next().or_else(|| std::env::var("VIDKIT_URI").ok().filter(|v| !v.trim().is_empty()));
 
     if matches!(first.as_deref(), Some("-h") | Some("--help")) {
         println!("vidkit-player [FILE | URL | --clipboard | --gpu-selftest]\n");
