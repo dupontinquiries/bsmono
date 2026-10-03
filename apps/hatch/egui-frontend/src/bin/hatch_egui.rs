@@ -80,6 +80,29 @@ impl eframe::App for App {
             return;
         }
 
+        // Diagnostic for the "only one character gets in" report with the on-screen keyboard: while the
+        // file /tmp/hatch-log-events exists, every text/IME/focus event is appended to ~/hatch-events.log
+        // with the focused widget, so a typing attempt shows where the stream stops.
+        if std::path::Path::new("/tmp/hatch-log-events").exists() {
+            let focus = ctx.memory(|m| m.focused());
+            let lines: Vec<String> = ctx.input(|i| {
+                i.raw.events.iter().filter_map(|e| match e {
+                    egui::Event::Text(_) | egui::Event::Ime(_) | egui::Event::WindowFocused(_) => Some(format!("{e:?}")),
+                    _ => None,
+                }).collect()
+            });
+            if !lines.is_empty() {
+                use std::io::Write;
+                if let Some(home) = std::env::var_os("HOME") {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(std::path::Path::new(&home).join("hatch-events.log")) {
+                        for l in lines {
+                            let _ = writeln!(f, "{:?} focus={:?} {l}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), focus);
+                        }
+                    }
+                }
+            }
+        }
+
         // Focus-loss hide, launcher-style.
         let mut lost_focus = false;
         ctx.input(|i| {
@@ -167,7 +190,10 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Glow,
         viewport: uikit_egui::desktop::viewport(APP_ID, "Hatch", size)
             .with_transparent(true)
-            .with_decorations(false),
+            .with_decorations(false)
+            // Fullscreen is how a toplevel ends up OVER the shell's side strips (layer-shell Top)
+            // instead of beside them: an experiment for carousel mode, behind a flag until seen.
+            .with_fullscreen(has("--fullscreen") || std::env::var_os("HATCH_FULLSCREEN").is_some()),
         ..Default::default()
     };
 

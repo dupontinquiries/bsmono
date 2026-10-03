@@ -20,9 +20,6 @@ pub mod toggle;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-const NOTICE_W: f32 = 230.0;
-const NOTICE_H: f32 = 74.0;
-
 /// Share of the configured icon size an app icon is drawn at inside its card.
 const ICON_FRAC: f32 = 0.72;
 
@@ -298,7 +295,7 @@ impl HatchUi {
         let sys_h = if sys_actions.is_empty() { 0.0 } else { 56.0 };
         let search_h = 52.0;
         let grabber_h = 26.0;
-        let notices_h = if self.notices.is_empty() { 0.0 } else { NOTICE_H + 10.0 };
+        let notices_h = if self.notices.is_empty() { 0.0 } else { cell.y + 24.0 };
         let grid_h =
             (ui.available_height() - grabber_h - sys_h - search_h - notices_h - 16.0).max(cell.y);
 
@@ -306,7 +303,7 @@ impl HatchUi {
             event = UiEvent::Dismiss;
         }
 
-        self.notice_strip(ui, colors);
+        self.notice_strip(ui, cell, colors);
 
         // ---- the grid ----
         let cols = Self::grid_cols(ui.available_width(), cell.x, self.core.config.columns);
@@ -363,26 +360,37 @@ impl HatchUi {
         event
     }
 
-    /// The strip of notices above the grid: one card each, scrolling sideways, a tap dismisses.
-    /// Demo data for now, and says so.
-    fn notice_strip(&mut self, ui: &mut egui::Ui, colors: &PaletteColors) {
+    /// The strip of notices above the grid: square tiles the size of an app tile, scrolling sideways,
+    /// a tap dismisses. Demo data for now, and says so.
+    fn notice_strip(&mut self, ui: &mut egui::Ui, cell: Vec2, colors: &PaletteColors) {
         if self.notices.is_empty() {
             return;
         }
         let mut dismiss: Option<u32> = None;
         egui::ScrollArea::horizontal().id_salt("hatch-notices").auto_shrink([false, true]).show(ui, |ui| {
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
                 for n in &self.notices {
-                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(NOTICE_W, NOTICE_H), Sense::click());
+                    let (slot, resp) = ui.allocate_exact_size(cell, Sense::click());
+                    let rect = slot.shrink(4.0);
                     let p = ui.painter();
                     let call = n.kind == hatch_core::notices::Kind::Call && n.when == "now";
                     let ground = if call { colors.accent_soft } else { colors.bg_raised };
                     p.rect_filled(rect, CornerRadius::same(14), ground);
                     p.rect_stroke(rect, CornerRadius::same(14), Stroke::new(1.0, colors.border.gamma_multiply(0.6)), StrokeKind::Inside);
-                    p.text(rect.left_top() + Vec2::new(12.0, 10.0), Align2::LEFT_TOP, n.kind.glyph(), FontId::proportional(16.0), colors.accent);
-                    p.text(rect.left_top() + Vec2::new(34.0, 11.0), Align2::LEFT_TOP, format!("{} · {}", n.kind.label(), n.when), FontId::proportional(11.0), colors.text_weak);
-                    p.text(rect.left_top() + Vec2::new(12.0, 30.0), Align2::LEFT_TOP, Self::elide(&n.title, 26), FontId::proportional(14.0), colors.text);
-                    p.text(rect.left_top() + Vec2::new(12.0, 50.0), Align2::LEFT_TOP, Self::elide(&n.body, 34), FontId::proportional(11.5), colors.text_weak);
+                    p.text(rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, n.kind.glyph(), FontId::proportional(18.0), colors.accent);
+                    p.text(rect.right_top() + Vec2::new(-8.0, 10.0), Align2::RIGHT_TOP, &n.when, FontId::proportional(10.5), colors.text_weak);
+                    let inner_w = rect.width() - 16.0;
+                    let title = p.layout(n.title.clone(), FontId::proportional(13.0), colors.text, inner_w);
+                    let title_h = title.size().y;
+                    p.galley(rect.left_top() + Vec2::new(8.0, 34.0), title, colors.text);
+                    // The body takes what is left of the tile, wrapped and cut with an ellipsis.
+                    let mut job = egui::text::LayoutJob::simple(n.body.clone(), FontId::proportional(11.0), colors.text_weak, inner_w);
+                    job.wrap.max_rows = 3;
+                    job.wrap.break_anywhere = false;
+                    job.wrap.overflow_character = Some('…');
+                    let body = p.layout_job(job);
+                    p.galley(rect.left_top() + Vec2::new(8.0, 36.0 + title_h), body, colors.text_weak);
                     if resp.clicked() {
                         dismiss = Some(n.id);
                     }
