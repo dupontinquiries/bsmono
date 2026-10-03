@@ -1350,8 +1350,10 @@ fn main() {
         // Side surfaces, each with an exclusive zone: the bar (right-bar
         // layout) and the two carousel peeks (carousel mode). Each has its
         // own egui context, input queue and EGL window.
-        let bar_geom = ShellView::bar_geometry(&sb.shell);
-        let peek = sb.shell.peek_reserve().round() as u32;
+        // Widths snapped to whole physical pixels at the output's (fractional) scale, in ONE place so the
+        // surfaces and the reserved-zone sum below agree to the pixel (see `layer::snap_logical`).
+        let bar_geom = ShellView::bar_geometry(&sb.shell).map(|(w, r)| (io.snap_width(w), io.snap_width(r.max(0) as u32) as i32));
+        let peek = io.snap_width(sb.shell.peek_reserve().round() as u32);
         let sides: [(Role, Option<(u32, i32)>); 3] = [
             (Role::Bar, bar_geom),
             (Role::PeekLeft, (peek > 0).then_some((peek, peek as i32))),

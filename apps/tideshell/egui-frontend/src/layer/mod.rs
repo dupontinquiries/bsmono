@@ -189,6 +189,30 @@ impl Surf {
     }
 }
 
+/// Nudge a logical width (at most 4 points either way, the smaller nudge first, narrower on a tie) to
+/// one whose PHYSICAL width at `scale` is a whole number of pixels. A surface is drawn into a buffer of
+/// `ceil(width x scale)` pixels and mapped onto `width` points by the compositor: when `width x scale`
+/// is not an integer (41 pt at 2.25 is 92.25 px) the buffer is a fraction of a pixel off the screen
+/// area it fills and the whole surface is resampled, which is what made the carousel peeks' small
+/// text soft. Integer scales and already-aligned widths come back unchanged.
+pub fn snap_logical(width: u32, scale: f32) -> u32 {
+    let aligned = |w: u32| {
+        let px = w as f32 * scale;
+        (px - px.round()).abs() < 0.003
+    };
+    if width == 0 || scale <= 0.0 || aligned(width) {
+        return width;
+    }
+    for d in 1..=4u32 {
+        for w in [width.saturating_sub(d), width + d] {
+            if w > 0 && aligned(w) {
+                return w;
+            }
+        }
+    }
+    width
+}
+
 /// Buffer pixels for a logical size at a (possibly fractional) scale. The
 /// protocol's rule: round up, so the viewport never stretches a short buffer.
 pub fn buffer_px(logical: (u32, u32), scale: f32) -> (i32, i32) {
@@ -527,6 +551,17 @@ impl Io {
 
     /// Map/resize or unmap a side surface (bar or peek). `width` is the
     /// drawn width, `reserve` the exclusive zone.
+    /// The output's scale as far as this runtime has heard it (any surface will do: they share the
+    /// output), or 1.0 before the first surface has been told.
+    pub fn scale_hint(&self) -> f32 {
+        self.st.surfs.iter().find(|s| s.frac_scale.is_some() || s.configured).map_or(1.0, |s| s.render_scale().0)
+    }
+
+    /// `snap_logical` at the output's scale.
+    pub fn snap_width(&self, w: u32) -> u32 {
+        snap_logical(w, self.scale_hint())
+    }
+
     pub fn ensure_side(&mut self, role: Role, on: bool, width: u32, reserve: i32) {
         let have = self.surf(role).is_some();
         if !on {
@@ -1206,6 +1241,30 @@ pub fn combine(modes: &[Option<bool>]) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn side_widths_snap_to_whole_physical_pixels_and_integer_scales_are_untouched() {
+        // The phone: 2.25 -> multiples of 4 points are whole pixels (9 px per 4 pt).
+        assert_eq!(snap_logical(41, 2.25), 40, "the carousel peek: 92.25 px becomes 90");
+        assert_eq!(snap_logical(64, 2.25), 64, "the bar is already aligned: 144 px");
+        assert_eq!(snap_logical(166, 2.25), 164, "the expanded bar: 373.5 px becomes 369");
+        assert_eq!(snap_logical(42, 2.25), 40, "ties go narrower");
+        for w in 1..300u32 {
+            assert_eq!(snap_logical(w, 1.0), w, "scale 1 at {w}");
+            assert_eq!(snap_logical(w, 2.0), w, "scale 2 at {w}");
+            assert_eq!(snap_logical(w, 3.0), w, "scale 3 at {w}");
+        }
+        for scale in [1.25f32, 1.5, 1.75, 2.25, 2.5, 2.75, 3.25] {
+            for w in 8..400u32 {
+                let s = snap_logical(w, scale);
+                let px = s as f32 * scale;
+                assert!((px - px.round()).abs() < 0.003, "{w} at {scale} -> {s} is {px} px");
+                assert!((s as i64 - w as i64).abs() <= 4, "{w} at {scale} moved to {s}");
+            }
+        }
+        assert_eq!(snap_logical(0, 2.25), 0);
+        assert_eq!(snap_logical(40, 0.0), 40, "a nonsense scale changes nothing");
+    }
+
     use super::*;
 
     #[test]
