@@ -1054,7 +1054,9 @@ impl eframe::App for Player {
 
         let mut want_analysis = false;
         let (mut want_clipboard, mut want_open) = (false, false);
-        egui::TopBottomPanel::top("what").show(ctx, |ui| match &self.opened {
+        let overlay_top = matches!(self.opened, Some(Ok(_)));
+        let top_hidden = self.chrome.hidden();
+        let mut top_bar = |ui: &mut egui::Ui| match &self.opened {
             Some(Err(e)) => {
                 ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
             }
@@ -1104,7 +1106,23 @@ impl eframe::App for Player {
                     }
                 });
             }
-        });
+        };
+        if overlay_top {
+            // With a video open the bar floats over the picture like the transport bar does,
+            // and goes with it, instead of owning a strip of window the video can never use.
+            if !top_hidden {
+                let fill = self.colors.bg_card.gamma_multiply(0.8);
+                egui::Area::new(egui::Id::new("vidkit-top"))
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::LEFT_TOP, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.set_width(ctx.screen_rect().width());
+                        egui::Frame::none().fill(fill).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| top_bar(ui));
+                    });
+            }
+        } else {
+            egui::TopBottomPanel::top("what").show(ctx, |ui| top_bar(ui));
+        }
         if want_analysis {
             self.start_analysis();
         }
