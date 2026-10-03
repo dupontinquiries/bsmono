@@ -1520,8 +1520,14 @@ fn cmd_cosmic(rest: &[String]) -> i32 {
 }
 
 /// The parts of `fp5_setup` whose name contains `want` (all of them when `want` is `None`).
-fn fp5_select(parts: Vec<(&'static str, Vec<cockpit::patchset::Step>)>, want: Option<&str>) -> Vec<(&'static str, Vec<cockpit::patchset::Step>)> {
-    parts.into_iter().filter(|(n, _)| want.map_or(true, |w| n.to_lowercase().contains(&w.to_lowercase()))).collect()
+///
+/// `opt_in` parts (autologin) are searched ONLY when a name is given: with no PART the result is the
+/// ordinary parts alone, so `apply USER@HOST` never changes how the phone can be entered by accident.
+fn fp5_select(parts: Vec<(&'static str, Vec<cockpit::patchset::Step>)>, opt_in: Vec<(&'static str, Vec<cockpit::patchset::Step>)>, want: Option<&str>) -> Vec<(&'static str, Vec<cockpit::patchset::Step>)> {
+    match want {
+        None => parts,
+        Some(w) => parts.into_iter().chain(opt_in).filter(|(n, _)| n.to_lowercase().contains(&w.to_lowercase())).collect(),
+    }
 }
 
 /// `gitmind fp5 list | plan [PART] | apply USER@HOST [PART] [--password-stdin]`: replay the
@@ -1544,10 +1550,13 @@ fn cmd_fp5(rest: &[String]) -> i32 {
             for (n, steps) in cockpit::fp5_setup::all_parts(root) {
                 println!("{n}  ({} steps)", steps.len());
             }
+            for (n, steps) in cockpit::fp5_setup::opt_in_parts(root) {
+                println!("{n}  ({} steps)  [opt-in: only by name]", steps.len());
+            }
             0
         }
         Some("plan") => {
-            let parts = fp5_select(cockpit::fp5_setup::all_parts(root), args.get(1).map(|s| s.as_str()));
+            let parts = fp5_select(cockpit::fp5_setup::all_parts(root), cockpit::fp5_setup::opt_in_parts(root), args.get(1).map(|s| s.as_str()));
             if parts.is_empty() { eprintln!("no part matches\n{usage}"); return 2; }
             for (n, steps) in parts {
                 println!("== {n}");
@@ -1560,7 +1569,7 @@ fn cmd_fp5(rest: &[String]) -> i32 {
         }
         Some("apply") => {
             let Some((user, host)) = args.get(1).and_then(|t| t.split_once('@')) else { eprintln!("{usage}"); return 2 };
-            let parts = fp5_select(cockpit::fp5_setup::all_parts(root), args.get(2).map(|s| s.as_str()));
+            let parts = fp5_select(cockpit::fp5_setup::all_parts(root), cockpit::fp5_setup::opt_in_parts(root), args.get(2).map(|s| s.as_str()));
             if parts.is_empty() { eprintln!("no part matches\n{usage}"); return 2; }
             for (n, steps) in parts {
                 println!("== {n}");
@@ -2652,11 +2661,15 @@ mod fp5_cli_tests {
         let root = cockpit::cosmic_setup::Root::NoPrompt;
         let all = cockpit::fp5_setup::all_parts(root);
         let n = all.len();
+        let opt = || cockpit::fp5_setup::opt_in_parts(root);
         assert!(n >= 6, "the scan found the parts: {n}");
-        assert_eq!(fp5_select(cockpit::fp5_setup::all_parts(root), None).len(), n);
-        let w = fp5_select(cockpit::fp5_setup::all_parts(root), Some("WATCHDOG"));
+        assert_eq!(fp5_select(cockpit::fp5_setup::all_parts(root), opt(), None).len(), n, "no PART: the ordinary parts only");
+        assert!(fp5_select(cockpit::fp5_setup::all_parts(root), opt(), None).iter().all(|(nm, _)| !nm.contains("autologin")));
+        let a = fp5_select(cockpit::fp5_setup::all_parts(root), opt(), Some("autologin"));
+        assert_eq!(a.len(), 1, "an opt-in part is reachable by name");
+        let w = fp5_select(cockpit::fp5_setup::all_parts(root), opt(), Some("WATCHDOG"));
         assert_eq!(w.len(), 1, "case-insensitive, one match");
         assert!(w[0].0.contains("watchdog"));
-        assert!(fp5_select(cockpit::fp5_setup::all_parts(root), Some("no such part")).is_empty());
+        assert!(fp5_select(cockpit::fp5_setup::all_parts(root), opt(), Some("no such part")).is_empty());
     }
 }

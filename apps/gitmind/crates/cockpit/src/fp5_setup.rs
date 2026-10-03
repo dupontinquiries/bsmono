@@ -415,6 +415,12 @@ pub fn autologin_plan(user: &str, root: Root) -> Vec<Step> {
     ]
 }
 
+/// Parts that change how the phone can be ENTERED or secured. Listed and replayable by name, never part
+/// of "all": `gitmind fp5 apply user@phone` must not quietly turn on autologin.
+pub fn opt_in_parts(root: Root) -> Vec<(&'static str, Vec<Step>)> {
+    vec![("autologin (skip the greeter)", autologin_plan("user", root))]
+}
+
 /// Every part that can be replayed without arguments, in a sensible order.
 pub fn all_parts(root: Root) -> Vec<(&'static str, Vec<Step>)> {
     vec![
@@ -488,6 +494,16 @@ mod tests {
         assert!(p[1].cmd.contains("scaling_governor - - - - schedutil") && p[1].cmd.contains("tmpfiles"), "{}", p[1].cmd);
         assert!(p[1].rollback.as_deref().unwrap().contains("echo performance"));
         assert!(p[2].gate == Gate::Contains("schedutil".into()), "the check must name the governor, not just run");
+    }
+
+    #[test]
+    fn autologin_is_opt_in_it_is_offered_by_name_and_never_swept_into_all() {
+        let root = Root::NoPrompt;
+        assert!(opt_in_parts(root).iter().any(|(n, s)| n.contains("autologin") && !s.is_empty()));
+        assert!(!all_parts(root).iter().any(|(n, _)| n.contains("autologin")), "all_parts must not enable autologin");
+        // and the plan really is the greeter change
+        let (_, steps) = &opt_in_parts(root)[0];
+        assert!(steps.iter().any(|s| s.cmd.contains("initial_session") || s.cmd.contains("cosmic-greeter.toml")), "it edits the greeter config");
     }
 
     #[test]

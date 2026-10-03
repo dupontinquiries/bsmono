@@ -40,6 +40,12 @@ pub fn parts(password: &str) -> Vec<(&'static str, Vec<Step>)> {
     cockpit::fp5_setup::all_parts(root_for(password))
 }
 
+/// Parts that change how the phone can be entered (autologin): offered, planned and applied one at a
+/// time, and never part of "apply all".
+pub fn opt_in(password: &str) -> Vec<(&'static str, Vec<Step>)> {
+    cockpit::fp5_setup::opt_in_parts(root_for(password))
+}
+
 /// A part's plan as plain text: what each step is for, the command, and what undoes it.
 pub fn plan_text(steps: &[Step]) -> String {
     let mut out = String::new();
@@ -81,12 +87,15 @@ pub fn section(app: &mut App, ui: &mut egui::Ui) {
     } else if user.trim().is_empty() || host.trim().is_empty() {
         ui.weak("set a user and host above first");
     }
-    let all = parts(&app.phone_setup.password);
+    let mut all = parts(&app.phone_setup.password);
+    let n_normal = all.len();
+    all.extend(opt_in(&app.phone_setup.password));
     ui.add_space(4.0);
     let mut run_one: Option<usize> = None;
     for (i, (name, steps)) in all.iter().enumerate() {
         ui.horizontal(|ui| {
-            ui.label(format!("{name}  ({} steps)", steps.len()));
+            let tag = if i >= n_normal { "  [opt-in: only by itself]" } else { "" };
+            ui.label(format!("{name}  ({} steps){tag}", steps.len()));
             if ui.small_button(if app.phone_setup.open == Some(i) { "hide plan" } else { "plan" }).clicked() {
                 app.phone_setup.open = if app.phone_setup.open == Some(i) { None } else { Some(i) };
             }
@@ -106,7 +115,7 @@ pub fn section(app: &mut App, ui: &mut egui::Ui) {
     if run_one.is_some() || run_all {
         let steps: Vec<(String, Vec<Step>)> = match run_one {
             Some(i) => vec![(all[i].0.to_string(), all[i].1.clone())],
-            None => all.iter().map(|(n, s)| (n.to_string(), s.clone())).collect(),
+            None => all[..n_normal].iter().map(|(n, s)| (n.to_string(), s.clone())).collect(),
         };
         let password = std::mem::take(&mut app.phone_setup.password);
         app.phone_setup.last.clear();
@@ -144,6 +153,14 @@ mod tests {
         for want in ["keyboard service", "panel memory watchdog", "cpu governor"] {
             assert!(names.contains(&want), "{want} is offered: {names:?}");
         }
+    }
+
+    #[test]
+    fn opt_in_parts_are_separate_from_the_ordinary_ones() {
+        let names: Vec<&str> = parts("").iter().map(|(n, _)| *n).collect();
+        let opt: Vec<&str> = opt_in("").iter().map(|(n, _)| *n).collect();
+        assert!(opt.iter().any(|n| n.contains("autologin")), "autologin is offered: {opt:?}");
+        assert!(opt.iter().all(|n| !names.contains(n)), "and is not among the ordinary parts that apply-all runs");
     }
 
     #[test]
