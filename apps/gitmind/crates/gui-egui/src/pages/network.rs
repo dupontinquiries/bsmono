@@ -260,6 +260,11 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     super::bluetooth::section(app, ui);
 
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+    super::phone_setup::section(app, ui);
+
 }
 
 #[cfg(test)]

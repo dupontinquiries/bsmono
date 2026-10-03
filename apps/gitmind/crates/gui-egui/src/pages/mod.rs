@@ -1,4 +1,5 @@
 pub mod bluetooth;
+pub mod phone_setup;
 pub mod diagnostics;
 pub mod share;
 pub mod artifacts;
@@ -23,6 +24,7 @@ pub mod tablets;
 /// sources.
 pub const SOURCES: &[(&str, &str)] = &[
     ("bluetooth", include_str!("bluetooth.rs")),
+    ("phone_setup", include_str!("phone_setup.rs")),
     ("diagnostics", include_str!("diagnostics.rs")),
     ("share", include_str!("share.rs")),
     ("artifacts", include_str!("artifacts.rs")),
