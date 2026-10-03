@@ -59,6 +59,7 @@ pub mod contacts;
 pub mod develop;
 pub mod autotone;
 pub mod tapfocus;
+pub mod autofocus;
 /// Clip-on lens profiles (Moment and others) and the black-border autocrop.
 pub mod lens;
 /// The camera's own manual controls through `v4l2-ctl`, where it has them.

@@ -176,6 +176,11 @@ pub struct Cam {
     /// first tap, for the camera that is live).
     pub focus: crate::tapfocus::TapFocus,
     focus_screen: Option<egui::Pos2>,
+    /// Point-and-shoot focus: the multi-region search, when to run it, and the camera the lens was resolved for.
+    pub autofocus: crate::autofocus::AutoRun,
+    governor: crate::autofocus::Governor,
+    af_for: Option<String>,
+    manual_focus_applied: Option<f32>,
     focus_lens: Option<(String, Box<dyn crate::tapfocus::Lens>, crate::tapfocus::Actuator)>,
     /// Where the picture was drawn last frame — what a pinch is measured
     /// against, and what the tests aim at.
@@ -262,6 +267,10 @@ impl Cam {
             gestures: GestureRecognizer::default(),
             focus: crate::tapfocus::TapFocus::default(),
             focus_screen: None,
+            autofocus: crate::autofocus::AutoRun::default(),
+            governor: crate::autofocus::Governor::default(),
+            af_for: None,
+            manual_focus_applied: None,
             focus_lens: None,
             picture_rect: egui::Rect::NOTHING,
             pro: Pro::default(),
@@ -772,27 +781,34 @@ impl Cam {
         }
     }
 
-    /// A tap at `at` on the picture drawn in `shown`: find the lens for the live camera (once) and
-    /// start a search on the tapped region.
-    fn tap_focus(&mut self, at: egui::Pos2, shown: egui::Rect) {
+    /// Find the lens motor for the live camera (once per camera). `Err` says why not: no motor, or not known.
+    fn ensure_lens(&mut self) -> Result<(), String> {
         let id = self.camera.camera_id();
-        let fresh = !matches!(&self.focus_lens, Some((cached, _, _)) if Some(cached) == id.as_ref());
-        if fresh {
-            self.focus_lens = None;
-            let Some(id) = id else { self.note = "no focus motor known for this camera source".into(); return };
-            let subdevs = capture_kit::focus::list_subdevs();
-            let Some(dev) = crate::tapfocus::actuator_for(&id, &subdevs) else {
-                self.note = "this camera has a fixed focus (no lens motor)".into();
-                return;
-            };
-            match capture_kit::focus::read_range(&hwctl::program(), &dev) {
-                Ok(range) => {
-                    let lens = crate::tapfocus::V4l2Lens::new(hwctl::program(), dev.clone());
-                    self.focus_lens = Some((id, Box::new(lens), crate::tapfocus::Actuator { device: dev, range }));
-                }
-                Err(e) => { self.note = format!("focus: {e}"); return; }
-            }
+        if matches!(&self.focus_lens, Some((cached, _, _)) if Some(cached) == id.as_ref()) { return Ok(()); }
+        // the camera changed (or this is the first look): forget what belonged to the other one
+        self.focus_lens = None;
+        self.autofocus.cancel();
+        self.focus.cancel();
+        self.governor.reset();
+        self.manual_focus_applied = None;
+        let id = id.ok_or("no focus motor known for this camera source")?;
+        let subdevs = capture_kit::focus::list_subdevs();
+        let dev = crate::tapfocus::actuator_for(&id, &subdevs).ok_or("this camera has a fixed focus (no lens motor)")?;
+        let range = capture_kit::focus::read_range(&hwctl::program(), &dev).map_err(|e| format!("focus: {e}"))?;
+        let lens = crate::tapfocus::V4l2Lens::new(hwctl::program(), dev.clone());
+        self.focus_lens = Some((id, Box::new(lens), crate::tapfocus::Actuator { device: dev, range }));
+        Ok(())
+    }
+
+    /// A tap at `at` on the picture drawn in `shown`: it overrides the automatic focus, which then
+    /// leaves the lens alone until the scene changes.
+    fn tap_focus(&mut self, at: egui::Pos2, shown: egui::Rect) {
+        if matches!(self.pro.profile().focus, lens::FocusHint::Manual(_)) {
+            self.note = "manual focus is set in the pro panel; choose the camera's focus to tap".into();
+            return;
         }
+        if let Err(e) = self.ensure_lens() { self.note = e; return; }
+        self.autofocus.cancel();
         let window = crate::pro::compose(self.pro.base_window(), self.zoom.window());
         let (roi, tapped) = crate::tapfocus::roi_for_tap(self.preview.picture_frac(at, shown), window);
         if let Some((_, lens, act)) = &mut self.focus_lens {
@@ -802,18 +818,78 @@ impl Cam {
         }
     }
 
-    /// Feed the newest frame to a running search.
+    /// Per frame: a tap's search, else the automatic one, else decide whether to start it.
     fn drive_focus(&mut self, ctx: &egui::Context) {
-        if !self.focus.is_searching() { return; }
-        ctx.request_repaint();
-        let (Some(f), Some((_, lens, _))) = (self.camera.snapshot(), self.focus_lens.as_mut()) else { return };
-        if self.focus.on_frame(&f, now_ms(), lens.as_mut()).is_some() {
-            if let Some(m) = self.focus.message() { self.note = m; }
+        let now = now_ms();
+        // TAP in progress: its frames, its verdict, then hold the lens until the scene changes
+        if self.focus.is_searching() {
+            ctx.request_repaint();
+            let (Some(f), Some((_, lens, _))) = (self.camera.snapshot(), self.focus_lens.as_mut()) else { return };
+            if self.focus.on_frame(&f, now, lens.as_mut()).is_some() {
+                if let Some(m) = self.focus.message() { self.note = m; }
+                self.governor.hold(&f, now);
+            }
+            return;
+        }
+        // AUTOMATIC search in progress
+        if self.autofocus.is_searching() {
+            ctx.request_repaint();
+            let (Some(f), Some((_, lens, _))) = (self.camera.snapshot(), self.focus_lens.as_mut()) else { return };
+            if let Some(v) = self.autofocus.on_frame(&f, now, lens.as_mut()) {
+                if let crate::autofocus::AutoVerdict::Failed(e) = v { self.note = format!("autofocus: {e}"); }
+            }
+            return;
+        }
+        if !self.camera.is_live() { return; }
+        // MANUAL focus (a pro lens profile): the lens goes where the profile says, nothing automatic
+        if let lens::FocusHint::Manual(frac) = self.pro.profile().focus {
+            if self.manual_focus_applied != Some(frac) && self.ensure_lens().is_ok() {
+                if let Some((_, lens, act)) = &mut self.focus_lens {
+                    let (min, max, _) = act.range;
+                    let _ = lens.move_to(min + ((max - min) as f32 * frac.clamp(0.0, 1.0)).round() as i64);
+                    self.manual_focus_applied = Some(frac);
+                }
+            }
+            return;
+        }
+        self.manual_focus_applied = None;
+        // POINT AND SHOOT: once the picture is held steady, and again when the scene really changes.
+        // SNAPSHOT_CAM_AUTOFOCUS=0 turns it off (the lens then only moves for a tap or a manual profile).
+        static AF_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*AF_ON.get_or_init(|| std::env::var("SNAPSHOT_CAM_AUTOFOCUS").map(|v| v.trim() != "0").unwrap_or(true)) { return; }
+        if self.af_for != self.camera.camera_id() {
+            self.af_for = self.camera.camera_id();
+            self.governor.reset();
+            if self.ensure_lens().is_err() { self.focus_lens = None; }
+        }
+        let (Some(f), Some((_, lens, act))) = (self.camera.snapshot(), self.focus_lens.as_mut()) else { return };
+        if let Some(w) = self.governor.feed(&f, now, false) {
+            self.autofocus.begin(w, act.range, lens.as_mut(), now);
         }
     }
 
     /// The square over the tap: white and pulsing while searching, then green / red and fading.
     fn draw_focus_ring(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // the grid cell the automatic search chose: four corner brackets, green, fading
+        if let Some((rect, a)) = self.autofocus.shown_region(now_ms()) {
+            let window = crate::pro::compose(self.pro.base_window(), self.zoom.window());
+            let shown = self.picture_rect;
+            let to_screen = |u: f32, v: f32| {
+                let (mut x, y) = ((u - window[0]) / (window[2] - window[0]).max(1e-3), (v - window[1]) / (window[3] - window[1]).max(1e-3));
+                if self.preview.facing.mirrored() { x = 1.0 - x; }
+                egui::pos2(shown.left() + x * shown.width(), shown.top() + y * shown.height())
+            };
+            let (p0, p1) = (to_screen(rect[0], rect[1]), to_screen(rect[2], rect[3]));
+            let r = egui::Rect::from_two_pos(p0, p1).shrink(6.0);
+            let col = egui::Color32::from_rgba_unmultiplied(90, 220, 110, (230.0 * a) as u8);
+            let st = egui::Stroke::new(2.5, col);
+            let l = (r.width().min(r.height()) * 0.18).max(8.0);
+            for (c, dx, dy) in [(r.left_top(), 1.0, 1.0), (r.right_top(), -1.0, 1.0), (r.left_bottom(), 1.0, -1.0), (r.right_bottom(), -1.0, -1.0)] {
+                ui.painter().line_segment([c, c + egui::vec2(dx * l, 0.0)], st);
+                ui.painter().line_segment([c, c + egui::vec2(0.0, dy * l)], st);
+            }
+            ctx.request_repaint();
+        }
         let (Some(at), Some((ring, a))) = (self.focus_screen, self.focus.ring(now_ms())) else { return };
         let (col, pulse) = match ring {
             crate::tapfocus::Ring::Searching => (egui::Color32::WHITE, 0.6 + 0.4 * ((now_ms() % 600) as f32 / 600.0 * std::f32::consts::TAU).sin()),
