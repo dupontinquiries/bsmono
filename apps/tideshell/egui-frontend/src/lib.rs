@@ -549,7 +549,16 @@ impl ShellView {
         let s = Stroke::new(2.5, Color32::WHITE);
         p.line_segment([c + Vec2::new(-6.0 * d, -9.0), c + Vec2::new(6.0 * d, 0.0)], s);
         p.line_segment([c + Vec2::new(6.0 * d, 0.0), c + Vec2::new(-6.0 * d, 9.0)], s);
-        if ui.interact(r, Id::new(("ts-peek", side == Side::Left)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        let resp = ui.interact(r, Id::new(("ts-peek", side == Side::Left)), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        if resp.drag_stopped() {
+            // Up / down along the strip steps the stack; mostly-sideways or tiny drags are not swipes.
+            let d = resp.drag_delta();
+            let total = ui.input(|i| i.pointer.press_origin()).zip(ui.input(|i| i.pointer.latest_pos())).map(|(a, b)| b - a).unwrap_or(d);
+            if total.y.abs() > 48.0 && total.y.abs() > 1.5 * total.x.abs() {
+                return shell.peek_swipe(total.y < 0.0);
+            }
+        }
+        if resp.clicked() {
             return shell.peek_tap(side);
         }
         vec![]
@@ -1650,7 +1659,7 @@ impl ShellView {
         if rv < 0.5 {
             self.switcher_landed = false;
         }
-        p.rect_filled(full, cr(0), with_alpha(pal.bg_base, if self.backdrop_blur { 0.5 } else { 0.94 } * rv));
+        p.rect_filled(full, cr(0), with_alpha(pal.bg_base, if self.backdrop_blur { 0.5 } else { 0.8 } * rv));
         let rise = (1.0 - rv) * size.y * 0.35;
         let scale = 0.86 + 0.14 * rv;
         if live && ui.interact(full, Id::new("ts-sw-back"), Sense::click()).clicked() {
