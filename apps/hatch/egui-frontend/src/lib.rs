@@ -1383,6 +1383,22 @@ mod tests {
     }
 
     #[test]
+    // Passes headless: the one-character bug the owner sees on the phone does NOT reproduce here, so this
+    // guards the logic path only (see FP5_QUEUE row 44).
+    fn typing_several_characters_keeps_the_search_focused() {
+        let mut h = Harness::new(vec![entry("Firefox"), entry("Files"), entry("Calculator")]);
+        h.app.notices = hatch_core::notices::demo();
+        h.settle();
+        h.frame(vec![]);
+        for (i, c) in ["f", "i", "l"].iter().enumerate() {
+            h.frame(vec![egui::Event::Text(c.to_string())]);
+            h.frame(vec![]);
+            h.frame(vec![]);
+            assert_eq!(h.app.query, ["f", "fi", "fil"][i], "after typing {c:?} the whole query is kept, one character did not replace the last");
+        }
+    }
+
+    #[test]
     fn the_notice_strip_shows_every_kind_and_a_tap_dismisses_one() {
         let mut h = Harness::new(vec![]);
         h.app.notices = hatch_core::notices::demo();
