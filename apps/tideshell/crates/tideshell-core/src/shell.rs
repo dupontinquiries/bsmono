@@ -167,6 +167,8 @@ impl Shell {
         let mut morse = crate::morse::Morse::default();
         morse.set_pattern(&prefs.unlock_morse);
         let mut ambient = AutoBrightness::default();
+        // v2: decide on window statistics, change at most every 5 s, glide at 30 updates a second
+        ambient.algo = crate::ambient::Algo::V2;
         ambient.enabled = prefs.auto_brightness;
         ambient.user = prefs.brightness_offset;
         ambient.night = prefs.night;

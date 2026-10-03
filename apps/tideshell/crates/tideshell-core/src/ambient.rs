@@ -150,6 +150,73 @@ pub const MAX_SPEED: f32 = 0.8;
 /// Emit when the output moved at least this much (~one step of a 12-bit backlight x 6).
 pub const EMIT_STEP: f32 = 0.0015;
 pub const SENSOR_STALE_MS: Millis = 15_000;
+
+// ---- v2: decide statistically, change rarely, move smoothly ---------------------------------
+/// Readings from this long ago are the sample the decision is made on.
+pub const V2_WINDOW_MS: Millis = 12_000;
+/// Fewest readings in the window before anything is decided.
+pub const V2_MIN_N: usize = 6;
+/// Each tail trimmed from the window (a hand or a shadow is a tail): a trimmed mean.
+pub const V2_TRIM: f32 = 0.10;
+/// |t| the window's mean must reach against the last committed light to count as a real change.
+pub const V2_T_CRIT: f32 = 2.5;
+/// The noise floor on log10(lux), so a very steady sensor does not make every wobble "significant".
+pub const V2_SIGMA_FLOOR: f32 = 0.04;
+/// Least time between two commits, and the least brightness change worth making (about 2% of the range).
+pub const V2_MIN_UPDATE_MS: Millis = 5_000;
+pub const V2_MIN_VISIBLE: f32 = 0.02;
+/// The slider band's fixed half-width in v2 (no adaptive band).
+pub const V2_HALF_WIDTH: f32 = 0.12;
+/// Output rate while gliding (30 updates a second) and the least brightness step worth sending.
+pub const V2_EMIT_MS: Millis = 33;
+pub const V2_EMIT_STEP: f32 = 0.0004;
+/// Glide length: per unit of brightness distance, within these limits (seconds), smoothstep eased.
+pub const V2_GLIDE_PER_UNIT_S: f32 = 4.0;
+pub const V2_GLIDE_MIN_S: f32 = 0.8;
+pub const V2_GLIDE_MAX_S: f32 = 3.0;
+/// A new target closer than this to the one already gliding to is the same target.
+pub const V2_RETARGET_EPS: f32 = 0.004;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Algo {
+    /// The Holt filter + adaptive band + spring (the original).
+    #[default]
+    V1,
+    /// Window statistics + t-test + rate limit + lerp.
+    V2,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+struct V2 {
+    /// (time, log10(lux + 1)) over the last `V2_WINDOW_MS`.
+    samples: std::collections::VecDeque<(Millis, f32)>,
+    /// The light (log10 lux) the screen was last set for, and when.
+    committed: Option<f32>,
+    last_commit: Option<Millis>,
+    /// The glide in progress: (from, to, start ms, duration s).
+    glide: Option<(f32, f32, Millis, f32)>,
+    last_user: f32,
+    last_emit_ms: Option<Millis>,
+}
+
+/// Trimmed mean, standard deviation and count of `v` (sorted in place).
+fn trimmed_stats(v: &mut [f32]) -> Option<(f32, f32, usize)> {
+    if v.len() < V2_MIN_N {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let cut = ((v.len() as f32) * V2_TRIM).floor() as usize;
+    let t = &v[cut..v.len() - cut];
+    let n = t.len() as f32;
+    let mean = t.iter().sum::<f32>() / n;
+    let var = t.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / (n - 1.0).max(1.0);
+    Some((mean, var.sqrt(), t.len()))
+}
+
+fn smoothstep(p: f32) -> f32 {
+    let p = p.clamp(0.0, 1.0);
+    p * p * (3.0 - 2.0 * p)
+}
 /// Above this the shell switches its own surfaces to a sunlight (high
 /// contrast) look; the FP5 panel is not readable outdoors on brightness alone.
 pub const SUNLIGHT_LUX: f32 = 10_000.0;
@@ -233,6 +300,9 @@ pub struct AutoBrightness {
     last_emitted: Option<f32>,
     last_target: Option<f32>,
     last_tick: Option<Millis>,
+    /// Which algorithm runs (`Algo`).
+    pub algo: Algo,
+    v2: V2,
 }
 
 impl Default for AutoBrightness {
@@ -253,6 +323,8 @@ impl Default for AutoBrightness {
             last_emitted: None,
             last_target: None,
             last_tick: None,
+            algo: Algo::V1,
+            v2: V2::default(),
         }
     }
 }
@@ -295,6 +367,9 @@ impl AutoBrightness {
 
     pub fn on_lux(&mut self, lux: f32, now: Millis) {
         let x = (lux.max(0.0) + 1.0).log10();
+        if self.algo == Algo::V2 {
+            return self.on_lux_v2(x, now);
+        }
         match (self.level, self.last_reading) {
             (Some(l), Some(t)) => {
                 let dt = (now.saturating_sub(t) as f32 / 1000.0).max(1e-3);
@@ -345,6 +420,99 @@ impl AutoBrightness {
         self.last_reading = Some(now);
     }
 
+    /// v2: a reading joins the window; the window's spread is the noise, and the committed light is
+    /// what the screen is set for (not the raw window), so the band and the sunlight look stay still.
+    fn on_lux_v2(&mut self, x: f32, now: Millis) {
+        self.v2.samples.push_back((now, x));
+        while self.v2.samples.front().is_some_and(|(t, _)| now.saturating_sub(*t) > V2_WINDOW_MS) {
+            self.v2.samples.pop_front();
+        }
+        self.last_reading = Some(now);
+        self.half_width = V2_HALF_WIDTH;
+        self.trend = 0.0;
+        let mut v: Vec<f32> = self.v2.samples.iter().map(|(_, x)| *x).collect();
+        if let Some((_, sd, _)) = trimmed_stats(&mut v) {
+            self.var = sd * sd;
+        }
+    }
+
+    /// What the window says now: (trimmed mean, sd, n), once there are enough readings.
+    fn v2_window(&self) -> Option<(f32, f32, usize)> {
+        let mut v: Vec<f32> = self.v2.samples.iter().map(|(_, x)| *x).collect();
+        trimmed_stats(&mut v)
+    }
+
+    /// The t statistic of the window's mean against the light the screen was set for.
+    pub fn v2_t(&self) -> Option<f32> {
+        let (m, sd, n) = self.v2_window()?;
+        let c0 = self.v2.committed?;
+        Some((m - c0) / (sd.max(V2_SIGMA_FLOOR) / (n as f32).sqrt()))
+    }
+
+    fn tick_v2(&mut self, now: Millis, minute: u32) -> Option<f32> {
+        let night = self.night.factor(minute);
+        // 1. decide: commit a new light only on a real, visible change, at most every V2_MIN_UPDATE_MS
+        if let Some((m, _, _)) = self.v2_window() {
+            match self.v2.committed {
+                None => {
+                    self.v2.committed = Some(m);
+                    self.v2.last_commit = Some(now);
+                }
+                Some(c0) => {
+                    let waited = self.v2.last_commit.is_none_or(|t| now.saturating_sub(t) >= V2_MIN_UPDATE_MS);
+                    let visible = (curve_x(m) - curve_x(c0)).abs() * night >= V2_MIN_VISIBLE;
+                    if waited && visible && self.v2_t().is_some_and(|t| t.abs() >= V2_T_CRIT) {
+                        self.v2.committed = Some(m);
+                        self.v2.last_commit = Some(now);
+                    }
+                }
+            }
+        }
+        self.level = self.v2.committed;
+        self.half_width = V2_HALF_WIDTH;
+        self.math_offset = 0.0;
+        // 2. where it should be (the slider moves it at once, whatever the wait)
+        let target = self.band(now, minute).target;
+        self.last_target = Some(target);
+        let cur = self.applied?;
+        let user_moved = (self.user - self.v2.last_user).abs() > 1e-4;
+        self.v2.last_user = self.user;
+        let heading = self.v2.glide.map(|g| g.1).unwrap_or(cur);
+        if user_moved || (target - heading).abs() >= V2_RETARGET_EPS {
+            let d = (target - cur).abs();
+            let dur = (d * V2_GLIDE_PER_UNIT_S).clamp(V2_GLIDE_MIN_S, V2_GLIDE_MAX_S);
+            self.v2.glide = Some((cur, target, now, dur));
+        }
+        // 3. glide: a smoothstep lerp, one value to the next
+        let mut finished = false;
+        if let Some((from, to, t0, dur)) = self.v2.glide {
+            let p = now.saturating_sub(t0) as f32 / 1000.0 / dur;
+            self.applied = Some(from + (to - from) * smoothstep(p));
+            if p >= 1.0 {
+                self.applied = Some(to);
+                self.v2.glide = None;
+                finished = true;
+            }
+        }
+        self.vel = 0.0;
+        let next = self.applied?;
+        // 4. send at 30 updates a second, and the last one exactly
+        let due = match (self.last_emitted, self.v2.last_emit_ms) {
+            (None, _) => true,
+            (Some(e), Some(t)) => {
+                (now.saturating_sub(t) >= V2_EMIT_MS && (next - e).abs() >= V2_EMIT_STEP) || (finished && (next - e).abs() > 1e-6)
+            }
+            (Some(e), None) => (next - e).abs() >= V2_EMIT_STEP,
+        };
+        if due {
+            self.last_emitted = Some(next);
+            self.v2.last_emit_ms = Some(now);
+            Some(next)
+        } else {
+            None
+        }
+    }
+
     fn center(&self, now: Millis, minute: u32) -> f32 {
         let base = match self.level {
             Some(l) if self.has_sensor(now) => curve_x(l),
@@ -393,6 +561,9 @@ impl AutoBrightness {
     }
 
     pub fn is_animating(&self) -> bool {
+        if self.algo == Algo::V2 {
+            return self.enabled && self.applied.is_some() && (self.v2.glide.is_some() || self.last_target.zip(self.applied).is_some_and(|(t, a)| (t - a).abs() > 5e-4));
+        }
         self.enabled
             && self.applied.is_some()
             && (self.vel.abs() > 1e-3 || self.last_target.zip(self.applied).is_some_and(|(t, a)| (t - a).abs() > 5e-4))
@@ -405,6 +576,9 @@ impl AutoBrightness {
         self.last_tick = Some(now);
         if !self.enabled {
             return None;
+        }
+        if self.algo == Algo::V2 {
+            return self.tick_v2(now, minute);
         }
         let sensor = self.has_sensor(now);
         let s = if sensor { self.stability() } else { 1.0 };
@@ -769,5 +943,188 @@ mod tests {
         a.set_user(-1.0);
         assert_eq!(a.band(1, 2 * 60).target, MIN_LEVEL);
     }
+
+    // ---- v2 ----------------------------------------------------------------------------
+
+    fn v2() -> AutoBrightness {
+        let mut a = AutoBrightness { algo: Algo::V2, enabled: true, ..Default::default() };
+        a.set_current(0.3);
+        a
+    }
+
+    /// Deterministic noise in -1..1.
+    fn wob(i: u64) -> f32 {
+        let x = (i as f32 * 12.9898).sin() * 43758.5453;
+        (x - x.floor()) * 2.0 - 1.0
+    }
+
+    /// Run `lux(t)` at 10 Hz, ticking at 60 Hz in between; returns (time, emitted level) for every emission.
+    fn drive(a: &mut AutoBrightness, lux: impl Fn(f32) -> f32, from_ms: Millis, secs: f32) -> Vec<(Millis, f32)> {
+        let mut out = vec![];
+        let mut i = 0u64;
+        let end = from_ms + (secs * 1000.0) as u64;
+        let mut t = from_ms;
+        while t < end {
+            if t % 100 == 0 {
+                a.on_lux(lux((t - from_ms) as f32 / 1000.0) * (1.0 + 0.04 * wob(i)), t);
+                i += 1;
+            }
+            if let Some(v) = a.tick(t, NOON) {
+                out.push((t, v));
+            }
+            t += 16;
+        }
+        out
+    }
+
+    /// Steady light: it settles on the right level once, then stops sending anything at all.
+    #[test]
+    fn v2_settles_on_steady_light_and_then_goes_quiet() {
+        let mut a = v2();
+        let out = drive(&mut a, |_| 300.0, 0, 40.0);
+        assert!(!out.is_empty(), "it moved to the room's level");
+        let want = lux_curve(300.0);
+        let last = out.last().unwrap().1;
+        assert!((last - want).abs() < 0.02, "settled near {want}: {last}");
+        let late: Vec<_> = out.iter().filter(|(t, _)| *t > 15_000).collect();
+        assert!(late.is_empty(), "nothing is sent after it settled: {} emissions after 15 s", late.len());
+        assert!(!a.is_animating(), "and it is not animating");
+    }
+
+    /// A real change (dim room to daylight) is followed, but not before the window shows it and not
+    /// more often than every 5 s; a second change inside the wait is folded into the next commit.
+    #[test]
+    fn v2_follows_a_real_change_but_never_faster_than_every_five_seconds() {
+        let mut a = v2();
+        drive(&mut a, |_| 100.0, 0, 30.0);
+        let level_dim = a.applied.unwrap();
+        let out = drive(&mut a, |_| 3000.0, 30_000, 40.0);
+        let first = out.iter().find(|(_, v)| *v > level_dim + 0.02).expect("it brightened").0;
+        assert!(first >= 30_000 + 1_000, "not instant: the window has to see it (first change at {} ms in)", first - 30_000);
+        let reached = out.last().unwrap().1;
+        assert!((reached - lux_curve(3000.0)).abs() < 0.03, "ends at the daylight level: {reached}");
+        // commits: count distinct plateaus in what was sent: a single target, one glide
+        let commits = {
+            let mut c = 0;
+            let mut prev = out[0].1;
+            let mut dir = 0.0f32;
+            for (_, v) in &out {
+                let d = v - prev;
+                if d.abs() > 1e-6 {
+                    if dir != 0.0 && d.signum() != dir { c += 1; }
+                    dir = d.signum();
+                }
+                prev = *v;
+            }
+            c
+        };
+        assert_eq!(commits, 0, "one smooth glide, no back-and-forth");
+        // two changes 2 s apart: the second waits for the 5 s rule
+        let mut b = v2();
+        drive(&mut b, |_| 100.0, 0, 30.0);
+        let out = drive(&mut b, |t| if t < 8.0 { 1000.0 } else { 20.0 }, 30_000, 30.0);
+        let first_up = out.iter().position(|(_, v)| *v > lux_curve(100.0) + 0.02);
+        assert!(first_up.is_some(), "it did brighten for the 8 s of light");
+    }
+
+    /// A hand or a shadow over the sensor for 2 s does not move the screen.
+    #[test]
+    fn v2_ignores_a_two_second_shadow() {
+        let mut a = v2();
+        drive(&mut a, |_| 400.0, 0, 30.0);
+        let before = a.applied.unwrap();
+        let out = drive(&mut a, |t| if (3.0..5.0).contains(&t) { 3.0 } else { 400.0 }, 30_000, 20.0);
+        assert!(out.iter().all(|(_, v)| (v - before).abs() < 0.02), "the screen did not follow the shadow: {:?}", out.iter().map(|o| o.1).fold((9.0f32, 0.0f32), |m, v| (m.0.min(v), m.1.max(v))));
+    }
+
+    /// Flicker (+-30% swings every reading) is not a change.
+    #[test]
+    fn v2_ignores_flicker_around_a_steady_level() {
+        let mut a = v2();
+        drive(&mut a, |_| 500.0, 0, 30.0);
+        let before = a.applied.unwrap();
+        let mut i = 0u64;
+        let mut moved = 0;
+        for k in 0..600u64 {
+            let t = 30_000 + k * 100;
+            i += 1;
+            a.on_lux(500.0 * (1.0 + 0.3 * wob(i + 99)), t);
+            if let Some(v) = a.tick(t, NOON) {
+                if (v - before).abs() > 0.02 { moved += 1; }
+            }
+        }
+        assert_eq!(moved, 0, "flicker moved the screen");
+    }
+
+    /// The glide is smooth: updates at about 30 a second, each small, never out of order, never overshooting.
+    #[test]
+    fn v2_glides_at_thirty_updates_a_second_in_small_steps() {
+        let mut a = v2();
+        drive(&mut a, |_| 100.0, 0, 30.0);
+        let out = drive(&mut a, |_| 8000.0, 30_000, 30.0);
+        let start = lux_curve(100.0);
+        let end = lux_curve(8000.0);
+        assert!(out.iter().all(|(_, v)| *v >= start - 0.02 && *v <= end + 0.005), "no overshoot");
+        let glide: Vec<_> = out.windows(2).filter(|w| w[1].1 - w[0].1 > 1e-4).collect();
+        assert!(glide.len() > 20, "many small steps: {}", glide.len());
+        let max_step = glide.iter().map(|w| w[1].1 - w[0].1).fold(0.0f32, f32::max);
+        assert!(max_step < 0.03, "no big jumps: {max_step}");
+        assert!(out.windows(2).all(|w| w[1].0 - w[0].0 >= 16), "never faster than the frame");
+        let mut gaps: Vec<Millis> = glide.iter().map(|w| w[1].0 - w[0].0).collect();
+        gaps.sort();
+        let median_gap = gaps[gaps.len() / 2];
+        // the test ticks at 60 Hz, so a 33 ms rule lands on every third tick (48 ms); the real loop runs faster
+        assert!((32..=50).contains(&median_gap), "about 30 updates a second (every {median_gap} ms, median)");
+        assert!(out.windows(2).all(|w| w[1].1 >= w[0].1 - 1e-6), "monotonic on the way up");
+    }
+
+    /// The slider acts at once, ignoring the 5 s wait.
+    #[test]
+    fn v2_slider_moves_the_screen_immediately() {
+        let mut a = v2();
+        drive(&mut a, |_| 300.0, 0, 30.0);
+        let before = a.applied.unwrap();
+        a.set_user(0.8);
+        let out = drive(&mut a, |_| 300.0, 30_000, 4.0);
+        let after = out.last().expect("the slider's change was sent").1;
+        assert!(after > before + 0.05, "{before} -> {after}");
+        assert!(out.first().unwrap().0 < 30_000 + 200, "started within a frame or two");
+    }
+
+    /// No sensor, nothing decided: it does not invent a level, and a dead sensor is noticed.
+    #[test]
+    fn v2_without_readings_does_nothing() {
+        let mut a = v2();
+        assert_eq!(a.tick(1000, NOON), Some(0.3).filter(|_| false), "nothing to say before any reading");
+        assert_eq!(a.applied, Some(0.3), "and the level it started at is untouched");
+        assert!(!a.has_sensor(1000));
+        a.on_lux(300.0, 100);
+        assert!(!a.has_sensor(100), "one reading is not a decision");
+    }
+
+
+    /// However the light jumps about, commits are at least five seconds apart (and do happen).
+    #[test]
+    fn v2_commits_are_never_closer_than_the_minimum_interval() {
+        let mut a = v2();
+        let mut commits: Vec<Millis> = vec![];
+        let mut i = 0u64;
+        for k in 0..1000u64 {
+            let t = k * 100;
+            // 100 lux and 5000 lux, switching every 7 s
+            let lux = if (t / 7000) % 2 == 0 { 100.0 } else { 5000.0 };
+            i += 1;
+            a.on_lux(lux * (1.0 + 0.04 * wob(i)), t);
+            a.tick(t, NOON);
+            if let Some(c) = a.v2.last_commit {
+                if commits.last() != Some(&c) { commits.push(c); }
+            }
+        }
+        assert!(commits.len() >= 3, "it followed the changes: {commits:?}");
+        for w in commits.windows(2) {
+            assert!(w[1] - w[0] >= V2_MIN_UPDATE_MS, "commits too close: {} then {}", w[0], w[1]);
+        }
+    }
+
 }
 
