@@ -19,6 +19,8 @@ fn arc(c: (f32, f32), r: f32, from_deg: f32, to_deg: f32) -> Vec<(f32, f32)> {
 /// Polylines for an action's glyph in a [-1, 1] box (y down). Unknown ids give a dot.
 pub fn paths(id: &str) -> Vec<Vec<(f32, f32)>> {
     match id {
+        // A chevron pointing down onto a line: tuck it away.
+        "hide" => vec![vec![(-0.75, -0.45), (0.0, 0.3), (0.75, -0.45)], vec![(-0.75, 0.75), (0.75, 0.75)]],
         // Open circle with a bar through the gap at the top.
         "poweroff" => vec![arc((0.0, 0.1), 0.78, -60.0, 240.0), vec![(0.0, -0.9), (0.0, -0.05)]],
         // A circular arrow: almost a full turn and a head at its open end.
@@ -70,21 +72,25 @@ pub fn paint(p: &Painter, rect: Rect, id: &str, color: Color32) {
 mod tests {
     use super::*;
 
+    fn ids() -> Vec<&'static str> {
+        hatch_core::SYSTEM_ACTIONS.iter().map(|a| a.id).chain(std::iter::once("hide")).collect()
+    }
+
     #[test]
-    fn every_system_action_has_a_glyph_inside_the_box() {
-        for a in hatch_core::SYSTEM_ACTIONS {
-            let ps = paths(a.id);
+    fn every_system_action_and_hide_has_a_glyph_inside_the_box() {
+        for id in ids() {
+            let ps = paths(id);
             let n: usize = ps.iter().map(|p| p.len()).sum();
-            assert!(n >= 4, "{} has real strokes ({n} points)", a.id);
+            assert!(n >= 4, "{id} has real strokes ({n} points)");
             for (x, y) in ps.iter().flatten() {
-                assert!(x.abs() <= 1.01 && y.abs() <= 1.01, "{}: ({x},{y}) is outside the glyph box", a.id);
+                assert!(x.abs() <= 1.01 && y.abs() <= 1.01, "{id}: ({x},{y}) is outside the glyph box");
             }
         }
     }
 
     #[test]
     fn the_glyphs_differ_from_each_other() {
-        let all: Vec<_> = hatch_core::SYSTEM_ACTIONS.iter().map(|a| format!("{:?}", paths(a.id))).collect();
+        let all: Vec<_> = ids().iter().map(|id| format!("{:?}", paths(id))).collect();
         for i in 0..all.len() {
             for j in i + 1..all.len() {
                 assert_ne!(all[i], all[j], "two actions share a glyph");

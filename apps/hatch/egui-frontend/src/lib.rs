@@ -22,6 +22,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 const SYS_BTN: f32 = 48.0;
+const SEARCH_H: f32 = 54.6;
+/// Space under the search pill: the bottom swipe-up gesture lives there.
+const SEARCH_BOTTOM_GAP: f32 = 24.0;
 
 /// Share of the configured icon size an app icon is drawn at inside its card.
 const ICON_FRAC: f32 = 0.72;
@@ -295,8 +298,10 @@ impl HatchUi {
 
         // Reserve the bottom stack first so the grid can take the remainder.
         let sys_actions = self.core.system_actions();
-        let sys_h = if sys_actions.is_empty() { 0.0 } else { 56.0 };
-        let search_h = 52.0;
+        // The system row always has the hide button, so it is always there.
+        let sys_h = 56.0;
+        // 5% taller than it was (52), with the clearance below it that the bottom swipe-up area needs.
+        let search_h = SEARCH_H;
         let grabber_h = 26.0;
         let notices_h = if self.notices.is_empty() { 0.0 } else { cell.y + 24.0 };
         let grid_h =
@@ -332,7 +337,7 @@ impl HatchUi {
         // ---- system row + search pill, bottom-anchored ----
         self.status.tick();
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-            ui.add_space(8.0);
+            ui.add_space(SEARCH_BOTTOM_GAP);
             if self.search_pill(ui, search_h, colors) {
                 event = UiEvent::Launched;
             }
@@ -870,23 +875,29 @@ impl HatchUi {
     /// bottom-up layout, which sizes itself from the first widget and let the 48 px buttons spill down
     /// over the search pill.
     fn system_row(&mut self, ui: &mut egui::Ui, colors: &PaletteColors) -> bool {
-        let actions: Vec<_> = self.core.system_actions().into_iter().collect();
+        // "Hide" is first: the way out that launches nothing. (The grabber at the top and Esc do the same,
+        // and were forgotten.)
+        let mut buttons: Vec<(&'static str, &'static str)> = vec![("hide", "Hide")];
+        buttons.extend(self.core.system_actions().into_iter().map(|a| (a.id, a.label)));
         let mut run: Option<&'static str> = None;
         let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), SYS_BTN), Sense::hover());
-        let total = actions.len() as f32 * (SYS_BTN + 4.0) - 4.0;
+        let total = buttons.len() as f32 * (SYS_BTN + 4.0) - 4.0;
         let mut x = row.center().x - total / 2.0;
-        for a in &actions {
+        for &(id, label) in &buttons {
             let rect = Rect::from_min_size(egui::pos2(x, row.top()), Vec2::splat(SYS_BTN));
             x += SYS_BTN + 4.0;
-            let resp = ui.interact(rect, egui::Id::new(("hatch-sys", a.id)), Sense::click());
+            let resp = ui.interact(rect, egui::Id::new(("hatch-sys", id)), Sense::click());
             let t = ui.ctx().animate_bool_with_time(resp.id, resp.is_pointer_button_down_on(), 0.08);
             let r = rect.shrink(2.0 + 3.0 * t);
             ui.painter().rect_filled(r, CornerRadius::same((SYS_BTN / 2.0) as u8), colors.accent.gamma_multiply(if resp.hovered() { 0.30 } else { 0.16 }));
-            sys_icons::paint(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(22.0)), a.id, ui.visuals().text_color());
-            let resp = resp.on_hover_text(a.label);
+            sys_icons::paint(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(22.0)), id, ui.visuals().text_color());
+            let resp = resp.on_hover_text(label);
             if resp.clicked() {
-                run = Some(a.id);
+                run = Some(id);
             }
+        }
+        if run == Some("hide") {
+            return true; // the caller hides the window; nothing is launched
         }
         if let Some(id) = run {
             match self.core.run_system_action(id) {
@@ -913,7 +924,7 @@ impl HatchUi {
             Stroke::new(1.0, colors.accent.gamma_multiply(0.4)),
             StrokeKind::Inside,
         );
-        let edit_rect = rect.shrink2(Vec2::new(18.0, 10.0));
+        let edit_rect = rect.shrink2(Vec2::new(18.9, 10.5));
         let resp = ui.put(
             edit_rect,
             egui::TextEdit::singleline(&mut self.query).id_salt("lib-self_query")
