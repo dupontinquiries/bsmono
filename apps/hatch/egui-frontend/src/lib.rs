@@ -16,9 +16,12 @@
 
 pub mod icons_img;
 pub mod toggle;
+mod sys_icons;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+const SYS_BTN: f32 = 48.0;
 
 /// Share of the configured icon size an app icon is drawn at inside its card.
 const ICON_FRAC: f32 = 0.72;
@@ -375,7 +378,8 @@ impl HatchUi {
                     let rect = slot.shrink(4.0);
                     let p = ui.painter();
                     let call = n.kind == hatch_core::notices::Kind::Call && n.when == "now";
-                    let ground = if call { colors.accent_soft } else { colors.bg_raised };
+                    // A call in progress is tinted toward the accent but stays dark enough for the light text.
+                    let ground = if call { colors.bg_raised.lerp_to_gamma(colors.accent, 0.35) } else { colors.bg_raised };
                     p.rect_filled(rect, CornerRadius::same(14), ground);
                     p.rect_stroke(rect, CornerRadius::same(14), Stroke::new(1.0, colors.border.gamma_multiply(0.6)), StrokeKind::Inside);
                     p.text(rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, n.kind.glyph(), FontId::proportional(18.0), colors.accent);
@@ -861,47 +865,29 @@ impl HatchUi {
     }
 
     /// Returns true when a system action was launched.
+    ///
+    /// The row's whole rectangle is allocated up front. It used to be a `ui.horizontal` inside the
+    /// bottom-up layout, which sizes itself from the first widget and let the 48 px buttons spill down
+    /// over the search pill.
     fn system_row(&mut self, ui: &mut egui::Ui, colors: &PaletteColors) -> bool {
         let actions: Vec<_> = self.core.system_actions().into_iter().collect();
         let mut run: Option<&'static str> = None;
-        ui.horizontal(|ui| {
-            let total = actions.len() as f32 * 52.0;
-            ui.add_space((ui.available_width() - total).max(0.0) / 2.0);
-            for a in &actions {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::click());
-                let t = ui.ctx().animate_bool_with_time(resp.id, resp.is_pointer_button_down_on(), 0.08);
-                let r = rect.shrink(2.0 + 3.0 * t);
-                ui.painter().rect_filled(
-                    r,
-                    CornerRadius::same(24),
-                    colors.accent.gamma_multiply(if resp.hovered() { 0.30 } else { 0.16 }),
-                );
-                match self.sys_texture(ui.ctx(), a.icon) {
-                    // painter.image returns a ShapeIdx since egui 0.34 — drop it.
-                    Some(id) => {
-                        ui.painter().image(
-                            id,
-                            Rect::from_center_size(rect.center(), Vec2::splat(24.0)),
-                            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            Color32::WHITE,
-                        );
-                    }
-                    None => {
-                        ui.painter().text(
-                            rect.center(),
-                            Align2::CENTER_CENTER,
-                            a.label.chars().next().unwrap_or('?'),
-                            FontId::proportional(18.0),
-                            ui.visuals().text_color(),
-                        );
-                    }
-                }
-                let resp = resp.on_hover_text(a.label);
-                if resp.clicked() {
-                    run = Some(a.id);
-                }
+        let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), SYS_BTN), Sense::hover());
+        let total = actions.len() as f32 * (SYS_BTN + 4.0) - 4.0;
+        let mut x = row.center().x - total / 2.0;
+        for a in &actions {
+            let rect = Rect::from_min_size(egui::pos2(x, row.top()), Vec2::splat(SYS_BTN));
+            x += SYS_BTN + 4.0;
+            let resp = ui.interact(rect, egui::Id::new(("hatch-sys", a.id)), Sense::click());
+            let t = ui.ctx().animate_bool_with_time(resp.id, resp.is_pointer_button_down_on(), 0.08);
+            let r = rect.shrink(2.0 + 3.0 * t);
+            ui.painter().rect_filled(r, CornerRadius::same((SYS_BTN / 2.0) as u8), colors.accent.gamma_multiply(if resp.hovered() { 0.30 } else { 0.16 }));
+            sys_icons::paint(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(22.0)), a.id, ui.visuals().text_color());
+            let resp = resp.on_hover_text(a.label);
+            if resp.clicked() {
+                run = Some(a.id);
             }
-        });
+        }
         if let Some(id) = run {
             match self.core.run_system_action(id) {
                 Ok(_) => return true,

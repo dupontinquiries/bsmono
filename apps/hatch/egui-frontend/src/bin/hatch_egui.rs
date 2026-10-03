@@ -39,6 +39,7 @@ struct App {
     /// When the window was created or last shown: the grid animates in from here and must be
     /// repainted every frame while it does.
     shown_at: std::time::Instant,
+    ime_repair: uikit_egui::ime::ImeRepair,
 }
 
 impl App {
@@ -60,6 +61,12 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+
+    /// The on-screen keyboard commits each key as `Disabled, Commit, Disabled` with no composition, which
+    /// egui's TextEdit drops after the first character; `ImeRepair` turns such a commit into plain text.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.ime_repair.repair(&mut raw_input.events);
+    }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // The plasmoid's translucent sheet: let the compositor blend the
@@ -222,6 +229,7 @@ fn main() -> eframe::Result<()> {
                 opacity,
                 was_focused: true,
                 shown_at: std::time::Instant::now(),
+                ime_repair: Default::default(),
             }))
         }),
     );
