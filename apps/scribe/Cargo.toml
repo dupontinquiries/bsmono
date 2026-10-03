@@ -1,0 +1,35 @@
+[package]
+name = "scribe"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A quick script writer: type scenes and lines, every line truly centred, export to a self-contained HTML page for printing in a choice of styles and fonts. The headless core parses and renders (tested without a display); a small egui editor and a CLI sit on top."
+
+[lib]
+path = "src/lib.rs"
+
+# The command line: `scribe export script.txt --style classic -o script.html`. No window, no UI crates.
+[[bin]]
+name = "scribe"
+path = "src/bin/scribe.rs"
+
+# The editor: type on the left, see the centred page on the right, export.
+[[bin]]
+name = "scribe-egui"
+path = "src/bin/scribe_egui.rs"
+required-features = ["app"]
+
+[features]
+default = ["app"]
+app = ["dep:eframe", "dep:egui", "dep:uikit-egui"]
+
+[dependencies]
+# glow, the fleet pattern (maintenance/tools/eframe_backend_check.py): eframe 0.34's default wgpu device asks for
+# more colour attachments than a phone GPU allows.
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+egui = { version = "0.34", optional = true }
+# The shared kit: the IME repair that lets an on-screen keyboard type more than one character, and the symbol fonts.
+uikit-egui = { path = "../../shared/uikit/crates/uikit-egui", optional = true }
+
+[dev-dependencies]
+tempfile = "3.8"
