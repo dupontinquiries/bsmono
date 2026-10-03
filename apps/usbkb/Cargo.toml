@@ -7,11 +7,14 @@ license = "MIT"
 
 [features]
 default = ["gui"]
-gui = ["dep:eframe", "dep:egui"]
+gui = ["dep:eframe", "dep:egui", "dep:uikit-egui"]
 
 [dependencies]
 egui = { version = "0.34", optional = true }
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+
+# The shared kit: the symbol fonts the key labels use (font_install_check.py).
+uikit-egui = { path = "../../shared/uikit/crates/uikit-egui", optional = true }
 
 [[bin]]
 name = "usbkb"

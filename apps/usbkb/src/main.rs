@@ -59,7 +59,7 @@ fn main() {
         #[cfg(feature = "gui")]
         Some("gui") => {
             let opts = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([420.0, 560.0]).with_title("usbkb"), ..Default::default() };
-            let _ = eframe::run_native("usbkb", opts, Box::new(|_| Ok(Box::new(gui::Remote::default()))));
+            let _ = eframe::run_native("usbkb", opts, Box::new(|cc| { uikit_egui::fonts::install(&cc.egui_ctx); Ok(Box::new(gui::Remote::default())) }));
         }
         _ => eprintln!("usbkb status | script setup|teardown|swap <port> | type \"text\" [--enter] | gui"),
     }
