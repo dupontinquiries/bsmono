@@ -272,3 +272,9 @@ the rest needs the exposure turned down at capture, which wants the camera run. 
 had `lens = no lens` (the wide sensor's distortion uncorrected) and `wb = auto`.
 Sensors from the device tree (`/sys/firmware/devicetree/base/soc@0/cci@*/i2c-bus@*/camera@*`): camera@1a imx800 (orientation 1,
 back), camera@29 imx858 (back, main, lens motor), camera@10 s5kjn1 (orientation 0 = FRONT); all rotation 270.
+
+## The COSMIC panel is off (2026-10-03)
+Tideshell draws the bar, drawer and switcher, so the stock COSMIC panel was a second, unwanted bar along the bottom (and its
+applets cost CPU, and crashed whenever the panel restarted). `com.system76.CosmicPanel/v1/entries` set to `[]` removes the panel and the
+dock live; cosmic-panel keeps running idle. To bring it back: restore `entries.prev`. (The `border_radius` fix above only matters
+when the panel is on.)
