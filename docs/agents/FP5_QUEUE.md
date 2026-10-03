@@ -71,6 +71,9 @@ Legend: **done** = committed and deployed; **built** = committed, not seen worki
 | 59 | Lockscreen / display turn-off states are inconsistent | open | owner report (2026-10-03); the sleep machine is `sleep.rs`, the DPU wedge notes in FP5_PHONE_LEARNINGS apply; trace one scenario at a time with `tideshell ctl` and the journal, do not change DSI timings blind |
 | 60 | Auto-rotate lost after a boot where the ADSP sensors were late | built, applied | `gitmind fp5 apply ... "auto-rotate sensor proxy"` (drop-in: start at boot after the sensors server, Restart=always); applied to the phone by hand-run sudo because gitmind's BatchMode ssh is refused there; whether it prevents the cold-boot failure is untested |
 | 61 | studio: drag on empty timeline space pans | built | `f385d7387`; the drag path itself is untested (the crate's drag harness is ignored) |
+| 62 | Palette controls ride above the on-screen keyboard | built, deployed (tideshell); rusty-board side committed, not deployed | `569a9e698` + `e24cbb167`: rusty-board writes `$XDG_RUNTIME_DIR/rusty-board.geom` (height), tideshell lifts the search bar and modes by it. Needs a rusty-board build on the phone to take effect; alphabet scrub rail (owner alternative) not started |
+| 63 | Drawer Wi-Fi/Bluetooth/mobile-data/airplane tiles show real state | built, deployed, unseen | `26c6321b4`: they were only set on tap; now read from rfkill every 2 s. Next: a minimal traffic line (`/proc/net/dev`) and a redacted last-peer address (show only truncated tail, e.g. `…:a4:7f`, never full IP/MAC) |
+| 64 | Autobrightness flicker | not tideshell | likely panel/backlight/DSI driver; check kernel on device and the Fairphone PDF before any change |
 | 14 | Older: logscope service test, switcher drawer redesign, home widget, steno multitouch, PAM shim, emergency access | open | see the C20 queues |
 
 ## Done tonight (all deployed unless noted)
