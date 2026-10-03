@@ -118,6 +118,11 @@ impl Sleep {
         }
     }
 
+    /// The sensor says near right now (no hold after it clears).
+    pub fn is_near(&self) -> bool {
+        self.near
+    }
+
     /// Covered right now, or cleared less than POCKET_HOLD_MS ago.
     pub fn is_covered(&self, now: Millis) -> bool {
         self.near || self.near_cleared_at.is_some_and(|t| now.saturating_sub(t) < POCKET_HOLD_MS)

@@ -42,6 +42,11 @@ pub struct HomeInfo {
     pub temp_note: String,
 }
 
+/// Covered this long with the lock cover lit (a bag, a pocket; lying face down on a table reads far, so
+/// it is not this) and the display goes off by itself instead of waiting for the idle timer. Long
+/// enough that a hand passing the sensor does not blank it.
+pub const POCKET_SLEEP_MS: Millis = 1500;
+
 /// How long the drawn accent takes to close most of the way (63%) to a new colour.
 pub const ACCENT_EASE_MS: f32 = 1200.0;
 
@@ -136,6 +141,8 @@ pub struct Shell {
     win_seen: HashMap<u64, (bool, Option<i32>, Millis)>,
     /// Double tap on the lock screen = screen off (see doubletap.rs).
     cover_taps: crate::doubletap::DoubleTap,
+    /// When the sensor first read near while the lock cover was lit (`POCKET_SLEEP_MS` later it sleeps).
+    cover_since: Option<Millis>,
     now: Millis,
     last_tick: Option<Millis>,
     trace: VecDeque<String>,
@@ -216,6 +223,7 @@ impl Shell {
             zone_since: 0,
             win_seen: HashMap::new(),
             cover_taps: Default::default(),
+            cover_since: None,
             now: 0,
             last_tick: None,
             trace: VecDeque::new(),
@@ -573,6 +581,21 @@ impl Shell {
         if let Some(o) = self.rotate.poll(now, rotate_blocked) {
             self.log(format!("rotate {o:?}"));
             out.extend(self.emit(vec![Action::Rotate(o.transform_deg(self.prefs.rotate_flip))]));
+        }
+        // In a bag with the lock cover lit: switch the display off now (touches while covered are
+        // already dropped, and a sleeping covered phone is never woken by taps), rather than burning
+        // the battery until the idle timer fires.
+        if self.sleep.is_near() && self.lock.is_locked() && matches!(self.sleep.phase, crate::sleep::Phase::Awake) {
+            let since = *self.cover_since.get_or_insert(now);
+            if now.saturating_sub(since) >= POCKET_SLEEP_MS {
+                self.cover_since = None;
+                self.log("covered with the lock screen up: display off");
+                let acts = self.sleep.idle();
+                let more: Vec<Action> = acts.into_iter().flat_map(|a| self.on_sleep_action(a)).collect();
+                out.extend(self.emit(more));
+            }
+        } else {
+            self.cover_since = None;
         }
         let events = self.recognizer.tick(now);
         self.drain_recognizer_log();
@@ -1554,6 +1577,44 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
+    /// Covered with the lock cover lit for 1.5 s: the display goes off by itself and stays off through
+    /// pocket taps; a hand passing the sensor, or an unlocked phone with an app up, is left alone.
+    #[test]
+    fn a_covered_lit_lock_screen_turns_the_display_off_by_itself() {
+        let mut sh = shell_with_three();
+        sh.lock_now();
+        let mut t = 1000;
+        sh.on_proximity(true, t);
+        sh.tick(t);
+        t += POCKET_SLEEP_MS - 300;
+        sh.tick(t);
+        assert!(!sh.sleep.captures_input(), "not yet: a hand passing the sensor does not blank it");
+        t += 600;
+        sh.tick(t);
+        assert!(sh.sleep.captures_input(), "off after 1.5 s covered");
+        assert!(!sh.camera_wanted(), "and the camera is not running");
+        for k in 0..6u64 {
+            sh.on_sleep_touch(TouchEvent::Down { slot: 0, x: 100.0, y: 200.0, t: t + k * 120 });
+            sh.on_sleep_touch(TouchEvent::Up { slot: 0, t: t + k * 120 + 60 });
+        }
+        assert!(sh.sleep.captures_input(), "six pocket taps: still off");
+
+        let mut wave = shell_with_three();
+        wave.lock_now();
+        wave.on_proximity(true, 1000);
+        wave.tick(1000);
+        wave.tick(1800);
+        wave.on_proximity(false, 1900);
+        wave.tick(4000);
+        assert!(!wave.sleep.captures_input(), "a wave does not sleep it");
+
+        let mut app = shell_with_three();
+        app.on_proximity(true, 1000);
+        app.tick(1000);
+        app.tick(1000 + POCKET_SLEEP_MS + 500);
+        assert!(!app.sleep.captures_input(), "no lock cover: no pocket sleep");
+    }
+
     /// Set down on a table: a transient orientation on the way down, then "undefined". Nothing rotates,
     /// however long the shell then ticks, and it still rotates once picked up and turned.
     #[test]
