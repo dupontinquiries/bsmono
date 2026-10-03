@@ -74,6 +74,7 @@ pub fn key_events(pressed: bool, keysym: u32, utf8: &str, ctrl: bool, alt: bool,
 pub mod sensors;
 /// cpupower's scaling governor, over sysfs. Pure std, no feature gate needed.
 pub mod appinfo_io;
+pub mod quiet_osd;
 pub mod cpu_governor;
 /// Hardware keys -- power and volume -- from evdev, with the logind power-key
 /// inhibitor. (Supersedes this branch's `power_key`, which handled power only;

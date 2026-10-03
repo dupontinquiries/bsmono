@@ -55,6 +55,7 @@ struct Shellbox {
     /// A physical keyboard is attached (re-read every few seconds), so the on-screen one stays down.
     hw_keyboard: bool,
     hw_checked_at: u64,
+    osd_checked_at: u64,
     /// What the on-screen keyboard was last told: `show` for the palette's search field.
     told_board_show: bool,
     /// Sleeping hours from bsettings (settingsd's file) and that file's mtime.
@@ -583,6 +584,7 @@ fn main() {
         told_keyboard_at: 0,
         hw_keyboard: false,
         hw_checked_at: 0,
+        osd_checked_at: 0,
         told_board_show: false,
         fleet_sleep: settings_kit::SleepPrefs::default(),
         fleet_sleep_seen: None,
@@ -887,6 +889,17 @@ fn main() {
             let acts = sb.shell.set_hw_pointer(ptr);
             if !acts.is_empty() {
                 sb.execute(acts);
+            }
+        }
+        // COSMIC's own brightness pop-up fires on every backlight write, ours included: keep cosmic-osd
+        // stopped (see quiet_osd.rs). A scan of /proc every 10 s, which also catches a respawn.
+        if now_ms.saturating_sub(sb.osd_checked_at) >= 10_000 {
+            sb.osd_checked_at = now_ms;
+            if tideshell_egui::quiet_osd::enabled() {
+                let n = tideshell_egui::quiet_osd::quiet();
+                if n > 0 {
+                    sb.shell.note(format!("stopped cosmic-osd ({n}): its brightness pop-up is replaced by tideshell's own"));
+                }
             }
         }
         let want_board = sb.shell.palette.open && sb.shell.palette.expanded && !sb.hw_keyboard;
