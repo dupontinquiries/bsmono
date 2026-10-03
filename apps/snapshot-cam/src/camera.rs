@@ -29,6 +29,45 @@ impl Facing {
     pub fn label(self) -> &'static str { match self { Facing::Front => "front", Facing::Rear => "rear" } }
 }
 
+/// Which source each facing opens, when the platform cannot say (a phone whose libcamera cameras
+/// are only addressed by devicetree path, as the FP5's are). `SNAPSHOT_CAM_FRONT_SOURCE` and
+/// `SNAPSHOT_CAM_REAR_SOURCE` name one each (a `/dev/video*`, a PipeWire node, or `gst:<element>`);
+/// the older `SNAPSHOT_CAM_SOURCE` pins ONE source whatever the facing, and
+/// `SNAPSHOT_CAM_SOURCE_FACING=front` says it is a selfie camera (otherwise it is taken as the rear).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sources {
+    pub front: Option<String>,
+    pub rear: Option<String>,
+    pub pinned: Option<String>,
+    pub pinned_is_front: bool,
+}
+
+impl Sources {
+    pub fn from_env() -> Sources {
+        let get = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        Sources {
+            front: get("SNAPSHOT_CAM_FRONT_SOURCE"),
+            rear: get("SNAPSHOT_CAM_REAR_SOURCE"),
+            pinned: get("SNAPSHOT_CAM_SOURCE"),
+            pinned_is_front: get("SNAPSHOT_CAM_SOURCE_FACING").as_deref() == Some("front"),
+        }
+    }
+
+    /// The source for `f`: its own, else the pin.
+    pub fn for_facing(&self, f: Facing) -> Option<&str> {
+        match f {
+            Facing::Front => self.front.as_deref(),
+            Facing::Rear => self.rear.as_deref(),
+        }
+        .or(self.pinned.as_deref())
+    }
+
+    /// Two different cameras are named, so there is something to switch between.
+    pub fn can_switch(&self) -> bool {
+        self.front.is_some() && self.rear.is_some()
+    }
+}
+
 /// The capture geometry the rig forces. 1280×720 is what a phone preview
 /// wants and what the fdsink framing makes every frame: 3.7 MB, ~110 MB/s
 /// at 30 fps through the pipe, which is within what a phone's page cache
@@ -57,6 +96,8 @@ pub struct Camera {
     /// The plan the rig was started with, so the live candidate's device
     /// can be named for `hwctl`.
     started: Vec<capture_kit::SourceCandidate>,
+    /// Named sources per facing (`Sources`); empty unless the environment gave some.
+    pub sources: Sources,
 }
 
 impl Camera {
@@ -71,7 +112,7 @@ impl Camera {
     /// `open`, with the pattern choice explicit.
     pub fn open_with(facing: Facing, test: bool) -> Camera {
         let probe = if test { Probe::default() } else { Probe::run() };
-        let mut cam = Camera { probe, facing, source: Source::None, rig: None, status: Status::Idle, drawn_seq: 0, started: vec![] };
+        let mut cam = Camera { probe, facing, source: Source::None, rig: None, status: Status::Idle, drawn_seq: 0, started: vec![], sources: if test { Sources::default() } else { Sources::from_env() } };
         cam.start(test);
         cam
     }
@@ -79,7 +120,7 @@ impl Camera {
     /// A camera over a probe, not started — for tests and for "no camera".
     pub fn unstarted(probe: Probe, facing: Facing) -> Camera {
         Camera { probe, facing, source: Source::None, rig: None,
-                 status: Status::Exhausted { log: vec!["no camera found".into()] }, drawn_seq: 0, started: vec![] }
+                 status: Status::Exhausted { log: vec!["no camera found".into()] }, drawn_seq: 0, started: vec![], sources: Sources::default() }
     }
 
     fn start(&mut self, test: bool) {
@@ -116,14 +157,33 @@ impl Camera {
     /// cannot exercise.
     pub fn plan(&self) -> Vec<capture_kit::SourceCandidate> {
         let want_front = self.facing == Facing::Front;
-        let preferred = std::env::var("SNAPSHOT_CAM_SOURCE").ok().filter(|v| !v.trim().is_empty())
+        let preferred = self.sources.for_facing(self.facing).map(str::to_string)
             .or_else(|| self.probe.pw.iter().find(|c| c.front == Some(want_front)).map(|c| c.node.clone()));
         self.probe.plan(preferred.as_deref(), false)
     }
 
+    /// The facing of the camera actually on screen. The viewfinder mirrors a FRONT camera only, so
+    /// this, not the facing the person asked for, decides the mirror and the saved name: with one
+    /// source pinned for both facings it is whatever that source is (the rear unless it says
+    /// otherwise), because a rear camera shown mirrored reads left-right backwards.
+    pub fn shown_facing(&self) -> Facing {
+        let own = match self.facing {
+            Facing::Front => self.sources.front.is_some(),
+            Facing::Rear => self.sources.rear.is_some(),
+        };
+        let platform_knows = self.probe.pw.iter().any(|c| c.front == Some(self.facing == Facing::Front));
+        if own || platform_knows || self.sources.pinned.is_none() {
+            self.facing
+        } else if self.sources.pinned_is_front {
+            Facing::Front
+        } else {
+            Facing::Rear
+        }
+    }
+
     /// Does this machine have a second camera to switch to?
     pub fn can_switch(&self) -> bool {
-        self.probe.pw.iter().filter(|c| c.front.is_some()).map(|c| c.front).collect::<std::collections::HashSet<_>>().len() > 1
+        self.sources.can_switch() || self.probe.pw.iter().filter(|c| c.front.is_some()).map(|c| c.front).collect::<std::collections::HashSet<_>>().len() > 1
     }
 
     /// Switch facing and restart the rig on the other camera.
@@ -251,4 +311,39 @@ mod tests {
         assert!(front.plan()[0].pipeline.contains("libcamera_front"));
         assert!(!front.plan()[0].pipeline.contains("flip"), "the file is not mirrored; the preview is");
     }
+
+    fn named(front: Option<&str>, rear: Option<&str>, pinned: Option<&str>) -> Sources {
+        Sources { front: front.map(Into::into), rear: rear.map(Into::into), pinned: pinned.map(Into::into), pinned_is_front: false }
+    }
+
+    /// The phone's case: a single source pinned (the rear sensor) while the person's facing is the
+    /// default Front. The picture on screen is the rear camera, so it must not be mirrored.
+    #[test]
+    fn a_pinned_rear_source_is_shown_as_rear_not_mirrored_as_a_selfie() {
+        let mut cam = Camera::unstarted(Probe::default(), Facing::Front);
+        cam.sources = named(None, None, Some("gst:libcamerasrc camera-name=rear"));
+        assert_eq!(cam.shown_facing(), Facing::Rear, "the pinned source is the rear camera");
+        cam.sources.pinned_is_front = true;
+        assert_eq!(cam.shown_facing(), Facing::Front, "unless it says it is the selfie camera");
+        let plain = Camera::unstarted(Probe::default(), Facing::Front);
+        assert_eq!(plain.shown_facing(), Facing::Front, "a desktop webcam with nothing pinned is still the mirror");
+    }
+
+    /// With a source per facing, the switch works, each facing opens its own, and the shown facing is the chosen one.
+    #[test]
+    fn each_facing_opens_its_own_named_source_and_the_switch_is_offered() {
+        let mut cam = Camera::unstarted(Probe::default(), Facing::Rear);
+        cam.sources = named(Some("gst:libcamerasrc camera-name=front"), Some("gst:libcamerasrc camera-name=rear"), None);
+        assert!(cam.can_switch(), "two named cameras: switchable");
+        assert_eq!(cam.sources.for_facing(Facing::Rear), Some("gst:libcamerasrc camera-name=rear"));
+        assert_eq!(cam.sources.for_facing(Facing::Front), Some("gst:libcamerasrc camera-name=front"));
+        assert!(cam.plan()[0].pipeline.contains("camera-name=rear"), "{:?}", cam.plan()[0].pipeline);
+        assert_eq!(cam.shown_facing(), Facing::Rear);
+        cam.facing = Facing::Front;
+        assert!(cam.plan()[0].pipeline.contains("camera-name=front"), "{:?}", cam.plan()[0].pipeline);
+        assert_eq!(cam.shown_facing(), Facing::Front, "the selfie camera is mirrored");
+        let one = Sources { pinned: Some("x".into()), ..Sources::default() };
+        assert!(!one.can_switch(), "one pinned source cannot be switched");
+    }
+
 }

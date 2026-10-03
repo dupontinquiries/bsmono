@@ -319,11 +319,11 @@ impl Cam {
                                     rgba: develop::render(&full.rgba, full.width, full.height, &p).into() }
         } else if self.zoom.is_zoomed() { full.crop(self.zoom.window()) } else { full };
         let now = now_ms();
-        let name = store::free_name(&self.capture_dir, &capture_filename(now, self.camera.facing.label(), "jpg"));
+        let name = store::free_name(&self.capture_dir, &capture_filename(now, self.camera.shown_facing().label(), "jpg"));
         let path = self.capture_dir.join(&name);
         match store::save_jpeg(&path, f.width, f.height, &f.rgba) {
             Ok(()) => {
-                self.roll.push(Shot::new(&name, f.width, f.height, now, self.camera.facing.label()));
+                self.roll.push(Shot::new(&name, f.width, f.height, now, self.camera.shown_facing().label()));
                 let (tw, th, px) = store::thumbnail(f.width, f.height, &f.rgba, THUMB);
                 if tw > 0 {
                     let img = egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], &px);
@@ -448,7 +448,7 @@ impl Cam {
         self.poll_handoffs();
         self.tick_countdown(&ctx);
         self.save_if_dirty();
-        self.preview.facing = match self.camera.facing { Facing::Front => preview::Facing::Front, Facing::Rear => preview::Facing::Rear };
+        self.preview.facing = match self.camera.shown_facing() { Facing::Front => preview::Facing::Front, Facing::Rear => preview::Facing::Rear };
         let compact = uikit_egui::adaptive::Adaptive::detect(&ctx).class.is_compact();
         // Polled every frame, whichever surface is up: the bridge tracks
         // live contacts from raw events, and a frame it does not see leaves
@@ -859,7 +859,9 @@ fn camera_aspect(c: &Camera) -> f32 {
 /// Facing, fill and timer from the settings file; front, letterboxed and no
 /// timer when there is none.
 pub fn load_settings() -> (Facing, bool, u8) {
-    let Some(text) = config_kit::load(store::APP, SETTINGS) else { return (Facing::Front, false, 0) };
+    // SNAPSHOT_CAM_DEFAULT_FACING=rear: a phone's first launch opens the main camera, not the selfie one
+    let default = if std::env::var("SNAPSHOT_CAM_DEFAULT_FACING").map(|v| v.trim() == "rear").unwrap_or(false) { Facing::Rear } else { Facing::Front };
+    let Some(text) = config_kit::load(store::APP, SETTINGS) else { return (default, false, 0) };
     let ini = config_kit::Ini::parse(&text);
     let get = |k: &str| ini.get("", k).or_else(|| ini.get("general", k)).map(str::trim);
     let facing = if get("facing") == Some("rear") { Facing::Rear } else { Facing::Front };
