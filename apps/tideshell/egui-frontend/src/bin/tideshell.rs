@@ -1487,6 +1487,12 @@ fn main() {
         // as a layer over them rather than a hole in them (ext-background-effect; a no-op without it).
         io.set_blur(Role::Overlay, sb.shell.switcher.is_visible() || sb.shell.palette.is_visible());
         sb.view.backdrop_blur = io.blur_supported();
+        // The whole overlay fades with the switcher's reveal in the compositor, so the blurred apps behind come back
+        // into focus smoothly as it closes. TIDESHELL_OVERLAY_ALPHA holds a fixed fade (0..1) for inspecting it.
+        let overlay_alpha = std::env::var("TIDESHELL_OVERLAY_ALPHA").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or_else(|| {
+            if sb.shell.switcher.is_visible() && !sb.shell.drawer.is_visible() && !sb.shell.palette.is_visible() { sb.shell.switcher.reveal.progress.clamp(0.0, 1.0) } else { 1.0 }
+        });
+        io.set_surface_alpha(Role::Overlay, overlay_alpha);
         let region = sb.view.input_rects(&sb.shell);
         if last_region.as_ref() != Some(&region) {
             let rects: Option<Vec<(i32, i32, i32, i32)>> =

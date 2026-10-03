@@ -52,6 +52,9 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_v1::{self, WpFractionalScaleV1},
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
+use wayland_protocols::wp::alpha_modifier::v1::client::{
+    wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1, wp_alpha_modifier_v1::WpAlphaModifierV1,
+};
 use wayland_protocols::ext::background_effect::v1::client::{
     ext_background_effect_manager_v1::{self, ExtBackgroundEffectManagerV1},
     ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
@@ -183,6 +186,10 @@ struct Surf {
     /// Created on first use; `blur_for` is the surface size the region was set for (None = no blur).
     blur: Option<ExtBackgroundEffectSurfaceV1>,
     blur_for: Option<(u32, u32)>,
+    /// wp-alpha-modifier: the compositor multiplies the whole surface (and what it composites over) by a
+    /// factor, which is how the switcher fades out smoothly; `alpha_last` is the factor last sent.
+    alpha: Option<WpAlphaModifierSurfaceV1>,
+    alpha_last: Option<u32>,
 }
 
 impl Surf {
@@ -363,6 +370,7 @@ pub struct Io {
     frac_mgr: Option<WpFractionalScaleManagerV1>,
     viewporter: Option<WpViewporter>,
     blur_mgr: Option<ExtBackgroundEffectManagerV1>,
+    alpha_mgr: Option<WpAlphaModifierV1>,
     pub strip_px: u32,
     /// Tint the strips so they can be seen (`TIDESHELL_SHOW_STRIPS=1`).
     pub show_strips: bool,
@@ -398,6 +406,7 @@ impl Io {
         let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
         // The compositor's own backdrop blur, for the switcher and palette sheets.
         let blur_mgr: Option<ExtBackgroundEffectManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+        let alpha_mgr: Option<WpAlphaModifierV1> = globals.bind(&qh, 1..=1, ()).ok();
         // Idle, as the compositor measures it: v1's get_idle_notification HONOURS idle
         // inhibitors, so a playing video (vidkit's wakelock) keeps the screen up.
         let idle_notifier: Option<ExtIdleNotifierV1> = globals.bind(&qh, 1..=1, ()).ok();
@@ -429,7 +438,7 @@ impl Io {
             overlay_cursor: CursorWant::Shape(Shape::Default),
             applied: None,
         };
-        let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, frac_mgr, viewporter, blur_mgr, strip_px, show_strips, right_enabled: false, side_sizes: HashMap::new(), _outputs: outputs, overlay_keyboard: false, idle_notifier, idle_note: None, idle_ms: 0 };
+        let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, frac_mgr, viewporter, blur_mgr, alpha_mgr, strip_px, show_strips, right_enabled: false, side_sizes: HashMap::new(), _outputs: outputs, overlay_keyboard: false, idle_notifier, idle_note: None, idle_ms: 0 };
         io.st.out_mgr = out_mgr;
         if let Some(m) = &power_mgr {
             io.st.powers = io._outputs.iter().enumerate().map(|(i, o)| m.get_output_power(o, &io.qh, i)).collect();
@@ -487,7 +496,7 @@ impl Io {
             (None, None)
         };
         wl.commit();
-        self.st.surfs.push(Surf { role, wl, layer, size: (0, 0), configured: false, fresh: false, scale: 1, closed: false, frac, frac_scale: None, viewport, sent: None, blur: None, blur_for: None });
+        self.st.surfs.push(Surf { role, wl, layer, size: (0, 0), configured: false, fresh: false, scale: 1, closed: false, frac, frac_scale: None, viewport, sent: None, blur: None, blur_for: None, alpha: None, alpha_last: None });
         if role == Role::Right && !self.right_enabled {
             self.set_input_region(Role::Right, Some(&[]));
         }
@@ -556,6 +565,9 @@ impl Io {
                 if let Some(b) = &s.blur {
                     b.destroy();
                 }
+                if let Some(x) = &s.alpha {
+                    x.destroy();
+                }
                 s.layer.destroy();
                 s.wl.destroy();
             }
@@ -596,6 +608,25 @@ impl Io {
         // Double-buffered state: applied at the next commit; a frame may not be due for a while.
         wl.commit();
         self.st.surfs[i].blur_for = want;
+    }
+
+    /// Fade a whole surface by `a` (0..1) in the compositor. Cheap every frame: only a changed factor is sent.
+    /// The state applies at the surface's next commit, which the frame loop makes on every swap.
+    pub fn set_surface_alpha(&mut self, role: Role, a: f32) {
+        let Some(mgr) = self.alpha_mgr.clone() else { return };
+        let Some(i) = self.st.surfs.iter().position(|s| s.role == role) else { return };
+        let factor = (a.clamp(0.0, 1.0) as f64 * u32::MAX as f64) as u32;
+        if self.st.surfs[i].alpha_last == Some(factor) {
+            return;
+        }
+        if self.st.surfs[i].alpha.is_none() {
+            let obj = mgr.get_surface(&self.st.surfs[i].wl, &self.qh, ());
+            self.st.surfs[i].alpha = Some(obj);
+        }
+        if let Some(obj) = &self.st.surfs[i].alpha {
+            obj.set_multiplier(factor);
+        }
+        self.st.surfs[i].alpha_last = Some(factor);
     }
 
     fn side_size(&self, role: Role) -> (u32, i32) {
@@ -1015,6 +1046,8 @@ impl Dispatch<WlKeyboard, ()> for State {
 }
 noop!(WpFractionalScaleManagerV1);
 noop!(ExtBackgroundEffectSurfaceV1);
+noop!(WpAlphaModifierV1);
+noop!(WpAlphaModifierSurfaceV1);
 
 impl Dispatch<ExtBackgroundEffectManagerV1, ()> for State {
     fn event(st: &mut Self, _: &ExtBackgroundEffectManagerV1, e: ext_background_effect_manager_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {

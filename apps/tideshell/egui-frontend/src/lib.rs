@@ -223,6 +223,35 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()), l(a.a(), b.a()))
 }
 
+/// Heights, in points, of the parts of a carousel peek strip.
+const PEEK_INITIAL_H: f32 = 52.0;
+const PEEK_CHEVRON_H: f32 = 44.0;
+const PEEK_STATS_H: f32 = 48.0;
+/// A turned title shorter than this is not worth drawing.
+const PEEK_MIN_TITLE: f32 = 40.0;
+/// Stats are only shown when the title still keeps at least this much.
+const PEEK_TITLE_KEEP: f32 = 80.0;
+
+/// How a peek strip of height `h` is shared out. The strip is narrow and, in landscape, short, so the parts
+/// are given room in priority order and nothing is drawn where it would overlap another: the initial and the
+/// chevron always, then the title, and the live numbers only if the title keeps `PEEK_TITLE_KEEP` after them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PeekLayout {
+    /// Height left for the (turned) title.
+    title_px: f32,
+    stats: bool,
+}
+
+fn peek_layout(h: f32, has_stats: bool) -> PeekLayout {
+    let fixed = PEEK_INITIAL_H + PEEK_CHEVRON_H;
+    let with_stats = h - fixed - PEEK_STATS_H;
+    if has_stats && with_stats >= PEEK_TITLE_KEEP {
+        PeekLayout { title_px: with_stats, stats: true }
+    } else {
+        PeekLayout { title_px: (h - fixed).max(0.0), stats: false }
+    }
+}
+
 fn with_alpha(c: Color32, a: f32) -> Color32 {
     let [r, g, b, _] = c.to_srgba_unmultiplied();
     Color32::from_rgba_unmultiplied(r, g, b, (a.clamp(0.0, 1.0) * 255.0) as u8)
@@ -487,15 +516,30 @@ impl ShellView {
         let dt = self.frame_dt;
         let inset = self.pressed_rect(ui, Id::new(("ts-peek-j", side == Side::Left)), r.shrink2(Vec2::new(4.0, 40.0)), dt);
         p.rect_filled(inset, cr(10), with_alpha(app_color(&app), 0.9));
-        p.text(inset.center_top() + Vec2::new(0.0, 26.0), Align2::CENTER_CENTER, initial(&title), FontId::proportional(20.0), Color32::WHITE);
-        // Title down the strip, one character per line, capped.
-        let chars: String = title.chars().take(14).collect();
-        for (i, ch) in chars.chars().enumerate() {
-            p.text(inset.center_top() + Vec2::new(0.0, 58.0 + 16.0 * i as f32), Align2::CENTER_CENTER, ch, FontId::proportional(13.0), with_alpha(Color32::WHITE, 0.9));
+        p.text(inset.center_top() + Vec2::new(0.0, PEEK_INITIAL_H / 2.0), Align2::CENTER_CENTER, initial(&title), FontId::proportional(20.0), Color32::WHITE);
+        // The strip's height is shared out in priority order (see `peek_layout`): initial, chevron, then the
+        // title turned like a book spine, then the live numbers only if there is room left.
+        let info = self.appinfo.info(id);
+        let lay = peek_layout(inset.height(), info.is_some());
+        if lay.title_px >= PEEK_MIN_TITLE {
+            let font = FontId::proportional(13.0);
+            let ink = with_alpha(Color32::WHITE, 0.9);
+            // Shorten with an ellipsis until the turned text fits the room it was given.
+            let mut text = title.clone();
+            let mut galley = p.layout_no_wrap(text.clone(), font.clone(), ink);
+            while galley.size().x > lay.title_px && text.chars().count() > 1 {
+                text.pop();
+                text = text.trim_end().to_string();
+                galley = p.layout_no_wrap(format!("{text}\u{2026}"), font.clone(), ink);
+            }
+            // Rotated a quarter turn anticlockwise about its anchor: it reads upward, and its rows extend to
+            // the right of the anchor, so the anchor is the bottom-left of the box it will fill.
+            let anchor = Pos2::new(inset.center().x - galley.size().y / 2.0, inset.top() + PEEK_INITIAL_H + lay.title_px.min(galley.size().x));
+            p.add(egui::epaint::TextShape::new(anchor, galley, ink).with_angle(-std::f32::consts::FRAC_PI_2));
         }
         // The app's live numbers, stacked above the chevron: CPU, memory, age.
-        if let Some(info) = self.appinfo.info(id) {
-            let base = inset.center_bottom() - Vec2::new(0.0, 84.0);
+        if let (Some(info), true) = (info, lay.stats) {
+            let base = inset.center_bottom() - Vec2::new(0.0, PEEK_CHEVRON_H + PEEK_STATS_H - 7.0);
             for (i, text) in [tideshell_core::appinfo::fmt_cpu(info.cpu_pct), tideshell_core::appinfo::fmt_mem(info.rss_mb), tideshell_core::appinfo::fmt_age(info.uptime_s)].into_iter().enumerate() {
                 p.text(base + Vec2::new(0.0, 14.0 * i as f32), Align2::CENTER_CENTER, text, FontId::monospace(10.0), with_alpha(Color32::WHITE, 0.85));
             }
@@ -1613,13 +1657,15 @@ impl ShellView {
             let rr = Rect::from_center_size(rr.center(), rr.size() * scale);
             let dt = self.frame_dt;
             let rr = if live { self.pressed_rect(ui, Id::new(("ts-card-j", *id)), rr, dt) } else { rr };
-            let fade = 1.0 - (-dy / (shell.switcher.close_px * 1.6)).clamp(0.0, 0.8);
+            // Everything on a card fades with the reveal as well as with a swipe-to-close drag: it used to slide
+            // down at full strength and vanish at the last frame.
+            let fade = (1.0 - (-dy / (shell.switcher.close_px * 1.6)).clamp(0.0, 0.8)) * rv;
             p.rect_filled(rr, cr(18), with_alpha(app_color(app), fade));
             if *active {
-                p.rect_filled(Rect::from_min_size(rr.min, Vec2::new(rr.width(), 4.0)), cr(2), pal.accent);
+                p.rect_filled(Rect::from_min_size(rr.min, Vec2::new(rr.width(), 4.0)), cr(2), with_alpha(pal.accent, rv));
             }
             p.text(rr.center(), Align2::CENTER_CENTER, initial(title), FontId::proportional(34.0), with_alpha(Color32::WHITE, 0.85 * fade));
-            p.text(rr.center_bottom() + Vec2::new(0.0, 11.0), Align2::CENTER_CENTER, title, FontId::proportional(12.0), pal.text);
+            p.text(rr.center_bottom() + Vec2::new(0.0, 11.0), Align2::CENTER_CENTER, title, FontId::proportional(12.0), with_alpha(pal.text, rv));
             if !live {
                 continue;
             }
@@ -1642,7 +1688,7 @@ impl ShellView {
             Style::Grid => "grid",
             Style::Deck => "deck",
         };
-        p.text(full.center_bottom() - Vec2::new(0.0, 36.0), Align2::CENTER_CENTER, format!("{} windows - {style} - swipe a card up to close", cards.len()), FontId::proportional(11.0), pal.text_weak);
+        p.text(full.center_bottom() - Vec2::new(0.0, 36.0), Align2::CENTER_CENTER, format!("{} windows - {style} - swipe a card up to close", cards.len()), FontId::proportional(11.0), with_alpha(pal.text_weak, rv));
         out
     }
 
@@ -1865,6 +1911,30 @@ fn app_button(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, id: Id, name: &str,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_peek_strip_never_asks_two_parts_for_the_same_pixels() {
+        for h10 in 800..14000 {
+            let h = h10 as f32 / 10.0;
+            for has in [false, true] {
+                let l = peek_layout(h, has);
+                let used = PEEK_INITIAL_H + PEEK_CHEVRON_H + l.title_px + if l.stats { PEEK_STATS_H } else { 0.0 };
+                if h >= PEEK_INITIAL_H + PEEK_CHEVRON_H {
+                    assert!(used <= h + 0.001, "h={h} has={has}: {l:?} uses {used}");
+                }
+                assert!(l.title_px >= 0.0);
+                assert!(!l.stats || has, "stats only when there are numbers");
+                assert!(!l.stats || l.title_px >= PEEK_TITLE_KEEP, "stats never squeeze the title below its keep: h={h}");
+            }
+        }
+        // the two real cases from the phone: tall portrait strip, short landscape strip
+        let portrait = peek_layout(1060.0, true);
+        assert!(portrait.stats && portrait.title_px > 800.0, "{portrait:?}");
+        let landscape = peek_layout(220.0, true);
+        assert!(!landscape.stats, "no room for numbers beside a title on a 220 pt strip: {landscape:?}");
+        assert!(landscape.title_px >= PEEK_MIN_TITLE, "but the title still shows: {landscape:?}");
+        assert!(peek_layout(80.0, true).title_px < PEEK_MIN_TITLE, "a stub of a strip shows only the initial and the chevron");
+    }
+
     #[test]
     fn the_whole_quick_settings_sheet_fits_the_short_landscape_screen() {
         // 1224x2700 at 2.25x: 544 x 1200 logical. Landscape is 1200 x 544.
