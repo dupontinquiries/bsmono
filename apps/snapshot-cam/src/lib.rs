@@ -57,6 +57,7 @@ pub mod contacts;
 /// desqueeze, white balance, exposure; and the histogram/zebra/peaking
 /// measurements the viewfinder draws.
 pub mod develop;
+pub mod autotone;
 /// Clip-on lens profiles (Moment and others) and the black-border autocrop.
 pub mod lens;
 /// The camera's own manual controls through `v4l2-ctl`, where it has them.

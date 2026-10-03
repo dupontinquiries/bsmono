@@ -153,6 +153,7 @@ impl Cam {
                 ui.colored_label(c.text_weak, "cover");
                 let measured = self.pro.cover != cover::CoverProfile::none();
                 if ui.add_enabled(measured, egui::Checkbox::new(&mut self.pro.cover_on, "correct")).changed() { self.settings_dirty = true; }
+                if ui.checkbox(&mut self.pro.auto_tone, "auto tone (saved photos)").on_hover_text("black point, white balance and exposure bias measured from each photo").changed() { self.settings_dirty = true; }
                 if ui.small_button("calibrate").on_hover_text("point at a grey or white card filling the middle, with a shadow or something black in the frame").clicked() {
                     self.calibrate_cover();
                 }

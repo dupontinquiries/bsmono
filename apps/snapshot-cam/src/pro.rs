@@ -38,13 +38,16 @@ pub struct Pro {
     /// The camera cover's measured tint and haze, and whether to undo them.
     pub cover: crate::cover::CoverProfile,
     pub cover_on: bool,
+    /// Develop each saved photo with `autotone` (black point, white balance, exposure bias). On by
+    /// default: this phone's frames need it. The preview is not changed by it.
+    pub auto_tone: bool,
 }
 
 impl Default for Pro {
     fn default() -> Self {
         Pro { lenses: lens::builtins(), lens: 0, measured_crop: None, ev: 0.0, wb: WhiteBalance::AsShot,
               auto_gains: [1.0; 3], overlays: Overlays::default(), load_errors: vec![],
-              cover: crate::cover::CoverProfile::none(), cover_on: false }
+              cover: crate::cover::CoverProfile::none(), cover_on: false, auto_tone: true }
     }
 }
 
@@ -222,8 +225,8 @@ impl Pro {
     /// Settings-file lines.
     pub fn conf(&self) -> String {
         let o = self.overlays;
-        format!("lens = {}\nev = {:.4}\nwb = {}\nhistogram = {}\nzebra = {}\npeaking = {}\ngrid = {}\ncover = {}\n",
-                self.profile().name, self.ev, self.wb.to_conf(), o.histogram, o.zebra, o.peaking, o.grid, self.cover_on)
+        format!("lens = {}\nev = {:.4}\nwb = {}\nhistogram = {}\nzebra = {}\npeaking = {}\ngrid = {}\ncover = {}\nauto_tone = {}\n",
+                self.profile().name, self.ev, self.wb.to_conf(), o.histogram, o.zebra, o.peaking, o.grid, self.cover_on, self.auto_tone)
     }
 
     /// Read what `conf` wrote; anything missing keeps its default.
@@ -239,6 +242,8 @@ impl Pro {
         let b = |k: &str| get(k).map(|v| v == "true").unwrap_or(false);
         self.overlays = Overlays { histogram: b("histogram"), zebra: b("zebra"), peaking: b("peaking"), grid: b("grid") };
         self.cover_on = b("cover");
+        // absent (an older settings file) keeps it on
+        if let Some(v) = get("auto_tone") { self.auto_tone = v == "true"; }
     }
 }
 

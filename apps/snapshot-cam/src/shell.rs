@@ -311,10 +311,18 @@ impl Cam {
         // lens correction, crop, zoom, desqueeze, WB, EV. Otherwise the zoom
         // window at native pixels: what the viewfinder showed is what the
         // file holds, and nothing is upscaled to pretend otherwise.
-        let developed = self.pro.develops() || gains.is_some();
+        let tone = self.pro.auto_tone.then(|| crate::autotone::measure(&full.rgba, full.width, full.height));
+        let developed = self.pro.develops() || gains.is_some() || tone.is_some();
         let f = if developed {
             let mut p = self.pro.params(self.zoom.window(), full.width, full.height, None);
             if let Some(g) = gains { p.gains = g; }
+            if let Some(t) = tone {
+                // black point under any cover correction already there; white balance only when the
+                // gains were not chosen for us (a WB bracket's are); the exposure bias always
+                p.flare = p.flare.map(|f| f.max(t.black));
+                let g = if gains.is_some() { [2f32.powf(t.ev); 3] } else { t.total_gains() };
+                p.gains = [p.gains[0] * g[0], p.gains[1] * g[1], p.gains[2] * g[2]];
+            }
             capture_kit::RawFrame { width: p.out_w, height: p.out_h, captured_ms: full.captured_ms, seq: full.seq,
                                     rgba: develop::render(&full.rgba, full.width, full.height, &p).into() }
         } else if self.zoom.is_zoomed() { full.crop(self.zoom.window()) } else { full };
@@ -1043,7 +1051,8 @@ mod tests {
         let texts = uikit_egui::layout_probe::texts(&shapes);
         assert!(texts.iter().any(|g| g.text == "2.0×"), "the chip says the magnification");
 
-        // The shutter saves THAT window at native pixels: half the pattern.
+        // The shutter saves THAT window at native pixels: half the pattern. (Raw path: auto tone off.)
+        cam.pro.auto_tone = false;
         cam.take_photo(&ctx);
         let shot = cam.roll.shots()[0].clone();
         assert_eq!((shot.width, shot.height), (crate::camera::PATTERN_WIDTH / 2, crate::camera::PATTERN_HEIGHT / 2));
@@ -1173,6 +1182,36 @@ mod tests {
                 assert!(has(want), "{size:?}: `{want}` not drawn");
             }
         }
+    }
+
+    #[test]
+    fn a_saved_photo_gets_its_black_point_back_and_the_switch_turns_that_off() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let size = egui::vec2(360.0, 720.0);
+        let (mut cam, _t) = live_pattern(d.path(), &ctx, size);
+        // a veiled, bright frame: every pixel lifted by about 5% linear, a grey ramp
+        let (w, h) = (96u32, 64u32);
+        let mut px = Vec::new();
+        for _y in 0..h {
+            for x in 0..w {
+                let l = (x as f32 / w as f32) * 0.8 + 0.05;
+                let v = crate::develop::to_srgb(l);
+                px.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let frame = || capture_kit::RawFrame { width: w, height: h, captured_ms: 0, seq: 1, rgba: px.clone().into() };
+        let darkest = |f: &str| image::open(d.path().join(f)).unwrap().to_luma8().as_raw().iter().copied().min().unwrap();
+        cam.pro.auto_tone = false;
+        cam.save_frame(&ctx, frame(), None, None);
+        let raw = cam.roll.shots()[0].clone();
+        cam.pro.auto_tone = true;
+        cam.save_frame(&ctx, frame(), None, None);
+        let toned = cam.roll.shots()[0].clone();
+        assert_ne!(raw.file, toned.file);
+        let (a, b) = (darkest(&raw.file), darkest(&toned.file));
+        assert!(a >= 60, "the veiled frame is saved as it is: darkest {a}");
+        assert!(b + 25 < a, "with auto tone its blacks come back: {a} -> {b}");
     }
 
     #[test]
