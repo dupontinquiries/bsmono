@@ -17,6 +17,7 @@ pub mod plasma;
 pub mod rank;
 pub mod store;
 pub mod watch;
+pub mod notices;
 pub mod status;   // the line from the boxes at home, off the DHT (feature status-dht)
 
 pub use entry::AppEntry;

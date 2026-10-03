@@ -20,6 +20,12 @@ pub mod toggle;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+const NOTICE_W: f32 = 230.0;
+const NOTICE_H: f32 = 74.0;
+
+/// Share of the configured icon size an app icon is drawn at inside its card.
+const ICON_FRAC: f32 = 0.72;
+
 use egui::{Align2, Color32, CornerRadius, FontId, Key, Rect, Sense, Stroke, StrokeKind, Vec2};
 use hatch_core::anim::{Board, TilePose};
 use hatch_core::grid::GridSpec;
@@ -86,6 +92,8 @@ pub struct HatchUi {
     /// layer that has to know which tile a swipe began on would use the same
     /// answer rather than recomputing the layout and drifting from it).
     tile_rects: Vec<(String, Rect)>,
+    /// Demo notices (see hatch_core::notices); a tap dismisses one.
+    notices: Vec<hatch_core::notices::Notice>,
     /// Voice/screen-reader registration for the grid. `sel` (above) stays the
     /// single source of truth for WHICH tile is selected and how arrow keys
     /// move it — 2D, row/col, wraps at grid edges — because `A11yScene`'s own
@@ -127,6 +135,7 @@ impl HatchUi {
             grabber_drag: 0.0,
             last_error: None,
             tile_rects: Vec::new(),
+            notices: if std::env::var("HATCH_NOTICES").as_deref() == Ok("0") { Vec::new() } else { hatch_core::notices::demo() },
             a11y: A11yScene::new(),
             board: Board::new(board_config),
         }
@@ -289,12 +298,15 @@ impl HatchUi {
         let sys_h = if sys_actions.is_empty() { 0.0 } else { 56.0 };
         let search_h = 52.0;
         let grabber_h = 26.0;
+        let notices_h = if self.notices.is_empty() { 0.0 } else { NOTICE_H + 10.0 };
         let grid_h =
-            (ui.available_height() - grabber_h - sys_h - search_h - 16.0).max(cell.y);
+            (ui.available_height() - grabber_h - sys_h - search_h - notices_h - 16.0).max(cell.y);
 
         if self.grabber(ui, grabber_h) {
             event = UiEvent::Dismiss;
         }
+
+        self.notice_strip(ui, colors);
 
         // ---- the grid ----
         let cols = Self::grid_cols(ui.available_width(), cell.x, self.core.config.columns);
@@ -349,6 +361,38 @@ impl HatchUi {
         }
 
         event
+    }
+
+    /// The strip of notices above the grid: one card each, scrolling sideways, a tap dismisses.
+    /// Demo data for now, and says so.
+    fn notice_strip(&mut self, ui: &mut egui::Ui, colors: &PaletteColors) {
+        if self.notices.is_empty() {
+            return;
+        }
+        let mut dismiss: Option<u32> = None;
+        egui::ScrollArea::horizontal().id_salt("hatch-notices").auto_shrink([false, true]).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for n in &self.notices {
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(NOTICE_W, NOTICE_H), Sense::click());
+                    let p = ui.painter();
+                    let call = n.kind == hatch_core::notices::Kind::Call && n.when == "now";
+                    let ground = if call { colors.accent_soft } else { colors.bg_raised };
+                    p.rect_filled(rect, CornerRadius::same(14), ground);
+                    p.rect_stroke(rect, CornerRadius::same(14), Stroke::new(1.0, colors.border.gamma_multiply(0.6)), StrokeKind::Inside);
+                    p.text(rect.left_top() + Vec2::new(12.0, 10.0), Align2::LEFT_TOP, n.kind.glyph(), FontId::proportional(16.0), colors.accent);
+                    p.text(rect.left_top() + Vec2::new(34.0, 11.0), Align2::LEFT_TOP, format!("{} · {}", n.kind.label(), n.when), FontId::proportional(11.0), colors.text_weak);
+                    p.text(rect.left_top() + Vec2::new(12.0, 30.0), Align2::LEFT_TOP, Self::elide(&n.title, 26), FontId::proportional(14.0), colors.text);
+                    p.text(rect.left_top() + Vec2::new(12.0, 50.0), Align2::LEFT_TOP, Self::elide(&n.body, 34), FontId::proportional(11.5), colors.text_weak);
+                    if resp.clicked() {
+                        dismiss = Some(n.id);
+                    }
+                }
+            });
+        });
+        ui.label(egui::RichText::new("demo messages: nothing is publishing these yet").small().color(colors.text_weak));
+        if let Some(id) = dismiss {
+            self.notices.retain(|n| n.id != id);
+        }
     }
 
     /// Draw the open tile menu, if any. Returns an event when it launched
@@ -642,6 +686,11 @@ impl HatchUi {
         // that's real additional work. Every other pattern's `rot` is 0, so
         // this only mutes Scatter's flourish, not its position/timing.
 
+        // Every app is a card, as in tideshell's window switcher: a raised rounded ground with a hairline,
+        // so the launcher and the window manager read as one family. The selection wash goes on top.
+        let card = rect.shrink(4.0);
+        p.rect_filled(card, CornerRadius::same(14), colors.bg_raised.gamma_multiply(alpha));
+        p.rect_stroke(card, CornerRadius::same(14), Stroke::new(1.0, colors.border.gamma_multiply(0.6 * alpha)), StrokeKind::Inside);
         if selected || resp.hovered() {
             let a = if selected { 70 } else { 40 };
             p.rect_filled(
@@ -659,8 +708,10 @@ impl HatchUi {
             }
         }
 
-        let icon_px = self.core.config.icon_px as f32 * scale;
-        let icon_center = egui::pos2(rect.center().x, rect.top() + 8.0 + self.core.config.icon_px as f32 / 2.0);
+        // Smaller than the cell asks for: the card carries the tile, the icon only labels it.
+        let icon_base = self.core.config.icon_px as f32 * ICON_FRAC;
+        let icon_px = icon_base * scale;
+        let icon_center = egui::pos2(rect.center().x, rect.top() + 14.0 + icon_base / 2.0);
         let icon_rect = Rect::from_center_size(icon_center, Vec2::splat(icon_px));
         match tex {
             Some(id) => {
@@ -979,9 +1030,12 @@ mod tests {
             std::env::set_var("XDG_CONFIG_HOME", &tmp);
 
             let core = hatch_core::Launcher::with_entries(config, entries);
+            let mut app = HatchUi::new(core);
+            // The demo notice strip is not a tile; the label checks scan every painted string.
+            app.notices.clear();
             Harness {
                 ctx: egui::Context::default(),
-                app: HatchUi::new(core),
+                app,
                 palette: uikit_egui::default_palette(),
                 size: Vec2::new(420.0, 900.0),
                 texts: Vec::new(),
@@ -1326,6 +1380,19 @@ mod tests {
         assert_eq!(h.click(tile.center()), UiEvent::None, "a failed launch does not hide the window");
         h.frame(vec![]);
         assert!(h.has_text("Launch failed"), "and says so on screen");
+    }
+
+    #[test]
+    fn the_notice_strip_shows_every_kind_and_a_tap_dismisses_one() {
+        let mut h = Harness::new(vec![]);
+        h.app.notices = hatch_core::notices::demo();
+        h.frame(vec![]);
+        for needle in ["Incoming call", "Game invite", "3 new photos", "Note"] {
+            assert!(h.has_text(needle), "{needle} is painted");
+        }
+        let r = h.text_rect("Incoming call").expect("painted");
+        h.click(r.center());
+        assert!(!h.app.notices.iter().any(|n| n.id == 1), "tapping the card dismissed it");
     }
 
     #[test]
