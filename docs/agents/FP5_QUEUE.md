@@ -81,6 +81,13 @@ Legend: **done** = committed and deployed; **built** = committed, not seen worki
 | 69 | gitmind Push: tideshell built no binary | fixed (`62ec2d73b`): preset needs `ei` too | not driven end to end; `.2.224` not touched |
 | 70 | clawbound Crestfall/Oremantle/Monsoon work, Wooting walk | committed on `cw/cleanup-gods`, laptop only | the phone has an old clawbound; no aarch64-musl build made; Wooting needs the Analog SDK installed on the laptop |
 | 71 | cosmic-panel corner-radius spin (battery) | fixed on the phone (config), verified | `border_radius` 0 on Panel and Dock; see PHONE_LEARNINGS. Open: coredump cap + journal/core vacuum (root, owner decides); pocket-sleep build deployed (`f5893a8f7`) |
+| 72 | Camera: photos blown out and cyan-cast (owner, 2026-10-03) | in progress | 39 photos from the day measured: mean luma ~170/255, 20-60% of pixels clipped, ~0% dark, a cyan cast; names say `-front` for the rear sensor (fixed in code, row 67). Plan: auto tone in `develop` (gray-world WB, exposure bias to a median target, highlight shoulder), tested on the real roll; lens distortion is strong (wide sensor). Capture-side exposure bias needs the camera run: ask first |
+| 73 | Apps open slowly | not started | measure cold-launch time per app on the phone (hatch/vidkit/switcheroo/browser), find what dominates (GL init, fonts, icon loading, compositor map) |
+| 74 | No fullscreen, especially video players | not started | carousel/tideshell: a fullscreen toplevel covers the Top layer (see learnings), so fullscreen for vidkit/mpv should hide the bars/gestures cleanly and edge-swipe to reveal; ties to row 47 |
+| 75 | Touchscreen miscalibrated | not started | measure: draw a tap-target grid and log touch vs expected; check the Goodix `gt9897` panel size/transform vs the rotated output and the libinput calibration matrix (also the `touchfilter` in tideshell) |
+| 76 | Snapclone voice calls + hatch voice channel: play quick voice messages inline in hatch, on-device whisper summaries | not started | design first: voice message tile in hatch notices (plays without launching), whisper on device (model size vs the FP5 SoC), summary text under the tile; calls via snapclone |
+| 77 | A fast mobile-friendly web browser | not started | options: a Rust port wrapping angelfish (KDE, Qt/QtWebEngine) vs growing voiceterm-egui web->egui; decide after measuring what is feasible on the FP5 (WebKitGTK/Servo/QtWebEngine startup and memory) |
+| 78 | Tideshell: brightness, volume, app switcher, tap-to-wake | owner says good | keep |
 | 14 | Older: logscope service test, switcher drawer redesign, home widget, steno multitouch, PAM shim, emergency access | open | see the C20 queues |
 
 ## Done tonight (all deployed unless noted)
