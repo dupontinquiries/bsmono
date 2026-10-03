@@ -140,10 +140,21 @@ impl Carousel {
         self.ring.retain(|id| windows.iter().any(|w| w.id == *id));
         self.touched.retain(|id| windows.iter().any(|w| w.id == *id));
         let at = cur.and_then(|c| self.ring.iter().position(|x| *x == c));
+        // A window that opens while the mode is on is what the user just launched: it joins right after
+        // the current one AND becomes current, maximized, instead of appearing tiled beside the carousel.
+        let mut opened: Option<u64> = None;
+        let mut pos = at.map(|a| a + 1).unwrap_or(self.ring.len()).min(self.ring.len());
         for w in windows {
             if !self.ring.contains(&w.id) {
-                let pos = at.map(|a| a + 1).unwrap_or(self.ring.len()).min(self.ring.len());
                 self.ring.insert(pos, w.id);
+                pos += 1;
+                opened = Some(w.id);
+            }
+        }
+        if let Some(id) = opened {
+            if self.ring.len() > 0 {
+                self.idx = self.ring.iter().position(|x| *x == id).unwrap_or(self.idx);
+                return self.focus(id, windows);
             }
         }
         if self.ring.is_empty() {
@@ -169,6 +180,29 @@ impl Carousel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_that_opens_in_the_mode_becomes_current_and_maximized() {
+        let mut c = Carousel::default();
+        let ws = [w(1, false), w(2, false)];
+        c.enter(&[1, 2], &ws);
+        let ws3 = [w(1, true), w(2, false), w(3, false)];
+        let out = c.sync(&ws3);
+        assert_eq!(out, vec![Action::Activate(3), Action::SetMaximized(3, true)]);
+        assert_eq!(c.current(), Some(3));
+        assert_eq!(c.ring(), &[1, 3, 2], "it sits right after the window it was launched from");
+        // and is restored on exit with the others the mode maximized
+        assert!(c.exit().contains(&Action::SetMaximized(3, false)));
+    }
+
+    #[test]
+    fn a_sync_with_no_new_window_changes_nothing() {
+        let mut c = Carousel::default();
+        let ws = [w(1, false), w(2, false)];
+        c.enter(&[1, 2], &ws);
+        assert!(c.sync(&ws).is_empty());
+        assert_eq!(c.current(), Some(1));
+    }
 
     fn w(id: u64, max: bool) -> WindowCard {
         WindowCard { id, title: String::new(), app_id: String::new(), activated: false, maximized: max, width: None }
@@ -222,12 +256,14 @@ mod tests {
     }
 
     #[test]
-    fn new_window_joins_after_current() {
+    fn new_window_joins_after_current_and_takes_focus() {
+        // (It used to stay put, tiled, until stepped to; a launch should land full size.)
         let mut c = Carousel::default();
         c.enter(&[1, 2, 3], &[w(1, true), w(2, true), w(3, true)]);
-        assert!(c.sync(&[w(1, true), w(2, true), w(3, true), w(9, false)]).is_empty());
+        let out = c.sync(&[w(1, true), w(2, true), w(3, true), w(9, false)]);
+        assert_eq!(out, vec![Action::Activate(9), Action::SetMaximized(9, true)]);
         assert_eq!(c.ring(), &[1, 9, 2, 3]);
-        assert_eq!(c.current(), Some(1));
+        assert_eq!(c.current(), Some(9));
     }
 
     #[test]

@@ -1394,6 +1394,13 @@ impl Shell {
         self.emit(out)
     }
 
+    /// A vertical swipe on a peek strip: up goes to the next window of the ring, down to the previous,
+    /// whichever strip it began on (the strips are one stack seen from both sides).
+    pub fn peek_swipe(&mut self, up: bool) -> Vec<Action> {
+        use crate::carousel::Side;
+        self.peek_tap(if up { Side::Right } else { Side::Left })
+    }
+
     /// Width in px the carousel peeks reserve on EACH side while active.
     pub fn peek_reserve(&self) -> f32 {
         if self.carousel.is_active() {
