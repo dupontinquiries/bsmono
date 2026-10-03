@@ -46,7 +46,7 @@ pub const POCKET_HOLD_MS: Millis = 800;
 /// its last touch, then is turned off ONCE. Refusing at once made every touch event of a swipe
 /// light and blank the panel again, ~5 ms apart: 132 times in one boot, with a DSI command
 /// timeout in the kernel at the same instant, and the triple tap never got to complete.
-pub const RELIGHT_GRACE_MS: Millis = 5000;
+pub const RELIGHT_GRACE_MS: Millis = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -488,6 +488,32 @@ mod tests {
         assert!(s.quiet(last + RELIGHT_GRACE_MS + 10).is_empty());
         // The panel going off is a report that agrees with us.
         assert!(s.display_reported(false, 20_000).is_empty());
+    }
+
+    #[test]
+    fn someone_tapping_the_black_screen_to_wake_it_is_never_blanked_under_their_finger() {
+        // The wedge: taps every few seconds each lit the panel, a short re-blank timer fired between
+        // two of them, and the compositor lit it again within a millisecond with brightness
+        // commands in flight; the DSI link died for ~11 s. A power cycle must not land between taps
+        // however spaced they are, so the panel stays lit (black, free on OLED) long after a touch.
+        let mut s = asleep();
+        let mut cmds = 0;
+        let mut t = 1000u64;
+        for _ in 0..8 {
+            s.display_reported(true, t); // the compositor lights the panel on this touch
+            s.touch_down(0, 100.0, 100.0, t);
+            s.touch_up(0, t + 60);
+            // every half second until the next tap, 12 s later, the loop asks the timer
+            for k in 0..24 {
+                cmds += s.quiet(t + 60 + k * 500).len();
+            }
+            t += 12_000;
+        }
+        assert_eq!(cmds, 0, "no power command between taps 12 s apart");
+        // and once they stop, it is blanked exactly once
+        let last = t - 12_000 + 60;
+        assert!(s.quiet(last + RELIGHT_GRACE_MS - 1).is_empty());
+        assert_eq!(s.quiet(last + RELIGHT_GRACE_MS), vec![SleepAction::DisplayPower(false)]);
     }
 
     #[test]

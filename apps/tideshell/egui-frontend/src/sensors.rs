@@ -271,7 +271,7 @@ pub enum BacklightMsg {
 }
 
 /// A panel just powered up needs a moment before it accepts commands.
-pub const WAKE_SETTLE: Duration = Duration::from_millis(120);
+pub const WAKE_SETTLE: Duration = Duration::from_millis(600);
 /// Consecutive failures before a write method is abandoned for the next.
 /// It was ONE: a single failure (a write racing a screen-off, say) moved on
 /// for good -- logind, then brightnessctl, then sysfs, which a normal user
