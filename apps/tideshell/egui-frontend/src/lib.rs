@@ -1195,6 +1195,30 @@ impl ShellView {
         }
     }
 
+    /// A small analog face for the bar: ring, four ticks, hour and minute hands (the minute hand is
+    /// absent for hour-fuzzy, and weekday mode writes the day's three letters instead).
+    fn bar_analog_clock(p: &egui::Painter, c: Pos2, r: f32, t: tideshell_core::clock::LocalTime, f: tideshell_core::clock::Fuzzy, col: Color32) {
+        use tideshell_core::clock::{hands, weekday_name};
+        let dir = |a: f32| Vec2::new(a.sin(), -a.cos());
+        p.circle_stroke(c, r, Stroke::new(1.5, col));
+        match hands(t, f) {
+            Some((ha, ma)) => {
+                for i in 0..4 {
+                    let d = dir(i as f32 * std::f32::consts::FRAC_PI_2);
+                    p.line_segment([c + d * (r - 4.0), c + d * (r - 1.0)], Stroke::new(1.5, col));
+                }
+                p.line_segment([c, c + dir(ha) * r * 0.5], Stroke::new(3.0, col));
+                if let Some(ma) = ma {
+                    p.line_segment([c, c + dir(ma) * r * 0.8], Stroke::new(2.0, col));
+                }
+                p.circle_filled(c, 2.0, col);
+            }
+            None => {
+                p.text(c, Align2::CENTER_CENTER, &weekday_name(t.weekday)[..3], FontId::proportional((r * 0.6).max(9.0)), col);
+            }
+        }
+    }
+
     /// The command palette: a sheet rising from the bottom (reveal follows
     /// the engine's DragTransition), the three mode buttons on top, a search
     /// field, then the rows. Hit-testing is the engine's (`palette::Geom`),
@@ -1504,8 +1528,14 @@ impl ShellView {
             let wid = Id::new(("ts-bar", pl.index));
             match &widgets[pl.index] {
                 BarWidget::Clock => {
-                    let txt = tideshell_core::clock::short_text(info.time, shell.prefs.clock_fuzzy);
-                    p.text(r.center(), Align2::CENTER_CENTER, txt, FontId::proportional(if expanded { 22.0 } else { 15.0 }), pal.text);
+                    if shell.prefs.clock_style == tideshell_core::clock::ClockStyle::Analog {
+                        // The same style choice as the cover clock; hands follow the same fuzzy snap.
+                        let rad = (r.width().min(r.height()) / 2.0 - 3.0).min(unit * 0.5).max(10.0);
+                        Self::bar_analog_clock(&p, r.center(), rad, info.time, shell.prefs.clock_fuzzy, pal.text);
+                    } else {
+                        let txt = tideshell_core::clock::short_text(info.time, shell.prefs.clock_fuzzy);
+                        p.text(r.center(), Align2::CENTER_CENTER, txt, FontId::proportional(if expanded { 22.0 } else { 15.0 }), pal.text);
+                    }
                 }
                 BarWidget::Battery => {
                     // A drawn battery (body, terminal, level fill, bolt while charging), not a number:
