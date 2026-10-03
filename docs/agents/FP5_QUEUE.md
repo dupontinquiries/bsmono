@@ -74,6 +74,12 @@ Legend: **done** = committed and deployed; **built** = committed, not seen worki
 | 62 | Palette controls ride above the on-screen keyboard | built, deployed (tideshell); rusty-board side committed, not deployed | `569a9e698` + `e24cbb167`: rusty-board writes `$XDG_RUNTIME_DIR/rusty-board.geom` (height), tideshell lifts the search bar and modes by it. Needs a rusty-board build on the phone to take effect; alphabet scrub rail (owner alternative) not started |
 | 63 | Drawer Wi-Fi/Bluetooth/mobile-data/airplane tiles show real state | built, deployed, unseen | `26c6321b4`: they were only set on tap; now read from rfkill every 2 s. Next: a minimal traffic line (`/proc/net/dev`) and a redacted last-peer address (show only truncated tail, e.g. `…:a4:7f`, never full IP/MAC) |
 | 64 | Autobrightness flicker | not tideshell | likely panel/backlight/DSI driver; check kernel on device and the Fairphone PDF before any change |
+| 65 | Pocket sleep: covered 1.5 s with the lock cover up turns the display off | built (`f5893a8f7`), NOT deployed: phone offline | build ready in the session scratchpad `tide-build/out/tideshell.new`; deploy = scp to `~/.local/bin/tideshell` (keep `.prev`), `systemctl --user restart tideshell` |
+| 66 | Tabletop autorotate freeze | built (`c1411e0f7`), deployed, unseen | undefined drops a pending turn; flat verdict freezes rotation |
+| 67 | snapshot-cam: rear camera mirrored, no front switch | code fixed (`909041f7f`), NOT deployed | wrapper must name both sensors: front `/base/soc@0/cci@ac4b000/i2c-bus@1/camera@10` (s5kjn1, orientation 0), rear `.../cci@ac4a000/i2c-bus@1/camera@29`; set `SNAPSHOT_CAM_FRONT_SOURCE`, `SNAPSHOT_CAM_REAR_SOURCE` (as `gst:libcamerasrc camera-name=...`) and `SNAPSHOT_CAM_DEFAULT_FACING=rear`; unseen, camera not run. Blown highlights: not started |
+| 68 | Phone `screen_off_time` 30 min -> 2 min | applied (`~/.config/cosmic/com.system76.CosmicIdle/v1/screen_off_time` = `Some(120000)`) | unverified that cosmic-idle re-read it live |
+| 69 | gitmind Push: tideshell built no binary | fixed (`62ec2d73b`): preset needs `ei` too | not driven end to end; `.2.224` not touched |
+| 70 | clawbound Crestfall/Oremantle/Monsoon work, Wooting walk | committed on `cw/cleanup-gods`, laptop only | the phone has an old clawbound; no aarch64-musl build made; Wooting needs the Analog SDK installed on the laptop |
 | 14 | Older: logscope service test, switcher drawer redesign, home widget, steno multitouch, PAM shim, emergency access | open | see the C20 queues |
 
 ## Done tonight (all deployed unless noted)
