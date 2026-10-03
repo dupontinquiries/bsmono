@@ -184,6 +184,16 @@ impl Sleep {
         }
     }
 
+    /// How long until `quiet` would blank the panel (None when nothing is pending), so a loop that
+    /// sleeps while the screen is off can wake for it instead of firing up to its whole idle
+    /// timeout late.
+    pub fn quiet_in(&self, now: Millis) -> Option<Millis> {
+        match (self.phase, self.lit_at) {
+            (Phase::Off, Some(t)) if self.down.is_none() => Some((t + RELIGHT_GRACE_MS).saturating_sub(now)),
+            _ => None,
+        }
+    }
+
     /// Called every tick with the clock: turn off a panel somebody else lit while we are Off,
     /// once, after RELIGHT_GRACE_MS without a touch (and never mid-touch).
     pub fn quiet(&mut self, now: Millis) -> Vec<SleepAction> {
@@ -478,6 +488,22 @@ mod tests {
         assert!(s.quiet(last + RELIGHT_GRACE_MS + 10).is_empty());
         // The panel going off is a report that agrees with us.
         assert!(s.display_reported(false, 20_000).is_empty());
+    }
+
+    #[test]
+    fn the_quiet_timer_can_be_asked_when_it_is_due() {
+        let mut s = asleep();
+        assert_eq!(s.quiet_in(0), None, "nothing lit, nothing pending");
+        s.display_reported(true, 1000);
+        assert_eq!(s.quiet_in(1000), Some(RELIGHT_GRACE_MS));
+        assert_eq!(s.quiet_in(1000 + 4000), Some(RELIGHT_GRACE_MS - 4000));
+        assert_eq!(s.quiet_in(1000 + RELIGHT_GRACE_MS + 777), Some(0), "overdue means now");
+        s.touch_down(0, 1.0, 1.0, 3000);
+        assert_eq!(s.quiet_in(3000), None, "never while a finger is down");
+        s.touch_up(0, 3050);
+        assert_eq!(s.quiet_in(3050), Some(RELIGHT_GRACE_MS), "restarted by the touch");
+        s.quiet(3050 + RELIGHT_GRACE_MS);
+        assert_eq!(s.quiet_in(99_999), None, "done once blanked");
     }
 
     #[test]

@@ -367,6 +367,21 @@ impl Shell {
         }
     }
 
+    /// The power key, with the clock of the loop that received it. While the screen is off the loop
+    /// sleeps on its sockets and `self.now` stops moving, so a press that arrives ten seconds later
+    /// would be stamped ten seconds ago -- and "the press that woke the screen is not a symbol"
+    /// (`power_released`) compares times. Always use this from the loop.
+    pub fn power_key_at(&mut self, now: Millis) -> Vec<Action> {
+        self.now = self.now.max(now);
+        self.power_key()
+    }
+
+    /// Milliseconds until the sleep layer wants a tick while the screen is off (re-blanking a panel
+    /// something else lit), for the loop's wait timeout.
+    pub fn next_quiet_ms(&self, now: Millis) -> Option<Millis> {
+        self.sleep.quiet_in(now)
+    }
+
     /// The power key: awake -> sleep (and cover); asleep -> wake.
     pub fn power_key(&mut self) -> Vec<Action> {
         self.log("power key");
@@ -2107,6 +2122,26 @@ mod tests {
         assert_eq!(sh.sleep.phase, crate::sleep::Phase::FadingIn);
         sh.power_released(100, t + 1100);
         assert_eq!(sh.morse.entered(), 2, "two dots counted, the wake press not");
+    }
+
+    #[test]
+    fn waking_after_a_long_tickless_sleep_does_not_turn_the_wake_press_into_a_dot() {
+        // The real loop does not tick while the screen is off: self.now stays where the last tick
+        // left it, and the wake press arrives ten seconds later carrying only the loop's clock.
+        let mut sh = morse_shell("..-");
+        sh.power_released(crate::morse::SLEEP_MS, 1000);
+        let mut t = 1000u64;
+        for _ in 0..400 { t += 11; sh.tick(t); }
+        assert_eq!(sh.sleep.phase, crate::sleep::Phase::Off);
+        let wake = t + 10_000; // no tick in between
+        sh.power_key_at(wake);
+        assert_eq!(sh.sleep.phase, crate::sleep::Phase::FadingIn);
+        sh.power_released(120, wake + 130); // the wake press's own release
+        assert_eq!(sh.morse.entered(), 0, "that release is not the first dot");
+        // and the next, real, press still counts
+        sh.power_key_at(wake + 700);
+        sh.power_released(100, wake + 800);
+        assert_eq!(sh.morse.entered(), 1);
     }
 
     #[test]

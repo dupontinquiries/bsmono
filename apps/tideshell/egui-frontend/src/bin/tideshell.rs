@@ -788,7 +788,9 @@ fn main() {
         let night_wake = sb.shell.night.next_wake_ms(t0.elapsed().as_millis() as u64, ms_into_minute, sb.shell.night_window && sb.shell.night_pulse);
         let timeout = if asleep {
             // Bedside mode wakes at each minute boundary (and at a pulse's end).
-            night_wake.map_or(30_000, |ms| ms.min(30_000) as i32)
+            // ... or when the sleep layer wants to blank a panel something else lit.
+            let quiet = sb.shell.next_quiet_ms(t0.elapsed().as_millis() as u64);
+            night_wake.into_iter().chain(quiet).min().map_or(30_000, |ms| ms.min(30_000) as i32)
         } else if sb.cam_duty.is_live(t0.elapsed().as_millis() as u64) {
             // Camera frames are not a wake fd: poll at the live frame rate.
             1000 / tideshell_egui::camera::LIVE_FPS as i32
@@ -1256,7 +1258,7 @@ fn main() {
                     sb.shell.note("power + volume-down: screenshot".to_string());
                     actions.push(tideshell_core::Action::Screenshot);
                 }
-                (KeyPress::Power, true) => actions.extend(sb.shell.power_key()),
+                (KeyPress::Power, true) => actions.extend(sb.shell.power_key_at(now_ms)),
                 (KeyPress::Power, false) => {}
                 (KeyPress::PowerUp(_), _) if power_chord => power_chord = false,
                 (KeyPress::PowerUp(held), _) => actions.extend(sb.shell.power_released(held, now_ms)),
