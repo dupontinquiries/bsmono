@@ -61,6 +61,16 @@ Legend: **done** = committed and deployed; **built** = committed, not seen worki
 | 49 | vidkit: after switching apps the video fast-forwards through a backlog | built | `playback::is_stale` cuts to the present (>1.5 s behind, once per 5 s); not seen on the device |
 | 50 | cosmic-osd stopped (SIGSTOP) so its brightness slider cannot cover the screen | built | volume/layout pop-ups from COSMIC go quiet too; `TIDESHELL_QUIET_OSD=0` undoes it |
 | 51 | Greeter without a keyboard still blocks dogfooding | blocked on the owner | the `autologin` plan is opt-in and needs root: `gitmind fp5 apply user@phone autologin --password-stdin` (sudo over ssh needs a tty/password) |
+| 52 | switcheroo does not open on the device | open | not investigated: the phone stopped answering on ssh (no route) at the time; start with running the binary in the session and reading its stderr |
+| 53 | "All apps" button at the bottom of the swipe-up window manager | open (same as row 24) | still not done |
+| 54 | Bottom press-and-hold search -> keyboard + list; fold hatch INTO tideshell so the bar-style list animates into hatch-style tiles with newcomers animating in | open | design: one surface, the list is the tile grid at a narrow width |
+| 55 | Cold mode: a reminder of the flick pattern after a pause (dismiss with a volume key), flicks highlight the selection with a border/glow; maybe the iPad-style cursor | open | cold mode opens with volume-down on the empty home screen |
+| 56 | Lockscreen: double tap turns the display off | open | the sleep machine has a triple-tap wake and a 1.5 s power hold; a double tap must not collide with the morse unlock |
+| 57 | Panel power: can the FP5 panel clock down / push fewer frames / dim for measurable savings | open | needs measurement with `battery-log` (current_now) at fixed brightness across refresh rates and frame cadences; see FP5_PHONE_LEARNINGS (DPU wedge) before touching DSI timings |
+| 58 | One-character typing was the egui IME gate | built | captured: the keyboard sends `Disabled, Commit, Disabled` per key; egui drops a commit unless an `Enabled` re-recorded the cursor. `uikit_egui::ime::enable_before_commit` in each app's `raw_input_hook`; wired into hatch only; every other egui app has the same bug until it adds the hook |
+| 59 | Lockscreen / display turn-off states are inconsistent | open | owner report (2026-10-03); the sleep machine is `sleep.rs`, the DPU wedge notes in FP5_PHONE_LEARNINGS apply; trace one scenario at a time with `tideshell ctl` and the journal, do not change DSI timings blind |
+| 60 | Auto-rotate lost after a boot where the ADSP sensors were late | built, applied | `gitmind fp5 apply ... "auto-rotate sensor proxy"` (drop-in: start at boot after the sensors server, Restart=always); applied to the phone by hand-run sudo because gitmind's BatchMode ssh is refused there; whether it prevents the cold-boot failure is untested |
+| 61 | studio: drag on empty timeline space pans | built | `f385d7387`; the drag path itself is untested (the crate's drag harness is ignored) |
 | 14 | Older: logscope service test, switcher drawer redesign, home widget, steno multitouch, PAM shim, emergency access | open | see the C20 queues |
 
 ## Done tonight (all deployed unless noted)
