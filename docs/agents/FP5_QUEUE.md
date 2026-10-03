@@ -28,6 +28,21 @@ Legend: **done** = committed and deployed; **built** = committed, not seen worki
 | 16 | Phone setup plans from the GUI | built | gitmind-egui Network page; not yet applied from the GUI |
 | 17 | reMarkable Paper Pro: probe, COSMIC on it | probed | see `maintenance/REMARKABLE_TABLETS.md` (probe of 2026-10-02): remote session via VNC needs pointer injection; local needs a Wayland-to-qtfb bridge |
 | 18 | clawbound: the bundle at 192.168.2.232:5002 (`WIP-clawbound`, 51 commits, 5 new cats, dunes map) and LAN multiplayer | open | branch is in the repo as `refs/remotes/bundle/WIP-clawbound`, not merged; the game already has `netcode`, `lockstep.rs`, `netplay.rs`, `lanlobby.rs` |
+| 19 | vidkit-player: ghost on-screen keyboard | built | cause proven by A/B on the phone: `fonts::install` enabled IME on every window; removed. vidkit-player rebuilt and deployed; the other apps pick it up when rebuilt. Typing into a focused field not yet confirmed |
+| 20 | vidkit-player: the top bar should overlay the video (the "chrome"), not block it | open | media controls as an overlay for now; later decide sidebar vs top slide-down vs press-and-hold vs a hatch tile |
+| 21 | bo-suite-egui: media controls, designed properly (not vidkit's rugged style) | open | |
+| 22 | bsettings (rusty-board-settings) integrated into tideshell | open | |
+| 23 | hatch should look like Windows 8 (live tiles) | open | |
+| 24 | Swipe-up switcher: move the all-apps button to the bottom | open | |
+| 25 | studio: tap-and-drag on empty timeline space; rolling-tape portrait timeline; multiple scopes for the empty vertical space; command palette swipe on touch | open | pinch-zoom already works |
+| 26 | Tablet as a smart second screen: Rust VNC viewer with touch first; then dashboards (monitoring, smarthome, photos, snapclone notifications), voiceterm notes sync + handwriting recognition, aperture/logscope layouts, AI chat updates | open | no Qt-Wayland bridge for now; the phone's pointer-injection gap blocks touch back through VNC |
+| 27 | Multi-day battery life | built | `battery-log.py` runs on the phone (one line a minute; first reading 2.8 W screen on, governor performance, ZERO suspends since boot); design question: suspend vs tap-to-wake; governor plan needs root |
+| 28 | Camera focus (tap-to-focus) and the 3D ToF probe | blocked | needs the go-ahead to run libcamera again (froze the phone once) |
+| 29 | Fingerprint sensor for PAM | open | no sensor node in the device tree, not a quick fix; postmarketOS lists it broken; honest feasibility write-up still to do |
+| 30 | Get past the cosmic-greeter no-keyboard barrier for dogfooding | open | autologin plan exists (`autologin_plan`) |
+| 31 | True black on the OLED | built | pure black went 0% -> 55% of a screenshot on the phone; apps pick it up when rebuilt with the new uikit-egui |
+| 32 | Drawer tile sub-labels are clipped ("Do not di", "Flashligh", "Screensho") | open | |
+| 33 | Known pre-existing test failures | open | uikit-egui `callout` (slate/Error contrast), clawbound `sentinel` x3 and `touch` x2 |
 | 14 | Older: logscope service test, switcher drawer redesign, home widget, steno multitouch, PAM shim, emergency access | open | see the C20 queues |
 
 ## Done tonight (all deployed unless noted)
