@@ -80,6 +80,7 @@ Legend: **done** = committed and deployed; **built** = committed, not seen worki
 | 68 | Phone `screen_off_time` 30 min -> 2 min | applied (`~/.config/cosmic/com.system76.CosmicIdle/v1/screen_off_time` = `Some(120000)`) | unverified that cosmic-idle re-read it live |
 | 69 | gitmind Push: tideshell built no binary | fixed (`62ec2d73b`): preset needs `ei` too | not driven end to end; `.2.224` not touched |
 | 70 | clawbound Crestfall/Oremantle/Monsoon work, Wooting walk | committed on `cw/cleanup-gods`, laptop only | the phone has an old clawbound; no aarch64-musl build made; Wooting needs the Analog SDK installed on the laptop |
+| 71 | cosmic-panel corner-radius spin (battery) | fixed on the phone (config), verified | `border_radius` 0 on Panel and Dock; see PHONE_LEARNINGS. Open: coredump cap + journal/core vacuum (root, owner decides); pocket-sleep build deployed (`f5893a8f7`) |
 | 14 | Older: logscope service test, switcher drawer redesign, home widget, steno multitouch, PAM shim, emergency access | open | see the C20 queues |
 
 ## Done tonight (all deployed unless noted)

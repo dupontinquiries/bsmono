@@ -246,3 +246,18 @@ Fix, user-level and replayable: `~/.config/systemd/user/rusty-board.service.d/la
 `Environment=RUSTY_BOARD_LAYER=overlay`, then `systemctl --user daemon-reload && restart rusty-board`. Verified by screenshot:
 the board draws over the sheet and the search bar sits right above it. The cost: it also sits above other overlays (hatch, switcher), which is where
 it belongs. Debug aid: `rusty-board.ctl` is a DGRAM socket (`show`/`hide`), phone `nc` has no `-U`, use python.
+
+## cosmic-panel spun a core for hours: corner radius vs the autohide handle (2026-10-03)  [measured]
+Found from `~/.local/share/tideshell/battery.jsonl` (the minute log): `cosmic-panel`, `cosmic-session` and
+`systemd-journal` burned CPU together in bursts (01-02h and 11-12h, the reboots), up to ~2 cores
+(`cpu_s` 129 per minute), and the persistent journal was 1 GB. On a fresh boot the journal showed
+`Protocol error 1 on object cosmic_corner_radius_layer_v1@55`, 2,027,492 suppressed messages in 27 s.
+Error 1 of that interface is `radius_too_large`: the panel asks for a corner radius bigger than half its own layer, and
+`Panel` is `autohide: OnOverlap` with `handle_size: 4`, so hidden it is ~4 px thick and `border_radius: 12` (Dock: 160!)
+cannot fit. The connection dies, the panel spins on it, and every restart of the panel aborts its eight applets
+(`cosmic-applets` SIGABRT, "wayland dispatch: Backend error: Broken pipe"): 311 core dumps today, 2.7 GB in
+`/var/lib/systemd/coredump` (1,205 files), each launching a 168 MB `drkonqi-coredump-launcher`.
+Fix: `~/.config/cosmic/com.system76.CosmicPanel.{Panel,Dock}/v1/border_radius` = `0` (were 12 and 160). Verified: panel 0 CPU ticks
+over 5 s with no protocol errors, load down, minute log `cpu_s` 129 -> 65 -> 4.5. NOT done (needs root, the owner's call): cap or
+disable coredump storage (`/etc/systemd/coredump.conf.d`), vacuum the 1 GB journal and the cores. Also: the journal is persistent
+here, but `battery.jsonl` is what showed the pattern first.
