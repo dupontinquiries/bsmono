@@ -177,6 +177,22 @@ pub fn cpu_governor_plan(root: Root) -> Vec<Step> {
     ]
 }
 
+/// The FP5's panel is OLED: a pixel at the usual "dark theme" ground (20, 20, 25) is a lit grey and only
+/// (0, 0, 0) is off, so every dark UI looked washed out and burned power. `~/.config/uikit/oled` = `on`
+/// makes `uikit_egui::apply_palette` (every themed app) and tideshell's own and published palettes use a
+/// true-black ground. Per user, and read by apps built with it; tideshell restarts to pick it up.
+pub fn oled_black_plan() -> Vec<Step> {
+    let f = "$HOME/.config/uikit/oled";
+    vec![
+        Step { on: Where::Device, what: "true black on the OLED panel",
+               cmd: format!("mkdir -p \"$HOME/.config/uikit\" && printf 'on\\n' > \"{f}\""),
+               gate: Gate::ExitZero, rollback: Some(format!("rm -f \"{f}\"")) },
+        Step { on: Where::Device, what: "the switch is on",
+               cmd: format!("grep -x on \"{f}\" && echo OLED_ON"),
+               gate: Gate::Contains("OLED_ON".into()), rollback: None },
+    ]
+}
+
 /// xwaylandvideobridge (KDE) keeps an invisible X11 window and a tray icon for screen-sharing X11
 /// apps. KWin and GNOME hide it; COSMIC shows it. Nothing on the phone shares X11 windows, so it
 /// is not started: a per-user autostart entry with `Hidden=true` shadows the system one.
@@ -409,6 +425,7 @@ pub fn all_parts(root: Root) -> Vec<(&'static str, Vec<Step>)> {
         ("panel and dock zones", panel_zones_plan()),
         ("panel memory watchdog", panel_watchdog_plan()),
         ("hide xwaylandvideobridge", hide_video_bridge_plan()),
+        ("true black (OLED)", oled_black_plan()),
         ("cpu governor", cpu_governor_plan(root)),
         ("emergency USB access", emergency_access_plan(root)),
     ]
@@ -429,6 +446,7 @@ mod tests {
         v.extend(panel_zones_plan());
         v.extend(panel_watchdog_plan());
         v.extend(hide_video_bridge_plan());
+        v.extend(oled_black_plan());
         v.extend(cpu_governor_plan(root));
         v.extend(rescue_console_plan("/tmp/fp5-rescue", root));
         v.extend(autologin_plan("user", root));
@@ -470,6 +488,14 @@ mod tests {
         assert!(p[1].cmd.contains("scaling_governor - - - - schedutil") && p[1].cmd.contains("tmpfiles"), "{}", p[1].cmd);
         assert!(p[1].rollback.as_deref().unwrap().contains("echo performance"));
         assert!(p[2].gate == Gate::Contains("schedutil".into()), "the check must name the governor, not just run");
+    }
+
+    #[test]
+    fn the_oled_plan_writes_the_per_user_switch_uikit_reads_and_can_undo_it() {
+        let p = oled_black_plan();
+        assert!(p[0].cmd.contains(".config/uikit/oled") && p[0].cmd.contains("printf 'on"), "{}", p[0].cmd);
+        assert!(p[0].rollback.as_deref().unwrap().contains("rm -f"));
+        assert!(all_parts(Root::NoPrompt).iter().any(|(n, _)| n.contains("OLED")));
     }
 
     #[test]
