@@ -391,4 +391,20 @@ mod tests {
         assert_eq!(camera_id_in("gst:libcamerasrc camera-name=/base/soc@0/cci@ac4a000/i2c-bus@1/camera@29"), Some("/base/soc@0/cci@ac4a000/i2c-bus@1/camera@29".into()));
         assert_eq!(camera_id_in("gst:videotestsrc"), None);
     }
+
+    /// The FP5's real subdevice names (read off the phone, 2026-10-03): the main camera's motor is found
+    /// by its bus, and the other two sensors have none.
+    #[test]
+    fn the_real_fp5_subdevices_pair_the_main_camera_with_its_motor() {
+        let subdevs: Vec<(String, String)> = [
+            ("/dev/v4l-subdev27", "imx858 17-0029"),
+            ("/dev/v4l-subdev28", "dw9719 17-000e"),
+            ("/dev/v4l-subdev29", "s5kjn1 19-0010"),
+            ("/dev/v4l-subdev30", "imx800 16-001a"),
+        ].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        assert_eq!(actuator_for("/base/soc@0/cci@ac4a000/i2c-bus@1/camera@29", &subdevs), Some("/dev/v4l-subdev28".into()));
+        assert_eq!(actuator_for("/base/soc@0/cci@ac4b000/i2c-bus@1/camera@10", &subdevs), None, "the selfie camera is fixed focus");
+        assert_eq!(actuator_for("/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a", &subdevs), None, "so is the other rear sensor");
+    }
+
 }
