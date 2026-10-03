@@ -261,3 +261,14 @@ Fix: `~/.config/cosmic/com.system76.CosmicPanel.{Panel,Dock}/v1/border_radius` =
 over 5 s with no protocol errors, load down, minute log `cpu_s` 129 -> 65 -> 4.5. NOT done (needs root, the owner's call): cap or
 disable coredump storage (`/etc/systemd/coredump.conf.d`), vacuum the 1 GB journal and the cores. Also: the journal is persistent
 here, but `battery.jsonl` is what showed the pattern first.
+
+## Photo quality, measured from a day's roll (2026-10-03)  [measured]
+39 rear-camera photos (720x1280, saved with `-front` in the name until the facing fix): the darkest 1% of pixels sits at
+52/255 (median over photos), the median luma at 161, p95/p99 are 255, 20-60% of pixels have a channel at >=250, nearly
+none are below 20, and the near-neutral surfaces lean green/cyan (G/R ~1.0-1.5). A 4-6% linear black lift reads as ~70/255 in
+sRGB, which fits libcamera's soft ISP having no black-level for the imx858 here. Clipped highlights are in the frame
+itself, so software can only lift the black, balance the neutrals and darken what is not burnt (`snapshot-cam/src/autotone.rs`);
+the rest needs the exposure turned down at capture, which wants the camera run. `~/.config/snapshot-cam/settings.conf`
+had `lens = no lens` (the wide sensor's distortion uncorrected) and `wb = auto`.
+Sensors from the device tree (`/sys/firmware/devicetree/base/soc@0/cci@*/i2c-bus@*/camera@*`): camera@1a imx800 (orientation 1,
+back), camera@29 imx858 (back, main, lens motor), camera@10 s5kjn1 (orientation 0 = FRONT); all rotation 270.
