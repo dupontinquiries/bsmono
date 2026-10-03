@@ -237,3 +237,12 @@ Found on the phone, boot of 02:27: rotation did nothing and tideshell logged
 * Recovery needs root: `sudo systemctl restart hexagonrpcd-adsp-sensorspd.service`, then
   `ls /sys/bus/iio/devices` for a third device, then `systemctl status iio-sensor-proxy`.
 * Not known: why the ADSP sensor path comes up on some boots and not others. A reboot is the blunt fix.
+
+## The keyboard hid behind the palette sheet (2026-10-03)
+
+Tideshell's palette sheet is a `Layer::Overlay` surface with a scrim; rusty-board defaulted to `Layer::Top`, so the keyboard
+was summoned and mapped but drawn UNDER the scrim (a blank band where it should be; `rusty-board.geom` read 216 all the while).
+Fix, user-level and replayable: `~/.config/systemd/user/rusty-board.service.d/layer.conf` with
+`Environment=RUSTY_BOARD_LAYER=overlay`, then `systemctl --user daemon-reload && restart rusty-board`. Verified by screenshot:
+the board draws over the sheet and the search bar sits right above it. The cost: it also sits above other overlays (hatch, switcher), which is where
+it belongs. Debug aid: `rusty-board.ctl` is a DGRAM socket (`show`/`hide`), phone `nc` has no `-U`, use python.
