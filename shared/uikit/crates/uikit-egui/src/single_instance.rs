@@ -55,11 +55,26 @@ pub enum Claim {
     Unavailable,
 }
 
-/// Is a process alive? Signal 0 checks for existence without delivering
-/// anything, which is the portable way to ask.
+/// Is a process alive? NOT "does /proc/<pid> exist": a ZOMBIE (exited, not yet reaped by its parent)
+/// keeps its /proc entry, and a lock naming a zombie made every later launch conclude "already running",
+/// poke an instance that does not exist, and exit: on the phone hatch never appeared after the first
+/// time it hid, because tideshell, its parent, never reaped it. The state letter after the command
+/// name in /proc/<pid>/stat says: `Z` (zombie) and `X` (dead) are not alive.
 fn pid_alive(pid: u32) -> bool {
     if pid == 0 { return false; }
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => proc_state_is_alive(&stat),
+        Err(_) => false,
+    }
+}
+
+/// From the text of /proc/<pid>/stat. The command name is in parentheses and may contain anything, so
+/// the state is the first letter after the LAST `)`.
+fn proc_state_is_alive(stat: &str) -> bool {
+    match stat.rfind(')').and_then(|i| stat[i + 1..].trim_start().chars().next()) {
+        Some('Z') | Some('X') | Some('x') | None => false,
+        Some(_) => true,
+    }
 }
 
 /// Try to become the single instance.
@@ -97,6 +112,37 @@ pub fn should_start(c: &Claim) -> bool { !matches!(c, Claim::AlreadyRunning(_)) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_zombie_is_not_an_instance_but_a_running_process_is() {
+        // The real thing, not a string: spawn a child that exits at once and DO NOT wait for it.
+        let mut child = std::process::Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+        // wait (without reaping) until it has exited: /proc/<pid>/stat says Z
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(false, |s| s.contains(") Z")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists(), "the premise: a zombie still has a /proc entry");
+        assert!(!pid_alive(pid), "a zombie must not hold the single-instance lock");
+        child.wait().unwrap();
+        assert!(!pid_alive(pid), "and a reaped process is gone");
+        assert!(pid_alive(std::process::id()), "this very process is alive");
+        assert!(!pid_alive(0));
+    }
+
+    #[test]
+    fn the_state_letter_is_read_after_the_last_paren_so_odd_names_cannot_fool_it() {
+        assert!(proc_state_is_alive("123 (hatch-egui) S 1 123 123 0 -1 4194304"));
+        assert!(proc_state_is_alive("123 (hatch-egui) R 1 123"));
+        assert!(!proc_state_is_alive("123 (hatch-egui) Z 1 123"));
+        assert!(proc_state_is_alive("123 (a) Z b (c)) S 1"), "a name with parens and spaces: the state is after the LAST paren, here S -> alive");
+        assert!(proc_state_is_alive("123 (a (Z) b) S 1 2"), "a Z inside the name is not the state");
+        assert!(!proc_state_is_alive("garbage"));
+    }
+
     use super::*;
 
     fn temp_id(tag: &str) -> String {
