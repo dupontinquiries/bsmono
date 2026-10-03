@@ -1488,7 +1488,7 @@ fn main() {
         // The blur has no strength, only on/off, so it cannot fade with the cards: it is dropped as soon as the
         // switcher is past half way out, and the alpha fade carries the rest.
         let switcher_blur = sb.shell.switcher.open || (sb.shell.switcher.is_visible() && sb.shell.switcher.reveal.progress > 0.5);
-        io.set_blur(Role::Overlay, switcher_blur || sb.shell.palette.is_visible());
+        io.set_blur(Role::Overlay, switcher_blur || sb.shell.palette.is_visible(), tideshell_egui::ShellView::reserved_right(&sb.shell).round() as u32);
         sb.view.backdrop_blur = io.blur_supported();
         // The whole overlay fades with the switcher's reveal in the compositor, so the blurred apps behind come back
         // into focus smoothly as it closes. TIDESHELL_OVERLAY_ALPHA holds a fixed fade (0..1) for inspecting it.

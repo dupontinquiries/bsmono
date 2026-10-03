@@ -582,10 +582,14 @@ impl Io {
 
     /// Ask the compositor to blur what is behind `role`'s surface (all of it), or stop. Cheap to call every
     /// loop: it acts only when the wish or the surface size changed.
-    pub fn set_blur(&mut self, role: Role, on: bool) {
+    ///
+    /// `keep_right` px along the right edge are left unblurred: the bar lives there on its own surface and
+    /// stays in use under the switcher, so it must not look like part of the blurred backdrop.
+    pub fn set_blur(&mut self, role: Role, on: bool, keep_right: u32) {
         let Some(mgr) = self.blur_mgr.clone().filter(|_| self.st.blur_caps) else { return };
         let Some(i) = self.st.surfs.iter().position(|s| s.role == role) else { return };
         let size = self.st.surfs[i].size;
+        let size = (size.0.saturating_sub(keep_right), size.1);
         let want = on.then_some(size).filter(|s| s.0 > 0 && s.1 > 0);
         if self.st.surfs[i].blur_for == want {
             return;
