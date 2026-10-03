@@ -375,8 +375,23 @@ pub struct Engine {
     /// Frames shown and dropped since the last (re)start.
     pub shown: u64,
     pub dropped: u64,
+    /// When the decoder was last re-aimed at the present (see [`is_stale`]); rate-limits cuts.
+    last_cut: Option<Instant>,
     /// What the audio went to, for the UI: a player name, or why there is none.
     pub audio_note: String,
+}
+
+/// How far behind the clock the next frame may be before it is a backlog rather than a late frame.
+pub const STALE_AFTER: Duration = Duration::from_millis(1500);
+/// Minimum gap between two cuts to the present, so a decoder that is merely slow cannot thrash.
+pub const CUT_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// The head frame is so far behind the clock that dropping it and the rest at decode speed would
+/// look like fast-forward and chug. That is what a window that was hidden for a while does: the
+/// compositor stops frame callbacks, the audio clock runs on, the decoder sits blocked on a full
+/// queue holding old frames, and on return every one is "late". Better to cut to the present.
+pub fn is_stale(head_pts: Duration, at: Duration) -> bool {
+    at > head_pts + STALE_AFTER
 }
 
 impl Engine {
@@ -408,6 +423,7 @@ impl Engine {
             display_latency: Duration::ZERO,
             shown: 0,
             dropped: 0,
+            last_cut: None,
             audio_note: String::new(),
         };
         e.restart(from)?;
@@ -637,6 +653,12 @@ impl Engine {
         // Seen at: now + the wake's lead + the compositor's pipeline. The
         // audio clock is what is HEARD, so the picture must be what is SEEN.
         let at = self.master.now() + lead + self.display_latency;
+        if self.queue.front().is_some_and(|h| is_stale(h.pts, at)) && self.last_cut.is_none_or(|t| t.elapsed() >= CUT_COOLDOWN) {
+            self.last_cut = Some(Instant::now());
+            if self.restart(at).is_ok() {
+                return Tick::Wait(Duration::from_millis(20));
+            }
+        }
         match pick(&mut self.queue, at, &self.policy, &mut |f| pool.recycle(f)) {
             Pick::Show { frame, dropped } => {
                 self.dropped += dropped as u64;
@@ -821,6 +843,14 @@ mod tests {
     fn q(pts: &[u64]) -> VecDeque<Frame> { pts.iter().map(|&p| f(p)).collect() }
     fn ms(n: u64) -> Duration { Duration::from_millis(n) }
     fn pol() -> SyncPolicy { SyncPolicy::for_refresh_hz(60) }
+
+    #[test]
+    fn a_backlog_is_stale_but_an_ordinary_late_frame_is_not() {
+        assert!(!is_stale(ms(10_000), ms(10_040)), "40 ms late: just late");
+        assert!(!is_stale(ms(10_000), ms(11_400)), "1.4 s: still within tolerance");
+        assert!(is_stale(ms(10_000), ms(11_501)), "past 1.5 s it is a backlog");
+        assert!(!is_stale(ms(12_000), ms(10_000)), "a frame ahead of the clock is never stale");
+    }
 
     #[test]
     fn a_due_frame_is_shown_and_a_future_one_held() {
