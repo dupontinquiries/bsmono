@@ -878,6 +878,21 @@ pub fn send_keyboard_command(cmd: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The keyboard's height from its geometry line (see rusty-board's `geom_line`): a number of logical px,
+/// 0 when hidden. Anything else reads as 0, so a bad file never lifts the sheet.
+pub fn parse_keyboard_inset(text: &str) -> f32 {
+    text.trim().parse::<f32>().ok().filter(|h| h.is_finite() && *h > 0.0).unwrap_or(0.0)
+}
+
+/// The keyboard's current height, from `$XDG_RUNTIME_DIR/rusty-board.geom`; 0 without one.
+pub fn read_keyboard_inset() -> f32 {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(|d| PathBuf::from(d).join("rusty-board.geom"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| parse_keyboard_inset(&t))
+        .unwrap_or(0.0)
+}
+
 pub fn fleet_settings_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
     Some(base.join("gitmind").join("settings.conf"))
@@ -991,6 +1006,15 @@ mod fleet_sleep_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_keyboard_geometry_line_parses_and_garbage_is_zero() {
+        assert_eq!(parse_keyboard_inset("312\n"), 312.0);
+        assert_eq!(parse_keyboard_inset("0\n"), 0.0);
+        for bad in ["", "abc", "-5", "NaN", "inf"] {
+            assert_eq!(parse_keyboard_inset(bad), 0.0, "{bad:?}");
+        }
+    }
+
     #[test]
     fn the_screenshot_script_saves_then_copies_the_saved_png_and_only_if_it_exists() {
         let s = SCREENSHOT_SH;

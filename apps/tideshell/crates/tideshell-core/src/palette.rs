@@ -101,6 +101,8 @@ pub enum Hit {
 pub struct Geom {
     pub screen: (f32, f32),
     pub sheet_top: f32,
+    /// The y the controls hang off: the screen's bottom, or the top of the on-screen keyboard.
+    pub bottom: f32,
     /// 1 = the short sheet's list of rows; `TILE_COLS` = the full sheet's grid of tiles.
     pub cols: usize,
 }
@@ -120,10 +122,16 @@ impl Geom {
     /// bottom edge so the controls stay where the thumb lands, and expanding only grows the list
     /// upward. `expanded` = the full sheet (`SHEET_FRAC` of the screen).
     pub fn new(screen: (f32, f32), expanded: bool) -> Geom {
-        let list_bottom = screen.1 - PAD - MODE_ROW_H - PAD - SEARCH_H - PAD;
+        Geom::with_bottom(screen, expanded, screen.1)
+    }
+
+    /// As `new`, with the controls hanging off `bottom` (the top of the keyboard) instead of the screen's
+    /// bottom edge. The sheet itself still reaches the edge: the keyboard covers its foot.
+    pub fn with_bottom(screen: (f32, f32), expanded: bool, bottom: f32) -> Geom {
+        let list_bottom = bottom - PAD - MODE_ROW_H - PAD - SEARCH_H - PAD;
         let full_top = screen.1 * (1.0 - SHEET_FRAC);
         let short_top = list_bottom - COLLAPSED_ROWS as f32 * ROW_H - PAD - HANDLE_H;
-        Geom { screen, sheet_top: if expanded { full_top } else { short_top.max(full_top) }, cols: if expanded { TILE_COLS } else { 1 } }
+        Geom { screen, sheet_top: if expanded { full_top } else { short_top.max(full_top) }, bottom, cols: if expanded { TILE_COLS } else { 1 } }
     }
 
     /// Height of one list row or one grid row of tiles (with its gap).
@@ -149,11 +157,11 @@ impl Geom {
 
     pub fn mode_rect(&self, i: usize) -> (f32, f32, f32, f32) {
         let w = (self.screen.0 - PAD * 4.0) / 3.0;
-        (PAD + i as f32 * (w + PAD), self.screen.1 - PAD - MODE_ROW_H, w, MODE_ROW_H)
+        (PAD + i as f32 * (w + PAD), self.bottom - PAD - MODE_ROW_H, w, MODE_ROW_H)
     }
 
     pub fn search_y(&self) -> f32 {
-        self.screen.1 - PAD * 2.0 - MODE_ROW_H - SEARCH_H
+        self.bottom - PAD * 2.0 - MODE_ROW_H - SEARCH_H
     }
 
     /// Top of the row (or tile row) that result `i` is in.
@@ -263,6 +271,8 @@ pub struct Palette {
     /// The list is showing in full: the thumb reached the search field (or it took focus).
     /// Until then the sheet is short, so the buttons and search sit under the thumb.
     pub expanded: bool,
+    /// Height of the on-screen keyboard (logical px, 0 when hidden): the sheet's controls sit above it.
+    pub kb_inset: f32,
 }
 
 impl Default for Palette {
@@ -280,6 +290,7 @@ impl Default for Palette {
             recents: Vec::new(),
             by_hold: false,
             expanded: false,
+            kb_inset: 0.0,
         }
     }
 }
@@ -333,7 +344,7 @@ impl Palette {
 
     /// The sheet's geometry for the current state (short until the thumb reaches the search).
     pub fn geom(&self, screen: (f32, f32)) -> Geom {
-        Geom::new(screen, self.expanded)
+        Geom::with_bottom(screen, self.expanded, screen.1 - self.kb_inset.clamp(0.0, screen.1 * 0.6))
     }
 
     pub fn open_by_hold(&mut self) {
@@ -739,6 +750,22 @@ mod tests {
         assert_eq!(p.hover, Some(Hit::Row(1)), "in the list, across does nothing");
         p.move_hover(0, 1);
         assert_eq!(p.hover, Some(Hit::Row(2)));
+    }
+
+    #[test]
+    fn the_controls_ride_above_the_keyboard_and_the_sheet_still_reaches_the_edge() {
+        let (mut p, _) = open();
+        p.expanded = true;
+        let flat = p.geom((408.0, 900.0));
+        p.kb_inset = 300.0;
+        let up = p.geom((408.0, 900.0));
+        assert!((flat.search_y() - up.search_y() - 300.0).abs() < 0.01, "the search bar moved up by the keyboard's height");
+        let (_, my, _, mh) = up.mode_rect(0);
+        assert!(my + mh <= 900.0 - 300.0 + 0.01, "the mode buttons end above the keyboard");
+        assert_eq!(flat.sheet_top, up.sheet_top, "the sheet is as tall as before");
+        assert!(up.rows_visible() < flat.rows_visible(), "fewer results fit above the keyboard");
+        p.kb_inset = 5000.0;
+        assert!(p.geom((408.0, 900.0)).search_y() > 0.0, "an absurd height is clamped, not trusted");
     }
 
     #[test]

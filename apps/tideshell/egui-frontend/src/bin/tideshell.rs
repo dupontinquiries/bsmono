@@ -56,6 +56,7 @@ struct Shellbox {
     hw_keyboard: bool,
     hw_checked_at: u64,
     osd_checked_at: u64,
+    kb_geom_at: u64,
     /// What the on-screen keyboard was last told: `show` for the palette's search field.
     told_board_show: bool,
     /// Sleeping hours from bsettings (settingsd's file) and that file's mtime.
@@ -585,6 +586,7 @@ fn main() {
         hw_keyboard: false,
         hw_checked_at: 0,
         osd_checked_at: 0,
+        kb_geom_at: 0,
         told_board_show: false,
         fleet_sleep: settings_kit::SleepPrefs::default(),
         fleet_sleep_seen: None,
@@ -901,6 +903,13 @@ fn main() {
                     sb.shell.note(format!("stopped cosmic-osd ({n}): its brightness pop-up is replaced by tideshell's own"));
                 }
             }
+        }
+        // Where the keyboard is, so the sheet's controls sit above it (rusty-board publishes its height).
+        if sb.shell.palette.open && now_ms.saturating_sub(sb.kb_geom_at) >= 200 {
+            sb.kb_geom_at = now_ms;
+            sb.shell.palette.kb_inset = tideshell_egui::effects::read_keyboard_inset();
+        } else if !sb.shell.palette.open {
+            sb.shell.palette.kb_inset = 0.0;
         }
         let want_board = sb.shell.palette.open && sb.shell.palette.expanded && !sb.hw_keyboard;
         if want_board != sb.told_board_show {
