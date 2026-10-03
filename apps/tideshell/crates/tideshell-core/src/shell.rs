@@ -1339,10 +1339,10 @@ impl Shell {
     /// The exclusive zones must have held still this long before a window is re-maximized. A
     /// carousel step maps and unmaps peeks and re-lays windows out; judging mid-change made the
     /// shell unmaximize/maximize windows through a distorted intermediate size, over and over.
-    pub const ZONE_SETTLE_MS: Millis = 700;
+    pub const ZONE_SETTLE_MS: Millis = 300;
     /// A window whose maximized state or width changed less than this ago is still being laid
     /// out by the compositor, and its reported width is not yet the answer.
-    pub const WINDOW_SETTLE_MS: Millis = 500;
+    pub const WINDOW_SETTLE_MS: Millis = 250;
 
     /// Re-maximize maximized windows that are laid out wider than the space
     /// the shell's exclusive zones leave (`reserved` px in total: the bar,

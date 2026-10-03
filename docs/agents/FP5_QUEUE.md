@@ -43,6 +43,16 @@ Legend: **done** = committed and deployed; **built** = committed, not seen worki
 | 31 | True black on the OLED | built | pure black went 0% -> 55% of a screenshot on the phone; apps pick it up when rebuilt with the new uikit-egui |
 | 32 | Drawer tile sub-labels are clipped ("Do not di", "Flashligh", "Screensho") | open | |
 | 33 | Known pre-existing test failures | open | uikit-egui `callout` (slate/Error contrast), clawbound `sentinel` x3 and `touch` x2 |
+| 34 | Hand tracking for a cold-glove keyboard / sign-language + letters input mode (`handtrack-rs`) | open | the monorepo already has a hand-kit corpus; camera work needs the owner's go-ahead |
+| 35 | Volume voicing pad has no audible effect | diagnosed | the chain is a PipeWire filter-chain; PipeWire cannot start here (`libpipewire-module-filter-chain` missing), PulseAudio is what runs. Decision: move to PipeWire or voice in Pulse |
+| 36 | Switcher closing: unblur over time | built | alpha-modifier fade implemented; blur protocol has no strength control; not verified on device |
+| 37 | Pull the lockscreen effect into the wallpaper | open | |
+| 38 | Sidebar scale issue in carousel landscape | open | recovers after the delayed poll; cause not found |
+| 39 | Crestfall (clawbound god) is a copy of Oremantle | blocked | owner supplies the ability outline |
+| 40 | vidkit-player: touch-drag scrub dead on the phone | built | the GPU path returned before `view.show`; gestures now shared (`View::handle_gestures`). Unconfirmed on device |
+| 41 | `VIDKIT_URI=` starts vidkit playing without the clipboard | built | |
+| 42 | vidkit-player top bar overlays the video | built | was a `TopBottomPanel`; now a floating Area that follows the chrome. Unconfirmed on device |
+| 43 | Clipboard history (as on Plasma): a hatch-like app or hatch tile with a clipboard icon; pick an entry; scan for YouTube URLs and dufs video requests and offer them to vidkit | open | needs a history store (a resident `wl-paste --watch` writer) |
 | 14 | Older: logscope service test, switcher drawer redesign, home widget, steno multitouch, PAM shim, emergency access | open | see the C20 queues |
 
 ## Done tonight (all deployed unless noted)
