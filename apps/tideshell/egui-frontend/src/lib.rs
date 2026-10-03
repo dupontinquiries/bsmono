@@ -986,6 +986,13 @@ impl ShellView {
                 out.extend(shell.on_sleep_touch(te));
                 continue;
             }
+            let te = match phase {
+                egui::TouchPhase::Start => TouchEvent::Down { slot, x: l.x, y: l.y, t: now },
+                egui::TouchPhase::Move => TouchEvent::Move { slot, x: l.x, y: l.y, t: now },
+                egui::TouchPhase::End => TouchEvent::Up { slot, t: now },
+                egui::TouchPhase::Cancel => TouchEvent::Cancel,
+            };
+            out.extend(shell.on_cover_touch(te));
             match phase {
                 egui::TouchPhase::Start => self.cover_drag = Some((slot, l.y)),
                 egui::TouchPhase::Move => {

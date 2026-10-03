@@ -29,6 +29,7 @@ pub mod anim;
 pub mod audio;
 pub mod bar;
 pub mod appinfo;
+pub mod doubletap;
 pub mod carousel;
 pub mod chaingraph;
 pub mod clock;

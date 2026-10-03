@@ -128,6 +128,8 @@ pub struct Shell {
     zone_seen: f32,
     zone_since: Millis,
     win_seen: HashMap<u64, (bool, Option<i32>, Millis)>,
+    /// Double tap on the lock screen = screen off (see doubletap.rs).
+    cover_taps: crate::doubletap::DoubleTap,
     now: Millis,
     last_tick: Option<Millis>,
     trace: VecDeque<String>,
@@ -206,6 +208,7 @@ impl Shell {
             zone_seen: 0.0,
             zone_since: 0,
             win_seen: HashMap::new(),
+            cover_taps: Default::default(),
             now: 0,
             last_tick: None,
             trace: VecDeque::new(),
@@ -466,6 +469,41 @@ impl Shell {
         self.prefs.home_widget = self.prefs.home_widget.next();
         self.log(format!("home widget: {}", self.prefs.home_widget.token()));
         vec![Action::SavePrefs]
+    }
+
+    /// A touch on the lock screen while the display is on: two quick taps turn it off. Not the power
+    /// key's path, which a morse unlock claims as a symbol; this one always sleeps.
+    pub fn on_cover_touch(&mut self, ev: TouchEvent) -> Vec<Action> {
+        if !self.lock.is_locked() || !matches!(self.sleep.phase, crate::sleep::Phase::Awake) {
+            self.cover_taps.cancel();
+            return vec![];
+        }
+        let fired = match ev {
+            TouchEvent::Down { slot, x, y, t } => {
+                self.now = self.now.max(t);
+                self.cover_taps.down(slot, x, y, t);
+                false
+            }
+            TouchEvent::Move { slot, x, y, .. } => {
+                self.cover_taps.moved(slot, x, y);
+                false
+            }
+            TouchEvent::Up { slot, t } => {
+                self.now = self.now.max(t);
+                self.cover_taps.up(slot, t)
+            }
+            TouchEvent::Cancel => {
+                self.cover_taps.cancel();
+                false
+            }
+        };
+        if !fired {
+            return vec![];
+        }
+        self.log("double tap on the lock screen: display off");
+        let acts = self.sleep.power_key();
+        let out: Vec<Action> = acts.into_iter().flat_map(|a| self.on_sleep_action(a)).collect();
+        self.emit(out)
     }
 
     /// A touch while the screen sleeps (all touches go here then).
@@ -2168,6 +2206,29 @@ mod tests {
         sh.set_prefs(p);
         sh.lock.lock();
         sh
+    }
+
+    fn tap_at(sh: &mut Shell, x: f32, y: f32, at: u64) {
+        sh.on_cover_touch(TouchEvent::Down { slot: 0, x, y, t: at });
+        sh.on_cover_touch(TouchEvent::Up { slot: 0, t: at + 70 });
+    }
+
+    #[test]
+    fn a_double_tap_on_the_lock_screen_turns_the_display_off_even_under_a_morse_unlock() {
+        let mut sh = morse_shell(".-.");
+        tap_at(&mut sh, 200.0, 500.0, 1000);
+        assert_eq!(sh.sleep.phase, crate::sleep::Phase::Awake, "one tap does nothing");
+        tap_at(&mut sh, 205.0, 505.0, 1250);
+        assert_eq!(sh.sleep.phase, crate::sleep::Phase::FadingOut, "two taps sleep it, though a press would have been a symbol");
+    }
+
+    #[test]
+    fn double_taps_on_an_unlocked_screen_do_nothing() {
+        let mut sh = shell_with_three();
+        assert!(!sh.lock.is_locked());
+        tap_at(&mut sh, 200.0, 500.0, 1000);
+        tap_at(&mut sh, 205.0, 505.0, 1250);
+        assert_eq!(sh.sleep.phase, crate::sleep::Phase::Awake);
     }
 
     #[test]
