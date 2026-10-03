@@ -193,6 +193,31 @@ pub fn oled_black_plan() -> Vec<Step> {
     ]
 }
 
+/// iio-sensor-proxy is what turns the ADSP's accelerometer into rotation. udev starts it when a sensor
+/// shows up, and it EXITS (status 0) when it finds none. On the boot of 2026-10-03 the ADSP was not
+/// ready: the proxy ran 21 s and left, nothing owned `net.hadess.SensorProxy` afterwards, and
+/// auto-rotate stayed dead until it was started by hand (the shell asks every 3 s and recovers by
+/// itself once the name exists). A drop-in makes it start with the system, after the sensors server,
+/// and come back whenever it leaves.
+pub fn sensor_proxy_plan(root: Root) -> Vec<Step> {
+    let dir = "/etc/systemd/system/iio-sensor-proxy.service.d";
+    let wants = "/etc/systemd/system/multi-user.target.wants/iio-sensor-proxy.service";
+    let put = format!(
+        "mkdir -p {dir} && printf '[Unit]\\nWants=hexagonrpcd-adsp-sensorspd.service\\nAfter=hexagonrpcd-adsp-sensorspd.service\\n[Service]\\nRestart=always\\nRestartSec=3\\n' > {dir}/keep.conf && mkdir -p /etc/systemd/system/multi-user.target.wants && ln -sf /usr/lib/systemd/system/iio-sensor-proxy.service {wants} && systemctl daemon-reload && systemctl start iio-sensor-proxy"
+    );
+    let undo = format!("rm -f {dir}/keep.conf {wants}; rmdir {dir} 2>/dev/null; systemctl daemon-reload");
+    vec![
+        Step { on: Where::Device, what: "iio-sensor-proxy and the sensors server exist",
+               cmd: "[ -x /usr/libexec/iio-sensor-proxy ] && systemctl cat hexagonrpcd-adsp-sensorspd >/dev/null 2>&1 && echo SENSORS".into(),
+               gate: Gate::Contains("SENSORS".into()), rollback: None },
+        Step { on: Where::Device, what: "start iio-sensor-proxy at boot after the sensors server, and restart it when it exits",
+               cmd: root_cmd(&put, root), gate: Gate::ExitZero, rollback: Some(root_cmd(&undo, root)) },
+        Step { on: Where::Device, what: "the proxy restarts on exit and is running",
+               cmd: "systemctl show iio-sensor-proxy -p Restart --value; systemctl is-active iio-sensor-proxy".into(),
+               gate: Gate::Contains("always".into()), rollback: None },
+    ]
+}
+
 /// xwaylandvideobridge (KDE) keeps an invisible X11 window and a tray icon for screen-sharing X11
 /// apps. KWin and GNOME hide it; COSMIC shows it. Nothing on the phone shares X11 windows, so it
 /// is not started: a per-user autostart entry with `Hidden=true` shadows the system one.
@@ -433,6 +458,7 @@ pub fn all_parts(root: Root) -> Vec<(&'static str, Vec<Step>)> {
         ("hide xwaylandvideobridge", hide_video_bridge_plan()),
         ("true black (OLED)", oled_black_plan()),
         ("cpu governor", cpu_governor_plan(root)),
+        ("auto-rotate sensor proxy", sensor_proxy_plan(root)),
         ("emergency USB access", emergency_access_plan(root)),
     ]
 }
@@ -454,6 +480,7 @@ mod tests {
         v.extend(hide_video_bridge_plan());
         v.extend(oled_black_plan());
         v.extend(cpu_governor_plan(root));
+        v.extend(sensor_proxy_plan(root));
         v.extend(rescue_console_plan("/tmp/fp5-rescue", root));
         v.extend(autologin_plan("user", root));
         v
@@ -486,6 +513,16 @@ mod tests {
         assert!(p[0].cmd.contains("Hidden=true") && p[0].cmd.contains("org.kde.xwaylandvideobridge.desktop"), "{}", p[0].cmd);
         assert!(p[0].rollback.as_deref().unwrap().contains("rm -f"));
         assert!(p[0].cmd.contains("pkill -x xwaylandvideobr;"), "comm is truncated to 15 chars: {}", p[0].cmd);
+    }
+
+    #[test]
+    fn the_sensor_proxy_plan_restarts_on_exit_after_the_sensors_server_and_can_undo() {
+        let p = sensor_proxy_plan(Root::NoPrompt);
+        assert!(p[1].cmd.contains("Restart=always") && p[1].cmd.contains("After=hexagonrpcd-adsp-sensorspd.service"), "{}", p[1].cmd);
+        assert!(p[1].cmd.contains("multi-user.target.wants"), "it starts at boot");
+        assert!(p[1].rollback.as_deref().unwrap().contains("rm -f"), "and goes back");
+        assert!(p[2].gate == Gate::Contains("always".into()), "the check names the setting, not just a run");
+        assert!(all_parts(Root::NoPrompt).iter().any(|(n, _)| n.contains("sensor proxy")));
     }
 
     #[test]
