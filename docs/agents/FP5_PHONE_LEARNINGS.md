@@ -218,3 +218,22 @@ the next call, and a bare commit sweeps the owner's staging); resync with `git r
 `kernel-validate --bench` panicked on a hybrid model (raw `new_cache()`); fixed to `new_cache_for`. Result:
 5.08 tok/s at context 544, 6.91 at 40; 190 of 197 ms/token is GPU wait, ~28 GB/s effective (~7% of 400 GB/s),
 the same as the 3B. See `apps/logscope/perf-loop/LEDGER.md`.
+
+## Auto-rotate dead after a reboot: no accelerometer in IIO (2026-10-03)
+
+Found on the phone, boot of 02:27: rotation did nothing and tideshell logged
+`orientation: HasAccelerometer: ... ServiceUnknown: The name is not activatable`.
+
+* `/sys/bus/iio/devices` held only the two PMIC ADCs, so there was no accelerometer for
+  `iio-sensor-proxy` to find. udev starts the proxy when an accelerometer appears; here it ran 21 s
+  (02:27:44 to 02:28:05) and exited cleanly, so nothing owned `net.hadess.SensorProxy`.
+* The sensors come from the ADSP through `hexagonrpcd-adsp-sensorspd`. Its log is the same on the good
+  boot (02:15) and the bad one: `Could not open /mnt/vendor/persist/sensors/registry/registry/../sns_reg_version`
+  and `Tried to open ... temp.json for writing`; that directory does not exist on the phone. So those
+  errors are not the difference. What differed was whether the ADSP sensor service came up far enough
+  to expose the IMU.
+* tideshell already asks again every 3 s (`OrientationFeed`), so it recovers by itself once the proxy
+  exists. Nothing in the shell was at fault.
+* Recovery needs root: `sudo systemctl restart hexagonrpcd-adsp-sensorspd.service`, then
+  `ls /sys/bus/iio/devices` for a third device, then `systemctl status iio-sensor-proxy`.
+* Not known: why the ADSP sensor path comes up on some boots and not others. A reboot is the blunt fix.
