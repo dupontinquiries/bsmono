@@ -101,7 +101,14 @@ pub enum Hit {
 pub struct Geom {
     pub screen: (f32, f32),
     pub sheet_top: f32,
+    /// 1 = the short sheet's list of rows; `TILE_COLS` = the full sheet's grid of tiles.
+    pub cols: usize,
 }
+
+/// The full sheet lays the results out as tiles, like hatch's grid, instead of rows.
+pub const TILE_COLS: usize = 3;
+pub const TILE_H: f32 = 92.0;
+pub const TILE_GAP: f32 = 8.0;
 
 /// Rows the sheet shows before the thumb asks for more.
 pub const COLLAPSED_ROWS: usize = 4;
@@ -116,7 +123,28 @@ impl Geom {
         let list_bottom = screen.1 - PAD - MODE_ROW_H - PAD - SEARCH_H - PAD;
         let full_top = screen.1 * (1.0 - SHEET_FRAC);
         let short_top = list_bottom - COLLAPSED_ROWS as f32 * ROW_H - PAD - HANDLE_H;
-        Geom { screen, sheet_top: if expanded { full_top } else { short_top.max(full_top) } }
+        Geom { screen, sheet_top: if expanded { full_top } else { short_top.max(full_top) }, cols: if expanded { TILE_COLS } else { 1 } }
+    }
+
+    /// Height of one list row or one grid row of tiles (with its gap).
+    pub fn cell_h(&self) -> f32 {
+        if self.cols == 1 { ROW_H } else { TILE_H + TILE_GAP }
+    }
+
+    /// Size of one result: a full-width row, or a tile.
+    pub fn item_size(&self) -> (f32, f32) {
+        if self.cols == 1 {
+            (self.screen.0 - PAD * 2.0, ROW_H)
+        } else {
+            ((self.screen.0 - PAD * 2.0 - TILE_GAP * (self.cols - 1) as f32) / self.cols as f32, TILE_H)
+        }
+    }
+
+    /// Where result `i` is: (x, y, w, h), row or tile as the sheet is laid out now.
+    pub fn item_rect(&self, i: usize) -> (f32, f32, f32, f32) {
+        let (w, h) = self.item_size();
+        let col = i % self.cols;
+        (PAD + col as f32 * (w + TILE_GAP), self.row_y(i), w, h)
     }
 
     pub fn mode_rect(&self, i: usize) -> (f32, f32, f32, f32) {
@@ -128,12 +156,15 @@ impl Geom {
         self.screen.1 - PAD * 2.0 - MODE_ROW_H - SEARCH_H
     }
 
+    /// Top of the row (or tile row) that result `i` is in.
     pub fn row_y(&self, i: usize) -> f32 {
-        self.sheet_top + PAD + HANDLE_H + i as f32 * ROW_H
+        self.sheet_top + PAD + HANDLE_H + (i / self.cols) as f32 * self.cell_h()
     }
 
+    /// How many results fit: whole rows (or tile rows) times the columns.
     pub fn rows_visible(&self) -> usize {
-        ((self.search_y() - PAD - self.row_y(0)) / ROW_H).max(0.0) as usize
+        let fit = ((self.search_y() - PAD - self.row_y(0)) / self.cell_h()).max(0.0) as usize;
+        fit * self.cols
     }
 
     pub fn hit(&self, x: f32, y: f32, rows: usize) -> Hit {
@@ -150,8 +181,11 @@ impl Geom {
             return Hit::Search;
         }
         if y >= self.row_y(0) {
-            let i = ((y - self.row_y(0)) / ROW_H) as usize;
-            if i < rows.min(self.rows_visible()) {
+            let line = ((y - self.row_y(0)) / self.cell_h()) as usize;
+            let (w, _) = self.item_size();
+            let col = if self.cols == 1 { 0 } else { ((x - PAD).max(0.0) / (w + TILE_GAP)) as usize };
+            let i = line * self.cols + col;
+            if col < self.cols && i < rows.min(self.rows_visible()) {
                 return Hit::Row(i);
             }
         }
@@ -344,7 +378,9 @@ impl Palette {
                 }
             }
             Some(Hit::Row(r)) => {
-                let r = r as i32 + dy;
+                // In the grid a step down is a whole row of tiles and a step across is one tile.
+                let cols = if self.expanded { TILE_COLS as i32 } else { 1 };
+                let r = r as i32 + dy * cols + if cols > 1 { dx } else { 0 };
                 if r < 0 {
                     Some(Hit::Mode(1))
                 } else {
@@ -593,7 +629,8 @@ mod tests {
     fn recents_come_first_on_an_empty_query_and_activation_records_them() {
         let (mut p, g) = open();
         // Tap the row for Console (index 2 in shell order).
-        let a = p.tap(&g, 100.0, g.row_y(2) + 5.0);
+        let (x, y, w, h) = g.item_rect(2);
+        let a = p.tap(&g, x + w / 2.0, y + h / 2.0);
         assert_eq!(a, Some(PaletteAction::App("org.gnome.Console".into())));
         assert!(!p.open, "activating closes");
         assert_eq!(p.recents_vec(), vec!["app:org.gnome.Console"]);
@@ -652,9 +689,56 @@ mod tests {
         let (x, y, ..) = g.mode_rect(2);
         assert_eq!(g.hit(x + 1.0, y + 1.0, 5), Hit::Mode(2));
         assert_eq!(g.hit(200.0, g.search_y() + 1.0, 5), Hit::Search);
-        assert_eq!(g.hit(200.0, g.row_y(3) + 1.0, 5), Hit::Row(3));
-        assert_eq!(g.hit(200.0, g.row_y(3) + 1.0, 2), Hit::Sheet, "past the last row");
+        let (x3, y3, w3, h3) = g.item_rect(3);
+        assert_eq!(g.hit(x3 + w3 / 2.0, y3 + h3 / 2.0, 5), Hit::Row(3));
+        assert_eq!(g.hit(x3 + w3 / 2.0, y3 + h3 / 2.0, 2), Hit::Sheet, "past the last result");
         assert!(g.rows_visible() >= 4, "{}", g.rows_visible());
+    }
+
+    #[test]
+    fn the_short_sheet_is_a_list_and_the_full_sheet_a_grid_of_tiles() {
+        let short = Geom::new((408.0, 900.0), false);
+        let full = Geom::new((408.0, 900.0), true);
+        assert_eq!((short.cols, full.cols), (1, TILE_COLS));
+        // short: result i is the i-th full-width row
+        let (x, _, w, h) = short.item_rect(2);
+        assert_eq!((x, h), (PAD, ROW_H));
+        assert!((w - (408.0 - PAD * 2.0)).abs() < 0.01);
+        assert_eq!(short.item_rect(2).1, short.row_y(2));
+        // full: results 0,1,2 share a line, 3 starts the next, columns do not overlap
+        let r: Vec<_> = (0..4).map(|i| full.item_rect(i)).collect();
+        assert_eq!((r[0].1, r[1].1, r[2].1), (r[0].1, r[0].1, r[0].1));
+        assert!(r[3].1 > r[0].1 && r[3].0 == r[0].0, "the fourth wraps to the first column");
+        assert!(r[0].0 + r[0].2 < r[1].0 && r[1].0 + r[1].2 < r[2].0, "tiles are separated");
+        assert!(r[2].0 + r[2].2 <= 408.0 - PAD + 0.01, "the last column stays on screen");
+        // every tile's centre hits itself and no other
+        for i in 0..full.rows_visible() {
+            let (x, y, w, h) = full.item_rect(i);
+            assert_eq!(full.hit(x + w / 2.0, y + h / 2.0, 99), Hit::Row(i), "tile {i}");
+        }
+        // the gap between tiles is the sheet, not the nearest tile's neighbour
+        assert_eq!(full.hit(r[0].0 + r[0].2 + TILE_GAP / 2.0, r[0].1 + 10.0, 99) != Hit::Row(5), true);
+        assert!(full.rows_visible() % TILE_COLS == 0 && full.rows_visible() >= 2 * TILE_COLS, "{}", full.rows_visible());
+    }
+
+    #[test]
+    fn gyro_steps_move_across_and_down_the_grid_but_only_down_the_list() {
+        let (mut p, _) = open();
+        p.expanded = true;
+        p.hover = Some(Hit::Row(4));
+        p.move_hover(1, 0);
+        assert_eq!(p.hover, Some(Hit::Row(5)), "across: the next tile");
+        p.move_hover(0, 1);
+        assert_eq!(p.hover.unwrap(), Hit::Row((5 + TILE_COLS).min(p.row_count() - 1)), "down: a whole row of tiles");
+        p.hover = Some(Hit::Row(1));
+        p.move_hover(0, -1);
+        assert_eq!(p.hover, Some(Hit::Mode(1)), "up out of the first line reaches the modes");
+        p.expanded = false;
+        p.hover = Some(Hit::Row(1));
+        p.move_hover(1, 0);
+        assert_eq!(p.hover, Some(Hit::Row(1)), "in the list, across does nothing");
+        p.move_hover(0, 1);
+        assert_eq!(p.hover, Some(Hit::Row(2)));
     }
 
     #[test]
@@ -718,7 +802,8 @@ mod band_tests {
             assert_eq!(p.hold_band(&g, press(), rx + rw / 2.0, ry + rh / 2.0), Band::Mode(i));
         }
         assert_eq!(p.hold_band(&g, press(), 540.0, g.search_y() + SEARCH_H / 2.0), Band::Search);
-        assert_eq!(p.hold_band(&g, press(), 540.0, g.row_y(0) + ROW_H / 2.0), Band::Row(0));
+        let (ix, iy, iw, ih) = g.item_rect(0);
+        assert_eq!(p.hold_band(&g, press(), ix + iw / 2.0, iy + ih / 2.0), Band::Row(0));
         // A gap between the mode buttons is nothing, not the nearest button.
         let (rx, ry, rw, rh) = g.mode_rect(0);
         assert_eq!(p.hold_band(&g, press(), rx + rw + 2.0, ry + rh / 2.0), Band::Idle);
