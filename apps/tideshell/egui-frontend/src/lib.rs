@@ -193,6 +193,8 @@ pub struct ShellView {
     palette_pub: ambient_palette::Publisher,
     /// This frame's dt for the springs (set at the top of `ui`).
     frame_dt: f32,
+    /// Where each palette result was last drawn, by key (see `palette_sheet`).
+    palette_anim: std::collections::HashMap<String, Rect>,
     /// The quick tile a finger is holding and since when (egui time), and the tile whose hold
     /// already fired, so the release that follows is not also a tap.
     /// Live CPU / memory / age of the windows the carousel is showing (appinfo_io.rs).
@@ -1306,18 +1308,65 @@ impl ShellView {
         if resp.changed() {
             shell.palette_query(&q);
         }
-        let rows: Vec<(String, &'static str)> = shell.palette.rows().map(|r| (r.label.clone(), r.hint)).collect();
-        for (i, (label, hint)) in rows.iter().enumerate().take(g.rows_visible()) {
-            let r = Rect::from_min_size(at(PAD, g.row_y(i)), Vec2::new(size.x - PAD * 2.0, ROW_H));
+        // Results are rows on the short sheet and hatch-style tiles on the full one. Each result keeps the
+        // rectangle it was last drawn at (by key) and eases to where the layout now wants it, so opening
+        // the sheet in full MORPHS the list into the grid instead of cutting to it; a result that was not
+        // there before grows in from its target.
+        let rows: Vec<(String, String, &'static str)> = shell.palette.rows().map(|r| (r.key.clone(), r.label.clone(), r.hint)).collect();
+        let ease = 1.0 - (-self.frame_dt / 1000.0 * 16.0).exp();
+        let mut seen: Vec<String> = Vec::new();
+        let mut moving = false;
+        let row_w = size.x - PAD * 2.0;
+        for (i, (key, label, hint)) in rows.iter().enumerate().take(g.rows_visible()) {
+            let (tx, ty, tw, th) = g.item_rect(i);
+            // Animated in sheet coordinates: the sheet's own slide (`dy`, the origin) is applied when drawing, or
+            // the results would trail behind a rising sheet.
+            let target = Rect::from_min_size(Pos2::new(tx, ty), Vec2::new(tw, th));
+            let (cur, born) = match self.palette_anim.get(key) {
+                Some(r) => (Rect::from_min_max(r.min + (target.min - r.min) * ease, r.max + (target.max - r.max) * ease), false),
+                None => (Rect::from_center_size(target.center(), target.size() * 0.6), true),
+            };
+            // fully arrived (or newly born and growing) results are drawn at `cur`
+            let cur = if born { Rect::from_min_max(cur.min + (target.min - cur.min) * ease, cur.max + (target.max - cur.max) * ease) } else { cur };
+            // Close enough is arrived: snap, so a settled sheet stops asking for frames.
+            let near = (cur.min - target.min).length() < 0.6 && (cur.max - target.max).length() < 0.6;
+            let cur = if near { target } else { cur };
+            moving |= !near;
+            self.palette_anim.insert(key.clone(), cur);
+            seen.push(key.clone());
+            let drawn = cur.translate(origin.to_vec2() + Vec2::new(0.0, dy));
+            let grow = ((cur.width() * cur.height()) / (target.width() * target.height())).clamp(0.0, 1.0).sqrt();
+            let alpha = if born { grow } else { 1.0 };
             let hot = shell.palette.hover == Some(Hit::Row(i));
-            if hot {
-                p.rect_filled(r, cr(10), pal.accent);
+            let as_row = cur.width() > row_w * 0.62;
+            let ink = if hot { pal.bg_base } else { pal.text };
+            let weak = if hot { pal.bg_base } else { pal.text_weak };
+            if as_row {
+                if hot {
+                    p.rect_filled(drawn, cr(10), with_alpha(pal.accent, alpha));
+                }
+                p.text(drawn.left_center() + Vec2::new(14.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(15.0), with_alpha(ink, alpha));
+                p.text(drawn.right_center() - Vec2::new(14.0, 0.0), Align2::RIGHT_CENTER, *hint, FontId::proportional(11.0), with_alpha(weak, alpha));
+            } else {
+                // A tile: a raised card (accent when the thumb is on it), the app's colour chip with its initial, the
+                // name under it, cut with an ellipsis, and the hint small beneath.
+                p.rect_filled(drawn, cr(14), with_alpha(if hot { pal.accent } else { pal.bg_raised }, alpha));
+                let chip = Rect::from_center_size(drawn.center_top() + Vec2::new(0.0, 28.0), Vec2::splat(36.0));
+                p.rect_filled(chip, cr(10), with_alpha(app_color(key), alpha));
+                p.text(chip.center(), Align2::CENTER_CENTER, initial(label), FontId::proportional(18.0), with_alpha(Color32::WHITE, 0.9 * alpha));
+                let max_chars = ((cur.width() - 10.0) / 7.0).max(4.0) as usize;
+                let name: String = if label.chars().count() > max_chars { format!("{}…", label.chars().take(max_chars - 1).collect::<String>()) } else { label.clone() };
+                p.text(drawn.center_bottom() - Vec2::new(0.0, 30.0), Align2::CENTER_CENTER, name, FontId::proportional(12.5), with_alpha(ink, alpha));
+                p.text(drawn.center_bottom() - Vec2::new(0.0, 13.0), Align2::CENTER_CENTER, *hint, FontId::proportional(10.0), with_alpha(weak, alpha));
             }
-            p.text(r.left_center() + Vec2::new(14.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(15.0), if hot { pal.bg_base } else { pal.text });
-            p.text(r.right_center() - Vec2::new(14.0, 0.0), Align2::RIGHT_CENTER, *hint, FontId::proportional(11.0), if hot { pal.bg_base } else { pal.text_weak });
+        }
+        self.palette_anim.retain(|k, _| seen.contains(k));
+        if moving {
+            ui.ctx().request_repaint();
         }
         if rows.is_empty() {
-            p.text(at(size.x / 2.0, g.row_y(0) + ROW_H / 2.0), Align2::CENTER_CENTER, "No matches", FontId::proportional(13.0), pal.text_weak);
+            let (tx, ty, tw, th) = g.item_rect(0);
+            p.text(at(tx + tw / 2.0, ty + th / 2.0), Align2::CENTER_CENTER, "No matches", FontId::proportional(13.0), pal.text_weak);
         }
         let _ = MODE_ROW_H;
         out
@@ -1675,11 +1724,13 @@ impl ShellView {
         }
         // Header actions: multitask-first means "close all" and "all apps"
         // are one tap away, not buried.
-        let hdr = |x: f32, w: f32| Rect::from_min_size(origin + Vec2::new(x, 14.0), Vec2::new(w, 34.0));
-        let (close_r, apps_r) = (hdr(14.0, 96.0), hdr(full.width() - 110.0, 96.0));
-        for (r, t) in [(close_r, "Close all"), (apps_r, "All apps")] {
-            p.rect_filled(r, cr(17), with_alpha(pal.bg_raised, rv));
-            p.text(r.center(), Align2::CENTER_CENTER, t, FontId::proportional(13.0), with_alpha(pal.text, rv));
+        // "Close all" stays up top; "All apps" is at the bottom, centred, where the thumb already is after a
+        // swipe up, and rises with the cards.
+        let close_r = Rect::from_min_size(origin + Vec2::new(14.0, 14.0), Vec2::new(96.0, 34.0));
+        let apps_r = Rect::from_center_size(origin + Vec2::new(full.width() / 2.0, size.y - 38.0 + (1.0 - rv) * 40.0), Vec2::new(176.0, 42.0));
+        for (r, t, fs) in [(close_r, "Close all", 13.0), (apps_r, "All apps", 15.0)] {
+            p.rect_filled(r, cr((r.height() / 2.0) as u8), with_alpha(pal.bg_raised, rv));
+            p.text(r.center(), Align2::CENTER_CENTER, t, FontId::proportional(fs), with_alpha(pal.text, rv));
         }
         if live && ui.interact(close_r, Id::new("ts-sw-closeall"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             out.extend(shell.switcher_close_all());
@@ -1688,7 +1739,8 @@ impl ShellView {
             out.extend(shell.open_launcher());
         }
         let top = 60.0;
-        let area = Vec2::new(full.width(), size.y - top - 30.0);
+        // leave the bottom strip to the All apps button
+        let area = Vec2::new(full.width(), size.y - top - 84.0);
         let rects = shell.switcher.layout(area.x, area.y);
         let cards: Vec<(u64, String, String, bool)> =
             shell.switcher.cards().iter().map(|c| (c.id, c.title.clone(), c.app_id.clone(), c.activated)).collect();
