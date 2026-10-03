@@ -42,6 +42,9 @@ pub struct HomeInfo {
     pub temp_note: String,
 }
 
+/// How long the drawn accent takes to close most of the way (63%) to a new colour.
+pub const ACCENT_EASE_MS: f32 = 1200.0;
+
 #[derive(Debug)]
 pub struct Shell {
     pub prefs: ShellPrefs,
@@ -106,6 +109,9 @@ pub struct Shell {
     /// Places and what they are like.
     pub ambience: crate::ambience::Ambience,
     ambience_dirty: bool,
+    /// The accent as drawn: eased toward `accent_target` each tick, so a new colour sample
+    /// fades in instead of cutting. None until the first tick (it starts at the target).
+    accent_shown: Option<[f32; 3]>,
     last_ambience_log: Option<Millis>,
     /// Local minute of the day, set by the runtime (the engine has no clock).
     clock_minute: u32,
@@ -197,6 +203,7 @@ impl Shell {
             day_of_year: 172,
             ambience: crate::ambience::Ambience::default(),
             ambience_dirty: false,
+            accent_shown: None,
             last_ambience_log: None,
             clock_minute: 12 * 60,
             offset_dirty_at: None,
@@ -549,6 +556,7 @@ impl Shell {
         let dt = self.last_tick.map(|l| now.saturating_sub(l) as f32).unwrap_or(0.0);
         self.last_tick = Some(now);
         self.drawer.tick(dt.min(100.0));
+        self.ease_accent(dt.min(100.0));
         self.switcher.tick_anim(dt.min(100.0));
         if self.flat.tick(dt.min(100.0), now) && !self.flat.is_transitioning() {
             self.log(format!("cover clock 3D {}", if self.flat.is_flat() { "in" } else { "out" }));
@@ -1069,11 +1077,36 @@ impl Shell {
     /// The accent to draw with now: the scene's, shaded 60/40 toward the
     /// place's own colour when one is known.
     pub fn accent(&self) -> [u8; 3] {
+        match self.accent_shown {
+            Some(c) => [c[0].round() as u8, c[1].round() as u8, c[2].round() as u8],
+            None => self.accent_target(),
+        }
+    }
+
+    /// Is the drawn accent still gliding toward its target (so frames should keep coming)?
+    pub fn accent_settling(&self) -> bool {
+        self.accent() != self.accent_target()
+    }
+
+    /// Where the accent is heading: what `accent` settles on.
+    pub fn accent_target(&self) -> [u8; 3] {
         let m = self.mood().accent;
         match self.place_accent() {
             Some(p) if self.prefs.living => crate::season::mix_rgb(m, p, 0.6),
             _ => m,
         }
+    }
+
+    /// Ease the drawn accent toward its target (time constant `ACCENT_EASE_MS`), so a fresh camera
+    /// sample or a mood change glides rather than cuts.
+    fn ease_accent(&mut self, dt: f32) {
+        let t = self.accent_target();
+        let t = [t[0] as f32, t[1] as f32, t[2] as f32];
+        let k = 1.0 - (-dt / ACCENT_EASE_MS).exp();
+        self.accent_shown = Some(match self.accent_shown {
+            None => t,
+            Some(c) => [c[0] + (t[0] - c[0]) * k, c[1] + (t[1] - c[1]) * k, c[2] + (t[2] - c[2]) * k],
+        });
     }
 
     /// Somewhere recognized: by WiFi (the shell) or a snapclone landmark.
@@ -1518,6 +1551,31 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_new_place_colour_fades_in_over_a_second_or_two_not_at_once() {
+        let mut sh = Shell::new(ShellPrefs::default(), S);
+        sh.prefs.living = true;
+        let mut t = 1000;
+        sh.tick(t);
+        let before = sh.accent();
+        sh.on_place(crate::ambience::PlaceKey::Wifi("aa:bb".into()), "Home");
+        sh.on_photo_colors(&[[220, 40, 40]]);
+        let target = sh.accent_target();
+        assert_ne!(target, before, "the sample moves the target");
+        assert_eq!(sh.accent(), before, "nothing cuts: the drawn accent has not moved yet");
+        t += 100;
+        sh.tick(t);
+        let early = sh.accent();
+        assert_ne!(early, before, "it has started");
+        let d = |a: [u8; 3], b: [u8; 3]| a.iter().zip(b).map(|(x, y)| (*x as i32 - y as i32).abs()).sum::<i32>();
+        assert!(d(early, target) > d(before, target) / 2, "and is still well short after 100 ms");
+        for _ in 0..60 {
+            t += 100;
+            sh.tick(t);
+        }
+        assert!(d(sh.accent(), target) <= 3, "six seconds on it has arrived: {:?} vs {target:?}", sh.accent());
+    }
+
     use super::*;
 
     #[test]

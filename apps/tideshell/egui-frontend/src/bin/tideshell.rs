@@ -776,6 +776,7 @@ fn main() {
             || sb.shell.switcher.is_animating()
             || sb.shell.sleep.is_animating()
             || sb.shell.ambient.is_animating()
+            || sb.shell.accent_settling()
             || (sb.shell.lock.is_locked() && !sb.shell.lock.reveal.is_settled());
         // The 3D cover clock: tipping in/out, or a style that moves on its own.
         let clock_3d_moving = sb.shell.lock.is_locked()
