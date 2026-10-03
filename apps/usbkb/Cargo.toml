@@ -1,0 +1,18 @@
+[package]
+name = "usbkb"
+version = "0.1.0"
+edition = "2021"
+description = "Turn this machine into a USB keyboard (HID gadget over configfs) and drive it from the command line or a small remote-keyboard window. Written to type a password at a greeter that has no on-screen keyboard."
+license = "MIT"
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:egui"]
+
+[dependencies]
+egui = { version = "0.34", optional = true }
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+
+[[bin]]
+name = "usbkb"
+path = "src/main.rs"
