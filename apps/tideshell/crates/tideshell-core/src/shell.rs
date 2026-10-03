@@ -1270,6 +1270,18 @@ impl Shell {
         self.log("switcher opened");
     }
 
+    /// The Tasks button: open the switcher, or close it if it is already open. Rapid taps peek and close
+    /// again (the second tap used to re-open it). Judged on `open`, not on the reveal animation, so a tap
+    /// in the middle of the slide-in still closes it.
+    pub fn toggle_switcher(&mut self) {
+        if self.switcher.open {
+            self.switcher.hide();
+            self.log("switcher closed (tasks button)");
+        } else {
+            self.open_switcher();
+        }
+    }
+
     pub fn activate(&mut self, id: u64) -> Vec<Action> {
         let out = self.switcher.tap(id);
         self.emit(out)
@@ -1775,6 +1787,26 @@ mod tests {
         let mut p = sh.prefs.clone();
         p.fat_cursor = false;
         assert!(sh.set_prefs(p).contains(&Action::HideSystemCursor(false)));
+    }
+
+    #[test]
+    fn the_tasks_button_toggles_so_a_quick_second_tap_closes_what_the_first_opened() {
+        let mut sh = shell_with_three();
+        assert!(!sh.switcher.open);
+        sh.toggle_switcher();
+        assert!(sh.switcher.open, "first tap opens");
+        sh.toggle_switcher(); // immediately, mid slide-in
+        assert!(!sh.switcher.open, "second tap closes, even mid-animation");
+        sh.tick(16);
+        for t in 0..80 {
+            sh.switcher.tick_anim(16.0 + t as f32);
+        }
+        assert!(!sh.switcher.is_visible(), "and it slides away fully");
+        sh.toggle_switcher();
+        assert!(sh.switcher.open, "a third tap opens it again");
+        // the socket command still only OPENS: a bound key must never close a switcher you are using
+        sh.open_switcher();
+        assert!(sh.switcher.open);
     }
 
     #[test]

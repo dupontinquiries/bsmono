@@ -1536,7 +1536,7 @@ impl ShellView {
                     if ui.interact(r, wid, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         match &widgets[pl.index] {
                             BarWidget::Hatch => out.extend(shell.open_launcher()),
-                            BarWidget::Switcher => shell.open_switcher(),
+                            BarWidget::Switcher => shell.toggle_switcher(),
                             _ => self.open_settings(shell),
                         }
                     }
