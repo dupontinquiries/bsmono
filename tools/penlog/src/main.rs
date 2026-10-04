@@ -12,7 +12,11 @@ use std::time::{Duration, Instant};
 
 extern "C" {
     fn ioctl(fd: i32, req: u64, ...) -> i32;
+    fn poll(fds: *mut PollFd, n: u64, timeout_ms: i32) -> i32;
 }
+
+#[repr(C)]
+struct PollFd { fd: i32, events: i16, revents: i16 }
 
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
@@ -43,13 +47,20 @@ fn main() {
     let mut last_report: Option<Instant> = None;
     let mut gaps: Vec<f64> = Vec::new();
     let mut tool_down = [false; KEYS.len()];
+    // multitouch: contacts down per slot (ABS_MT_TRACKING_ID >= 0), for a touch device that reports no BTN_TOOL_*
+    let (mut slot, mut slots_down, mut mt_seen) = (0usize, [false; 16], false);
     let mut seen = [false; KEYS.len()];
     let (mut dist, mut pres) = ((i32::MAX, i32::MIN), (i32::MAX, i32::MIN));
     let mut log: Vec<String> = Vec::new();
     // non-blocking-ish read with a deadline: set O_NONBLOCK and poll
     unsafe { let fl = libc_fcntl(f.as_raw_fd(), 3, 0); libc_fcntl(f.as_raw_fd(), 4, fl | 0o4000); }
     while t0.elapsed() < Duration::from_secs(secs) {
-        let n = match f.read(&mut buf) { Ok(n) => n, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { std::thread::sleep(Duration::from_micros(500)); continue } Err(_) => break };
+        let n = match f.read(&mut buf) { Ok(n) => n, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // block until the device has something (or 200 ms, to notice the deadline): no busy wait on a battery
+                let mut p = PollFd { fd: f.as_raw_fd(), events: 1, revents: 0 };
+                unsafe { poll(&mut p, 1, 200) };
+                continue
+            } Err(_) => break };
         let now = Instant::now();
         for ev in buf[..n].chunks_exact(24) {
             let (ty, code, val) = (u16::from_ne_bytes([ev[16], ev[17]]), u16::from_ne_bytes([ev[18], ev[19]]), i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]));
@@ -58,11 +69,13 @@ fn main() {
                     seen[i] = true;
                     if val != 2 && (val == 1) != tool_down[i] { tool_down[i] = val == 1; log.push(format!("{:>7.3}s {} {}", t0.elapsed().as_secs_f32(), KEYS[i].1, if val == 1 { "ENTER/DOWN" } else { "LEAVE/UP" })); }
                 },
+                EV_ABS if code == 0x2f => { slot = (val.max(0) as usize).min(15); }
+                EV_ABS if code == 0x39 => { mt_seen = true; slots_down[slot] = val >= 0; }
                 EV_ABS if code == 0x19 => { dist = (dist.0.min(val), dist.1.max(val)); }
                 EV_ABS if code == 0x18 => { pres = (pres.0.min(val), pres.1.max(val)); }
                 EV_SYN if code == SYN_REPORT => {
                     reports += 1;
-                    if tool_down[0] || tool_down[1] || tool_down[5] {
+                    if tool_down[0] || tool_down[1] || tool_down[5] || slots_down.iter().any(|d| *d) {
                         in_range_reports += 1;
                         if let Some(l) = last_report { gaps.push(now.duration_since(l).as_secs_f64() * 1000.0); }
                     }
@@ -82,6 +95,7 @@ fn main() {
     } else {
         println!("not enough in-range reports to measure a rate");
     }
+    if mt_seen { println!("multitouch contacts were reported (ABS_MT_TRACKING_ID)"); }
     let names: Vec<&str> = KEYS.iter().zip(seen).filter(|(_, s)| *s).map(|((_, n), _)| *n).collect();
     println!("tools/buttons seen: {}", if names.is_empty() { "none".into() } else { names.join(", ") });
     if dist.0 != i32::MAX { println!("hover distance seen: {}..{}", dist.0, dist.1); }
