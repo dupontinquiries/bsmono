@@ -20,7 +20,7 @@
 use capture_kit::focus;
 use capture_kit::RawFrame;
 
-use crate::tapfocus::{Lens, AVG_FRAMES, FRESH_FRAMES, NUDGE, SETTLE_MS, TIMEOUT_MS, VERIFY_RATIO};
+use crate::tapfocus::{trace, Lens, AVG_FRAMES, FRESH_FRAMES, NUDGE, SETTLE_MS, TIMEOUT_MS, VERIFY_RATIO};
 
 pub const GRID_W: usize = 3;
 pub const GRID_H: usize = 3;
@@ -365,6 +365,7 @@ impl AutoRun {
                     }
                     AStep::Done(Some((p, r))) => {
                         // what the search measured at the chosen position, in the deciding region
+                        if trace() { eprintln!("af-auto: DONE position={p} region={r}"); }
                         let want = self.seen.iter().filter(|(pos, _)| *pos == p).filter_map(|(_, sc)| sc.get(r).copied()).fold(0.0f64, f64::max);
                         if want <= 0.0 {
                             let v = match lens.move_to(p) { Ok(()) => AutoVerdict::Locked { pos: p, region: r }, Err(e) => AutoVerdict::Failed(e) };
@@ -395,6 +396,7 @@ impl AutoRun {
                     let n = self.acc[0].len();
                     let m: Vec<f64> = (0..n).map(|k| { let mut col: Vec<f64> = self.acc.iter().map(|a| a[k]).collect(); median(&mut col) }).collect();
                     self.acc.clear();
+                    if trace() { eprintln!("af-auto: PROBE pos={} regions={}", pr.pos, m.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>().join(" ")); }
                     self.seen.push((pr.pos, m.clone()));
                     search.feed(m);
                     self.probe = None;
@@ -412,6 +414,7 @@ impl AutoRun {
         if v.acc.len() < AVG_FRAMES { return None; }
         let m = median(&mut v.acc);
         v.acc.clear();
+        if trace() { eprintln!("af-auto: VERIFY pos={} region={} score={:.3} want>={:.3}", pr.pos, v.region, m, v.want * VERIFY_RATIO); }
         if m > v.best.1 { v.best = (pr.pos, m); }
         if m >= v.want * VERIFY_RATIO {
             // reproduced: this is where the lens is, and it is sharp
@@ -424,6 +427,7 @@ impl AutoRun {
             return None;
         }
         // Nothing near the answer reproduced the peak: noise, or the scene moved. Do not leave the lens somewhere blurry.
+        if trace() { eprintln!("af-auto: REFUSED after verify"); }
         if let Some(prev) = self.previous { let _ = lens.move_to(prev); }
         self.finish(AutoVerdict::Refused, now_ms)
     }

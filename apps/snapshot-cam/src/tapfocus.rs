@@ -40,7 +40,7 @@ pub const RESULT_SHOW_MS: u64 = 1_400;
 /// `SNAPSHOT_CAM_AF_TRACE=1` logs, to stderr, every frame's score while a probe settles (position, ms and frames since
 /// the move) and each probe's accepted score and the verdict. It changes nothing else. One tap's trace shows how long
 /// the lens really takes to ring down after a step and where the peak truly is, which is what overshoot tuning needs.
-fn trace() -> bool {
+pub(crate) fn trace() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *T.get_or_init(|| std::env::var("SNAPSHOT_CAM_AF_TRACE").is_ok_and(|v| v == "1"))
 }
