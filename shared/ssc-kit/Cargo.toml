@@ -1,0 +1,9 @@
+[package]
+name = "ssc-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The Fairphone 5's IMU (LSM6DSO accelerometer + gyroscope, MMC56x3x magnetometer), which Linux cannot see: Qualcomm's sensor core on the ADSP owns the chips, and libssc talks to it over QMI. This crate parses the stream of the `sscstream` helper (helper/, built against a libssc patched to choose its sample rate: stock libssc takes the slowest, ~25 Hz; the hardware allows 500) and spawns it. Zero dependencies."
+
+[lib]
+path = "src/lib.rs"

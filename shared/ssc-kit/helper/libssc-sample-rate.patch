@@ -1,0 +1,34 @@
+diff --git a/src/libssc-sensor.c b/src/libssc-sensor.c
+index 5947dba..41568c3 100644
+--- a/src/libssc-sensor.c
++++ b/src/libssc-sensor.c
+@@ -391,12 +391,23 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 						priv->available = attr_msg->attr[i]->value_array->v[0]->b;
+ 					break;
+ 				case SSC_ATTRIBUTE_SAMPLE_RATE:
+-					/* Only a single sample rate is supported for now. */
+-					for (gsize j = 0; j < attr_msg->attr[i]->value_array->n_v; j++) {
+-						if (attr_msg->attr[i]->value_array->v[j]->has_f
+-						 && attr_msg->attr[i]->value_array->v[j]->f > 0) {
+-							priv->sample_rate = attr_msg->attr[i]->value_array->v[j]->f;
+-							break;
++					/* Stock libssc takes the FIRST rate the sensor lists, which is its slowest (about 25 Hz for the
++					 * FP5's LSM6DSO, whose config allows 20-500). LIBSSC_SAMPLE_RATE=<Hz> picks the listed rate
++					 * nearest to that instead; unset, the old behaviour is unchanged. */
++					{
++						const char *want_env = g_getenv ("LIBSSC_SAMPLE_RATE");
++						gdouble want = want_env ? g_ascii_strtod (want_env, NULL) : 0.0;
++						gboolean have = FALSE;
++						for (gsize j = 0; j < attr_msg->attr[i]->value_array->n_v; j++) {
++							if (attr_msg->attr[i]->value_array->v[j]->has_f
++							 && attr_msg->attr[i]->value_array->v[j]->f > 0) {
++								gfloat r = attr_msg->attr[i]->value_array->v[j]->f;
++								if (!have || (want > 0.0 && ABS (r - want) < ABS (priv->sample_rate - want)))
++									priv->sample_rate = r;
++								have = TRUE;
++								if (want <= 0.0)
++									break;
++							}
+ 						}
+ 					}
+ 					break;
