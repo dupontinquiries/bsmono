@@ -1029,11 +1029,12 @@ impl ShellView {
         if let Some((cells, cols, rows)) = self.glass.clone() {
             let r = Rect::from_min_size(top, size);
             let corners = crate::wash::lattice(&cells, cols, rows);
+            let night = crate::wash::nightness(shell.ambient.smoothed_lux());
             let mut mesh = egui::Mesh::default();
             for gy in 0..=rows {
                 for gx in 0..=cols {
                     let c = corners[gy * (cols + 1) + gx];
-                    let c = if self.oled == Some(true) { crate::wash::black_point(c, 24) } else { c };
+                    let c = if self.oled == Some(true) { crate::wash::night_wash(c, night) } else { c };
                     let p = Pos2::new(r.left() + r.width() * gx as f32 / cols as f32, r.top() + r.height() * gy as f32 / rows as f32);
                     mesh.vertices.push(egui::epaint::Vertex {
                         pos: p,

@@ -107,6 +107,44 @@ pub fn black_point(c: [u8; 3], floor: u8) -> [u8; 3] {
     [m(c[0]), m(c[1]), m(c[2])]
 }
 
+/// How night it is, 0 (a lit room) to 1 (dark), from the smoothed ambient lux; `None` (no reading) is day, so a phone
+/// with no light sensor keeps the daytime wash. Smooth in log lux, so it never steps: full night at 3 lux and below,
+/// none at 40 and above.
+pub fn nightness(lux: Option<f32>) -> f32 {
+    let Some(l) = lux else { return 0.0 };
+    let t = ((40f32.ln() - l.max(0.01).ln()) / (40f32.ln() - 3f32.ln())).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The OLED wash at night: a gate that takes the dark cells to exactly 0 (a camera frame of a dark room is never
+/// black, it is a lifted grey, and a lit OLED pixel at (20,20,22) is the glow you see on the ceiling), and a
+/// compressor that stops a bright patch (a lamp in frame) from lighting the whole panel. `night` is
+/// [`nightness`]. At 0 it is close to the daytime `black_point(c, 24)` (the same floor, eased in rather than a hard clamp).
+///
+/// Per channel so hue survives. The gate is a smooth knee rather than a hard clamp: a hard clamp turns a
+/// gradient into a flat black region with a visible edge. The compressor is a soft limit (tanh) above a knee, so
+/// ordering of brightness is kept and nothing clips flat.
+pub fn night_wash(c: [u8; 3], night: f32) -> [u8; 3] {
+    let n = night.clamp(0.0, 1.0);
+    let gate = 24.0 + 36.0 * n; // 24 by day, 60 deep at night
+    let cap = 255.0 - 150.0 * n; // 255 by day, 105 at night
+    // the knee sits at the top of the range by day (the compressor does nothing) and drops to 55% of the cap at night
+    let knee = cap - (cap * 0.45) * n;
+    let one = |v: u8| -> u8 {
+        let v = v as f32;
+        // gate: 0 below `gate`, eased up to the identity by 1.6x gate
+        let g = if v <= gate { 0.0 } else {
+            let t = ((v - gate) / (0.6 * gate)).min(1.0);
+            let ease = t * t * (3.0 - 2.0 * t);
+            (v - gate) * (255.0 / (255.0 - gate)) * ease
+        };
+        // compressor
+        let o = if g <= knee || cap - knee < 1e-3 { g.min(cap) } else { knee + (cap - knee) * ((g - knee) / (cap - knee)).tanh() };
+        o.round().clamp(0.0, 255.0) as u8
+    };
+    [one(c[0]), one(c[1]), one(c[2])]
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -186,5 +224,30 @@ mod tests {
         assert_eq!(lattice(&[[1, 2, 3]], 4, 5).len(), 1, "too few cells is refused, not read past");
         assert!(indices(0, 0).is_empty());
         assert_eq!(noise_tile(0, 1, 255).len(), 1);
+    }
+
+    #[test]
+    fn at_night_a_dark_room_is_exactly_off_and_a_lamp_cannot_light_the_panel() {
+        use super::*;
+        assert_eq!(night_wash([50, 50, 56], 1.0), [0, 0, 0], "a lifted grey of a dark room is off at night");
+        assert_ne!(night_wash([50, 50, 56], 0.0), [0, 0, 0], "but the day wash keeps more of it");
+        let lamp = night_wash([255, 255, 255], 1.0);
+        assert!(lamp[0] <= 110 && lamp[0] > 60, "a lamp is held down but is still the brightest thing: {lamp:?}");
+        assert_eq!(night_wash([255, 255, 255], 0.0), [255, 255, 255], "by day white is white");
+        // order is preserved: brighter in, brighter (or equal) out
+        let mut last = 0;
+        for v in 0..=255u8 { let o = night_wash([v, v, v], 1.0)[0]; assert!(o >= last, "monotone at {v}"); last = o; }
+        // and nothing steps: neighbouring inputs differ by a few levels at most (no cliff at the gate)
+        for v in 0..255u8 { let (a, b) = (night_wash([v; 3], 1.0)[0] as i32, night_wash([v + 1; 3], 1.0)[0] as i32); assert!((b - a).abs() <= 4, "cliff at {v}: {a} -> {b}"); }
+    }
+
+    #[test]
+    fn nightness_follows_the_room_in_log_lux_and_a_missing_sensor_is_day() {
+        use super::*;
+        assert_eq!(nightness(None), 0.0);
+        assert_eq!(nightness(Some(1.0)), 1.0);
+        assert_eq!(nightness(Some(300.0)), 0.0);
+        let (a, b, c) = (nightness(Some(5.0)), nightness(Some(12.0)), nightness(Some(30.0)));
+        assert!(a > b && b > c && a < 1.0 && c > 0.0, "{a} {b} {c}");
     }
 }
