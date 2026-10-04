@@ -1,0 +1,12 @@
+[package]
+name = "gaze-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Turning eye measurements into a cursor that reads well: a One Euro filter on the gaze point (steady in a fixation, quick in a saccade), an affine calibration from eye position to screen position, and the pipeline that joins them. Sclera (white-of-the-eye) signals are layered on top of orlosky-kit's pupil detector here. Zero dependencies apart from orlosky-kit."
+
+[dependencies]
+orlosky-kit = { path = "../orlosky-kit" }
+
+[lib]
+path = "src/lib.rs"
