@@ -288,6 +288,9 @@ pub fn run(title: &str) -> Result<(), LayerError> {
     let mut mapped = true;
     let mut map_requested: Option<Instant> = None;
     let mut last_geom = String::new();
+    // A frame has actually been painted since the last map: until then the keyboard covers nothing, whatever
+    // the protocol says (a configure can arrive while nothing has been drawn yet).
+    let mut painted_since_map = false;
     // Hidden by parking (1 px, no zone), and the transparent parked buffer is still owed.
     let mut park_paint_owed = false;
     let start = Instant::now();
@@ -414,6 +417,7 @@ pub fn run(title: &str) -> Result<(), LayerError> {
                 state.layer.set_exclusive_zone(0);
                 state.layer.wl_surface().commit();
                 park_paint_owed = true;
+                painted_since_map = false;
                 mapped = false;
                 state.configured = false;
                 state.frame_pending = false;
@@ -437,6 +441,7 @@ pub fn run(title: &str) -> Result<(), LayerError> {
                 state.configured = false;
                 mapped = true;
                 map_requested = Some(Instant::now());
+                painted_since_map = false;
                 tracing::debug!("layer: map requested");
             }
             _ => {}
@@ -460,7 +465,7 @@ pub fn run(title: &str) -> Result<(), LayerError> {
         }
 
         // ---- 2c. tell the shell where the keyboard is (see `geom_line`), when that changed.
-        let line = geom_line(mapped, state.configured, state.height);
+        let line = geom_line(mapped && painted_since_map, state.configured, state.height);
         if line != last_geom {
             publish_geom(&line);
             last_geom = line;
@@ -497,6 +502,7 @@ pub fn run(title: &str) -> Result<(), LayerError> {
             callback_lost_noted = false;
             gl.swap().map_err(LayerError::Runtime)?;
             state.needs_paint = false;
+            painted_since_map = true;
             stats.paints += 1;
         }
         // Parked: the compositor answered the 1 px resize, so give it a matching transparent
