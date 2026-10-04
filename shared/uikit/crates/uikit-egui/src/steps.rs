@@ -38,7 +38,7 @@ pub fn strip(ui: &mut Ui, cells: &[StepCell], c: &PaletteColors) {
         let color = if cell.current { c.accent } else if cell.done { c.text } else { c.text_weak };
         let mut fmt = TextFormat { font_id: font.clone(), color, ..Default::default() };
         if cell.current {
-            fmt.underline = egui::Stroke::new(1.0, c.accent);
+            fmt.underline = egui::Stroke::new(1.0_f32, c.accent);
         }
         job.append(&cell.label, 0.0, fmt);
         if i + 1 < cells.len() {

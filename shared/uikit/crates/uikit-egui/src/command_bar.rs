@@ -292,7 +292,7 @@ pub fn show(
     let no_match = shown == 0 && !state.query.trim().is_empty();
     let mut clicked = None;
     let area = egui::Area::new(egui::Id::new((id_salt, "surface"))).order(egui::Order::Foreground).anchor(anchor, offset).show(ctx, |ui| {
-        egui::Frame::new().fill(colors.bg_raised).stroke(egui::Stroke::new(1.0, colors.border)).corner_radius(10.0).inner_margin(10.0).show(ui, |ui| {
+        egui::Frame::new().fill(colors.bg_raised).stroke(egui::Stroke::new(1.0_f32, colors.border)).corner_radius(10.0).inner_margin(10.0).show(ui, |ui| {
             ui.set_width(width);
             let draw_rows = |ui: &mut egui::Ui, clicked: &mut Option<usize>| {
                 let order: Vec<usize> = match placement {

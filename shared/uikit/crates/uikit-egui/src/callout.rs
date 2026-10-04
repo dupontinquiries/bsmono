@@ -140,7 +140,7 @@ fn draw(ui: &mut egui::Ui, c: &PaletteColors, sev: Severity, code: &str, title: 
     let folds = open.is_some();
     let frame = egui::Frame::new()
         .fill(fill(sev, c))
-        .stroke(Stroke::new(1.0, border(sev, c)))
+        .stroke(Stroke::new(1.0_f32, border(sev, c)))
         .corner_radius(CornerRadius::same(RADIUS_MD as u8))
         .shadow(egui::Shadow { offset: [0, 3], blur: 10, spread: 0, color: Color32::from_black_alpha(70) })
         // Room for the stripe on the leading edge, then the same breathing space

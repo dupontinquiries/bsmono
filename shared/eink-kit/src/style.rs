@@ -49,12 +49,12 @@ pub fn visuals(color_panel: bool) -> Visuals {
     v.extreme_bg_color = paper;
     v.faint_bg_color = paper;
     v.code_bg_color = Color32::from_gray(235);
-    v.window_stroke = Stroke::new(2.0, ink);
+    v.window_stroke = Stroke::new(2.0_f32, ink);
     v.window_shadow = Shadow::NONE;
     v.popup_shadow = Shadow::NONE;
     v.hyperlink_color = accent;
     v.selection.bg_fill = if color_panel { Color32::from_rgb(170, 190, 245) } else { Color32::from_gray(190) };
-    v.selection.stroke = Stroke::new(2.0, ink);
+    v.selection.stroke = Stroke::new(2.0_f32, ink);
     v.slider_trailing_fill = true;
 
     let rest = egui::style::WidgetVisuals {
@@ -62,23 +62,23 @@ pub fn visuals(color_panel: bool) -> Visuals {
         // invisible. Buttons use weak_bg_fill, which stays paper.
         bg_fill: Color32::from_gray(215),
         weak_bg_fill: paper,
-        bg_stroke: Stroke::new(2.0, ink),
+        bg_stroke: Stroke::new(2.0_f32, ink),
         corner_radius: CornerRadius::same(6),
-        fg_stroke: Stroke::new(2.0, ink),
+        fg_stroke: Stroke::new(2.0_f32, ink),
         expansion: 0.0,
     };
     let pressed = egui::style::WidgetVisuals {
         bg_fill: Color32::from_gray(150),
         weak_bg_fill: Color32::from_gray(150),
-        bg_stroke: Stroke::new(3.0, ink),
-        fg_stroke: Stroke::new(2.0, ink),
+        bg_stroke: Stroke::new(3.0_f32, ink),
+        fg_stroke: Stroke::new(2.0_f32, ink),
         ..rest
     };
-    v.widgets.noninteractive = egui::style::WidgetVisuals { bg_stroke: Stroke::new(1.0, ink), fg_stroke: Stroke::new(1.0, ink), ..rest };
+    v.widgets.noninteractive = egui::style::WidgetVisuals { bg_stroke: Stroke::new(1.0_f32, ink), fg_stroke: Stroke::new(1.0_f32, ink), ..rest };
     v.widgets.inactive = rest;
     v.widgets.hovered = rest; // deliberately identical: hover costs a refresh
     v.widgets.active = pressed;
-    v.widgets.open = egui::style::WidgetVisuals { bg_stroke: Stroke::new(3.0, ink), ..rest };
+    v.widgets.open = egui::style::WidgetVisuals { bg_stroke: Stroke::new(3.0_f32, ink), ..rest };
     v
 }
 

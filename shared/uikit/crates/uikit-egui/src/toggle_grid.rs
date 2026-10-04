@@ -124,7 +124,7 @@ impl ToggleGrid {
                 }
                 painter.rect_filled(rect, cr, fill);
                 let stroke_col = if on { vis.selection.stroke.color } else { vis.widgets.noninteractive.bg_stroke.color };
-                painter.rect_stroke(rect, cr, Stroke::new(if hot_i { 2.0 } else { 1.0 }, stroke_col), StrokeKind::Inside);
+                painter.rect_stroke(rect, cr, Stroke::new(if hot_i { 2.0_f32 } else { 1.0_f32 }, stroke_col), StrokeKind::Inside);
                 let text_col = if on { Color32::WHITE } else { vis.weak_text_color() };
                 // label + a small on/off mark
                 let center = rect.center();

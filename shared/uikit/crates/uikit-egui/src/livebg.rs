@@ -198,8 +198,8 @@ impl LiveBackground {
             if class == 0 && tw > 0.85 {
                 // a bright star at its peak gets the hairline cross the glass highlights have
                 let g = with_alpha(colors.text, self.lift(STAR_POINT * 0.35));
-                painter.line_segment([Pos2::new(x - 5.0, y), Pos2::new(x + 5.0, y)], egui::Stroke::new(0.6, g));
-                painter.line_segment([Pos2::new(x, y - 5.0), Pos2::new(x, y + 5.0)], egui::Stroke::new(0.6, g));
+                painter.line_segment([Pos2::new(x - 5.0, y), Pos2::new(x + 5.0, y)], egui::Stroke::new(0.6_f32, g));
+                painter.line_segment([Pos2::new(x, y - 5.0), Pos2::new(x, y + 5.0)], egui::Stroke::new(0.6_f32, g));
             }
         }
     }

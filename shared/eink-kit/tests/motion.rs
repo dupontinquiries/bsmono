@@ -108,7 +108,7 @@ fn an_unhinted_playhead_is_detected_as_motion() {
                     let c = [Color32::RED, Color32::BLUE, Color32::GREEN][i % 3];
                     ui.painter().rect_filled(Rect::from_min_size(egui::pos2(20.0 + i as f32 * 50.0, 100.0), Vec2::new(40.0, 30.0)), 2.0, c);
                 }
-                ui.painter().vline(self.x, r.y_range(), egui::Stroke::new(2.0, Color32::BLACK));
+                ui.painter().vline(self.x, r.y_range(), egui::Stroke::new(2.0_f32, Color32::BLACK));
                 if self.running {
                     self.x += 3.0;
                     ui.ctx().request_repaint_after(ms(33));

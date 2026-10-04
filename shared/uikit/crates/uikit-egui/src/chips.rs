@@ -23,7 +23,7 @@ pub fn row(ui: &mut Ui, label: Option<&str>, options: &[&str], selected: usize, 
             let on = i == selected;
             let chip = egui::Button::new(egui::RichText::new(*opt).strong().color(if on { c.bg_base } else { c.text }))
                 .fill(if on { c.accent } else { crate::glass::key_fill(c.bg_card) })
-                .stroke(Stroke::new(1.0, if on { c.accent } else { crate::glass::tint(c.border, crate::glass::GlassAlphas::BORDER) }))
+                .stroke(Stroke::new(1.0_f32, if on { c.accent } else { crate::glass::tint(c.border, crate::glass::GlassAlphas::BORDER) }))
                 .corner_radius(CornerRadius::same(6))
                 .min_size(egui::vec2(0.0, CHIP_HEIGHT));
             if ui.add(chip).clicked() {

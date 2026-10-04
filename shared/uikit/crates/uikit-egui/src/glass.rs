@@ -95,7 +95,7 @@ pub fn card<R>(ui: &mut Ui, bg_card: Color32, add_contents: impl FnOnce(&mut Ui)
         .fill(surface_fill(bg_card))
         .corner_radius(CornerRadius::same(crate::tokens::RADIUS_MD as u8))
         .inner_margin(egui::Margin::same(crate::tokens::SPACE_MD as i8))
-        .stroke(Stroke::new(1.0, Color32::from_white_alpha(GlassAlphas::HAIRLINE)));
+        .stroke(Stroke::new(1.0_f32, Color32::from_white_alpha(GlassAlphas::HAIRLINE)));
     // FULL WIDTH. A card sized to its content makes a page of cards a
     // staircase — a narrow "connect" beside a wide "find" (seen in the first
     // screenshot). Every card spans the page; the content decides the height.

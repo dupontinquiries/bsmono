@@ -98,7 +98,7 @@ impl MicIndicator {
             ui.painter().circle_stroke(
                 rect.center(),
                 14.0,
-                egui::Stroke::new(2.0, colors.accent),
+                egui::Stroke::new(2.0_f32, colors.accent),
             );
         }
         ui.painter().text(

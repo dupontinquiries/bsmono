@@ -111,7 +111,7 @@ pub fn card(ui: &mut Ui, rect: Rect, c: &PaletteColors, style: CardStyle) -> Ui 
     }
     ui.painter().rect_filled(rect, style.radius, c.bg_raised);
     if style.border {
-        ui.painter().rect_stroke(rect, style.radius, egui::Stroke::new(1.0, c.border),
+        ui.painter().rect_stroke(rect, style.radius, egui::Stroke::new(1.0_f32, c.border),
                                  egui::StrokeKind::Inside);
     }
     let inner = style.inner(rect);

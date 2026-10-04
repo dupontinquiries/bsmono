@@ -274,7 +274,7 @@ pub fn paint(painter: &egui::Painter, rect: Rect, layout: &Layout, pixels_per_po
     painter.rect_stroke(
         rect,
         CornerRadius::same(CARD_RADIUS),
-        egui::Stroke::new(1.0, Color32::from_white_alpha(crate::glass::GlassAlphas::HAIRLINE)),
+        egui::Stroke::new(1.0_f32, Color32::from_white_alpha(crate::glass::GlassAlphas::HAIRLINE)),
         egui::StrokeKind::Inside,
     );
     paint_modules(painter, rect.shrink(CARD_PAD), layout, pixels_per_point, c, reveal_t);
@@ -687,7 +687,7 @@ pub fn paint_tilted(painter: &egui::Painter, rect: Rect, layout: &Layout, pixels
     painter.rect_stroke(
         rect,
         CornerRadius::same(CARD_RADIUS),
-        egui::Stroke::new(1.0, Color32::from_white_alpha(crate::glass::GlassAlphas::HAIRLINE)),
+        egui::Stroke::new(1.0_f32, Color32::from_white_alpha(crate::glass::GlassAlphas::HAIRLINE)),
         egui::StrokeKind::Inside,
     );
 }

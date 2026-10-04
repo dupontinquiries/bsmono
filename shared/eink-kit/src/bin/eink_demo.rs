@@ -87,7 +87,7 @@ impl eink_kit::EinkApp for Demo {
             let size = ui.available_size() - Vec2::new(0.0, 8.0);
             let (rect, resp) = ui.allocate_exact_size(size, Sense::drag());
             let p = ui.painter_at(rect);
-            p.rect_stroke(rect, 4.0, Stroke::new(2.0, Color32::BLACK), egui::StrokeKind::Inside);
+            p.rect_stroke(rect, 4.0, Stroke::new(2.0_f32, Color32::BLACK), egui::StrokeKind::Inside);
             let corners = [rect.left_top(), rect.right_top(), rect.left_bottom(), rect.right_bottom()];
             for (i, c) in corners.iter().enumerate() {
                 let c = *c + (rect.center() - *c).normalized() * 30.0;
@@ -105,7 +105,7 @@ impl eink_kit::EinkApp for Demo {
                 }
             }
             for s in &self.strokes {
-                p.add(egui::Shape::line(s.clone(), Stroke::new(4.0, Color32::BLACK)));
+                p.add(egui::Shape::line(s.clone(), Stroke::new(4.0_f32, Color32::BLACK)));
             }
             if self.animate {
                 let (x, y, vx, vy) = &mut self.ball;
