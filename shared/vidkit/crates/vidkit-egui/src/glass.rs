@@ -163,7 +163,7 @@ pub fn draw(
     p.rect_stroke(
         rect,
         style.corner_radius,
-        egui::Stroke::new(1.0, style.border),
+        egui::Stroke::new(1.0_f32, style.border),
         egui::StrokeKind::Inside,
     );
 }
@@ -183,7 +183,7 @@ pub fn window_frame(style: &GlassStyle) -> egui::Frame {
     egui::Frame::NONE
         .fill(style.tint)
         .corner_radius(style.corner_radius)
-        .stroke(egui::Stroke::new(1.0, style.border))
+        .stroke(egui::Stroke::new(1.0_f32, style.border))
         .inner_margin(14.0)
 }
 

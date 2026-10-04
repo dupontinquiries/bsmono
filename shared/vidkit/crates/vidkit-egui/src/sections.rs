@@ -175,9 +175,9 @@ impl SectionsPanel {
                     // panel colour: in a screenshot the boxes were invisible
                     // until ticked. An outline in the weak text colour, for
                     // this row only.
-                    let edge = Stroke::new(1.0, ui.visuals().weak_text_color());
+                    let edge = Stroke::new(1.0_f32, ui.visuals().weak_text_color());
                     ui.visuals_mut().widgets.inactive.bg_stroke = edge;
-                    ui.visuals_mut().widgets.hovered.bg_stroke = Stroke::new(1.5, ui.visuals().text_color());
+                    ui.visuals_mut().widgets.hovered.bg_stroke = Stroke::new(1.5_f32, ui.visuals().text_color());
                     let mut ticked = self.selected.contains(&i);
                     if ui.checkbox(&mut ticked, "").changed() {
                         if ticked {
@@ -221,10 +221,10 @@ impl SectionsPanel {
             band(s.start, s.end, rect.top(), rect.center().y, v.selection.bg_fill);
         }
         for c in m.chapters.iter().skip(1) {
-            p.line_segment([egui::pos2(x(c.start), rect.top()), egui::pos2(x(c.start), rect.bottom())], Stroke::new(1.0, v.text_color()));
+            p.line_segment([egui::pos2(x(c.start), rect.top()), egui::pos2(x(c.start), rect.bottom())], Stroke::new(1.0_f32, v.text_color()));
         }
         let px = x(m.position);
-        p.line_segment([egui::pos2(px, rect.top() - 2.0), egui::pos2(px, rect.bottom() + 2.0)], Stroke::new(2.0, v.strong_text_color()));
+        p.line_segment([egui::pos2(px, rect.top() - 2.0), egui::pos2(px, rect.bottom() + 2.0)], Stroke::new(2.0_f32, v.strong_text_color()));
         if resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let f = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;

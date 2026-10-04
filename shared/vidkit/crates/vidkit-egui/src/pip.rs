@@ -217,7 +217,7 @@ impl Pip {
             ui.painter().rect_filled(r.expand(1.0), 10.0, egui::Color32::from_black_alpha(140));
             paint(ui, r);
             let edge = ui.visuals().widgets.inactive.bg_stroke.color;
-            ui.painter().rect_stroke(r, 10.0, egui::Stroke::new(1.0, edge), egui::StrokeKind::Outside);
+            ui.painter().rect_stroke(r, 10.0, egui::Stroke::new(1.0_f32, edge), egui::StrokeKind::Outside);
         });
         if self.hidden.is_some() && !self.dragging() {
             // The tab: a grip on the visible sliver, so it reads as a handle
@@ -227,7 +227,7 @@ impl Pip {
                 p.rect_filled(t, 8.0, egui::Color32::from_black_alpha(200));
                 let x = t.center().x;
                 for dy in [-6.0, 0.0, 6.0] {
-                    p.line_segment([Pos2::new(x - 5.0, t.center().y + dy), Pos2::new(x + 5.0, t.center().y + dy)], egui::Stroke::new(2.0, egui::Color32::from_gray(200)));
+                    p.line_segment([Pos2::new(x - 5.0, t.center().y + dy), Pos2::new(x + 5.0, t.center().y + dy)], egui::Stroke::new(2.0_f32, egui::Color32::from_gray(200)));
                 }
             }
         }

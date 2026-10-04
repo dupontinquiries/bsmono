@@ -1394,7 +1394,7 @@ impl Player {
     fn overlay_frame(&self) -> egui::Frame {
         egui::Frame::window(&egui::Style::default())
             .fill(self.colors.bg_card)
-            .stroke(egui::Stroke::new(1.0, self.colors.border))
+            .stroke(egui::Stroke::new(1.0_f32, self.colors.border))
     }
 
     fn palette_ui(&mut self, ctx: &egui::Context) {
