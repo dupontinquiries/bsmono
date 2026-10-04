@@ -44,5 +44,9 @@ wayland = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols
 # Adds the GTK app's GDK-connection-sharing path on top of `wayland`.
 gdk-integration = ["wayland", "dep:gdk4-wayland", "dep:gtk4", "dep:glib"]
 # AT-SPI focus tracking for the X11-desktop fallback (needs the same
-# InputMethodActiveCallback type `wayland` defines).
-atspi = ["wayland", "dep:zbus", "dep:tokio", "dep:futures"]
+# InputMethodActiveCallback type `wayland` defines). Its GTK-main-thread
+# side is a GLib timer (`glib::source::timeout_add_local`), so it needs
+# `glib` in its own right: `gdk-integration` happened to supply it, and
+# `atspi` without `gdk-integration` (rusty-board's `dbus` without
+# `wayland`) did not compile.
+atspi = ["wayland", "dep:zbus", "dep:tokio", "dep:futures", "dep:glib"]
