@@ -4682,6 +4682,123 @@ everywhere: it looks like a hardware problem"
     // addition is not associative, so the results differ by reassociation exactly as
     // linear_q8_0_gemm_rb already notes about its own tiling. An exact-match gate would fail on a
     // correct kernel, which is worse than no gate.
+    if let Some(i) = args.iter().position(|a| a == "--gate-fused-v2") {
+        // The V2 (word-per-thread, tiled) rewrites of the three fused decode kernels against the
+        // originals AND a CPU reference built from the int8 codes the GPU actually holds — so a
+        // disagreement is the kernel's arithmetic or indexing, never the quantiser. Shapes cover
+        // n < tile, n not a multiple of tile, k = one block, and a real-model k; tiles 1..8.
+        // With a GGUF after the flag, the same model is decoded through both kernel sets (the
+        // in-process `set_fused_v2` switch) and the logits compared: that is the whole-path check
+        // that the f32 oracle gates (deltanet-load, prefill-parity) do not do, because their
+        // fixtures never take the int8 route these kernels live on.
+        let gpu = Gpu::new();
+        println!("gate-fused-v2: adapter = {}", gpu.adapter_name);
+        let eps = 1e-5f32;
+        let mut worst_v2_vs_v1 = 0f32; let mut worst_v2_vs_cpu = 0f32; let mut worst_v1_vs_cpu = 0f32;
+        let mut cases = 0usize;
+        // CPU reference from the resident codes: c[col] = Σ_k a[k]·qs[col][k/32]·q[col][k]
+        let cpu_matvec = |words: &[u32], qs: &[f32], n: usize, k: usize, act: &[f32]| -> Vec<f32> {
+            let kb = k / 32; let kw = k / 4;
+            (0..n).map(|col| {
+                let mut acc = 0f32;
+                for kk in 0..k {
+                    let word = words[col * kw + kk / 4];
+                    let q = ((word >> ((kk % 4) * 8)) & 0xFF) as u8 as i8 as f32;
+                    acc += act[kk] * qs[col * kb + kk / 32] * q;
+                }
+                acc
+            }).collect()
+        };
+        let rel = |got: &[f32], want: &[f32]| -> f32 {
+            let scale = want.iter().fold(1f32, |m, v| m.max(v.abs()));
+            maxerr(got, want) / scale
+        };
+        for &(n, k) in &[(5usize, 32usize), (96, 128), (257, 256), (1000, 4096), (4099, 2048)] {
+            let w = rnd(n * k, 11 + n);
+            let act = rnd(k, 13 + k);
+            let nw = rnd(k, 12);
+            let resid = rnd(n, 14);
+            let gu = rnd(2 * k, 15);
+            let qw = gpu.quantize_q8_resident(&w, n, k);
+            let words = gpu.download_u32(&qw.qw);
+            let scales = gpu.download(&qw.qs);
+            let a = gpu.upload(&act, 1, k);
+            let nwt = gpu.upload(&nw, 1, k);
+            let rt = gpu.upload(&resid, 1, n);
+            let gut = gpu.upload(&gu, 1, 2 * k);
+            // references
+            let normed: Vec<f32> = { let ss: f32 = act.iter().map(|v| v * v).sum::<f32>() / k as f32; let inv = 1.0 / (ss + eps).sqrt(); act.iter().zip(&nw).map(|(x, w)| x * inv * w).collect() };
+            let cpu_norm = cpu_matvec(&words, &scales, n, k, &normed);
+            let cpu_add: Vec<f32> = cpu_matvec(&words, &scales, n, k, &act).iter().zip(&resid).map(|(x, r)| x + r).collect();
+            let h: Vec<f32> = (0..k).map(|i| { let g = gu[i]; (g / (1.0 + (-g).exp())) * gu[k + i] }).collect();
+            let cpu_swi: Vec<f32> = cpu_matvec(&words, &scales, n, k, &h).iter().zip(&resid).map(|(x, r)| x + r).collect();
+            let v1_norm = gpu.download(&gpu.linear_q8_0_norm_v1(&a, &nwt, &qw, eps));
+            let v1_add = gpu.download(&gpu.linear_q8_0_add_v1(&a, &qw, &rt));
+            let v1_swi = gpu.download(&gpu.swiglu_down_add_q8_v1(&gut, &qw, &rt));
+            for (label, v1, cpu) in [("norm", &v1_norm, &cpu_norm), ("add", &v1_add, &cpu_add), ("swiglu", &v1_swi, &cpu_swi)] {
+                let e = rel(v1, cpu); worst_v1_vs_cpu = worst_v1_vs_cpu.max(e);
+                if e > 1e-4 { println!("  n={n} k={k} {label}: ORIGINAL kernel vs CPU rel {e:.2e}"); }
+            }
+            for tile in [1u32, 2, 3, 4, 8] {
+                let v2_norm = gpu.download(&gpu.linear_q8_0_norm_v2(&a, &nwt, &qw, eps, tile));
+                let v2_add = gpu.download(&gpu.linear_q8_0_add_v2(&a, &qw, &rt, tile));
+                let v2_swi = gpu.download(&gpu.swiglu_down_add_q8_v2(&gut, &qw, &rt, tile));
+                for (label, v2, v1, cpu) in [("norm", &v2_norm, &v1_norm, &cpu_norm), ("add", &v2_add, &v1_add, &cpu_add), ("swiglu", &v2_swi, &v1_swi, &cpu_swi)] {
+                    cases += 1;
+                    let e1 = rel(v2, v1); let e2 = rel(v2, cpu);
+                    worst_v2_vs_v1 = worst_v2_vs_v1.max(e1); worst_v2_vs_cpu = worst_v2_vs_cpu.max(e2);
+                    if e1 > 1e-4 || e2 > 1e-4 || !v2.iter().all(|x| x.is_finite()) {
+                        println!("  n={n} k={k} tile={tile} {label}: v2 vs v1 rel {e1:.2e}, v2 vs cpu rel {e2:.2e}  v2[..4]={:?} v1[..4]={:?}", &v2[..4.min(n)], &v1[..4.min(n)]);
+                    }
+                }
+            }
+        }
+        println!("  {cases} kernel cases: worst rel error v2-vs-v1 {worst_v2_vs_v1:.2e}, v2-vs-cpu {worst_v2_vs_cpu:.2e}, v1-vs-cpu {worst_v1_vs_cpu:.2e} (bound 1e-4: f32 reassociation only)");
+        let kernels_ok = worst_v2_vs_v1 < 1e-4 && worst_v2_vs_cpu < 1e-4 && worst_v1_vs_cpu < 1e-4;
+        // whole-model A/B: the same quantised model decoded through both kernel sets
+        let mut model_ok = true;
+        if let Some(path) = args.get(i + 1).filter(|p| !p.starts_with("--")) {
+            let mm = gpu_kernels::mmap_ro(path).expect("mmap gguf");
+            let model = gpu.load_gguf_quantized(&mm[..]).expect("load");
+            let prompt: Vec<u32> = (0..5u32).map(|j| (j * 7 + 3) % model.vocab as u32).collect();
+            let calls = |arr: &[std::sync::atomic::AtomicU64; 3]| -> [u64; 3] {
+                [arr[0].load(std::sync::atomic::Ordering::Relaxed), arr[1].load(std::sync::atomic::Ordering::Relaxed), arr[2].load(std::sync::atomic::Ordering::Relaxed)]
+            };
+            let run = |v2: bool| -> (Vec<Vec<f32>>, [u64; 3]) {
+                gpu_kernels::set_fused_v2(v2);
+                let before = if v2 { calls(&gpu_kernels::FUSED_V2_CALLS) } else { calls(&gpu_kernels::FUSED_V1_CALLS) };
+                let cache = gpu.new_cache_for(&model, 32);
+                let mut out = vec![gpu.prefill_batched(&model, &cache, &prompt)];
+                let mut pos = prompt.len();
+                for t in 0..6u32 { out.push(gpu.decode_step(&model, &cache, (t * 11 + 1) % model.vocab as u32, pos)); pos += 1; }
+                let after = if v2 { calls(&gpu_kernels::FUSED_V2_CALLS) } else { calls(&gpu_kernels::FUSED_V1_CALLS) };
+                (out, [after[0] - before[0], after[1] - before[1], after[2] - before[2]])
+            };
+            let (a, used_v1) = run(false); let (b, used_v2) = run(true);
+            gpu_kernels::set_fused_v2(true);
+            let mut worst = 0f32; let mut argmax_agree = 0; let mut steps = 0;
+            for (x, y) in a.iter().zip(&b) {
+                steps += 1;
+                worst = worst.max(rel(y, x));
+                let am = |v: &[f32]| v.iter().enumerate().fold((0usize, f32::MIN), |m, (i, &z)| if z > m.1 { (i, z) } else { m }).0;
+                if am(x) == am(y) { argmax_agree += 1; }
+            }
+            // int8 logits through 2·layers reassociated sums: 1e-3 of the logit scale is generous
+            // and still far inside what would move a sample; argmax must agree on every step.
+            // AND every kernel must have run under both levers, or the comparison says nothing
+            // about the kernel it skipped — the §5b class of pass.
+            let covered = used_v1.iter().all(|&c| c > 0) && used_v2.iter().all(|&c| c > 0) && used_v1 == used_v2;
+            model_ok = worst < 1e-3 && argmax_agree == steps && covered;
+            println!("  model {}: d={} layers={} | {steps} steps (prefill + 6 decode): worst logit rel diff v2-vs-v1 {worst:.2e}, argmax agrees on {argmax_agree}/{steps}",
+                std::path::Path::new(path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), model.d, model.n_layers);
+            println!("  fused dispatches [norm+matvec, matvec+resid, swiglu+down+resid]: v1 {used_v1:?}, v2 {used_v2:?}{}",
+                if covered { "" } else { " — NOT COVERED: a kernel the model never reached is not checked by this A/B (f32 weights? k % 32 != 0? LOGSCOPE_NO_DECODE_FUSE?)" });
+        } else {
+            println!("  (no GGUF given: whole-model A/B skipped — pass one after the flag, e.g. /tmp/tiny-qwen3.gguf)");
+        }
+        println!("gate-fused-v2: {}", if kernels_ok && model_ok { "PASS ✓" } else { "FAIL" });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-iq1s-kernel") {
         let gpu = Gpu::new();
         println!("gate-iq1s-kernel: adapter = {}", gpu.adapter_name);
@@ -6881,7 +6998,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-batched-fused  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-gemma4-altv  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-prefill-parity --gate-qwen3\n  --gate-residency  --gate-rope-kv  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-batched-fused  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-gemma4-altv  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-prefill-parity --gate-qwen3\n  --gate-residency  --gate-rope-kv  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy\n  --gate-deltanet-prefix-reuse  --gate-sgladder  --gate-fused-v2");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
@@ -8449,8 +8566,12 @@ gpu argmax {ga} (margin {gm:.3e}) | cross-impl max|Δlogit| {xe:.3e}{}",
         let ok_store = a_hot && b_warm && c_warm && store.usage() <= 2600;
         check("smart cache ranked two-tier eviction", if ok_store { 0.0 } else { 1.0 }, 0.5);
 
-        // Fused RMSNorm+matvec (decode norm→matmul pair): must be bit-identical to the explicit
-        // two-dispatch chain rmsnorm_t → linear_q8_0_t. Same reduction, same accumulation order.
+        // Fused RMSNorm+matvec (decode norm→matmul pair) against the explicit two-dispatch chain
+        // rmsnorm_t → linear_q8_0_t. The ORIGINAL kernel (v1) is bit-identical: same reduction,
+        // same accumulation order. The V2 kernel (the default since the word-per-thread rewrite)
+        // accumulates four weights per word and reduces 128-wide, so it is equal only to f32
+        // reassociation; --gate-fused-v2 is its full check, this pins that the default path still
+        // lands within 1e-5 of the chain.
         {
             let (n, k) = (96usize, 128usize);
             let w = rnd(n * k, 11);
@@ -8463,9 +8584,12 @@ gpu argmax {ga} (margin {gm:.3e}) | cross-impl max|Δlogit| {xe:.3e}{}",
             // reference: explicit rmsnorm then matvec
             let n1 = gpu.rmsnorm_t(&a, &nwt, 1, k, eps);
             let want = gpu.download(&gpu.linear_q8_0_t(&n1, &qw, 1));
-            // fused
+            // fused, default kernel set
             let got = gpu.download(&gpu.linear_q8_0_norm(&a, &nwt, &qw, k, eps));
             check("fused rmsnorm+matvec == rmsnorm then matvec", maxerr(&got, &want), 1e-5);
+            // the original kernel: bit-identical, and that exactness is the claim
+            let got_v1 = gpu.download(&gpu.linear_q8_0_norm_v1(&a, &nwt, &qw, eps));
+            check("fused rmsnorm+matvec (v1) is BIT-IDENTICAL to the chain", maxerr(&got_v1, &want), 0.0);
         }
 
         // KV tier round-trip fidelity (the AnchorPool Cold path): a prefix demoted to int8, its

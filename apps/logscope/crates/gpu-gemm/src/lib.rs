@@ -1570,6 +1570,33 @@ fn fuse_norm_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| std::env::var("LOGSCOPE_FUSE_NORM").as_deref() != Ok("0"))
 }
+/// The three fused decode kernels (norm+matvec, matvec+residual, swiglu+down+residual) run with the
+/// V2 word-per-thread access pattern by default; `LOGSCOPE_FUSED_V2=0` restores the original
+/// byte-per-thread kernels for the ledger A/B. The env is read once; `set_fused_v2` overrides it
+/// in-process so `--gate-fused-v2` can run one model through both kernel sets and compare logits
+/// (the kernel-level half of that gate calls the `_v1`/`_v2` entry points directly).
+pub fn fused_v2_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    match FUSED_V2.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var("LOGSCOPE_FUSED_V2").as_deref() != Ok("0");
+            FUSED_V2.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+/// 0 = not yet read from the env, 1 = V2 kernels, 2 = original kernels.
+static FUSED_V2: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// How many times each fused kernel was dispatched, [norm+matvec, matvec+resid, swiglu+down+resid],
+/// V1 and V2 separately. `--gate-fused-v2` reads these so its whole-model A/B can REFUSE to pass
+/// when the model never reached a kernel (a fixture whose down-projection stays f32 exercises the
+/// norm fusion and nothing else, and reported 7/7 argmax agreement with a deliberately broken
+/// swiglu kernel before this count existed).
+pub static FUSED_V1_CALLS: [std::sync::atomic::AtomicU64; 3] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+pub static FUSED_V2_CALLS: [std::sync::atomic::AtomicU64; 3] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+pub fn set_fused_v2(on: bool) { FUSED_V2.store(if on { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed); }
 
 /// Whether ROUTE_TRACE is armed (env set + v1 path forced so routing is CPU-visible). Cached once.
 fn route_trace_armed() -> bool {
@@ -6476,19 +6503,59 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// changes. Returns None when the shape or kind does not fit, and the caller keeps its chain.
     pub fn swiglu_down_add_q8(&self, gu: &Tensor, w: &QWeight, resid: &Tensor) -> Option<Tensor> {
         if gu.rows != 1 || gu.cols != 2 * w.k { return None; }
+        if fused_v2_enabled() { return Some(self.swiglu_down_add_q8_v2(gu, w, resid, self.decode_cfg_for(w.n, w.k).tile)); }
+        Some(self.swiglu_down_add_q8_v1(gu, w, resid))
+    }
+    /// The original byte-per-thread kernel (64 threads per output row). Kept callable for the A/B.
+    pub fn swiglu_down_add_q8_v1(&self, gu: &Tensor, w: &QWeight, resid: &Tensor) -> Tensor {
+        FUSED_V1_CALLS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let out = self.alloc(1, w.n);
         let gx = (w.n as u32).min(32768); let gy = (w.n as u32).div_ceil(gx);
         let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
         self.dispatch(SWIGLU_MATVEC_Q8_0_ADD, &[gu, &w.qw, &w.qs, resid], &out,
                       bytemuck::cast_slice(&dims), (gx, gy, 1));
-        Some(out)
+        out
+    }
+    /// V2 word-per-thread, `tile` columns per 128-thread workgroup. See RMSNORM_MATVEC_Q8_V2's note.
+    pub fn swiglu_down_add_q8_v2(&self, gu: &Tensor, w: &QWeight, resid: &Tensor, tile: u32) -> Tensor {
+        FUSED_V2_CALLS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let out = self.alloc(1, w.n);
+        let (gx, gy, t) = Self::fused_v2_grid(w.n, tile);
+        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, t, 0, 0];
+        self.dispatch(SWIGLU_MATVEC_Q8_0_ADD_V2, &[gu, &w.qw, &w.qs, resid], &out,
+                      bytemuck::cast_slice(&dims), (gx, gy, 1));
+        out
+    }
+    /// Grid for the V2 fused kernels: one workgroup per `tile` output columns, 2-D so n > 65535·tile
+    /// still fits the per-dimension workgroup limit. Returns (gx, gy, tile clamped to 1..=8).
+    fn fused_v2_grid(n: usize, tile: u32) -> (u32, u32, u32) {
+        let t = tile.clamp(1, 8);
+        let cols_wg = (n as u32).div_ceil(t);
+        let gx = cols_wg.min(32768);
+        let gy = cols_wg.div_ceil(gx);
+        (gx, gy, t)
     }
 
     pub fn linear_q8_0_add(&self, a: &Tensor, w: &QWeight, resid: &Tensor) -> Tensor {
+        if fused_v2_enabled() { return self.linear_q8_0_add_v2(a, w, resid, self.decode_cfg_for(w.n, w.k).tile); }
+        self.linear_q8_0_add_v1(a, w, resid)
+    }
+    /// The original byte-per-thread kernel. Kept callable for the A/B.
+    pub fn linear_q8_0_add_v1(&self, a: &Tensor, w: &QWeight, resid: &Tensor) -> Tensor {
+        FUSED_V1_CALLS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let out = self.alloc(1, w.n);
         let gx = (w.n as u32).min(32768); let gy = (w.n as u32).div_ceil(gx);
         let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
         self.dispatch(MATVEC_Q8_0_ADD, &[a, &w.qw, &w.qs, resid], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+        out
+    }
+    /// V2 word-per-thread, `tile` columns per 128-thread workgroup.
+    pub fn linear_q8_0_add_v2(&self, a: &Tensor, w: &QWeight, resid: &Tensor, tile: u32) -> Tensor {
+        FUSED_V2_CALLS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let out = self.alloc(1, w.n);
+        let (gx, gy, t) = Self::fused_v2_grid(w.n, tile);
+        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, t, 0, 0];
+        self.dispatch(MATVEC_Q8_0_ADD_V2, &[a, &w.qw, &w.qs, resid], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
         out
     }
     pub fn linear_q4_0_add(&self, a: &Tensor, w: &Q4Weight, resid: &Tensor) -> Tensor {
@@ -6773,12 +6840,29 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// Bit-identical to the two-dispatch chain (same reduction, same accumulation order).
     pub fn linear_q8_0_norm(&self, a: &Tensor, nw: &Tensor, w: &QWeight, cols: usize, eps: f32) -> Tensor {
         debug_assert_eq!(cols, w.k, "fused norm-matvec: norm width must equal the matmul's k");
+        if fused_v2_enabled() { return self.linear_q8_0_norm_v2(a, nw, w, eps, self.decode_cfg_for(w.n, w.k).tile); }
+        self.linear_q8_0_norm_v1(a, nw, w, eps)
+    }
+    /// The original byte-per-thread kernel (bit-identical to rmsnorm_t → MATVEC_Q8_0). Kept for the A/B.
+    pub fn linear_q8_0_norm_v1(&self, a: &Tensor, nw: &Tensor, w: &QWeight, eps: f32) -> Tensor {
+        FUSED_V1_CALLS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let out = self.alloc(1, w.n);
         let gx = (w.n as u32).min(32768);
         let gy = (w.n as u32).div_ceil(gx);
         let kb = (w.k / 32) as u32;
         let dims = [1u32, w.n as u32, w.k as u32, kb, gx, eps.to_bits(), 0, 0];
         self.dispatch(RMSNORM_MATVEC_Q8, &[a, nw, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+        out
+    }
+    /// V2 word-per-thread, `tile` columns per 128-thread workgroup; the RMS reduction runs once per
+    /// workgroup instead of once per column. See RMSNORM_MATVEC_Q8_V2's note.
+    pub fn linear_q8_0_norm_v2(&self, a: &Tensor, nw: &Tensor, w: &QWeight, eps: f32, tile: u32) -> Tensor {
+        FUSED_V2_CALLS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let out = self.alloc(1, w.n);
+        let (gx, gy, t) = Self::fused_v2_grid(w.n, tile);
+        let kb = (w.k / 32) as u32;
+        let dims = [1u32, w.n as u32, w.k as u32, kb, gx, eps.to_bits(), t, 0];
+        self.dispatch(RMSNORM_MATVEC_Q8_V2, &[a, nw, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
         out
     }
     pub fn linear_q8_0_t(&self, a: &Tensor, w: &QWeight, m: usize) -> Tensor {
@@ -8633,6 +8717,184 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   red[tid]=acc; workgroupBarrier();
   for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
   if(tid==0u){ c[col]=red[0]+resid[col]; }
+}"#;
+
+// ── The fused decode kernels, V2 access pattern ──────────────────────────────────────────────
+//
+// The three kernels above (RMSNORM_MATVEC_Q8, MATVEC_Q8_0_ADD, SWIGLU_MATVEC_Q8_0_ADD) carry EVERY
+// layer projection of a decode step — on a Qwen3.5/Ornith hybrid that is the DeltaNet in_proj and
+// out, the attention qkv+gate and o_proj, and both FFN halves, 32 layers deep — and all three still
+// use the ORIGINAL m=1 access pattern: one 64-thread workgroup per output row, `widx = kk/4`, so four
+// neighbouring lanes load the SAME u32 and each peel one byte, plus one `qs` scale load per element.
+// MATVEC_Q8_0_TILED_V2's own comment calls that pattern "up to 4× redundant weight traffic — the
+// leading suspect for the decode running at ~6% of memory bandwidth", and the V2 word-per-thread
+// fix has been the LM head's default (V2Wg128) ever since — while the 31 other projections per layer,
+// ~90% of the bytes a token reads, never got it. Ornith-1.5-9B at 5.08 tok/s on the M2 Max is ~9 GB
+// of int8 per token at ~45 GB/s, about 11% of the 400 GB/s the part has.
+//
+// These are the same three fusions with V2Wg128's loop: 128 threads, each owning whole u32 words
+// (4 weights, read once, all four bytes used), ONE scale load per word, `tile` output columns per
+// workgroup so each activation (and, for the norm/swiglu variants, the per-element prologue work —
+// `a·inv·nw`, or `silu(g)·u` with its exp) is computed once per word and reused across the tile.
+// The RMS reduction happens once per WORKGROUP, i.e. once per `tile` columns instead of once per
+// column. Output differs from the originals only by f32 reassociation (4-per-word accumulation, a
+// 128-wide tree instead of 64), far below the int8 quantisation error; `--gate-fused-v2` pins both
+// against each other and against a CPU reference across ragged n/tile combinations.
+//
+// Selection: `fused_v2_enabled()` — default ON, `LOGSCOPE_FUSED_V2=0` falls back to the originals
+// for the ledger A/B. The tile comes from `decode_cfg_for(n, k)`, so the per-shape autotune and
+// `LOGSCOPE_DECODE_TILE` finally reach the layer projections: ledger row e6 ("tile is not a lever")
+// pinned a tile that, until now, only the LM head ever saw.
+//
+// Speed is NOT measured here (lavapipe); correctness is. The first hardware ledger row decides.
+const RMSNORM_MATVEC_Q8_V2: &str = r#"
+// RMSNORM_MATVEC_Q8_V2
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,eps:u32,tile:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;      // raw (un-normed) input row [k]
+@group(0)@binding(1) var<storage,read> nw: array<f32>;     // RMSNorm weight [k]
+@group(0)@binding(2) var<storage,read> qw: array<u32>;
+@group(0)@binding(3) var<storage,read> qs: array<f32>;
+@group(0)@binding(4) var<storage,read_write> c: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,1024>; // tile(≤8) x 128 threads
+var<workgroup> inv_sh: f32;
+@compute @workgroup_size(128,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col0=(wg.y*d.gx+wg.x)*d.tile; let tid=lid.x;
+  // --- RMS reduction over the input row: once per WORKGROUP (= once per `tile` output columns) ---
+  var ss=0.0; var j=tid;
+  loop { if(j>=d.k){break;} let v=a[j]; ss=ss+v*v; j=j+128u; }
+  red[tid]=ss; workgroupBarrier();
+  for(var s=64u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ inv_sh = 1.0/sqrt(red[0]/f32(d.k)+bitcast<f32>(d.eps)); }
+  workgroupBarrier();
+  let inv = inv_sh;
+  if(col0>=d.n){ return; }   // workgroup-uniform: every barrier above has already been passed
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  let words=d.k/4u;
+  var w=tid;
+  loop {
+    if(w>=words){break;}
+    let kk0=w*4u;
+    // the normalised activation, computed ONCE per word and reused across the tile
+    let a0=a[kk0]*inv*nw[kk0];       let a1=a[kk0+1u]*inv*nw[kk0+1u];
+    let a2=a[kk0+2u]*inv*nw[kk0+2u]; let a3=a[kk0+3u]*inv*nw[kk0+3u];
+    let blk=kk0/32u; // 4 consecutive k always share ONE 32-block, so ONE scale index
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      let col=col0+ci;
+      if(col<d.n){
+        let word=qw[col*words+w];
+        let u0=extractBits(word,0u,8u);  let u1=extractBits(word,8u,8u);
+        let u2=extractBits(word,16u,8u); let u3=extractBits(word,24u,8u);
+        let q0=select(i32(u0),i32(u0)-256,u0>=128u); let q1=select(i32(u1),i32(u1)-256,u1>=128u);
+        let q2=select(i32(u2),i32(u2)-256,u2>=128u); let q3=select(i32(u3),i32(u3)-256,u3>=128u);
+        let sc=qs[col*d.kb+blk];
+        acc[ci]=acc[ci]+a0*sc*f32(q0)+a1*sc*f32(q1)+a2*sc*f32(q2)+a3*sc*f32(q3);
+      }
+    }
+    w=w+128u;
+  }
+  for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*128u+tid]=acc[ci]; }
+  workgroupBarrier();
+  for(var s=64u;s>0u;s=s>>1u){
+    if(tid<s){ for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*128u+tid]=red[ci*128u+tid]+red[ci*128u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var ci=0u;ci<d.tile;ci=ci+1u){ let col=col0+ci; if(col<d.n){ c[col]=red[ci*128u]; } } }
+}"#;
+
+const MATVEC_Q8_0_ADD_V2: &str = r#"
+// MATVEC_Q8_0_ADD_V2
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> resid: array<f32>;
+@group(0)@binding(4) var<storage,read_write> c: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,1024>; // tile(≤8) x 128 threads
+@compute @workgroup_size(128,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col0=(wg.y*d.gx+wg.x)*d.tile; let tid=lid.x;
+  if(col0>=d.n){ return; }
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  let words=d.k/4u;
+  var w=tid;
+  loop {
+    if(w>=words){break;}
+    let kk0=w*4u;
+    let a0=a[kk0]; let a1=a[kk0+1u]; let a2=a[kk0+2u]; let a3=a[kk0+3u];
+    let blk=kk0/32u;
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      let col=col0+ci;
+      if(col<d.n){
+        let word=qw[col*words+w];
+        let u0=extractBits(word,0u,8u);  let u1=extractBits(word,8u,8u);
+        let u2=extractBits(word,16u,8u); let u3=extractBits(word,24u,8u);
+        let q0=select(i32(u0),i32(u0)-256,u0>=128u); let q1=select(i32(u1),i32(u1)-256,u1>=128u);
+        let q2=select(i32(u2),i32(u2)-256,u2>=128u); let q3=select(i32(u3),i32(u3)-256,u3>=128u);
+        let sc=qs[col*d.kb+blk];
+        acc[ci]=acc[ci]+a0*sc*f32(q0)+a1*sc*f32(q1)+a2*sc*f32(q2)+a3*sc*f32(q3);
+      }
+    }
+    w=w+128u;
+  }
+  for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*128u+tid]=acc[ci]; }
+  workgroupBarrier();
+  for(var s=64u;s>0u;s=s>>1u){
+    if(tid<s){ for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*128u+tid]=red[ci*128u+tid]+red[ci*128u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var ci=0u;ci<d.tile;ci=ci+1u){ let col=col0+ci; if(col<d.n){ c[col]=red[ci*128u]+resid[col]; } } }
+}"#;
+
+const SWIGLU_MATVEC_Q8_0_ADD_V2: &str = r#"
+// SWIGLU_MATVEC_Q8_0_ADD_V2
+// y[n] = resid[n] + sum_h silu(gu[h])*gu[k+h] * W[n,h]; gu is the packed [gate: k | up: k].
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> gu: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> resid: array<f32>;
+@group(0)@binding(4) var<storage,read_write> c: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,1024>; // tile(≤8) x 128 threads
+fn act(i:u32) -> f32 { let g=gu[i]; return (g/(1.0+exp(-g)))*gu[d.k+i]; }
+@compute @workgroup_size(128,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col0=(wg.y*d.gx+wg.x)*d.tile; let tid=lid.x;
+  if(col0>=d.n){ return; }
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  let words=d.k/4u;
+  var w=tid;
+  loop {
+    if(w>=words){break;}
+    let kk0=w*4u;
+    // silu(gate)*up: four exps per word per thread, reused across the tile (the original paid
+    // one exp per element per OUTPUT ROW)
+    let a0=act(kk0); let a1=act(kk0+1u); let a2=act(kk0+2u); let a3=act(kk0+3u);
+    let blk=kk0/32u;
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      let col=col0+ci;
+      if(col<d.n){
+        let word=qw[col*words+w];
+        let u0=extractBits(word,0u,8u);  let u1=extractBits(word,8u,8u);
+        let u2=extractBits(word,16u,8u); let u3=extractBits(word,24u,8u);
+        let q0=select(i32(u0),i32(u0)-256,u0>=128u); let q1=select(i32(u1),i32(u1)-256,u1>=128u);
+        let q2=select(i32(u2),i32(u2)-256,u2>=128u); let q3=select(i32(u3),i32(u3)-256,u3>=128u);
+        let sc=qs[col*d.kb+blk];
+        acc[ci]=acc[ci]+a0*sc*f32(q0)+a1*sc*f32(q1)+a2*sc*f32(q2)+a3*sc*f32(q3);
+      }
+    }
+    w=w+128u;
+  }
+  for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*128u+tid]=acc[ci]; }
+  workgroupBarrier();
+  for(var s=64u;s>0u;s=s>>1u){
+    if(tid<s){ for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*128u+tid]=red[ci*128u+tid]+red[ci*128u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var ci=0u;ci<d.tile;ci=ci+1u){ let col=col0+ci; if(col<d.n){ c[col]=red[ci*128u]+resid[col]; } } }
 }"#;
 
 const MATVEC_Q4_ADD: &str = r#"
