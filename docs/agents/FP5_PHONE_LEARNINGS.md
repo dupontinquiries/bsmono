@@ -344,3 +344,25 @@ averaging costs fine-detail sensitivity (distant text, macro). Not adopted: no r
    of each of 5 positions. Works today; untested on a face.
 4. A face detector (none in the repo) to centre the region on the eyes.
 5. Keep the 2.0 bar but report "too smooth to focus, try the stack" instead of silently doing nothing.
+
+## Eye finding on the selfie camera: classical blob detection does NOT work (2026-10-04)
+
+Tried and discarded, so nobody repeats it. Goal: find the two eyes in a face frame from the front camera (57 frames,
+1280x720 grey, delivered on their side: `Gray::rotate_cw` stands the face up) so each can be cropped for orlosky-kit's pupil
+detector, which needs a close-up of one eye. At normal selfie distance the face is ~500 px wide, each eye ~100 px, iris
+radius ~20 px.
+
+* **Dark-disc detector** (difference of Gaussians over iris-sized scales, pair by spacing/level/size: eyes are ~10.8 iris
+  radii apart): 5 candidates on a typical frame, none an eye. Real eyes in flat room light are not dark discs: the iris is
+  mid-grey, half covered by the lid, and about as dark as the shadowed skin around it. The strongest "discs" were the ear,
+  a mole, the collar and the edge of a lens.
+* **Horizontally elongated blob filter** (an almond, 2.2:1): "found a pair" on 25 of 57 frames, and every one of the
+  ones drawn and checked was WRONG (collar, chin, hairline, background). A pairing rule on geometry alone accepts any two
+  dark blobs at the right distance; with this contrast there is nothing in the pixels to prefer the eyes.
+* Synthetic faces (round and almond eyes on a flat skin tone) were found to 2-3 px by both: a test that passes on a model
+  of the problem and fails on the problem. The tests were not kept.
+
+What would work (not built): a face model. A small detector plus an eye/iris landmark network (MediaPipe's face detector
+and iris landmark model, Apache-2.0, are the obvious ones), run through a pure-Rust ONNX runtime such as `tract`, then
+orlosky-kit's pupil detector on the crop the landmarks give. That also yields the things Jason Orlosky's trackers anchor
+on (eye corners for the sclera system, head pose from the face mesh).

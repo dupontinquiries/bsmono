@@ -19,6 +19,31 @@ impl Gray {
     #[inline]
     pub fn at(&self, x: usize, y: usize) -> u8 { self.d[y * self.w + x] }
 
+    /// Turned a quarter turn clockwise (what a phone's sideways front sensor needs to stand a face upright).
+    pub fn rotate_cw(&self) -> Gray {
+        Gray::from_fn(self.h, self.w, |x, y| self.at(y, self.h - 1 - x))
+    }
+
+    /// Turned a quarter turn counter-clockwise.
+    pub fn rotate_ccw(&self) -> Gray {
+        Gray::from_fn(self.h, self.w, |x, y| self.at(self.w - 1 - y, x))
+    }
+
+    /// Bilinear sample of a window: `cx`,`cy` its centre and `w`,`h` its size in THIS image's pixels, resampled to
+    /// `out_w` x `out_h`. Samples outside the image take the nearest edge pixel.
+    pub fn window(&self, cx: f64, cy: f64, w: f64, h: f64, out_w: usize, out_h: usize) -> Gray {
+        Gray::from_fn(out_w, out_h, |x, y| {
+            let fx = (cx - w / 2.0 + (x as f64 + 0.5) * w / out_w as f64 - 0.5).clamp(0.0, self.w as f64 - 1.0);
+            let fy = (cy - h / 2.0 + (y as f64 + 0.5) * h / out_h as f64 - 0.5).clamp(0.0, self.h as f64 - 1.0);
+            let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
+            let (x1, y1) = ((x0 + 1).min(self.w - 1), (y0 + 1).min(self.h - 1));
+            let (ax, ay) = (fx - x0 as f64, fy - y0 as f64);
+            let p = |xx: usize, yy: usize| self.at(xx, yy) as f64;
+            let v = p(x0, y0) * (1.0 - ax) * (1.0 - ay) + p(x1, y0) * ax * (1.0 - ay) + p(x0, y1) * (1.0 - ax) * ay + p(x1, y1) * ax * ay;
+            (v + 0.5) as u8
+        })
+    }
+
     /// A binary PGM (P5, maxval 255), what `ffmpeg -f image2pipe -vcodec pgm` writes.
     pub fn from_pgm(b: &[u8]) -> Option<Gray> {
         fn token(b: &[u8], pos: &mut usize) -> Option<usize> {
@@ -300,5 +325,30 @@ mod tests {
         assert!(Gray::from_pgm(b"P6\n1 1\n255\nabc").is_none());
         assert!(Gray::from_pgm(b"P5\n4 4\n255\nshort").is_none());
         assert!(Gray::from_pgm(b"").is_none());
+    }
+
+    #[test]
+    fn quarter_turns_undo_each_other_and_move_the_corner_where_they_should() {
+        let g = Gray::from_fn(5, 3, |x, y| (x * 10 + y) as u8);
+        assert_eq!(g.rotate_cw().rotate_ccw(), g);
+        assert_eq!(g.rotate_cw().rotate_cw().rotate_cw().rotate_cw(), g);
+        let r = g.rotate_cw();
+        assert_eq!((r.w, r.h), (3, 5));
+        assert_eq!(r.at(2, 0), g.at(0, 0), "the top-left corner goes to the top-right when turned clockwise");
+        assert_eq!(r.at(0, 4), g.at(4, 2), "and the bottom-right to the bottom-left");
+    }
+
+    #[test]
+    fn a_window_resamples_the_requested_region_and_clamps_at_the_edge() {
+        let g = Gray::from_fn(40, 40, |x, y| if x >= 10 && x < 20 && y >= 10 && y < 20 { 200 } else { 50 });
+        // a window a pixel inside the square on each side (bilinear blends at a boundary, as it should)
+        let w = g.window(15.0, 15.0, 8.0, 8.0, 20, 20);
+        assert!(w.d.iter().all(|&p| p == 200), "a window inside the square sees only the square");
+        let straddle = g.window(10.0, 15.0, 6.0, 6.0, 12, 12);
+        assert!(straddle.d.iter().any(|&p| p == 200) && straddle.d.iter().any(|&p| p == 50), "one over the boundary sees both");
+        let edge = g.window(0.0, 0.0, 10.0, 10.0, 8, 8);
+        assert!(edge.d.iter().all(|&p| p == 50), "off the corner it holds the edge value");
+        let wide = g.window(15.0, 15.0, 40.0, 40.0, 4, 4);
+        assert!(wide.d.iter().any(|&p| p == 50) && wide.d.iter().any(|&p| p > 50));
     }
 }
