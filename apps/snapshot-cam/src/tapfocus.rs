@@ -15,6 +15,7 @@
 //!
 //! `actuator_for` answers which subdevice moves which camera, from the camera's libcamera id.
 
+use crate::lensmove;
 use capture_kit::focus::{self, Search, Step};
 use capture_kit::RawFrame;
 
@@ -340,13 +341,63 @@ impl V4l2Lens {
         let err = std::sync::Arc::new(std::sync::Mutex::new(None));
         let (e2, p2, d2) = (err.clone(), prog.clone(), device.clone());
         std::thread::Builder::new().name("lens".into()).spawn(move || {
-            while let Ok(mut pos) = rx.recv() {
-                // only the newest request matters
-                while let Ok(p) = rx.try_recv() { pos = p; }
-                *e2.lock().unwrap() = focus::set_focus(&p2, &d2, pos).err();
+            // The motor's device, opened once and written with the V4L2 ioctl: no process per step (a full sweep was
+            // ~500 spawns), and the steps can be paced a few milliseconds apart. If it cannot be opened, fall back to
+            // v4l2-ctl and a single jump (it clicks, but it works).
+            let mut io = IoctlFocus::open(&d2).ok();
+            let mut mover: Option<lensmove::Mover> = None;
+            while let Ok(mut target) = rx.recv() {
+                while let Ok(t) = rx.try_recv() { target = t; } // only the newest request matters
+                match io.as_mut() {
+                    Some(f) => {
+                        // Move in small steps (see `lensmove`: big steps click, 50-step ones do not). A new request that
+                        // arrives mid-move turns the move round instead of waiting for it to finish.
+                        let mv = mover.get_or_insert_with(|| lensmove::Mover::new(f.read().unwrap_or(target)));
+                        let r = lensmove::glide(mv, f, target, |cur| { let mut t = cur; while let Ok(n) = rx.try_recv() { t = n; } t }, |ms| std::thread::sleep(std::time::Duration::from_millis(ms)));
+                        *e2.lock().unwrap() = r.err();
+                    }
+                    None => *e2.lock().unwrap() = focus::set_focus(&p2, &d2, target).err(),
+                }
             }
         }).ok();
         V4l2Lens { tx, err, device, prog }
+    }
+}
+
+/// The lens motor's sub-device, written with `VIDIOC_S_CTRL` on `V4L2_CID_FOCUS_ABSOLUTE`.
+pub struct IoctlFocus { file: std::fs::File }
+
+extern "C" {
+    fn ioctl(fd: i32, request: std::os::raw::c_ulong, ...) -> i32;
+}
+
+/// `_IOWR('V', nr, struct v4l2_control)`: the struct is 8 bytes.
+const fn vidioc(nr: u32) -> std::os::raw::c_ulong { ((3u32 << 30) | (8 << 16) | ((b'V' as u32) << 8) | nr) as std::os::raw::c_ulong }
+const VIDIOC_G_CTRL: std::os::raw::c_ulong = vidioc(27);
+const VIDIOC_S_CTRL: std::os::raw::c_ulong = vidioc(28);
+const V4L2_CID_FOCUS_ABSOLUTE: u32 = 0x009a_090a;
+
+#[repr(C)]
+struct V4l2Control { id: u32, value: i32 }
+
+impl IoctlFocus {
+    pub fn open(device: &str) -> Result<IoctlFocus, String> {
+        std::fs::OpenOptions::new().read(true).write(true).open(device).map(|file| IoctlFocus { file }).map_err(|e| format!("{device}: {e}"))
+    }
+
+    /// The motor's current position as the driver reports it.
+    pub fn read(&self) -> Option<i64> {
+        use std::os::fd::AsRawFd;
+        let mut c = V4l2Control { id: V4L2_CID_FOCUS_ABSOLUTE, value: 0 };
+        (unsafe { ioctl(self.file.as_raw_fd(), VIDIOC_G_CTRL, &mut c as *mut V4l2Control) } == 0).then_some(c.value as i64)
+    }
+}
+
+impl lensmove::FocusWrite for IoctlFocus {
+    fn write(&mut self, pos: i64) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
+        let mut c = V4l2Control { id: V4L2_CID_FOCUS_ABSOLUTE, value: pos as i32 };
+        if unsafe { ioctl(self.file.as_raw_fd(), VIDIOC_S_CTRL, &mut c as *mut V4l2Control) } == 0 { Ok(()) } else { Err(format!("focus_absolute={pos}: {}", std::io::Error::last_os_error())) }
     }
 }
 
@@ -718,5 +769,15 @@ mod tests {
         assert_eq!(nudges(0, r), vec![20, 10], "at the near end only the far side exists");
         assert_eq!(nudges(1023, r), vec![1003, 1013], "at the far end only the near side exists");
         assert!(nudges(7, r).iter().all(|x| *x >= 0), "-3 is dropped");
+    }
+
+    #[test]
+    fn the_v4l2_request_numbers_match_the_kernel_headers_and_a_missing_device_is_an_error() {
+        // <linux/videodev2.h>: VIDIOC_G_CTRL = _IOWR('V', 27, struct v4l2_control), VIDIOC_S_CTRL = ... 28 (8 bytes each)
+        assert_eq!(VIDIOC_G_CTRL as u32, 0xC008_561B);
+        assert_eq!(VIDIOC_S_CTRL as u32, 0xC008_561C);
+        assert_eq!(V4L2_CID_FOCUS_ABSOLUTE, 0x009A_090A);
+        assert_eq!(std::mem::size_of::<V4l2Control>(), 8);
+        assert!(IoctlFocus::open("/dev/v4l-subdev-that-does-not-exist").is_err());
     }
 }

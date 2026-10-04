@@ -59,6 +59,7 @@ pub mod contacts;
 pub mod develop;
 pub mod autotone;
 pub mod fusion;
+pub mod lensmove;
 pub mod tapfocus;
 pub mod autofocus;
 /// Clip-on lens profiles (Moment and others) and the black-border autocrop.
