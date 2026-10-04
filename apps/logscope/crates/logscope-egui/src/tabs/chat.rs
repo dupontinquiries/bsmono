@@ -716,10 +716,7 @@ enum RightPage { Files, Graph, Context, Prompting, Engine }
 /// while staying invisible in the UI and reading as ordinary text to the model. The builders' OWN
 /// structural markers are written as literals and never pass through here, so they stay intact. No-op
 /// for normal text (only touches content already containing a `<|` / `<｜` sigil).
-fn neutralize_markers(text: &str) -> String {
-    if !text.contains("<|") && !text.contains("<\u{ff5c}") { return text.to_string(); }
-    text.replace("<|", "<\u{200b}|").replace("<\u{ff5c}", "<\u{200b}\u{ff5c}")
-}
+fn neutralize_markers(text: &str) -> String { crate::agent_render::neutralize_markers(text) }
 
 /// Sentinel pushed onto the generation queue by `:continue-all` — `(CONTINUE_ALL_TOK, Some(leaf))` means
 /// "expand this leaf with a continuation" rather than "start a new turn with this text". Can't collide
@@ -3560,6 +3557,9 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
         // to Mid for everything — the harness's "unknown" — so a 1B drowns in reads it cannot hold
         // and a large model gets a transcript bound far below what its window could carry.
         cfg.model_label = self.model_label();
+        // The loaded model's template family: the run renders its transcript through it
+        // (agent_render) instead of sending the flat ASSISTANT:/TOOL RESULTS: form.
+        cfg.template = self.live_template();
         // Hero reflexes (logscope_fan::hero): model-free procedures that read the code at a compiler
         // error / find a failed test BEFORE the model has to ask — one generation saved per firing.
         // On in the app; LOGSCOPE_REFLEXES=0 is the off switch while this is new.
@@ -3613,6 +3613,7 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
         // fan did not, so fan branches were still resolving to the harness's "unknown" Mid class for
         // their read chunks, git entries and transcript bound.
         if cfg.model_label.is_empty() { cfg.model_label = self.model_label(); }
+        if cfg.template == crate::backend::TemplateKind::Plain { cfg.template = self.live_template(); }
         let task = task.trim().to_string();
         if task.is_empty() {
             self.note = format!(":{label} needs a task");
@@ -3832,7 +3833,9 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
         let run = match self.agent_run.take() { Some(r) => r, None => return false };
         // the run's next prompt is queued in agent_pending_submit if it's between turns; None ⇒ mid-generation
         let pending = self.agent_pending_submit.take();
-        let cfg = crate::workspace_exec::AgentConfig::default();
+        let mut cfg = crate::workspace_exec::AgentConfig::default();
+        cfg.model_label = self.model_label();
+        cfg.template = self.live_template();
         let diff_fn = Box::new(|dir: &std::path::Path| -> String {
             std::process::Command::new("git").arg("-C").arg(dir).args(["diff", "logscope-base"])
                 .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).chars().take(8000).collect()).unwrap_or_default()

@@ -272,6 +272,7 @@ pub mod scene3d;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod longterm;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod interject;
 #[allow(dead_code)] pub mod mount; // pure (git/workspace, no egui) + imported by lean modules → not gui-gated
+#[allow(dead_code)] pub mod agent_render; // the agent transcript in the loaded model's chat template (pure)
 #[allow(dead_code)] pub mod workspace_exec; // pure (std-only agent loop over an isolated tmp workspace) → not gui-gated
 pub mod phase_guide; // engmode's Fsm wired to the agent loop: observation → signal, phase → prompt (StatefulGuide)
 pub mod plancheck;   // is a plan step actually DONE? decided from what the run wrote, not from turns elapsing

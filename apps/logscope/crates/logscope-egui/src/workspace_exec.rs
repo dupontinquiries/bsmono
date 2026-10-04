@@ -1717,6 +1717,10 @@ pub struct AgentConfig {
     /// Which tool-call syntax the prompt teaches. None = decide from `model_label` (and the
     /// LOGSCOPE_TOOL_SYNTAX env override) via `ToolSyntax::for_model`; see `AgentConfig::syntax`.
     pub tool_syntax: Option<ToolSyntax>,
+    /// The loaded model's chat-template family. `AgentRun` renders the transcript through it
+    /// (`agent_render`) at the two points the prompt leaves the driver; Plain (the default, and
+    /// what the synchronous `run_agent_cfg` loop and the fixtures use) keeps the flat form.
+    pub template: crate::backend::TemplateKind,
     /// The worker's STANCE, from `coordinator::plan()` — how this branch should approach its unit,
     /// as distinct from the tool protocol every branch shares. Empty for an ordinary run.
     ///
@@ -1810,6 +1814,7 @@ impl Default for AgentConfig {
             model_label: String::new(),
             model_params: None,
             tool_syntax: None,
+            template: crate::backend::TemplateKind::Plain,
             persona: String::new(),
             require_proof: false,
             extra_allow: Vec::new(),
@@ -3781,6 +3786,9 @@ pub struct AgentRun {
     /// nothing could answer "what is this run doing" without reading the transcript back.
     task: String,
     started: std::time::Instant,
+    /// Every reply the model gave, in order — what `agent_render` uses to place each reply /
+    /// harness boundary exactly when it renders the flat transcript into the template.
+    replies: Vec<String>,
     /// Consecutive turns where every write/edit attempted was refused by `check_owned` — see
     /// `Stop::LaneRefused`. Reset by any turn that isn't purely lane-refused writes.
     lane_refusals: u32,
@@ -3826,9 +3834,17 @@ impl AgentRun {
             compacted: 0,
             task: task.to_string(),
             started: std::time::Instant::now(),
+            replies: Vec::new(),
             lane_refusals: 0,
         };
-        (run, prompt)
+        let first = run.rendered();
+        (run, first)
+    }
+
+    /// The transcript as the model should see it: the flat form rendered into `cfg.template`'s
+    /// turn grammar (`agent_render`), or the flat form itself for Plain / under the escape.
+    fn rendered(&self) -> String {
+        crate::agent_render::render(&self.prompt, &self.replies, &self.task, self.cfg.template)
     }
 
     /// The growing prompt, for tests in OTHER modules that drive a real run (the field is private
@@ -3855,6 +3871,9 @@ impl AgentRun {
     pub fn on_done(&mut self) -> AgentStep {
         let text = std::mem::take(&mut self.reply);
         let (results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step, &mut self.guard, &mut self.ladder, self.guide.as_mut(), self.heroes.as_mut());
+        // What step_turn appended after TURN_MARK is the GATED text (authorize_text's rewrite),
+        // not `text` — the renderer matches segments against what is in the prompt.
+        self.replies.push(crate::taint::authorize_text(&text, &self.cfg.gate).0);
         self.turns += 1;
         self.counts.turns += 1;
         self.counts.tool_calls += results.len();
@@ -3899,7 +3918,7 @@ change elsewhere, say so and stop rather than trying another out-of-lane path.)\
         // Bound the transcript before it is submitted again — this is the only place the growing
         // prompt leaves the driver, so it is the only place the bound has to hold.
         self.compacted += maybe_compact(&mut self.prompt, &self.ws, &self.cfg, &self.plan, self.guide.as_ref());
-        AgentStep::Submit(self.prompt.clone())
+        AgentStep::Submit(self.rendered())
     }
 
     /// Where the phase machine places the run right now ("survey", "diagnose", …), when the run is
@@ -5508,6 +5527,31 @@ That is this machine, not the allowlist.", tldr.output.trim());
         for ch in replies[1].chars() { run.on_token(&ch.to_string()); }
         assert_eq!(run.on_done(), AgentStep::Finished(Stop::Done));
         assert!(std::fs::read_to_string(run.root().join("src/lib.rs")).unwrap().contains("pub fn x"));
+    }
+
+    /// The live driver renders through the template: the first prompt is the family's system +
+    /// user turns ending in the generation prompt; after a reply the next Submit carries that
+    /// reply as a closed assistant turn and the tool result as a `<tool_response>` user turn; the
+    /// flat transcript inside the run is untouched (compaction and the reflexes keep working on
+    /// it); and the gate's rewrite is what the assistant turn shows (the run records the gated
+    /// text, which is what step_turn appended).
+    #[test]
+    fn async_driver_renders_the_transcript_through_the_template() {
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(),
+            gate_done_on_verify: false, read_policy: ReadPolicy::Full, template: crate::backend::TemplateKind::ChatML, ..Default::default() };
+        let (mut run, first) = AgentRun::start(tmp("async-tpl"), "make a lib", cfg);
+        assert!(first.starts_with("<|im_start|>system\n"), "{first}");
+        assert!(first.contains("<|im_start|>user\nmake a lib<|im_end|>\n<|im_start|>assistant\n"), "{first}");
+        assert!(first.ends_with("<|im_start|>assistant\n"));
+        let reply = "```plan\n1. write lib\n```\n```tool\n{\"tool\":\"write_file\",\"path\":\"src/lib.rs\",\"contents\":\"pub fn x(){}\\n\"}\n```";
+        for ch in reply.chars() { run.on_token(&ch.to_string()); }
+        let AgentStep::Submit(next) = run.on_done() else { panic!("expected a second prompt") };
+        assert!(next.starts_with(&first), "append-only: the first prompt must be a prefix of the second\n{first}\n---\n{next}");
+        assert!(next.contains(&format!("<|im_start|>assistant\n{reply}<|im_end|>\n<|im_start|>user\n<tool_response>\n[ok] write ")), "{next}");
+        assert!(next.contains("</tool_response>") && next.ends_with("<|im_start|>assistant\n"), "{next}");
+        // the run's own transcript is still the flat form
+        assert!(run.prompt_for_test().contains(TURN_MARK) && run.prompt_for_test().contains("TOOL RESULTS:"));
+        assert!(!run.prompt_for_test().contains("<|im_start|>"));
     }
 
     #[test]
