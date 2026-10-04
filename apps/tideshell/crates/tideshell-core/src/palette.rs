@@ -79,11 +79,26 @@ pub struct PaletteItem {
     /// Small grey text after the label ("running", "app", "setting").
     pub hint: &'static str,
     pub action: PaletteAction,
+    /// Words that find this item without being its label (an app's keywords: "browser" finds Firefox). A match here
+    /// ranks below any label match.
+    pub search: String,
+    /// Only a search shows it (an app's desktop actions, Lock): it is not listed while the query is empty.
+    pub search_only: bool,
 }
 
 impl PaletteItem {
     pub fn new(key: impl Into<String>, label: impl Into<String>, hint: &'static str, action: PaletteAction) -> Self {
-        PaletteItem { key: key.into(), label: label.into(), hint, action }
+        PaletteItem { key: key.into(), label: label.into(), hint, action, search: String::new(), search_only: false }
+    }
+
+    pub fn with_search(mut self, words: impl Into<String>) -> Self {
+        self.search = words.into();
+        self
+    }
+
+    pub fn search_only(mut self) -> Self {
+        self.search_only = true;
+        self
     }
 }
 
@@ -223,6 +238,10 @@ pub enum Band {
     Dismissing(f32),
 }
 
+/// How far a match on an item's hidden words, or on a search-only item, ranks below an ordinary label match.
+const WORDS_PENALTY: i32 = 1500;
+const SEARCH_ONLY_PENALTY: i32 = 500;
+
 /// Score a query against a label; None = no match.
 pub fn score(query: &str, label: &str) -> Option<i32> {
     let q: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).filter(|c| !c.is_whitespace()).collect();
@@ -330,7 +349,16 @@ impl Palette {
             .items
             .iter()
             .enumerate()
-            .filter_map(|(i, it)| score(&self.query, &it.label).map(|s| (s, i, self.recency(&it.key))))
+            // a search-only item (an app's action, Lock) is not listed while nothing has been typed
+            .filter(|(_, it)| !it.search_only || !self.query.trim().is_empty())
+            .filter_map(|(i, it)| {
+                // a label match always outranks a hidden-words match; a search-only item sits below an app's label hit
+                let penalty = if it.search_only { SEARCH_ONLY_PENALTY } else { 0 };
+                score(&self.query, &it.label)
+                    .map(|s| s - penalty)
+                    .or_else(|| (!it.search.is_empty()).then(|| score(&self.query, &it.search).map(|s| s - WORDS_PENALTY - penalty)).flatten())
+                    .map(|s| (s, i, self.recency(&it.key)))
+            })
             .collect();
         // Higher score first; among equals, more recent first (lower rank);
         // then the shell's own order.
@@ -955,5 +983,58 @@ mod step_tests {
         p.hover = Some(Hit::Row(2));
         assert_eq!(p.selected, Some(0));
         assert!(p.activate_selected().is_some());
+    }
+
+    // ---- the search finds more than names ----
+
+    fn labels(p: &Palette) -> Vec<String> { p.rows().map(|r| r.label.clone()).collect() }
+
+    #[test]
+    fn hidden_search_words_find_an_item_but_a_label_match_always_ranks_above_them() {
+        let mut p = Palette::default();
+        p.set_items(vec![
+            PaletteItem::new("app:ff", "Firefox", "app", PaletteAction::App("ff".into())).with_search("web browser internet"),
+            PaletteItem::new("app:bt", "xbxrxoxwxsxexrx", "app", PaletteAction::App("bt".into())), // matches "browser" only as scattered letters
+            PaletteItem::new("app:fl", "Files", "app", PaletteAction::App("fl".into())),
+        ]);
+        p.set_query("internet");
+        assert_eq!(labels(&p), vec!["Firefox"], "found by a word that is in no label");
+        p.set_query("browser");
+        assert_eq!(labels(&p), vec!["xbxrxoxwxsxexrx", "Firefox"], "even a scattered label match beats a perfect hidden-words match");
+        p.set_query("zzz");
+        assert!(labels(&p).is_empty());
+    }
+
+    #[test]
+    fn a_search_only_item_is_hidden_until_something_is_typed_and_ranks_below_an_apps_own_name() {
+        let mut p = Palette::default();
+        p.set_items(vec![
+            PaletteItem::new("app:ff", "Firefox", "app", PaletteAction::App("ff".into())),
+            PaletteItem::new("app:ff#priv", "New Private Window \u{b7} Firefox", "action", PaletteAction::App("ff#priv".into())).with_search("Firefox web browser").search_only(),
+            PaletteItem::new("app:system#lock", "Lock screen", "system", PaletteAction::App("system#lock".into())).search_only(),
+        ]);
+        assert_eq!(labels(&p), vec!["Firefox"], "an empty query lists only the ordinary items");
+        p.set_query("private");
+        assert_eq!(labels(&p), vec!["New Private Window \u{b7} Firefox"]);
+        p.set_query("fire");
+        assert_eq!(labels(&p)[0], "Firefox", "the app's own name first: {:?}", labels(&p));
+        assert_eq!(labels(&p).len(), 2, "and its action is still there");
+        p.set_query("lock");
+        assert_eq!(labels(&p), vec!["Lock screen"]);
+        p.set_query("");
+        assert_eq!(labels(&p), vec!["Firefox"], "cleared: back to the ordinary list");
+    }
+
+    #[test]
+    fn at_equal_match_quality_an_app_outranks_a_search_only_item_whatever_order_they_were_listed_in() {
+        let mut p = Palette::default();
+        // the search-only item is listed FIRST, so only the rank penalty can put the app above it
+        p.set_items(vec![
+            PaletteItem::new("app:sys#lock", "Lock", "system", PaletteAction::App("sys#lock".into())).search_only(),
+            PaletteItem::new("app:lock", "Lock", "app", PaletteAction::App("lock".into())),
+        ]);
+        p.set_query("lock");
+        let hints: Vec<&str> = p.rows().map(|r| r.hint).collect();
+        assert_eq!(hints, vec!["app", "system"], "the app first even though it was listed second");
     }
 }

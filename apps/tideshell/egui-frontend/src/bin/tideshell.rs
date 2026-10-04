@@ -725,6 +725,19 @@ fn main() {
     // The palette lists every hatch entry, not just the bar's favourites.
     let all_apps: Vec<(String, String)> = sb.system.launcher.as_ref().map(|l| l.results().map(|e| (e.id.clone(), e.name.clone())).collect()).unwrap_or_default();
     sb.shell.set_apps(all_apps);
+    // what lets the palette find more than names: an app's keywords, its desktop actions, and Lock (hatch's own search does)
+    if let Some(l) = sb.system.launcher.as_ref() {
+        let mut keywords = Vec::new();
+        let mut extras = Vec::new();
+        for e in l.all_entries() {
+            match &e.kind {
+                hatch_core::entry::EntryKind::App => { if !e.keywords.is_empty() { keywords.push((e.id.clone(), e.keywords.clone())); } }
+                hatch_core::entry::EntryKind::Action { .. } => extras.push((e.id.clone(), e.name.clone(), format!("{} {}", e.description, e.keywords), "action")),
+                hatch_core::entry::EntryKind::System(_) => extras.push((e.id.clone(), e.name.clone(), e.keywords.clone(), "system")),
+            }
+        }
+        sb.shell.set_app_search(keywords, extras);
+    }
 
     let ctx = egui::Context::default();
     let mut ui_prefs = settings_kit::Prefs::default();

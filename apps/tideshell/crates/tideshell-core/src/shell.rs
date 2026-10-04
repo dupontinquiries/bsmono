@@ -74,6 +74,9 @@ pub struct Shell {
     pub palette: Palette,
     /// Apps for the palette (desktop id, name), from hatch via the frontend.
     apps: Vec<(String, String)>,
+    /// Hidden search words per app id, and the search-only extras (see `set_app_search`).
+    app_keywords: std::collections::HashMap<String, String>,
+    app_extras: Vec<(String, String, String, &'static str)>,
     /// The palette asked for the settings sheet; the view takes it.
     pub settings_requested: bool,
     /// The lock cover (cover mode for now: swipe dismisses, no auth).
@@ -188,6 +191,8 @@ impl Shell {
             ambient,
             palette: Palette::default(),
             apps: Vec::new(),
+            app_keywords: std::collections::HashMap::new(),
+            app_extras: Vec::new(),
             settings_requested: false,
             lock: LockScreen::default(),
             sleep: Sleep::default(),
@@ -803,13 +808,27 @@ impl Shell {
         self.rebuild_palette();
     }
 
+    /// What lets the palette find more than app names: `keywords` is (desktop id, words) for apps ("browser" finds
+    /// Firefox), `extras` is (id, label, words, hint) for things that are not apps but launch through hatch (an app's
+    /// desktop actions, Lock): they appear only while a query is typed.
+    pub fn set_app_search(&mut self, keywords: Vec<(String, String)>, extras: Vec<(String, String, String, &'static str)>) {
+        self.app_keywords = keywords.into_iter().collect();
+        self.app_extras = extras;
+        self.rebuild_palette();
+    }
+
     fn rebuild_palette(&mut self) {
         let mut items = Vec::new();
         for w in self.switcher.cards() {
             items.push(PaletteItem::new(format!("win:{}", w.id), w.title.clone(), "running", PaletteAction::Window(w.id)));
         }
         for (id, name) in &self.apps {
-            items.push(PaletteItem::new(format!("app:{id}"), name.clone(), "app", PaletteAction::App(id.clone())));
+            let mut it = PaletteItem::new(format!("app:{id}"), name.clone(), "app", PaletteAction::App(id.clone()));
+            if let Some(words) = self.app_keywords.get(id) { it = it.with_search(words.clone()); }
+            items.push(it);
+        }
+        for (id, label, words, hint) in &self.app_extras {
+            items.push(PaletteItem::new(format!("app:{id}"), label.clone(), hint, PaletteAction::App(id.clone())).with_search(words.clone()).search_only());
         }
         let ab = if self.ambient.enabled { "Auto brightness: off" } else { "Auto brightness: on" };
         items.push(PaletteItem::new("set:autobright", ab, "setting", PaletteAction::ToggleAutoBrightness));
@@ -2472,6 +2491,24 @@ mod tests {
         sh.power_released(120, 8130); // the wake press's own release
         assert_eq!(sh.morse.entered(), 0, "that release is not the first dot");
     }
+    #[test]
+    fn the_palette_finds_an_apps_keywords_and_actions_through_the_shell() {
+        let mut sh = shell_with_three();
+        sh.set_apps(vec![("org.mozilla.firefox".into(), "Firefox".into()), ("org.gnome.Files".into(), "Files".into())]);
+        sh.set_app_search(
+            vec![("org.mozilla.firefox".into(), "web browser internet".into())],
+            vec![("org.mozilla.firefox#new-private-window".into(), "New Private Window \u{b7} Firefox".into(), "Firefox web browser".into(), "action")],
+        );
+        sh.palette.open_by_tap();
+        sh.palette.set_query("private");
+        let rows: Vec<_> = sh.palette.rows().map(|r| (r.label.clone(), r.action.clone())).collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].1, PaletteAction::App("org.mozilla.firefox#new-private-window".into()), "it launches through hatch by that id");
+        sh.palette.set_query("internet");
+        assert_eq!(sh.palette.rows().map(|r| r.label.clone()).collect::<Vec<_>>(), vec!["Firefox".to_string()]);
+        sh.palette.set_query("");
+        assert!(sh.palette.rows().all(|r| !r.label.contains('\u{b7}')), "no action rows while browsing");
+    }
 }
 
 #[cfg(test)]
@@ -2532,4 +2569,5 @@ mod cold_palette_tests {
         s.rebuild_palette();
         assert_eq!(hint(&s), "active");
     }
+
 }
