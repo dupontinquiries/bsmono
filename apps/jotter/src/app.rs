@@ -278,7 +278,9 @@ impl Jotter {
         for c in screens.get(page).map(|v| v.as_slice()).unwrap_or(&[]) {
             let tex = self.texture(ui.ctx(), &mats[c.frame]);
             let px = 1.0 / ppp;
-            let tl = rect.min + egui::vec2(c.x as f32 * px, c.y as f32 * px);
+            // snap the code's corner to a whole physical pixel: a fractional origin makes nearest-neighbour modules uneven
+            let snap = |v: f32| (v * ppp).round() / ppp;
+            let tl = egui::pos2(snap(rect.min.x + c.x as f32 * px), snap(rect.min.y + c.y as f32 * px));
             let quiet = share::QUIET as f32 * c.module_px as f32 * px;
             let side = mats[c.frame].size as f32 * c.module_px as f32 * px;
             ui.painter().image(tex.id(), egui::Rect::from_min_size(tl + egui::vec2(quiet, quiet), egui::vec2(side, side)), egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
