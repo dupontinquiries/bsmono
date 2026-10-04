@@ -8409,7 +8409,10 @@ fn main(@builtin(local_invocation_id) l:vec3<u32>, @builtin(workgroup_id) w:vec3
 // reads each — but the matmul's weight traffic is n·k and dominates bandwidth, so the redundant
 // 2·k input reads are noise next to saving a whole dispatch's encoder setup. Net win exactly when
 // setup cost > the extra reduction, which is the M4/Metal decode regime; LOGSCOPE_FUSE_NORM=0 backs
-// out to the two-dispatch path for the A/B. Output is bit-identical to RMSNORM then MATVEC_Q8_0.
+// out to the two-dispatch path for the A/B. Output equals RMSNORM then MATVEC_Q8_0 up to f32
+// reassociation (RMSNORM sums the squares serially, this tree-reduces them): measured 1.9e-6 at
+// k=128, NOT bit-identical as this line used to claim. Superseded by default by the V2 kernel
+// below (RMSNORM_MATVEC_Q8_V2); kept as the LOGSCOPE_FUSED_V2=0 fallback.
 const RMSNORM_MATVEC_Q8: &str = r#"
 // RMSNORM_MATVEC_Q8
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,eps:u32,_a:u32,_b:u32 };

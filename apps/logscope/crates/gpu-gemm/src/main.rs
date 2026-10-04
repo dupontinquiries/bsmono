@@ -8567,11 +8567,13 @@ gpu argmax {ga} (margin {gm:.3e}) | cross-impl max|Δlogit| {xe:.3e}{}",
         check("smart cache ranked two-tier eviction", if ok_store { 0.0 } else { 1.0 }, 0.5);
 
         // Fused RMSNorm+matvec (decode norm→matmul pair) against the explicit two-dispatch chain
-        // rmsnorm_t → linear_q8_0_t. The ORIGINAL kernel (v1) is bit-identical: same reduction,
-        // same accumulation order. The V2 kernel (the default since the word-per-thread rewrite)
-        // accumulates four weights per word and reduces 128-wide, so it is equal only to f32
-        // reassociation; --gate-fused-v2 is its full check, this pins that the default path still
-        // lands within 1e-5 of the chain.
+        // rmsnorm_t → linear_q8_0_t. This check used to say "must be bit-identical ... same
+        // reduction, same accumulation order" and pass at 1e-5, and the claim was never true:
+        // RMSNORM sums the squares single-threaded while the fused kernel tree-reduces them, and
+        // linear_q8_0_t at m=1 is V2Wg128, not MATVEC_Q8_0. Pinning the ORIGINAL kernel at tol 0.0
+        // failed at 1.9e-6, which is the honest number — both kernel generations are equal to the
+        // chain up to f32 reassociation, and 1e-5 is the bar for both. --gate-fused-v2 is the
+        // V2 kernels' full check (CPU oracle, ragged shapes, every tile).
         {
             let (n, k) = (96usize, 128usize);
             let w = rnd(n * k, 11);
