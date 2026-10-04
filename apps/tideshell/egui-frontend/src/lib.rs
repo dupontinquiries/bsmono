@@ -176,6 +176,8 @@ pub struct ShellView {
     /// gradient quads instead of a stretched texture. 60 bytes a window
     /// rather than a 5 kB upload.
     glass: Option<(Vec<[u8; 3]>, usize, usize)>,
+    /// A/B state for the lock-screen night wash: when the cover was last drawn and how many sessions so far.
+    ab: std::cell::Cell<(Option<std::time::Instant>, u32)>,
     /// Grain, uploaded once. Per-frame noise would put back exactly the data
     /// movement this avoids, and would shimmer.
     grain: Option<egui::TextureHandle>,
@@ -1016,6 +1018,22 @@ impl ShellView {
         out
     }
 
+    /// Which lock-screen session this is, counting up whenever the cover reappears after being away for 2 s or more.
+    /// Logs each new session once so a journal read says which variant was on screen when.
+    fn ab_session(&self, mode: &str) -> u32 {
+        let now = std::time::Instant::now();
+        let (last, n) = self.ab.get();
+        let n = match last {
+            Some(t) if now.duration_since(t) < std::time::Duration::from_secs(2) => n,
+            _ => {
+                eprintln!("lock-night A/B: session {} uses {} (mode {mode})", n + 1, if (n + 1) % 2 == 0 { "auto night curve" } else { "old fixed black" });
+                n + 1
+            }
+        };
+        self.ab.set((Some(now), n));
+        n
+    }
+
     fn cover(&self, p: &egui::Painter, shell: &Shell, info: &FrameInfo, origin: Pos2, size: Vec2) {
         let prog = shell.lock.reveal.progress;
         let alpha = (1.0 - prog * 0.8).clamp(0.0, 1.0);
@@ -1029,12 +1047,19 @@ impl ShellView {
         if let Some((cells, cols, rows)) = self.glass.clone() {
             let r = Rect::from_min_size(top, size);
             let corners = crate::wash::lattice(&cells, cols, rows);
-            let night = crate::wash::nightness(shell.ambient.smoothed_lux());
+            let auto = crate::wash::nightness(shell.ambient.smoothed_lux());
+            // None = the old fixed black point (24); Some(n) = the night curve at nightness n
+            let night: Option<f32> = match shell.prefs.lock_night.as_str() {
+                "off" => None,
+                "force" => Some(1.0),
+                "ab" => if self.ab_session(shell.prefs.lock_night.as_str()) % 2 == 0 { Some(auto) } else { None },
+                _ => Some(auto),
+            };
             let mut mesh = egui::Mesh::default();
             for gy in 0..=rows {
                 for gx in 0..=cols {
                     let c = corners[gy * (cols + 1) + gx];
-                    let c = if self.oled == Some(true) { crate::wash::night_wash(c, night) } else { c };
+                    let c = match (self.oled == Some(true), night) { (true, Some(n)) => crate::wash::night_wash(c, n), (true, None) => crate::wash::black_point(c, 24), _ => c };
                     let p = Pos2::new(r.left() + r.width() * gx as f32 / cols as f32, r.top() + r.height() * gy as f32 / rows as f32);
                     mesh.vertices.push(egui::epaint::Vertex {
                         pos: p,
@@ -1938,6 +1963,12 @@ impl ShellView {
                     }
                 });
                 ui.checkbox(&mut draft.living, "Living lock screen (rear camera glass; uses the GPU)");
+                ui.horizontal(|ui| {
+                    ui.label("Lock-screen night black (OLED):");
+                    for (v, label) in [("on", "auto"), ("off", "old"), ("ab", "A/B"), ("force", "force night")] {
+                        ui.radio_value(&mut draft.lock_night, v.to_string(), label);
+                    }
+                });
                 ui.separator();
                 ui.label("Unlock pattern (power key: . short, - long, 3+ symbols; empty = swipe only)");
                 ui.add(egui::TextEdit::singleline(&mut draft.unlock_morse).id(egui::Id::new("ts-morse")).hint_text("..-").desired_width(160.0));

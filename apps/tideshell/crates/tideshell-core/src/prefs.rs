@@ -60,6 +60,10 @@ pub struct ShellPrefs {
     pub hemisphere: String,
     /// The living design (season/time-of-day colour and motion) on/off.
     pub living: bool,
+    /// The lock-screen wash on an OLED panel: `on` (the night gate and compressor), `off` (the old fixed black
+    /// point), or `ab` (alternate on every new lock-screen session, logging which, to dogfood the two), or
+    /// `force` (full night whatever the room, to see it with the lights on).
+    pub lock_night: String,
     /// How brightness reaches the panel: smooth (a rate-limited ramp),
     /// stepped (>= 5% steps, 2/s), safe (one write once the value has
     /// settled). auto = safe on a DSI backlight (the FP5's DPU driver
@@ -130,6 +134,7 @@ impl Default for ShellPrefs {
             min_target: 0.0,
             hemisphere: "north".into(),
             living: true,
+            lock_night: "on".into(),
             cold: "auto".into(),
             ambient_mic: true,
             audio_tone: 0.0,
@@ -175,7 +180,7 @@ impl HomeWidget {
     }
 }
 
-pub const KEYS: [&str; 32] = [
+pub const KEYS: [&str; 33] = [
     "shell.layout",
     "shell.bar.widgets",
     "shell.bar.width",
@@ -196,6 +201,7 @@ pub const KEYS: [&str; 32] = [
     "shell.scale.min_target",
     "shell.hemisphere",
     "shell.living",
+    "shell.lock.night",
     "shell.cold",
     "shell.ambient.mic",
     "shell.audio.tone",
@@ -240,6 +246,7 @@ impl ShellPrefs {
             ("shell.scale.min_target".into(), format!("{:.0}", self.min_target)),
             ("shell.hemisphere".into(), self.hemisphere.clone()),
             ("shell.living".into(), if self.living { "on" } else { "off" }.into()),
+            ("shell.lock.night".into(), self.lock_night.clone()),
             ("shell.cold".into(), self.cold.clone()),
             ("shell.ambient.mic".into(), if self.ambient_mic { "on" } else { "off" }.into()),
             ("shell.audio.tone".into(), format!("{:.3}", self.audio_tone)),
@@ -327,6 +334,12 @@ impl ShellPrefs {
                 self.hemisphere = v.to_string();
             }
             "shell.living" => self.living = parse_on_off(key, v)?,
+            "shell.lock.night" => {
+                if !matches!(v, "on" | "off" | "ab" | "force") {
+                    return Err(format!("shell.lock.night: '{v}' is not on|off|ab|force"));
+                }
+                self.lock_night = v.to_string();
+            }
             "shell.cold" => {
                 if !matches!(v, "auto" | "on" | "off") {
                     return Err(format!("shell.cold: '{v}' is not auto|on|off"));
@@ -455,6 +468,7 @@ mod tests {
         p.hemisphere = "south".into();
         p.brightness_mode = "stepped".into();
         p.living = false;
+        p.lock_night = "ab".into();
         p.rotate_flip = true;
         p.home_widget = HomeWidget::Temperature;
         p.unlock_morse = ".-.".into();
