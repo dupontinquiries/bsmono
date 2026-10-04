@@ -345,8 +345,13 @@ mod tests {
             // made and caught earlier in cleanup.rs/deltahostile.rs. The
             // property that holds in BOTH cases is that the healthy file
             // is still correctly verified either way.
-            assert_eq!(rep.ok, 1, "the healthy file must still be verified regardless of the other file's readability");
-            if !rep.read_errors.is_empty() {
+            // ...and the assertion has to say that in BOTH cases too: as root the "dying" file
+            // reads fine and is verified, so ok is 2, not 1 — this line asserted 1 unconditionally
+            // and failed in a root sandbox while its own comment above explained why it would.
+            if rep.read_errors.is_empty() {
+                assert_eq!(rep.ok, 2, "as root both files read, and both must verify");
+            } else {
+                assert_eq!(rep.ok, 1, "the healthy file must still be verified regardless of the other file's readability");
                 assert_eq!(rep.read_errors[0].0, "dying.bin");
                 assert!(!rep.clean(), "a real read error must make the report non-clean");
             }
