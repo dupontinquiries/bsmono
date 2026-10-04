@@ -40,6 +40,7 @@ pub mod orbs;
 pub mod cold;
 pub mod control_center;
 pub mod cursor;
+pub mod daygraph;
 pub mod dimming;
 pub mod edge;
 pub mod hold;

@@ -1244,6 +1244,45 @@ impl ShellView {
         }
     }
 
+    /// The thin bar's clock: the day as two bars on a grid, time running down (see `tideshell_core::daygraph`). The left
+    /// bar fills to now, the right one is how bright the shell runs through the day (dark in the night window), the
+    /// grid has a tick every three hours, and a marker crosses both bars at the present.
+    fn bar_day_graph(p: &egui::Painter, r: Rect, minute: u32, night: &tideshell_core::ambient::NightWindow, pal: &PaletteColors) {
+        let g = tideshell_core::daygraph::layout(minute, night);
+        let top = r.top() + 3.0;
+        let h = (r.height() - 6.0).max(8.0);
+        let bar_w = ((r.width() - 10.0) / 2.0 - 1.0).clamp(4.0, 11.0);
+        let x0 = r.center().x - bar_w - 1.5;
+        let (left, right) = (Rect::from_min_size(Pos2::new(x0, top), Vec2::new(bar_w, h)), Rect::from_min_size(Pos2::new(x0 + bar_w + 3.0, top), Vec2::new(bar_w, h)));
+        let y_at = |f: f32| top + h * f;
+        // left bar: the day gone
+        p.rect_filled(left, cr(2), pal.bg_raised);
+        p.rect_filled(Rect::from_min_max(left.min, Pos2::new(left.right(), y_at(g.now))), cr(2), with_alpha(pal.accent, 0.7));
+        // right bar: brightness through the day, a slice per half hour
+        let (night_col, day_col) = ((28.0f32, 30.0, 48.0), (150.0f32, 190.0, 210.0));
+        p.rect_filled(right, cr(2), Color32::from_rgb(night_col.0 as u8, night_col.1 as u8, night_col.2 as u8));
+        for (i, lv) in g.level.iter().enumerate() {
+            let (a, b) = (y_at(i as f32 / g.level.len() as f32), y_at((i + 1) as f32 / g.level.len() as f32));
+            let mix = |n: f32, d: f32| (n + (d - n) * lv) as u8;
+            let c = Color32::from_rgb(mix(night_col.0, day_col.0), mix(night_col.1, day_col.1), mix(night_col.2, day_col.2));
+            p.rect_filled(Rect::from_min_max(Pos2::new(right.left(), a), Pos2::new(right.right(), b + 0.5)), 0.0, c);
+        }
+        // the grid
+        for t in &g.ticks {
+            let y = y_at(t.at);
+            let (x0, x1) = if t.major { (left.left() - 3.0, right.right() + 3.0) } else { (left.left(), right.right()) };
+            p.line_segment([Pos2::new(x0, y), Pos2::new(x1, y)], Stroke::new(1.0, with_alpha(pal.text, if t.major { 0.55 } else { 0.25 })));
+        }
+        // now
+        let y = y_at(g.now);
+        p.line_segment([Pos2::new(left.left() - 4.0, y), Pos2::new(right.right() + 4.0, y)], Stroke::new(2.0, pal.text));
+        p.add(egui::Shape::convex_polygon(
+            vec![Pos2::new(left.left() - 6.0, y - 3.0), Pos2::new(left.left() - 6.0, y + 3.0), Pos2::new(left.left() - 2.0, y)],
+            pal.text,
+            Stroke::NONE,
+        ));
+    }
+
     /// A small analog face for the bar: ring, four ticks, hour and minute hands (the minute hand is
     /// absent for hour-fuzzy, and weekday mode writes the day's three letters instead).
     fn bar_analog_clock(p: &egui::Painter, c: Pos2, r: f32, t: tideshell_core::clock::LocalTime, f: tideshell_core::clock::Fuzzy, col: Color32) {
@@ -1624,7 +1663,10 @@ impl ShellView {
             let wid = Id::new(("ts-bar", pl.index));
             match &widgets[pl.index] {
                 BarWidget::Clock => {
-                    if shell.prefs.clock_style == tideshell_core::clock::ClockStyle::Analog {
+                    if shell.prefs.layout == tideshell_core::prefs::Layout::Thin && !expanded {
+                        // 32 px wide: neither a face nor "12:34" fits; the day as a graph does
+                        Self::bar_day_graph(&p, r, info.time.hour * 60 + info.time.minute, &shell.prefs.night, pal);
+                    } else if shell.prefs.clock_style == tideshell_core::clock::ClockStyle::Analog {
                         // The same style choice as the cover clock; hands follow the same fuzzy snap.
                         let rad = (r.width().min(r.height()) / 2.0 - 3.0).min(unit * 0.5).max(10.0);
                         Self::bar_analog_clock(&p, r.center(), rad, info.time, shell.prefs.clock_fuzzy, pal.text);
