@@ -3587,12 +3587,25 @@ the signal for these models.", m.mla_layers(), m.n_layers, m.deltanet_layers());
         let q4t = resident_weight_bytes(&shape6, Residency::Q4) + kv_cache_bytes(&shape6, 4096, 2) + ovh;
         let budget = (i8t + q4t) / 2;
         let plan_q4 = matches!(plan(&shape6, budget, 4096, 2, ovh), Fit::Resident { fmt: Residency::Q4, .. });
-        std::env::set_var("LOGSCOPE_MAX_RESIDENT_GB", format!("{:.9}", budget as f64 / (1u64 << 30) as f64));
+        // The loader plans against the GPU-BUFFER budget, which gpu_buffer_budget_uma derives from the
+        // resident budget (half of it, capped) — so a between-budget handed over as
+        // LOGSCOPE_MAX_RESIDENT_GB alone arrives at plan() halved, below even the q4 total, and the
+        // load is REFUSED rather than auto-q4. That is what this check reported as a failure from the
+        // day the halving landed. LOGSCOPE_MAX_GPU_GB is the override that reaches plan() as given,
+        // and it is what the check is about: the loader's choice at a budget that fits q4 and not int8.
+        let set_budget = |b: u64| {
+            let gb = format!("{:.9}", b as f64 / (1u64 << 30) as f64);
+            std::env::set_var("LOGSCOPE_MAX_RESIDENT_GB", &gb);
+            std::env::set_var("LOGSCOPE_MAX_GPU_GB", &gb);
+        };
+        set_budget(budget);
         let auto = gpu.load_gguf_quantized(&write_gguf(&hm));
+        if let Err(e) = &auto { eprintln!("gate-q4resident: between-budget load refused: {e}"); }
         let auto_is_q4 = auto.as_ref().map(|m| gpu.model_forward(m, &ids) == lq).unwrap_or(false);
-        std::env::set_var("LOGSCOPE_MAX_RESIDENT_GB", format!("{:.9}", (q4t / 2) as f64 / (1u64 << 30) as f64));
+        set_budget(q4t / 2);
         let refused = gpu.load_gguf_quantized(&write_gguf(&hm)).is_err();
         std::env::remove_var("LOGSCOPE_MAX_RESIDENT_GB");
+        std::env::remove_var("LOGSCOPE_MAX_GPU_GB");
         ck("memplan picks q4 at the between-budget", plan_q4);
         ck("loader AUTO-selects q4 when int8 won't fit (no flag) → bit-identical to forced q4", auto.is_ok() && auto_is_q4);
         ck("loader refuses with a number when even q4 won't fit", refused);
