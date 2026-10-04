@@ -22,7 +22,16 @@ use capture_kit::RawFrame;
 pub const FRESH_FRAMES: u64 = 2;
 pub const SETTLE_MS: u64 = 150;
 /// The whole search.
-pub const TIMEOUT_MS: u64 = 7_000;
+pub const TIMEOUT_MS: u64 = 12_000;
+/// A probe is the MEDIAN of this many settled frames: one frame of a smooth face is mostly sensor noise (scores
+/// of 0.3-0.5 across the whole lens range in the first field log), and a peak picked from noise leaves the lens at
+/// an arbitrary spot.
+pub const AVG_FRAMES: usize = 3;
+/// After the search the lens is re-measured where it was left: it must score at least this much of the peak the
+/// search found, or the peak was noise, the scene moved, or the motor landed somewhere else.
+pub const VERIFY_RATIO: f64 = 0.85;
+/// How far (lens steps) to nudge either side when the landing does not reproduce the peak.
+pub const NUDGE: i64 = 10;
 /// The scored region: a square of this fraction of each axis, centred on the tap.
 pub const ROI_SIZE: f32 = 0.18;
 /// How long the result is shown over the picture.
@@ -68,7 +77,15 @@ struct Probe {
 
 enum State {
     Idle,
-    Searching { search: Search, roi: [f32; 4], probe: Option<Probe>, started_ms: u64, previous: Option<i64> },
+    Searching { search: Search, roi: [f32; 4], probe: Option<Probe>, started_ms: u64, previous: Option<i64>, acc: Vec<f64> },
+    /// The search found `want` at `target`; the lens is re-measured there (and a little either side) before it is
+    /// called locked. `todo` is the nudges still to try, `best` the best (position, score) re-measured so far.
+    Verifying { roi: [f32; 4], want: f64, contrast: f64, probe: Option<Probe>, started_ms: u64, previous: Option<i64>, acc: Vec<f64>, best: (i64, f64), todo: Vec<i64> },
+}
+
+fn median(v: &mut [f64]) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v[v.len() / 2]
 }
 
 /// What the picture should show over the tap.
@@ -92,12 +109,12 @@ impl Default for TapFocus {
 }
 
 impl TapFocus {
-    pub fn is_searching(&self) -> bool { matches!(self.state, State::Searching { .. }) }
+    pub fn is_searching(&self) -> bool { matches!(self.state, State::Searching { .. } | State::Verifying { .. }) }
 
     /// Start (or restart) a search on `roi` (frame fractions). `tap` is where to draw the ring.
     pub fn begin(&mut self, roi: [f32; 4], tap: [f32; 2], act: &Actuator, lens: &mut dyn Lens, now_ms: u64) {
         let (min, max, step) = act.range;
-        self.state = State::Searching { search: Search::new(min, max, step), roi, probe: None, started_ms: now_ms, previous: lens.current() };
+        self.state = State::Searching { search: Search::new(min, max, step), roi, probe: None, started_ms: now_ms, previous: lens.current(), acc: Vec::new() };
         self.tapped_at = Some(tap);
         self.result = None;
     }
@@ -110,49 +127,102 @@ impl TapFocus {
 
     /// Feed the newest frame. Returns the verdict on the call that finishes the search.
     pub fn on_frame(&mut self, f: &RawFrame, now_ms: u64, lens: &mut dyn Lens) -> Option<Verdict> {
-        let State::Searching { search, roi, probe, started_ms, previous } = &mut self.state else { return None };
-        if now_ms.saturating_sub(*started_ms) > TIMEOUT_MS {
+        let (started, searching) = match &self.state {
+            State::Idle => return None,
+            State::Searching { started_ms, .. } => (*started_ms, true),
+            State::Verifying { started_ms, .. } => (*started_ms, false),
+        };
+        if now_ms.saturating_sub(started) > TIMEOUT_MS {
             return self.finish(Verdict::Failed("focus timed out".into()), now_ms);
         }
+        if searching { self.search_frame(f, now_ms, lens) } else { self.verify_frame(f, now_ms, lens) }
+    }
+
+    fn search_frame(&mut self, f: &RawFrame, now_ms: u64, lens: &mut dyn Lens) -> Option<Verdict> {
+        let State::Searching { search, roi, probe, previous, acc, .. } = &mut self.state else { return None };
+        let mut verify: Option<(i64, f64, f64)> = None; // (position, peak, contrast) to re-measure
+        let mut verdict: Option<Verdict> = None;
         loop {
             match probe {
                 None => match search.step() {
                     Step::Probe(p) => {
-                        if let Err(e) = lens.move_to(p) { return self.finish(Verdict::Failed(e), now_ms); }
+                        if let Err(e) = lens.move_to(p) { verdict = Some(Verdict::Failed(e)); break; }
+                        acc.clear();
                         *probe = Some(Probe { pos: p, issued_ms: now_ms, issued_seq: f.seq });
                         return None; // the frames in flight are the old position's
                     }
                     Step::Done(o) => {
-                        if trace() { eprintln!("af: DONE position={:?} peak={:.1} contrast={:.2} probes={}", o.position, o.peak, o.contrast, o.probes); }
-                        let verdict = match o.position {
-                            Some(p) => match lens.move_to(p) {
-                                Ok(()) => Verdict::Locked { pos: p, contrast: o.contrast },
-                                Err(e) => Verdict::Failed(e),
-                            },
+                        if trace() { eprintln!("af: DONE position={:?} peak={:.3} contrast={:.2} probes={}", o.position, o.peak, o.contrast, o.probes); }
+                        match o.position {
+                            Some(p) => verify = Some((p, o.peak, o.contrast)),
                             None => {
                                 // refuse: back to where the lens was, when it can say
                                 if let Some(prev) = *previous { let _ = lens.move_to(prev); }
-                                Verdict::Refused
+                                verdict = Some(Verdict::Refused);
                             }
-                        };
-                        return self.finish(verdict, now_ms);
+                        }
+                        break;
                     }
                 },
                 Some(pr) => {
                     let settled = now_ms.saturating_sub(pr.issued_ms) >= SETTLE_MS && f.seq >= pr.issued_seq + FRESH_FRAMES;
                     if trace() {
                         if let Some(s) = focus::sharpness(f, *roi) {
-                            eprintln!("af: pos={} +{}ms seq+{} score={:.1} settled={settled}", pr.pos, now_ms.saturating_sub(pr.issued_ms), f.seq.saturating_sub(pr.issued_seq), s);
+                            eprintln!("af: pos={} +{}ms seq+{} score={:.3} settled={settled}", pr.pos, now_ms.saturating_sub(pr.issued_ms), f.seq.saturating_sub(pr.issued_seq), s);
                         }
                     }
                     if !settled { return None; }
                     let Some(score) = focus::sharpness(f, *roi) else { return None }; // a torn frame: wait for the next
-                    if trace() { eprintln!("af: PROBE pos={} score={:.1}", pr.pos, score); }
-                    search.feed(score);
+                    acc.push(score);
+                    if acc.len() < AVG_FRAMES { return None; } // a median of several frames, not one noisy one
+                    let m = median(acc);
+                    acc.clear();
+                    if trace() { eprintln!("af: PROBE pos={} score={:.3}", pr.pos, m); }
+                    search.feed(m);
                     *probe = None; // ask for the next one in this same call
                 }
             }
         }
+        if let Some(v) = verdict { return self.finish(v, now_ms); }
+        let (p, peak, contrast) = verify?;
+        // Re-measure where the lens is about to be left: the first stop is the answer itself, then nudges either side.
+        let roi = *roi;
+        let previous = *previous;
+        let mut todo = vec![p - 2 * NUDGE, p + 2 * NUDGE, p - NUDGE, p + NUDGE, p];
+        let first = todo.pop().unwrap();
+        if let Err(e) = lens.move_to(first) { return self.finish(Verdict::Failed(e), now_ms); }
+        let started_ms = match &self.state { State::Searching { started_ms, .. } => *started_ms, _ => now_ms };
+        self.state = State::Verifying { roi, want: peak, contrast, probe: Some(Probe { pos: first, issued_ms: now_ms, issued_seq: f.seq }), started_ms, previous, acc: Vec::new(), best: (p, 0.0), todo };
+        None
+    }
+
+    fn verify_frame(&mut self, f: &RawFrame, now_ms: u64, lens: &mut dyn Lens) -> Option<Verdict> {
+        let State::Verifying { roi, want, contrast, probe, previous, acc, best, todo, .. } = &mut self.state else { return None };
+        let Some(pr) = *probe else { return None };
+        let settled = now_ms.saturating_sub(pr.issued_ms) >= SETTLE_MS && f.seq >= pr.issued_seq + FRESH_FRAMES;
+        if !settled { return None; }
+        let Some(score) = focus::sharpness(f, *roi) else { return None };
+        acc.push(score);
+        if acc.len() < AVG_FRAMES { return None; }
+        let m = median(acc);
+        acc.clear();
+        if trace() { eprintln!("af: VERIFY pos={} score={:.3} want>={:.3}", pr.pos, m, *want * VERIFY_RATIO); }
+        if m > best.1 { *best = (pr.pos, m); }
+        if m >= *want * VERIFY_RATIO {
+            // reproduced: this is where the lens is, and it is sharp
+            let (pos, c) = (pr.pos, *contrast);
+            return self.finish(Verdict::Locked { pos, contrast: c }, now_ms);
+        }
+        if let Some(next) = todo.pop() {
+            if let Err(e) = lens.move_to(next) { return self.finish(Verdict::Failed(e), now_ms); }
+            *probe = Some(Probe { pos: next, issued_ms: now_ms, issued_seq: f.seq });
+            return None;
+        }
+        // Nothing near the answer reproduced the peak: it was noise, or the scene moved. Do not leave the lens
+        // somewhere blurry; go back to where it was.
+        if trace() { eprintln!("af: REFUSED after verify: best {:.3} at {} never reached {:.3}", best.1, best.0, *want * VERIFY_RATIO); }
+        if let Some(prev) = *previous { let _ = lens.move_to(prev); }
+        self.finish(Verdict::Refused, now_ms)
     }
 
     fn finish(&mut self, v: Verdict, now_ms: u64) -> Option<Verdict> {
@@ -255,16 +325,20 @@ mod tests {
     /// A scene seen through a lens: two regions with their own best lens position. A frame's local
     /// contrast falls off as the lens leaves a region's best position.
     #[derive(Clone, Copy)]
-    struct Scene { left_peak: i64, right_peak: i64, flat: bool }
+    struct Scene { left_peak: i64, right_peak: i64, flat: bool, width: f32, noise: u32, drift_at: u64, drift: i64 }
 
     fn frame(scene: &Scene, lens_pos: i64, seq: u64) -> RawFrame {
         let (w, h) = (160u32, 90u32);
         let mut v = Vec::with_capacity((w * h * 4) as usize);
         for y in 0..h {
             for x in 0..w {
-                let peak = if x < w / 2 { scene.left_peak } else { scene.right_peak };
-                let d = (lens_pos - peak) as f32 / 180.0;
-                let contrast = if scene.flat { 0.0 } else { (-d * d).exp() };
+                let peak = (if x < w / 2 { scene.left_peak } else { scene.right_peak }) + if seq >= scene.drift_at { scene.drift } else { 0 };
+                let d = (lens_pos - peak) as f32 / scene.width;
+                let contrast = if scene.noise != 0 {
+                    // no real peak: a different amount of texture every frame, whatever the lens does
+                    let r = (seq.wrapping_mul(2654435761).wrapping_add(scene.noise as u64 * 40503) >> 7) % 1000;
+                    0.25 + 0.12 * (r as f32 / 1000.0)
+                } else if scene.flat { 0.0 } else { (-d * d).exp() };
                 let chk = if (x + y) % 2 == 0 { 1.0 } else { -1.0 };
                 v.extend_from_slice(&[(128.0 + 100.0 * contrast * chk) as u8, (128.0 + 100.0 * contrast * chk) as u8, (128.0 + 100.0 * contrast * chk) as u8, 255]);
             }
@@ -306,7 +380,7 @@ mod tests {
 
     #[test]
     fn it_finds_the_peak_in_the_tapped_region_despite_the_pipeline_lag() {
-        let scene = Scene { left_peak: 300, right_peak: 800, flat: false };
+        let scene = Scene { left_peak: 300, right_peak: 800, flat: false, width: 180.0, noise: 0, drift_at: u64::MAX, drift: 0 };
         // tap on the left
         let (v, lens, _) = run(scene, [0.1, 0.3, 0.3, 0.6], 100, 3);
         let Some(Verdict::Locked { pos, .. }) = v else { panic!("{v:?}") };
@@ -320,7 +394,7 @@ mod tests {
 
     #[test]
     fn a_flat_scene_is_refused_and_the_lens_goes_back() {
-        let scene = Scene { left_peak: 300, right_peak: 800, flat: true };
+        let scene = Scene { left_peak: 300, right_peak: 800, flat: true, width: 180.0, noise: 0, drift_at: u64::MAX, drift: 0 };
         let (v, lens, _) = run(scene, [0.4, 0.4, 0.6, 0.6], 555, 2);
         assert_eq!(v, Some(Verdict::Refused));
         assert_eq!(lens.pos, 555, "back where it started");
@@ -330,7 +404,7 @@ mod tests {
     fn a_probe_is_scored_only_on_a_settled_fresh_frame() {
         // with a lag of 3 frames the search only works if the controller waits: scoring the frame
         // right after a move reads the old position. Check the wait directly.
-        let scene = Scene { left_peak: 600, right_peak: 600, flat: false };
+        let scene = Scene { left_peak: 600, right_peak: 600, flat: false, width: 180.0, noise: 0, drift_at: u64::MAX, drift: 0 };
         let mut lens = FakeLens::new(100, 3);
         let mut tf = TapFocus::default();
         tf.begin([0.2, 0.2, 0.8, 0.8], [0.5, 0.5], &act(), &mut lens, 0);
@@ -343,15 +417,20 @@ mod tests {
             tf.on_frame(&frame(&scene, lens.seen(), seq), t, &mut lens);
             assert_eq!(lens.moves.len(), 1, "still waiting at {t} ms (seq {seq})");
         }
-        // 2 frames past and 150 ms later: the next probe goes out
+        // 2 frames past and 150 ms later the frames count, but a probe is the median of AVG_FRAMES of them
+        for (seq, t) in [(5u64, 200u64), (6, 233)] {
+            lens.tick();
+            tf.on_frame(&frame(&scene, lens.seen(), seq), t, &mut lens);
+            assert_eq!(lens.moves.len(), 1, "still collecting frames for this probe at {t} ms");
+        }
         lens.tick();
-        tf.on_frame(&frame(&scene, lens.seen(), 5), 200, &mut lens);
-        assert_eq!(lens.moves.len(), 2, "scored, then the next position asked for");
+        tf.on_frame(&frame(&scene, lens.seen(), 7), 266, &mut lens);
+        assert_eq!(lens.moves.len(), 2, "scored (median of three), then the next position asked for");
     }
 
     #[test]
     fn it_times_out_if_frames_never_settle_and_restarts_on_a_new_tap() {
-        let scene = Scene { left_peak: 500, right_peak: 500, flat: false };
+        let scene = Scene { left_peak: 500, right_peak: 500, flat: false, width: 180.0, noise: 0, drift_at: u64::MAX, drift: 0 };
         let mut lens = FakeLens::new(0, 0);
         let mut tf = TapFocus::default();
         tf.begin([0.3, 0.3, 0.7, 0.7], [0.5, 0.5], &act(), &mut lens, 0);
@@ -370,7 +449,7 @@ mod tests {
 
     #[test]
     fn the_ring_shows_searching_then_the_result_and_fades() {
-        let scene = Scene { left_peak: 500, right_peak: 500, flat: false };
+        let scene = Scene { left_peak: 500, right_peak: 500, flat: false, width: 180.0, noise: 0, drift_at: u64::MAX, drift: 0 };
         let (v, _, t) = run(scene, [0.3, 0.3, 0.7, 0.7], 0, 1);
         assert!(matches!(v, Some(Verdict::Locked { .. })));
         let mut tf = TapFocus::default();
@@ -438,5 +517,77 @@ mod tests {
         assert!(!tap_counts([450.0, 350.0], shown, 280.0), "below the picture");
         assert!(!tap_counts([950.0, 100.0], shown, 280.0), "beside it");
         assert!(tap_counts([800.0, 290.0], shown, f32::INFINITY), "with no controls known yet the picture alone decides");
+    }
+
+    /// A lens that lands short or long depending on which way it was moved (a voice coil's hysteresis), with the
+    /// pipeline lag. `effective()` is where the glass really is.
+    struct HystLens { cmd: i64, bias: i64, history: Vec<i64>, lag: usize, up: i64, down: i64, moves: Vec<i64> }
+    impl HystLens {
+        fn new(pos: i64, lag: usize, up: i64, down: i64) -> HystLens { HystLens { cmd: pos, bias: 0, history: vec![], lag, up, down, moves: vec![] } }
+        fn effective(&self) -> i64 { self.cmd + self.bias }
+        fn tick(&mut self) { let e = self.effective(); self.history.push(e); }
+        fn seen(&self) -> i64 { let n = self.history.len(); self.history[n.saturating_sub(1 + self.lag)] }
+    }
+    impl Lens for HystLens {
+        fn move_to(&mut self, pos: i64) -> Result<(), String> {
+            if pos > self.cmd { self.bias = self.up; } else if pos < self.cmd { self.bias = self.down; }
+            self.cmd = pos; self.moves.push(pos); Ok(())
+        }
+        fn current(&mut self) -> Option<i64> { Some(self.cmd) }
+    }
+
+    fn run_hyst(scene: Scene, start: i64, up: i64, down: i64) -> (Option<Verdict>, HystLens) {
+        let mut lens = HystLens::new(start, 2, up, down);
+        let mut tf = TapFocus::default();
+        tf.begin([0.2, 0.2, 0.8, 0.8], [0.5, 0.5], &act(), &mut lens, 0);
+        let mut verdict = None;
+        for seq in 0..500u64 {
+            lens.tick();
+            let f = frame(&scene, lens.seen(), seq);
+            if let Some(v) = tf.on_frame(&f, seq * 33, &mut lens) { verdict = Some(v); break; }
+        }
+        (verdict, lens)
+    }
+
+    #[test]
+    fn a_lens_that_lands_short_or_long_still_ends_up_sharp_because_the_landing_is_re_measured() {
+        // a sharp-ish peak (width 60) and a motor that lands 30 steps off depending on the direction of travel: when the
+        // final move comes from the other side than the probe did, the glass ends up 60 steps from where it was measured
+        // (score x0.37). Many starts and peaks, so some of them do arrive from the other side.
+        let mut worst = 0;
+        for peak in [300, 500, 800] {
+            for start in [0, 100, 250, 400, 650, 800, 950, 1023] {
+                let scene = Scene { left_peak: peak, right_peak: peak, flat: false, width: 60.0, noise: 0, drift_at: u64::MAX, drift: 0 };
+                let (v, lens) = run_hyst(scene, start, -30, 30);
+                let Some(Verdict::Locked { .. }) = v else { panic!("peak {peak} start {start}: {v:?}") };
+                let off = (lens.effective() - peak).abs();
+                worst = worst.max(off);
+                assert!(off <= 35, "peak {peak} start {start}: the glass ends {off} steps from the peak (effective {}, commanded {})", lens.effective(), lens.cmd);
+            }
+        }
+        assert!(worst <= 35, "worst {worst}");
+    }
+
+    #[test]
+    fn a_peak_that_is_gone_when_the_lens_arrives_is_refused_not_locked() {
+        // run once to learn which frame the search ends on, then move the subject just before that: the sweep found a
+        // real peak, and the re-measure at the answer finds nothing
+        let steady = Scene { left_peak: 400, right_peak: 400, flat: false, width: 60.0, noise: 0, drift_at: u64::MAX, drift: 0 };
+        let (_, _, t) = run(steady, [0.2, 0.2, 0.8, 0.8], 100, 2);
+        let end_seq = t / 33;
+        let moved = Scene { drift_at: end_seq.saturating_sub(12), drift: 500, ..steady };
+        let (v, lens, _) = run(moved, [0.2, 0.2, 0.8, 0.8], 100, 2);
+        assert_eq!(v, Some(Verdict::Refused), "the peak moved away during the search");
+        assert_eq!(lens.pos, 100, "and the lens went back instead of staying on a spot that is now blurry");
+    }
+
+    #[test]
+    fn a_scene_with_no_real_peak_is_never_locked_even_when_noise_makes_one_look_good() {
+        for seed in 1..=12u32 {
+            let scene = Scene { left_peak: 500, right_peak: 500, flat: false, width: 180.0, noise: seed, drift_at: u64::MAX, drift: 0 };
+            let (v, lens, _) = run(scene, [0.3, 0.3, 0.7, 0.7], 321, 2);
+            assert!(!matches!(v, Some(Verdict::Locked { .. })), "seed {seed}: noise was locked as focus ({v:?})");
+            assert_eq!(lens.pos, 321, "seed {seed}: the lens did not go back");
+        }
     }
 }
