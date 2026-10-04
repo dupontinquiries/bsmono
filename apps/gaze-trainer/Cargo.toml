@@ -1,0 +1,28 @@
+[package]
+name = "gaze-trainer"
+version = "0.1.0"
+edition = "2021"
+description = "Train and test a gaze-to-screen model on the phone: dots to look at, the front camera, a small network trained on the device from what it saw, then a live test of how well it predicts where you look."
+
+[[bin]]
+name = "gaze-trainer"
+path = "src/main.rs"
+required-features = ["app"]
+
+[features]
+# The library (features, dataset, models, evaluation, the dot schedule) is feature-free and tests without a display or a
+# camera; `app` adds the window. Default-on so a plain release build gives the deployable binary, as the rest of the fleet.
+default = ["app"]
+app = ["dep:eframe", "dep:egui", "dep:uikit-egui"]
+
+[dependencies]
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+egui = { version = "0.34", optional = true }
+uikit-egui = { path = "../../shared/uikit/crates/uikit-egui", optional = true }
+capture-kit = { path = "../../shared/capture-kit" }
+# YuNet through tract: the face and eye landmarks the whole pipeline hangs from (always on: the features need its Face type)
+gaze-kit = { path = "../../shared/gaze-kit", features = ["yunet"] }
+orlosky-kit = { path = "../../shared/orlosky-kit" }
+
+[dev-dependencies]
+tempfile = "3.8"
