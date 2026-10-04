@@ -225,7 +225,31 @@ impl Default for Save {
     }
 }
 
+thread_local! {
+    static SANDBOX: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// TESTS: point this thread's save file at a scratch directory of its own.
+///
+/// The save lives in the working directory, and cargo runs a crate's tests
+/// FROM the crate root -- so every test that drove a console through
+/// `stations::apply` (which stores) wrote a real `blackstar.save` next to
+/// `Cargo.toml`: a dirty tree after `cargo test` (CLAUDE.md §4), and, for
+/// anyone who runs the game from the crate root, the player's own save
+/// overwritten with test state. One directory per THREAD, since cargo runs
+/// one test per thread, so parallel tests cannot read each other's
+/// half-written file either. Returns the directory.
+pub fn sandbox_this_thread() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("blackstar-save-{}-{:?}", std::process::id(), std::thread::current().id()));
+    let _ = std::fs::create_dir_all(&dir);
+    SANDBOX.with(|s| *s.borrow_mut() = Some(dir.clone()));
+    dir
+}
+
 pub fn path() -> PathBuf {
+    if let Some(dir) = SANDBOX.with(|s| s.borrow().clone()) {
+        return dir.join("blackstar.save");
+    }
     // blackstar.save is the name now. skydribble.save is still READ when the
     // new one is absent, because renaming a binary should not silently
     // discard a player's progress -- the first write lands in the new file
@@ -408,6 +432,20 @@ pub fn render(s: &Save, b: &Bindings, cfg: &Config) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sandboxed_thread_stores_in_its_own_directory_and_the_working_directory_stays_clean() {
+        let dir = sandbox_this_thread();
+        assert_eq!(path(), dir.join("blackstar.save"));
+        let before = std::path::Path::new("blackstar.save").exists();
+        store(&Save::default(), &Bindings::default_scheme(), &Config::default());
+        assert!(dir.join("blackstar.save").exists(), "the store went to the sandbox");
+        assert_eq!(std::path::Path::new("blackstar.save").exists(), before, "and not to the working directory");
+        // another thread is not sandboxed by this one
+        let other = std::thread::spawn(|| path()).join().unwrap();
+        assert_eq!(other, PathBuf::from("blackstar.save"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_new_save_has_real_starter_gear_not_empty_strings() {

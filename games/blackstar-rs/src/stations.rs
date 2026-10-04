@@ -1895,6 +1895,9 @@ mod tests {
     }
 
     fn board() -> Shipboard {
+        // `apply` stores on several events; without this the store lands in
+        // the crate root as a real blackstar.save (see `save::sandbox_this_thread`).
+        crate::save::sandbox_this_thread();
         Shipboard {
             camp: CampaignLog::default(),
             raids: RaidLog::default(),
