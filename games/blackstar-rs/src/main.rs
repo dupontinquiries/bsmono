@@ -4504,12 +4504,18 @@ impl Game {
         let horiz = (self.car.vel - up * vert).length();
         let boosting = self.car.flight || self.action_down(Action::Boost);
         // HOW BADLY IS IT DOING, AND IS THERE ANYTHING TO LEAN ON.
-        // `limp()` is already 0..1 across the section damage, which is
-        // exactly the input the gait machine wants — no second damage
-        // model. The wall is probed with the SDF the physics already
-        // trusts: sample left and right at shoulder height and take the
-        // nearer, so a body only hugs a surface that is really there.
-        let hurt = self.body.limp();
+        // `limp()` is SIGNED: its magnitude is the damage across the two
+        // legs (0..1) and its sign says which leg (positive right, negative
+        // left). The gait machine wants only the magnitude -- it crouches and
+        // hugs walls the same whichever leg is hurt -- and `condition` clamps
+        // to 0..1, so the signed value went in and a hurt LEFT leg clamped to
+        // zero: a body missing its left leg walked upright (C20_TODO). The
+        // rig below takes the signed value, since it picks the leg from it.
+        // The wall is probed with the SDF the physics already trusts: sample
+        // left and right at shoulder height and take the nearer, so a body
+        // only hugs a surface that is really there.
+        let limp = self.body.limp();
+        let hurt = gait_hurt(limp);
         let wall = if hurt > anim::CROUCH_HURT {
             let side = self.car.rot * Vec3::X;
             let at = self.car.pos + up * (self.car.half_h * 0.5);
@@ -4533,11 +4539,11 @@ impl Game {
             .loco
             .update(dt, horiz, vert, self.car.on_ground, boosting, self.car.climbing > 0.5);
         // THE RIG, driven by the same truth: the gait the machine chose, the
-        // ground speed, the gravity where the body is, and the damage -- with
-        // limp()'s SIGN (the gait machine above clamps it to 0..1, which drops
-        // a hurt LEFT leg entirely; the rig reads the side from the sign).
+        // ground speed, the gravity where the body is, and the damage WITH its
+        // sign (the rig reads the side from it; the gait machine above took the
+        // magnitude).
         let (_gd, gmul) = self.world.gravity_field(self.car.pos);
-        self.rig_frame = Some(self.rig.update(dt, self.loco.gait, horiz, gmul * self.cfg.arena.gravity, hurt));
+        self.rig_frame = Some(self.rig.update(dt, self.loco.gait, horiz, gmul * self.cfg.arena.gravity, limp));
         // element movement also belongs here: Air runs, Rock does not
         let _ = self.wep.move_mul();
 
@@ -9797,6 +9803,37 @@ impl Game {
                 push_skinned(objs, world::M_RIM_0 + rim_style, None, rm, rim_col, [0.0, 0.08, 0.75, 0.0], [0.0; 4], [0.0; 4], [0.0; 4]);
             }
         }
+    }
+}
+
+/// What the gait machine is told about leg damage: the MAGNITUDE of
+/// `sections::Body::limp()`. `limp()` is signed — negative is the left leg —
+/// and `anim::Locomotion::condition` clamps its input to 0..1, so handing it
+/// the signed value silently dropped every hurt left leg (C20_TODO: "a hurt
+/// left leg never limps"). The sign is the rig's business (`rigmotion`), not
+/// the gait's: a body crouches and hugs a wall the same whichever leg it is.
+fn gait_hurt(limp: f32) -> f32 {
+    limp.abs()
+}
+
+#[cfg(test)]
+mod limp_tests {
+    use super::*;
+
+    #[test]
+    fn a_hurt_left_leg_reaches_the_gait_machine_as_damage_not_as_zero() {
+        // left (negative) and right (positive) damage are the same hurt to the gait
+        assert_eq!(gait_hurt(-0.8), 0.8);
+        assert_eq!(gait_hurt(0.8), 0.8);
+        assert_eq!(gait_hurt(0.0), 0.0);
+        // and the value the machine clamps is already in range, so nothing is lost at the clamp
+        let mut l = anim::Locomotion::new();
+        l.condition(gait_hurt(-0.8), 0.0);
+        let hobbled = l.update(0.016, 2.0, 0.0, true, false, false);
+        let mut fit = anim::Locomotion::new();
+        fit.condition(gait_hurt(0.0), 0.0);
+        let sound = fit.update(0.016, 2.0, 0.0, true, false, false);
+        assert_ne!(format!("{hobbled:?}"), format!("{sound:?}"), "a left-leg limp changes the gait; before the fix it clamped to no damage at all");
     }
 }
 
