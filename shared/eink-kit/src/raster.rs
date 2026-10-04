@@ -42,6 +42,9 @@ pub const TILE: usize = 64;
 #[derive(Default)]
 pub struct Textures {
     map: HashMap<TextureId, Tex>,
+    /// Bumped by every upload or free: a tile signature (`TileCache`) hashes the triangles that cover a tile, not the
+    /// pixels of the textures they sample, so any texture change invalidates every cached tile.
+    generation: u64,
 }
 
 struct Tex {
@@ -53,12 +56,14 @@ struct Tex {
 impl Textures {
     /// Apply the `set` half of a delta. Call before painting the frame.
     pub fn apply_set(&mut self, delta: &TexturesDelta) {
+        if !delta.set.is_empty() { self.generation += 1; }
         for (id, d) in &delta.set {
             self.set(*id, d);
         }
     }
     /// Apply the `free` half. egui's contract is: free AFTER painting.
     pub fn apply_free(&mut self, delta: &TexturesDelta) {
+        if !delta.free.is_empty() { self.generation += 1; }
         for id in &delta.free {
             self.map.remove(id);
         }
@@ -125,6 +130,23 @@ impl DirtyTiles {
     }
 }
 
+/// What the last frame painted into each tile, as a hash of the ordered triangles that cover it.
+///
+/// Without it every frame clears, paints, encodes and compares EVERY tile of the screen (~40-60 ms on the Paper Pro
+/// at 1620x2160) even when a pen adds one stroke: the cost is the screen, not the change. With it, a tile whose
+/// triangles, clip, dithering and textures are the same as last frame is skipped outright: its pixels in the shared
+/// buffer are already right, and it is not dirty. The output (buffer bytes and dirty tiles) is identical to `render`.
+///
+/// Invalidated whole, never partly, by: a different screen size, clear colour or pixel format, any texture upload
+/// or free, and `force_all` (the buffer was replaced, so nothing in it can be trusted).
+#[derive(Default)]
+pub struct TileCache {
+    sigs: Vec<u64>,
+    key: Option<(usize, usize, [u8; 4], u64, usize)>,
+    /// How many tiles the last render skipped as unchanged (for the trace, and to prove the cache is doing something).
+    pub skipped: usize,
+}
+
 /// A mesh in pixel space, prepared once per frame.
 struct Prim<'a> {
     clip: IRect,
@@ -145,6 +167,65 @@ pub fn render(
     threads: usize,
     force_all: bool,
     dither: Option<&[bool]>,
+) -> DirtyTiles {
+    render_impl(prims, pixels_per_point, textures, target, clear, threads, force_all, dither, None)
+}
+
+/// [`render`] that skips tiles whose content did not change since the last call with the same `cache`.
+pub fn render_cached(
+    prims: &[ClippedPrimitive],
+    pixels_per_point: f32,
+    textures: &Textures,
+    target: Target<'_>,
+    clear: [u8; 4],
+    threads: usize,
+    force_all: bool,
+    dither: Option<&[bool]>,
+    cache: &mut TileCache,
+) -> DirtyTiles {
+    render_impl(prims, pixels_per_point, textures, target, clear, threads, force_all, dither, Some(cache))
+}
+
+/// A signature of everything that decides a tile's pixels, apart from texture CONTENT (see `Textures::generation`).
+fn tile_sig(bin: &[(u32, u32)], prepared: &[Prim], dith: bool) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write_u8(dith as u8);
+    h.write_usize(bin.len());
+    for &(pi, ti) in bin {
+        let p = &prepared[pi as usize];
+        h.write_u32(pi);
+        let c = &p.clip;
+        for v in [c.x0, c.y0, c.x1, c.y1] { h.write_i32(v); }
+        match p.mesh.texture_id {
+            TextureId::Managed(n) => { h.write_u8(0); h.write_u64(n); }
+            TextureId::User(n) => { h.write_u8(1); h.write_u64(n); }
+        }
+        let tri = &p.mesh.indices[ti as usize * 3..ti as usize * 3 + 3];
+        for &i in tri {
+            let v = &p.mesh.vertices[i as usize];
+            let pos = p.pos[i as usize];
+            h.write_u32(pos[0].to_bits());
+            h.write_u32(pos[1].to_bits());
+            h.write_u32(v.uv.x.to_bits());
+            h.write_u32(v.uv.y.to_bits());
+            h.write(&v.color.to_array());
+        }
+    }
+    h.finish() | 1 // 0 means "nothing cached"
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_impl(
+    prims: &[ClippedPrimitive],
+    pixels_per_point: f32,
+    textures: &Textures,
+    target: Target<'_>,
+    clear: [u8; 4],
+    threads: usize,
+    force_all: bool,
+    dither: Option<&[bool]>,
+    mut cache: Option<&mut TileCache>,
 ) -> DirtyTiles {
     let (w, h) = (target.width as usize, target.height as usize);
     let cols = w.div_ceil(TILE);
@@ -200,6 +281,20 @@ pub fn render(
     let mut dirty = vec![false; cols * rows];
     let mut chroma = vec![false; cols * rows];
     let bpp = target.format.bytes_per_pixel();
+    // The cache is only valid for the same screen, colour, format and textures; otherwise start it over.
+    let mut sig_bands: Vec<Option<&mut [u64]>> = Vec::new();
+    if let Some(c) = cache.as_deref_mut() {
+        let key = (w, h, clear, textures.generation, bpp);
+        if c.key != Some(key) || c.sigs.len() != cols * rows || force_all {
+            c.sigs.clear();
+            c.sigs.resize(cols * rows, 0);
+            c.key = Some(key);
+        }
+        sig_bands = c.sigs.chunks_mut(rows_per_band * cols).map(Some).collect();
+    }
+    sig_bands.resize_with(threads.max(1).min(rows.max(1)).max(sig_bands.len()), || None);
+    let skipped = std::sync::atomic::AtomicUsize::new(0);
+    let skipped_ref = &skipped;
     let (stride, fmt) = (target.stride, target.format);
 
     std::thread::scope(|s| {
@@ -212,6 +307,7 @@ pub fn render(
         {
             let (bins, prepared) = (&bins, &prepared);
             let dither = dither;
+            let mut sigs: Option<&mut [u64]> = sig_bands.get_mut(band).and_then(|o| o.take());
             handles.push(s.spawn(move || {
                 let mut scratch = vec![[0u8; 4]; TILE * TILE];
                 let mut rowbuf = vec![0u8; TILE * bpp];
@@ -226,6 +322,17 @@ pub fn render(
                             ((r + 1) * TILE).min(h) as i32,
                         );
                         let tw = tr.width() as usize;
+                        let dith = dither.is_some_and(|m| m[r * cols + c]);
+                        // unchanged since the last frame: its pixels in the shared buffer are already right
+                        let sig = sigs.as_ref().map(|_| tile_sig(&bins[r * cols + c], prepared, dith));
+                        if let (Some(s), Some(v)) = (sig, sigs.as_ref()) {
+                            if !force_all && v[lr * cols + c] == s {
+                                skipped_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                dchunk[lr * cols + c] = false;
+                                cchunk[lr * cols + c] = false;
+                                continue;
+                            }
+                        }
                         for px in scratch.iter_mut() {
                             *px = clear;
                         }
@@ -238,7 +345,6 @@ pub fn render(
                         // Motion tiles are dithered HERE, at encode, so an
                         // unchanged dithered image compares equal to what is
                         // already in the buffer (no phantom damage).
-                        let dith = dither.is_some_and(|m| m[r * cols + c]);
                         for y in 0..tr.height() as usize {
                             let src = &scratch[y * TILE..y * TILE + tw];
                             for (x, p) in src.iter().enumerate() {
@@ -260,6 +366,7 @@ pub fn render(
                         }
                         dchunk[lr * cols + c] = changed;
                         cchunk[lr * cols + c] = changed && col;
+                        if let (Some(s), Some(v)) = (sig, sigs.as_mut()) { v[lr * cols + c] = s; }
                     }
                 }
             }));
@@ -269,6 +376,7 @@ pub fn render(
         }
     });
 
+    if let Some(c) = cache.as_deref_mut() { c.skipped = skipped.load(std::sync::atomic::Ordering::Relaxed); }
     DirtyTiles { cols, rows, dirty, chroma, width: target.width, height: target.height }
 }
 
@@ -566,5 +674,146 @@ mod tests {
         render(&prims, 1.0, &Textures::default(), Target { buf: &mut a, stride: w as usize * 3, width: w, height: h, format: fmt }, [255; 4], 1, true, None);
         render(&prims, 1.0, &Textures::default(), Target { buf: &mut b, stride: w as usize * 3, width: w, height: h, format: fmt }, [255; 4], 7, true, None);
         assert!(a == b);
+    }
+
+    // ---- the tile cache must change the COST, never the picture ----
+
+    fn both(frames: &[(Vec<ClippedPrimitive>, Option<Vec<bool>>, bool)], w: u32, h: u32, threads: usize, tex: &Textures) -> Vec<usize> {
+        let fmt = PixelFormat::Rgb888;
+        let (mut plain, mut cached) = (frame(w, h, fmt), frame(w, h, fmt));
+        let mut cache = TileCache::default();
+        let mut skipped = Vec::new();
+        for (i, (prims, dither, force)) in frames.iter().enumerate() {
+            let t1 = Target { buf: &mut plain, stride: w as usize * 3, width: w, height: h, format: fmt };
+            let a = render(prims, 1.0, tex, t1, [255, 255, 255, 255], threads, *force || i == 0, dither.as_deref());
+            let t2 = Target { buf: &mut cached, stride: w as usize * 3, width: w, height: h, format: fmt };
+            let b = render_cached(prims, 1.0, tex, t2, [255, 255, 255, 255], threads, *force || i == 0, dither.as_deref(), &mut cache);
+            assert!(plain == cached, "frame {i}: the cached picture differs from the plain one");
+            assert_eq!(a.dirty, b.dirty, "frame {i}: dirty tiles differ");
+            assert_eq!(a.chroma, b.chroma, "frame {i}: chroma flags differ");
+            skipped.push(cache.skipped);
+        }
+        skipped
+    }
+
+    #[test]
+    fn the_tile_cache_gives_the_same_picture_and_dirty_tiles_over_a_sequence_and_skips_what_did_not_change() {
+        let (w, h) = (256, 192); // 4 x 3 tiles
+        let red = Color32::from_rgb(220, 30, 30);
+        let blue = Color32::from_rgb(30, 30, 220);
+        let a = || quad(10.0, 10.0, 60.0, 40.0, red);
+        let b = |dx: f32| quad(150.0 + dx, 100.0, 200.0 + dx, 150.0, blue);
+        let mask = |v: bool| Some(vec![v; 12]);
+        let frames = vec![
+            (vec![a()], None, false),                        // 0: first frame, everything painted
+            (vec![a(), b(0.0)], None, false),                // 1: a second shape appears
+            (vec![a(), b(0.0)], None, false),                // 2: nothing changed
+            (vec![a(), b(20.0)], None, false),               // 3: it moves
+            (vec![b(20.0)], None, false),                    // 4: the first is removed
+            (vec![b(20.0)], None, false),                    // 5: nothing changed
+            (vec![b(20.0)], mask(true), false),              // 6: the same shapes, now dithered (a different picture)
+            (vec![b(20.0)], mask(false), false),             // 7: dither off again
+            (vec![b(20.0)], None, true),                     // 8: forced (the shared buffer was replaced): all repainted
+            (vec![b(20.0)], None, false),                    // 9: nothing changed
+        ];
+        for threads in [1, 3] {
+            let skipped = both(&frames, w, h, threads, &Textures::default());
+            let total = 12;
+            assert_eq!(skipped[0], 0, "threads {threads}: the first frame paints everything");
+            assert!(skipped[2] == total, "threads {threads}: an unchanged frame skips every tile ({} of {total})", skipped[2]);
+            assert!(skipped[3] > 0 && skipped[3] < total, "threads {threads}: a moved shape repaints only the tiles it touched ({} skipped)", skipped[3]);
+            assert!(skipped[5] == total, "threads {threads}: unchanged again");
+            assert!(skipped[6] < total, "threads {threads}: turning dither on is a different picture, not a skip ({})", skipped[6]);
+            assert_eq!(skipped[8], 0, "threads {threads}: a forced frame skips nothing");
+            assert!(skipped[9] == total, "threads {threads}: and the next unchanged frame skips everything again");
+        }
+    }
+
+    #[test]
+    fn a_texture_that_changes_under_the_same_triangles_is_never_shown_stale() {
+        use egui::epaint::textures::TexturesDelta;
+        use egui::epaint::{ColorImage, ImageDelta};
+        use egui::TextureOptions;
+        let (w, h) = (128, 128);
+        let id = TextureId::Managed(7);
+        let textured = || {
+            let mut m = Mesh::default();
+            m.texture_id = id;
+            for (x, y) in [(8.0, 8.0), (100.0, 8.0), (100.0, 100.0), (8.0, 100.0)] {
+                m.vertices.push(Vertex { pos: pos2(x, y), uv: pos2(0.5, 0.5), color: Color32::WHITE });
+            }
+            m.indices = vec![0, 1, 2, 0, 2, 3];
+            ClippedPrimitive { clip_rect: Rect::EVERYTHING, primitive: Primitive::Mesh(m) }
+        };
+        let upload = |tex: &mut Textures, c: Color32| tex.apply_set(&TexturesDelta { set: vec![(id, ImageDelta::full(ColorImage::filled([4, 4], c), TextureOptions::LINEAR))], free: vec![] });
+        let fmt = PixelFormat::Rgb888;
+        let (mut plain, mut cached) = (frame(w, h, fmt), frame(w, h, fmt));
+        let mut cache = TileCache::default();
+        let mut tex = Textures::default();
+        for (i, colour) in [Color32::RED, Color32::RED, Color32::GREEN, Color32::GREEN, Color32::BLUE].into_iter().enumerate() {
+            if i == 0 || i == 2 || i == 4 { upload(&mut tex, colour); } // frames 1 and 3 keep the texture and the triangles
+            let prims = vec![textured()];
+            let t1 = Target { buf: &mut plain, stride: w as usize * 3, width: w, height: h, format: fmt };
+            render(&prims, 1.0, &tex, t1, [255; 4], 2, i == 0, None);
+            let t2 = Target { buf: &mut cached, stride: w as usize * 3, width: w, height: h, format: fmt };
+            render_cached(&prims, 1.0, &tex, t2, [255; 4], 2, i == 0, None, &mut cache);
+            assert!(plain == cached, "frame {i}: a stale texture was shown");
+            if i == 1 || i == 3 { assert!(cache.skipped > 0, "frame {i}: with nothing changed the cache should skip tiles"); }
+        }
+        let p = px(&cached, w, fmt, 50, 50);
+        assert!(p[2] > 200 && p[0] < 60, "the last texture (blue) is what is on screen: {p:?}");
+    }
+
+    #[test]
+    fn a_change_of_screen_size_or_clear_colour_starts_the_cache_over() {
+        let fmt = PixelFormat::Rgb888;
+        let mut cache = TileCache::default();
+        let prims = vec![quad(5.0, 5.0, 40.0, 40.0, Color32::from_rgb(10, 200, 10))];
+        for (w, h, clear) in [(128u32, 128u32, [255u8; 4]), (128, 128, [255; 4]), (128, 128, [0, 0, 0, 255]), (192, 128, [0, 0, 0, 255])] {
+            let (mut plain, mut cached) = (frame(w, h, fmt), frame(w, h, fmt));
+            // a persistent buffer that the cache believes is already right would be wrong here: use fresh buffers and
+            // force the first frame of each configuration, as the engine does after a buffer is replaced
+            let t1 = Target { buf: &mut plain, stride: w as usize * 3, width: w, height: h, format: fmt };
+            render(&prims, 1.0, &Textures::default(), t1, clear, 2, true, None);
+            let t2 = Target { buf: &mut cached, stride: w as usize * 3, width: w, height: h, format: fmt };
+            render_cached(&prims, 1.0, &Textures::default(), t2, clear, 2, true, None, &mut cache);
+            assert!(plain == cached, "{w}x{h} clear {clear:?}");
+        }
+    }
+
+    /// `cargo test --release --lib bench_the_tile_cache -- --ignored --nocapture`: the cost of a frame where one small
+    /// shape changed, on a Paper-Pro-sized screen, plain against cached. Prints; asserts only that cached is not slower.
+    #[test]
+    #[ignore]
+    fn bench_the_tile_cache() {
+        let (w, h, fmt) = (1620u32, 2160u32, PixelFormat::Rgb565);
+        let bpp = fmt.bytes_per_pixel();
+        let scene = |dx: f32| {
+            let mut v = vec![quad(0.0, 0.0, 1620.0, 2160.0, Color32::WHITE)];
+            for i in 0..60 { v.push(quad(40.0 + (i % 6) as f32 * 250.0, 120.0 + (i / 6) as f32 * 190.0, 240.0 + (i % 6) as f32 * 250.0, 260.0 + (i / 6) as f32 * 190.0, Color32::from_gray(200 + (i % 5) as u8 * 10))); }
+            v.push(quad(700.0 + dx, 1000.0, 740.0 + dx, 1040.0, Color32::BLACK)); // the "pen": a small mark that moves
+            v
+        };
+        let (mut a, mut b) = (vec![0u8; w as usize * h as usize * bpp], vec![0u8; w as usize * h as usize * bpp]);
+        let mut cache = TileCache::default();
+        let tex = Textures::default();
+        fn tgt<'a>(buf: &'a mut Vec<u8>, w: u32, h: u32, fmt: PixelFormat) -> Target<'a> { Target { buf, stride: w as usize * fmt.bytes_per_pixel(), width: w, height: h, format: fmt } }
+        render(&scene(0.0), 1.0, &tex, tgt(&mut a, w, h, fmt), [255; 4], 4, true, None);
+        render_cached(&scene(0.0), 1.0, &tex, tgt(&mut b, w, h, fmt), [255; 4], 4, true, None, &mut cache);
+        let (mut plain_ms, mut cached_ms) = (0.0, 0.0);
+        let n = 20;
+        for i in 1..=n {
+            let p = scene(i as f32 * 6.0);
+            let t0 = std::time::Instant::now();
+            render(&p, 1.0, &tex, tgt(&mut a, w, h, fmt), [255; 4], 4, false, None);
+            plain_ms += t0.elapsed().as_secs_f64() * 1000.0;
+            let t0 = std::time::Instant::now();
+            render_cached(&p, 1.0, &tex, tgt(&mut b, w, h, fmt), [255; 4], 4, false, None, &mut cache);
+            cached_ms += t0.elapsed().as_secs_f64() * 1000.0;
+            assert!(a == b, "frame {i}");
+        }
+        let total = (w as usize).div_ceil(TILE) * (h as usize).div_ceil(TILE);
+        println!("BENCH {w}x{h}, {n} frames with one small mark moving: plain {:.1} ms/frame, cached {:.1} ms/frame ({:.1}x), {} of {} tiles skipped", plain_ms / n as f64, cached_ms / n as f64, plain_ms / cached_ms.max(0.001), cache.skipped, total);
+        assert!(cached_ms <= plain_ms * 1.1, "the cache made it slower");
     }
 }

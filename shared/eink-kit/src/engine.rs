@@ -14,7 +14,7 @@ use crate::format::PixelFormat;
 use crate::geom::IRect;
 use crate::policy::{Policy, Profile, Update};
 use crate::present::{Caps, Input, InputHub, Present};
-use crate::raster::{render, Target, Textures};
+use crate::raster::{render_cached, Target, TileCache, Textures};
 use crate::touch::{TouchEvent, TouchToEgui};
 use egui::{Context, Event, RawInput, Rect, ViewportId, ViewportInfo};
 use std::time::{Duration, Instant};
@@ -69,6 +69,8 @@ pub struct FrameReport {
 pub struct Engine {
     pub ctx: Context,
     textures: Textures,
+    /// What the last frame painted into each tile: unchanged tiles are skipped, not repainted (see `TileCache`).
+    tile_cache: TileCache,
     pub policy: Policy,
     touch: TouchToEgui,
     caps: Caps,
@@ -127,6 +129,7 @@ impl Engine {
         Engine {
             ctx,
             textures: Textures::default(),
+            tile_cache: TileCache::default(),
             policy,
             touch: TouchToEgui::default(),
             caps,
@@ -311,7 +314,7 @@ impl Engine {
             self.dithered = true;
         }
         let (w, h, stride, format) = (self.caps.width, self.caps.height, self.caps.stride, self.caps.format);
-        let dirty = render(
+        let dirty = render_cached(
             &prims,
             full.pixels_per_point,
             &self.textures,
@@ -320,8 +323,12 @@ impl Engine {
             self.threads,
             self.first,
             dither.as_deref(),
+            &mut self.tile_cache,
         );
         let raster = t0.elapsed();
+        if self.trace {
+            eprintln!("eink: t={:>7.3}s painted {} tile(s), {} unchanged and skipped, in {:.1} ms", now.as_secs_f32(), dirty.cols * dirty.rows - self.tile_cache.skipped, self.tile_cache.skipped, raster.as_secs_f64() * 1000.0);
+        }
         self.textures.apply_free(&full.textures_delta);
         self.first = false;
 
