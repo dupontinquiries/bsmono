@@ -305,3 +305,20 @@ move, so a move being queued but not applied is NOT the cause. Fixed in tapfocus
 re-measure the landing, refuse if it does not reproduce). Not yet fixed: automatic (3x3) focus in `autofocus.rs` has the
 same driver. Focus stack and HDR found no V4L2 focus/exposure control on the camera node and silently took no photo
 (the lens is a separate sub-device): focus stack now drives the lens; HDR still needs the virtual-bracket path.
+
+
+## Paper Pro input: what was measured (2026-10-04)
+
+* **Touch** is `Elan touch input` (event3, 2064 x 2832 MT grid, slightly larger than the 1620 x 2160 display), the **pen**
+  is `Elan marker input` (event2, 11180 x 15340, pressure 0..4096, tilt +-9000, hover distance), both on one Elan SPI chip
+  (`elants_spi`). The chip reports touch at ~60 Hz (median gap 11.6 ms while drawing). AppLoad (qtfb) forwards it to the
+  app at ~7/s in bursts, which is why handwriting looked sparse. `EINK_INPUT=evdev` reads the finger directly: 15 of 15
+  paired touches matched AppLoad's to within 1 px (identity transform) and a stroke carried ~46 points instead of ~6.
+* **A non-active (unpowered) pen works through the TOUCH layer**, like a finger: the owner drew with one and its strokes
+  arrived on event3. So an unpowered brass/ceramic tip does not need the EMR digitizer at all. The EMR pen path is a
+  different device; its direct mapping is still unchecked (`EINK_INPUT=evdev-pen-compare` logs it).
+* The touch chip has tunables in `/sys/.../spi1.1/elants_ktf/`: `idle_rate` (30), `idle_mode` (0), `palm_reject` (1),
+  untouched. `palm_reject=1` is the first suspect if a wide conductive tip is dropped as a palm.
+* `date +%N` and `head -N` do not exist in the tablet's busybox either; `tools/penlog` (static aarch64) replaces
+  `evtest` there.
+* eink-kit repainted the whole screen every frame (41-68 ms) until `TileCache`; see queue row 101.
