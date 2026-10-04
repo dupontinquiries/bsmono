@@ -41,6 +41,11 @@ pub struct Config {
     pub dither: bool,
     pub mem_size: (u32, u32),
     pub dump: Option<String>,
+    /// `EINK_INPUT`: where touch and pen come from under qtfb. `qtfb` (default): the display server's forwarded input,
+    /// which on the Paper Pro arrives at ~7 reports/s although the digitizer reports at ~60 Hz. `evdev`: read the
+    /// digitizers directly (non-exclusive) and drop the forwarded input. `compare`: forwarded input drives the app,
+    /// the direct readers only LOG what they see, to check their coordinates first.
+    pub input: String,
     /// `EINK_FULL_EVERY_PAGES`: full refresh every N page turns (0 = never).
     pub full_every_pages: u32,
     /// `EINK_THEME=egui` keeps egui's own theme instead of the e-ink preset.
@@ -81,6 +86,7 @@ impl Config {
             dither: env("EINK_DITHER").as_deref() != Some("0"),
             mem_size,
             dump: env("EINK_DUMP"),
+            input: env("EINK_INPUT").unwrap_or_else(|| "qtfb".into()),
             eink_theme: env("EINK_THEME").as_deref() != Some("egui"),
             full_every_pages: num("EINK_FULL_EVERY_PAGES", 6) as u32,
         })

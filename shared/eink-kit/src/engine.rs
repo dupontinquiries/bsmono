@@ -489,7 +489,20 @@ fn open_tablet_backend(cfg: &Config, hub: &InputHub, want: &str) -> std::io::Res
         let profile = cfg.profile.unwrap_or(if color { Profile::FastColor } else { Profile::FastMono });
         let mode = if profile == Profile::Quality { qtfb::Mode::Ui } else { mode };
         eprintln!("eink: qtfb window {key}");
-        return Ok(Box::new(qtfb::QtfbPresent::connect(key, model, mode, hub.sender())?));
+        // Where touch and pen come from (EINK_INPUT, see Config::input): AppLoad forwards them at ~7 reports/s on the
+        // Paper Pro though the digitizer reports at ~60 Hz, so `evdev` reads the digitizers directly instead.
+        let (qtfb_route, direct) = match cfg.input.as_str() {
+            "evdev" => (crate::present::Route::DropTouch, Some(crate::present::Route::Pass)),
+            "compare" => (crate::present::Route::Pass, Some(crate::present::Route::LogTouch)),
+            _ => (crate::present::Route::Pass, None),
+        };
+        eprintln!("eink: input = {} (AppLoad's forwarded touch is {})", cfg.input, if qtfb_route == crate::present::Route::DropTouch { "ignored" } else { "used" });
+        let present = qtfb::QtfbPresent::connect(key, model, mode, hub.sender_with(qtfb_route))?;
+        if let Some(route) = direct {
+            let caps = present.caps();
+            crate::present::evdev::start_direct(cfg.touch, cfg.pen, caps.width, caps.height, hub.sender_with(route));
+        }
+        return Ok(Box::new(present));
     }
     if want == "blight" || want == "auto" {
         let fast = blight::fast_waveform(&fast_name).ok_or_else(|| err(format!("EINK_FAST_WAVEFORM={fast_name:?} unknown")))?;

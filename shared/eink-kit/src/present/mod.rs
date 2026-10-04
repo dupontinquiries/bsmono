@@ -78,15 +78,38 @@ pub struct InputHub {
     wake_w: RawFd,
 }
 
+/// What an [`InputSender`] does with touch and pen it is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Forward everything.
+    Pass,
+    /// Drop touch and pen (and their raw coordinates); `Closed` and `Wake` still go through. Used for the display
+    /// server's own forwarded input when the digitizers are read directly (`EINK_INPUT=evdev`).
+    DropTouch,
+    /// Print each touch to the log and forward nothing (`EINK_INPUT=compare`): lets the direct reader's coordinates be
+    /// checked against the display server's before it is trusted.
+    LogTouch,
+}
+
 /// Sending end, cloned into each input thread.
 #[derive(Clone)]
 pub struct InputSender {
     tx: mpsc::Sender<Input>,
     wake_w: RawFd,
+    route: Route,
 }
 
 impl InputSender {
     pub fn send(&self, ev: Input) {
+        match (&ev, self.route) {
+            (Input::Touch(_) | Input::Raw { .. }, Route::DropTouch) => return,
+            (Input::Touch(t), Route::LogTouch) => {
+                eprintln!("eink: direct {:?} id={} ({:.0},{:.0})", t.phase, t.id, t.x, t.y);
+                return;
+            }
+            (Input::Raw { .. }, Route::LogTouch) => return,
+            _ => {}
+        }
         if self.tx.send(ev).is_ok() {
             let b = [1u8];
             // Non-blocking: a full pipe already means "wake up".
@@ -104,7 +127,11 @@ impl InputHub {
     }
 
     pub fn sender(&self) -> InputSender {
-        InputSender { tx: self.tx.clone(), wake_w: self.wake_w }
+        self.sender_with(Route::Pass)
+    }
+
+    pub fn sender_with(&self, route: Route) -> InputSender {
+        InputSender { tx: self.tx.clone(), wake_w: self.wake_w, route }
     }
 
     /// Sleep until input arrives or `timeout_ms` passes (-1 = forever).
@@ -160,6 +187,31 @@ impl Drop for InputHub {
         unsafe {
             libc::close(self.wake_r);
             libc::close(self.wake_w);
+        }
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use crate::touch::{Phase, TouchEvent};
+
+    fn touch() -> Input { Input::Touch(TouchEvent { id: 1, phase: Phase::Start, x: 10.0, y: 20.0 }) }
+
+    #[test]
+    fn a_route_decides_whether_touch_is_forwarded_and_never_blocks_close_or_wake() {
+        let hub = InputHub::new().unwrap();
+        for (route, forwards_touch) in [(Route::Pass, true), (Route::DropTouch, false), (Route::LogTouch, false)] {
+            let s = hub.sender_with(route);
+            s.send(touch());
+            s.send(Input::Raw { x: 1, y: 2 });
+            s.send(Input::Closed("gone".into()));
+            s.send(Input::Wake);
+            let got = hub.drain();
+            assert_eq!(got.iter().any(|i| matches!(i, Input::Touch(_))), forwards_touch, "{route:?}: touch");
+            assert_eq!(got.iter().any(|i| matches!(i, Input::Raw { .. })), forwards_touch, "{route:?}: raw coordinates follow touch");
+            assert!(got.iter().any(|i| matches!(i, Input::Closed(_))), "{route:?}: a closed display must always reach the runner");
+            assert!(got.iter().any(|i| matches!(i, Input::Wake)), "{route:?}: wake");
         }
     }
 }

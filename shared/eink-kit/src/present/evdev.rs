@@ -174,6 +174,44 @@ pub fn spawn_reader(dev: &TouchDevice, width: u32, height: u32, t: Transform, in
     Ok(())
 }
 
+/// Blocking reader thread over the pen digitizer, the pen counterpart of [`spawn_reader`].
+pub fn spawn_pen_reader(dev: &TouchDevice, width: u32, height: u32, t: Transform, input: InputSender) -> io::Result<()> {
+    let fd = open_ro(&dev.path)?;
+    let mut dec = crate::touch::PenDecoder::new(dev.x, dev.y, width, height, t);
+    std::thread::Builder::new().name("evdev-pen".into()).spawn(move || {
+        let sz = std::mem::size_of::<libc::input_event>();
+        let mut evs: [libc::input_event; 64] = unsafe { std::mem::zeroed() };
+        let mut out = Vec::new();
+        loop {
+            let n = unsafe { libc::read(fd, evs.as_mut_ptr().cast(), sz * evs.len()) };
+            if n <= 0 { return; } // touch reports Closed; the pen just stops
+            for e in &evs[..n as usize / sz] {
+                dec.feed(e.type_, e.code, e.value, &mut out);
+            }
+            forward_pen(&dec, &mut out, &input);
+        }
+    })?;
+    Ok(())
+}
+
+/// Start the direct touch and pen readers for a `width` x `height` surface; both send through `input`.
+pub fn start_direct(touch: Transform, pen: Transform, width: u32, height: u32, input: InputSender) {
+    match find_touchscreen() {
+        Some(dev) => {
+            eprintln!("eink: direct touch = event{} {:?} x{:?} y{:?} -> {width}x{height}", dev.number, dev.name, dev.x, dev.y);
+            if let Err(e) = spawn_reader(&dev, width, height, touch, input.clone()) { eprintln!("eink: direct touch failed: {e}"); }
+        }
+        None => eprintln!("eink: no multitouch device found for direct input"),
+    }
+    match find_pen() {
+        Some(dev) => {
+            eprintln!("eink: direct pen = event{} {:?} x{:?} y{:?} -> {width}x{height}", dev.number, dev.name, dev.x, dev.y);
+            if let Err(e) = spawn_pen_reader(&dev, width, height, pen, input) { eprintln!("eink: direct pen failed: {e}"); }
+        }
+        None => eprintln!("eink: no pen digitizer found for direct input"),
+    }
+}
+
 pub(crate) fn forward_pen(dec: &crate::touch::PenDecoder, out: &mut Vec<crate::touch::TouchEvent>, input: &InputSender) {
     if let Some((x, y)) = dec.last_raw {
         input.send(Input::Raw { x, y });
