@@ -1,0 +1,55 @@
+name: build and upload artifacts for release
+on:
+  release:
+    types:
+      - published
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  publish:
+    needs: build
+    name: publish ${{ matrix.artifact }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: lo-mac-arm64
+            binary: lo
+            asset: lo-mac-arm64.gz
+          - artifact: lo-mac-x64
+            binary: lo
+            asset: lo-mac-x64.gz
+          - artifact: lo-linux-x64
+            binary: lo
+            asset: lo-linux-x64.gz
+          - artifact: lo-linux-arm64
+            binary: lo
+            asset: lo-linux-arm64.gz
+          - artifact: lo-linux-musl-x64
+            binary: lo
+            asset: lo-linux-musl-x64.gz
+          - artifact: lo-linux-musl-arm64
+            binary: lo
+            asset: lo-linux-musl-arm64.gz
+          - artifact: lo.exe
+            binary: lo.exe
+            asset: lo.exe.gz
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+      - name: compress runtime
+        run: |
+          gzip -9 -c ${{ matrix.binary }} > ${{ matrix.asset }}
+      - name: upload compressed artifact
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ${{ matrix.asset }}
+          asset_name: ${{ matrix.asset }}
+          asset_content_type: application/gzip

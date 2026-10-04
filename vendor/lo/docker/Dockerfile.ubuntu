@@ -1,0 +1,160 @@
+# Plain glibc build environment for `lo`, matching the existing
+# `build-linux` CI job's own recipe (.github/workflows/push.yml) as
+# closely as possible - LLVM 22 from apt.llvm.org, same package list.
+# That job runs directly on a GitHub-hosted `ubuntu-22.04` runner, which
+# comes with a large preinstalled toolset (make, curl, build-essential,
+# etc.) for free; this Dockerfile starts from the bare `ubuntu:22.04`
+# image, which has none of that, so it installs it all explicitly below
+# - anything the native job gets "for free" from the runner had to be
+# found and added here by hand, same kind of gap-hunting as
+# `Dockerfile.alpine`'s own bring-up (see ../../LO-MUSL.md for that
+# story; this file's approach mirrors it, not the musl-specific content).
+#
+# Architecture: written to be arch-agnostic on purpose (no hardcoded
+# amd64 paths/package names) - `docker build` on an arm64 host should
+# pull the arm64 variant of `ubuntu:22.04` and produce an arm64 `lo`
+# the same way, matching how `build-linux-arm64` already builds natively
+# on an `ubuntu-24.04-arm` runner. Not independently verified for arm64
+# (this sandbox is x64-only) - apt.llvm.org does publish arm64 packages,
+# but that's reasoned through, not tested here.
+#
+# Same usage pattern as Dockerfile.alpine - environment only, no source
+# COPY, no build baked into `docker build` itself. Mount the checked-out
+# repo in and run make against it:
+#
+#   docker build -t lo-glibc -f docker/Dockerfile.ubuntu .
+#   docker run --rm -v "$(pwd):/src" -w /src lo-glibc make lo
+#   docker run --rm -v "$(pwd):/src" -w /src lo-glibc make check
+#   docker run --rm -v "$(pwd):/src" -w /src lo-glibc make check-build
+#
+# Wired up for real in .github/workflows/push.yml as the `build-linux`
+# job - replaced what used to be two separate jobs (native LLVM-install-
+# on-the-runner for x64, a disabled native job for arm64) with one
+# Docker-based job matrixed over both platforms (`runs-on` computed per
+# platform via `matrix.include`, same `ubuntu-22.04`/`ubuntu-24.04-arm`
+# runners as before - Docker builds/runs natively on each, no QEMU
+# involved), same artifact names (`lo-linux-x64`/`lo-linux-arm64`) as
+# before. Confirmed working for x64 by hand before being wired in;
+# arm64 inherits the same image/recipe but hasn't been independently
+# checked on that runner.
+
+# Pinned to a digest, not the floating `22.04` tag - that tag gets
+# silently repointed at newer point releases over time (Canonical ships
+# maintenance updates under the same tag), which is real, moving upstream
+# drift outside this repo's control. Re-resolve with
+# `docker manifest inspect ubuntu:22.04` if this ever needs a deliberate
+# bump (e.g. for a security update).
+FROM ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# prerequisites for the (now-hardcoded, see below) LLVM apt repo setup -
+# none of these are in the bare ubuntu:22.04 image, unlike on the
+# GitHub-hosted runner where they're already present
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates wget gnupg lsb-release software-properties-common \
+    && rm -rf /var/lib/apt/lists/*
+
+# Real, repeatedly-confirmed CI failure (4/4 attempts across 18+ hours on
+# just-js/v8 run 33136205378, linux/arm64 specifically - same commit's
+# linux/x64 leg succeeded every time): apt.llvm.org's own official
+# llvm.sh install script does a `wget --timeout=15` HEAD-request probe
+# against https://apt.llvm.org/jammy/ before installing anything, and
+# reports *any* failure of that probe (timeout, DNS, anything) as
+# "Distribution 'ubuntu' in version '...' is not supported by this
+# script." - a genuinely misleading message that hid the real cause.
+# Ruled out via direct verification, not assumed: apt.llvm.org's arm64
+# packages for LLVM 22/jammy do exist (checked the actual dists listing
+# directly); the identical Docker build succeeds consistently both from
+# a plain curl and from a real, native arm64 Mac (`docker build
+# --platform linux/arm64 ...`) - only GitHub's own ARM64-hosted Actions
+# runner pool (still in public preview) failed, repeatedly, consistent
+# with that runner class's documented network-latency issues
+# (actions/actions-runner-controller#4365) tripping llvm.sh's tight
+# 15-second timeout. Fix: skip llvm.sh's live check entirely - hardcode
+# the exact apt source line, GPG key, and package list it would have
+# used anyway (confirmed against its own verbose trace output in a real
+# successful build log: `PKG='clang-22 lldb-22 lld-22 clangd-22'`,
+# `REPO_NAME='deb https://apt.llvm.org/jammy/ llvm-toolchain-jammy-22
+# main'`), removing the fragile short-timeout network probe from the
+# critical path. `retry()` wraps what network calls remain (the GPG key
+# fetch, `apt-get update`/`install`) with real backoff, since `wget`'s
+# own `--tries=3` has no delay between attempts and may not ride out a
+# multi-second hiccup.
+RUN retry() { for i in 1 2 3; do "$@" && return 0; echo "retry $i/3 failed: $*" >&2; sleep 5; done; return 1; }; \
+    retry wget -qO /etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key && \
+    echo "deb https://apt.llvm.org/jammy/ llvm-toolchain-jammy-22 main" > /etc/apt/sources.list.d/llvm-22.list && \
+    retry apt-get update && \
+    retry apt-get install -y --no-install-recommends clang-22 lldb-22 lld-22 clangd-22 && \
+    rm -rf /var/lib/apt/lists/*
+
+# build-essential (not just for gcc/g++, which we don't use as the
+# compiler - it's what actually pulls in make, binutils, and libc6-dev,
+# the last of which is what provides unistd.h and friends; a bare clang
+# install alone does not) plus this build's own real, direct needs:
+# libcurl4-openssl-dev (curl.o + the final link's -lcurl), libssl-dev
+# (the final link's own -lssl/-lcrypto - libcurl4-openssl-dev does not
+# pull this in on its own, same "runtime lib present, dev symlink/header
+# missing" shape as zlib-dev back in the musl bring-up), curl itself
+# (the CLI - the Makefile's own v8/em_inflate download steps use it, and
+# it's not part of the bare base image the way it is on the GH runner),
+# unzip (cfzlib's build.js fetches zlib as a .zip and shells out to the
+# real `unzip` binary - found via a real CI failure, `could not execvp 2`
+# i.e. ENOENT, not reasoned through ahead of time - more per-binding CLI
+# tool gaps like this are plausible as `make check-build`'s wider sweep
+# gets further, same pattern as everywhere else in this bring-up), and
+# everything the existing job's own "check" step installs for
+# `make check-build` (./lo test/build.js's wider binding sweep)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl unzip \
+    libcurl4-openssl-dev \
+    libssl-dev \
+    libffi-dev liblz4-dev libseccomp-dev libsqlite3-dev libtcc-dev zlib1g-dev tcc \
+    python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# real, confirmed CI failure: linking runtime/base.config.js/lo.config.js
+# (which add -static-libstdc++ on Linux - the plain Makefile above only
+# does -static-libgcc, so this never showed up there) against
+# v8/libv8_monolith.a fails with `undefined symbol:
+# std::__glibcxx_assert_fail` - confirmed via `nm` that this exact x64
+# archive genuinely references that symbol 352 times across its own
+# object files (not a stale/broken archive), so it's real and needs
+# resolving, not something to wait out. Dynamic linking never hits this
+# because it defers symbol resolution to whatever libstdc++.so is
+# present at runtime; static linking needs it in libstdc++.a right now,
+# and it's missing from build-essential's default GCC 11 static archive
+# on a bare ubuntu:22.04 image. g++-12 alongside it - clang
+# automatically prefers the newest GCC installation it finds for
+# header/library resolution, so this should be picked up with no extra
+# flags needed - not independently confirmed to fully fix it yet.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    g++-12 \
+    && rm -rf /var/lib/apt/lists/*
+
+# mbedtls's vendored build shells out to its own
+# scripts/generate_driver_wrappers.py, which imports jsonschema and
+# jinja2 (the driver-wrapper .c/.h files are generated from .jinja
+# templates) - not a real V8/lo dependency, just something mbedtls's own
+# build needs. The existing build-mac CI job already has an explicit
+# `pip install jsonschema` step for the same reason; jinja2 turned up as
+# a second real gap the same way jsonschema and unzip did - one real CI
+# failure at a time, not reasoned through ahead of time
+RUN pip3 install --no-cache-dir jsonschema jinja2
+
+# the Makefile hardcodes CC=clang/CXX=clang++/LINK=clang++ as plain (not
+# ?=) assignments, which in GNU Make always wins over an inherited
+# environment variable of the same name - so `ENV CC=clang-22` etc. here
+# would silently do nothing, unlike the existing build-linux CI job,
+# which passes CC/CXX/LINK as actual `make` command-line arguments on
+# every invocation instead. apt.llvm.org only installs versioned binaries
+# (clang-22, no bare `clang`), so the Makefile's hardcoded default
+# doesn't exist in this image at all without one of those two fixes.
+# Symlinking instead, so `make lo`/`make check`/`make check-build` work
+# here with no extra flags, same as the rest of this file's intent.
+RUN ln -sf clang-22 /usr/bin/clang && \
+    ln -sf clang++-22 /usr/bin/clang++ && \
+    ln -sf ld.lld-22 /usr/bin/ld.lld
+
+WORKDIR /src

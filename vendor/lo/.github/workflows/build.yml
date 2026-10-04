@@ -1,0 +1,226 @@
+name: build lo runtime (reusable)
+on:
+  workflow_call:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-mac:
+#    if: ${{ false }}  # disable
+    name: mac
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [arm64]
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '^1.22.1'
+      - name: compile runtime
+        run: |
+          make ARCH=${{ matrix.platform }} lo
+      - name: check
+        env:
+          LO_HOME: ${{ github.workspace }}
+          PREFIX: /opt/homebrew/opt
+        run: |
+          pip install jsonschema
+          brew install lz4 zstd openssl@3
+          make check
+          make check-build
+          ./lo build runtime runtime/lo -v
+      - name: upload runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ github.workspace }}/lo
+          name: lo-mac-${{ matrix.platform }}
+
+  build-mac-x64:
+#    if: ${{ false }}  # disable
+    name: mac-x64
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [arm64]
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '^1.22.1'
+      - name: rosetta diagnostics
+        # Real data for whenever mac-x64's check-build gets a proper look
+        # (task 49-adjacent: check-build's wider sweep hit a real
+        # undefined-symbol libssl link failure here, cross-compiling
+        # -arch x86_64 against Homebrew's arm64-only /opt/homebrew
+        # openssl@3 - reverted check back to basic below rather than
+        # guess at a Rosetta-based fix without being able to test it).
+        # Never fails the job - `|| true` on every probe, this is
+        # observational only.
+        run: |
+          echo "=== uname ==="
+          uname -a
+          echo "=== rosetta present? (arch -x86_64 /usr/bin/true) ==="
+          arch -x86_64 /usr/bin/true && echo "rosetta: present (exit 0)" || echo "rosetta: NOT present (exit $?)"
+          echo "=== Rosetta pkg receipt ==="
+          pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto 2>&1 || echo "no RosettaUpdateAuto receipt found"
+          echo "=== homebrew prefixes on PATH ==="
+          which -a brew || true
+          echo "=== /usr/local/Homebrew present? (separate x86_64 prefix) ==="
+          ls -la /usr/local/Homebrew 2>&1 || echo "/usr/local/Homebrew: not present"
+          echo "=== /opt/homebrew/opt/openssl@3 lib architectures ==="
+          file /opt/homebrew/opt/openssl@3/lib/*.dylib 2>&1 || echo "openssl@3 not installed yet at this point in the job"
+        continue-on-error: true
+      - name: compile runtime
+        run: |
+          make ARCH=x64 lo
+      - name: check
+        env:
+          LO_HOME: ${{ github.workspace }}
+          PREFIX: /opt/homebrew/opt
+        run: |
+          make ARCH=x64 check
+      - name: upload runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ github.workspace }}/lo
+          name: lo-mac-x64
+
+  build-linux:
+#    if: ${{ false }}  # disable
+    name: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x64
+            runs-on: ubuntu-22.04
+          - platform: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v3
+      - name: build glibc toolchain image
+        run: |
+          docker build -t lo-glibc -f docker/Dockerfile.ubuntu .
+      - name: compile
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" -w /src lo-glibc make ARCH=${{ matrix.platform }} lo
+      - name: check
+        run: |
+          docker run --rm -e LO_HOME=/src -v "${{ github.workspace }}:/src" -w /src lo-glibc sh -c "make check && make check-build && ./lo build runtime runtime/lo -v"
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ github.workspace }}/lo
+          name: lo-linux-${{ matrix.platform }}
+
+  build-linux-musl:
+#    if: ${{ false }}  # disable
+    name: linux-musl
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x64
+            runs-on: ubuntu-22.04
+          - platform: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v3
+      - name: build musl toolchain image
+        run: |
+          docker build -t lo-musl -f docker/Dockerfile.alpine .
+      - name: compile
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" -w /src lo-musl make ARCH=${{ matrix.platform }} lo
+      # check-build/build runtime added here to match linux (glibc)'s
+      # comprehensive check - real risk, not assumed risk-free: musl's
+      # own bring-up (LO-MUSL.md) already flagged check-build (test/build.js,
+      # ~19 more bindings beyond this build's five) as untested under musl,
+      # since every per-module build.js touched so far needed some
+      # sysroot-shaped fix - more are plausible here too (PLAN.md task 34).
+      - name: check
+        run: |
+          docker run --rm -e LO_HOME=/src -v "${{ github.workspace }}:/src" -w /src lo-musl sh -c "make ARCH=${{ matrix.platform }} check && make ARCH=${{ matrix.platform }} check-build && ./lo build runtime runtime/lo -v"
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ github.workspace }}/lo
+          name: lo-linux-musl-${{ matrix.platform }}
+
+  build-windows:
+#    if: ${{ false }}  # disable
+    name: windows
+    # trying VS2026 (GA on windows-2025 since 2026-05-07) instead of
+    # the windows-2022/VS2022 pin used elsewhere (repos/v8) - VS2022's
+    # bundled clang-cl is 19.1.5, one version below what the vendored
+    # libc++ headers require ("Libc++ only supports Clang 20 and
+    # later"). Unlike repos/v8's windows-2022 pin (forced by V8's own
+    # vs_toolchain.py not recognizing VS2026 - a V8-specific
+    # constraint, N/A here since build.cmd is a plain script with no
+    # vs_toolchain.py involved), this repo has no reason to avoid a
+    # newer VS. Whether VS2026 actually bundles clang >=20 isn't
+    # confirmed yet - this is the real test. build.cmd's vcvars64.bat
+    # path updated to match (VS2026 installs under ...\18\Enterprise,
+    # not ...\2026\Enterprise - its internal major version number,
+    # following VS2022's own 17.x scheme, confirmed via GitHub's own
+    # actions/runner-images issues).
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64]
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install MSVC/MCBuild (Windows)
+        uses: microsoft/setup-msbuild@v1.0.2
+      - name: compile
+        shell: cmd
+        run: |
+          call ${{ github.workspace}}\build.cmd
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ github.workspace }}/lo.exe
+          name: lo.exe
+          # default is 'warn' - a missing lo.exe would otherwise leave
+          # the whole job green even though nothing was actually built
+          # (which is exactly what just happened: build.cmd has no
+          # error propagation between its own internal commands, so an
+          # earlier failure doesn't stop the script or fail the step)
+          if-no-files-found: error
+
+  # Verification-only, not wired into build-windows above yet. Confirms
+  # install-llvm.cmd's mechanism actually works on a real windows-2025
+  # runner before it replaces build-windows's current implicit reliance
+  # on whatever clang-cl VS2026 happens to bundle (which is what's
+  # failing against V8 14.9 - see V8-LIBCXX-CLANG-FLOOR.md in the claude
+  # sandbox repo for the full writeup). Deliberately isolated from
+  # build-windows so this job's own pass/fail is never masked by, or
+  # blamed on, anything else in the real build. Two separate things being
+  # checked, not just "does the installer run": (1) does the LLVM GitHub
+  # Release installer's /S /D= silent install actually work here, (2)
+  # does GITHUB_PATH genuinely carry the new clang forward into a later,
+  # separate step - each CI step is its own fresh process, so this is
+  # not the same question as "did the install step itself see clang."
+  # Safe to delete once confirmed and folded into build-windows for real.
+  check-windows-llvm-install:
+    name: check windows llvm install
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v3
+      - name: install llvm
+        shell: cmd
+        run: |
+          call install-llvm.cmd
+      - name: confirm clang is on PATH in a later, separate step
+        shell: cmd
+        run: |
+          clang --version
+          clang++ --version

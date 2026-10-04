@@ -1,0 +1,185 @@
+const api = {
+  fopen: {
+    parameters: ['string', 'string'],
+    result: 'pointer'
+  },
+  fdopen: {
+    parameters: ['i32', 'string'],
+    result: 'pointer'
+  },
+  fclose: {
+    parameters: ['pointer'],
+    pointers: ['FILE*'],
+    result: 'i32'
+  },
+  fflush: {
+    parameters: ['pointer'],
+    pointers: ['FILE*'],
+    result: 'i32'
+  },
+  global_init: {
+    parameters: ['u32'],
+    result: 'i32',
+    name: 'curl_global_init'
+  },
+  easy_init: {
+    parameters: [],
+    result: 'pointer',
+    name: 'curl_easy_init'
+  },
+  version: {
+    parameters: [],
+    result: 'pointer',
+    name: 'curl_version'
+  },
+  easy_setopt: {
+    parameters: ['pointer', 'u32', 'string'],
+    pointers: ['CURL*'],
+    casts: [, '(CURLoption)'],
+    result: 'i32',
+    name: 'curl_easy_setopt'
+  },
+  easy_setopt_2: {
+    parameters: ['pointer', 'u32', 'u32'],
+    result: 'i32',
+    pointers: ['CURL*'],
+    casts: [, '(CURLoption)'],
+    name: 'curl_easy_setopt'
+  },
+  easy_setopt_3: {
+    parameters: ['pointer', 'u32', 'u64'],
+    result: 'i32',
+    pointers: ['CURL*'],
+    casts: [, '(CURLoption)'],
+    name: 'curl_easy_setopt'
+  },
+  easy_setopt_4: {
+    parameters: ['pointer', 'u32', 'pointer'],
+    result: 'i32',
+    pointers: ['CURL*', , 'struct curl_slist *'],
+    casts: [, '(CURLoption)'],
+    name: 'curl_easy_setopt'
+  },
+  easy_setopt_5: {
+    parameters: ['pointer', 'u32', 'pointer'],
+    result: 'i32',
+    pointers: ['CURL*', , 'char*'],
+    casts: [, '(CURLoption)'],
+    name: 'curl_easy_setopt'
+  },
+/*
+  easy_nextheader: {
+    parameters: ['pointer', 'u32', 'i32', 'pointer'],
+    pointers: ['CURL*'],
+    casts: [, , , '(struct curl_header*)'],
+    result: 'pointer',
+    name: 'curl_easy_nextheader'
+  },
+*/
+  easy_perform: {
+    parameters: ['pointer'],
+    result: 'i32',
+    pointers: ['CURL*'],
+    name: 'curl_easy_perform'
+  },
+  easy_cleanup: {
+    parameters: ['pointer'],
+    result: 'void',
+    pointers: ['CURL*'],
+    name: 'curl_easy_cleanup'
+  },
+  global_cleanup: {
+    parameters: [],
+    result: 'void',
+    name: 'curl_global_cleanup'
+  },
+  easy_getinfo: {
+    parameters: ['pointer', 'u32', 'u32array'],
+    result: 'i32',
+    casts: [, '(CURLINFO)'],
+    pointers: ['CURL*'],
+    name: 'curl_easy_getinfo'
+  },
+  slist_append: {
+    parameters: ['pointer', 'pointer'],
+    result: 'pointer',
+    pointers: ['struct curl_slist*', 'const char*'],
+    rpointer: 'struct curl_slist*',
+    name: 'curl_slist_append'
+  },
+  slist_free_all: {
+    parameters: ['pointer'],
+    result: 'void',
+    pointers: ['struct curl_slist*'],
+    name: 'curl_slist_free_all'
+  }
+}
+
+const includes = ['curl/curl.h', 'stdint.h']
+const constants = {
+  CURLINFO_OFF_T: 'i32', CURL_GLOBAL_DEFAULT: 'i32', CURLOPT_URL: 'i32',
+  CURLOPT_BUFFERSIZE: 'i32', CURLOPT_HTTP_VERSION: 'i32',
+  CURL_HTTP_VERSION_1_1: 'i32', CURLOPT_FOLLOWLOCATION: 'i32',
+  CURLINFO_SIZE_DOWNLOAD_T: 'i32', CURLOPT_WRITEFUNCTION: 'i32',
+  CURLOPT_WRITEDATA: 'i32', CURLINFO_RESPONSE_CODE: 'i32', CURLOPT_FAILONERROR: 'i32',
+  CURL_GLOBAL_NOTHING: 'i32', CURLOPT_ERRORBUFFER: 'i32', CURLOPT_HEADER: 'i32',
+  CURLOPT_USERAGENT: 'i32', CURLOPT_HTTPHEADER: 'i32', CURLOPT_REFERER: 'i32',
+  CURLOPT_SSL_VERIFYPEER: 'i32', CURLOPT_SSL_VERIFYHOST: 'i32'
+}
+
+//const include_paths = ['./deps/curl/include']
+//const includes = ['curl/curl.h', 'curl/header.h', 'stdint.h']
+//constants.CURLH_HEADER = 'i32'
+//const libs = []
+//const obj = ['deps/curl/lib/.libs/libcurl.a']
+//const obj = ['/lib/x86_64-linux-gnu/libcurl.a'] // system
+//if (lo.core.os === 'mac') {
+//  libs.push('curl')
+//  obj.length = 0
+//}
+//include_paths.length = 0
+//export { name, api, libs, constants, includes, obj, include_paths }
+
+const libs = []
+const obj = []
+
+/*
+const linux = {
+  obj: ['deps/curl/lib/.libs/libcurl.a'],
+  libs: ['ssl', 'crypto', 'z'],
+  include_paths: ['deps/curl/include']
+}
+*/
+/*
+const mac = {
+  libs: ['curl']
+}
+*/
+
+const structs = ['curl_slist']
+
+// codegen (this file) needs to run standalone under `node` too, e.g.
+// via bindings/gen-module.js - same node/Deno/Bun/lo detection style as
+// lib/gen.js's own readFile fallback, not a shared utility module
+const isNode = globalThis.process?.versions?.node
+const os = isNode ? (process.platform === 'darwin' ? 'mac' : process.platform === 'win32' ? 'win' : 'linux') : lo.core.os
+const getenv = isNode ? (k => process.env[k]) : lo.getenv
+
+// built
+if (os === 'linux') {
+  if (getenv('CURL_STATIC') === '1') {
+    obj.push('deps/curl/lib/.libs/libcurl.a')
+    libs.push('ssl')
+    libs.push('crypto')
+    libs.push('z')
+  } else {
+    libs.push('curl')
+  }
+} else {
+  // use system libcurl
+  libs.push('curl')
+}
+
+const name = 'curl'
+
+export { name, api, libs, constants, includes, obj, structs }

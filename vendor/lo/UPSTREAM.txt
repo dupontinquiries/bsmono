@@ -1,0 +1,5 @@
+upstream: https://github.com/just-js/lo.git
+commit:   1fe29accd48d0d9d5e26c95c63fbcf2f2565d72e
+date:     2026-09-16
+snapshot: 2026-10-03, shallow clone, .git removed, files unmodified
+license:  see LICENSE

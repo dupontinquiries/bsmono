@@ -1,0 +1,15 @@
+const api = {
+  inflate: {
+    parameters: ['pointer', 'u32', 'pointer', 'u32'],
+    pointers: ['unsigned char*', , 'unsigned char*'],
+    result: 'i32',
+    name: 'em_inflate'
+  }
+}
+
+const name = 'inflate'
+const includes = ['em_inflate.h']
+
+const obj = ['em_inflate.o']
+
+export { name, api, includes, obj }
