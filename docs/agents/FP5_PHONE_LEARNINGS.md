@@ -278,3 +278,30 @@ Tideshell draws the bar, drawer and switcher, so the stock COSMIC panel was a se
 applets cost CPU, and crashed whenever the panel restarted). `com.system76.CosmicPanel/v1/entries` set to `[]` removes the panel and the
 dock live; cosmic-panel keeps running idle. To bring it back: restore `entries.prev`. (The `border_radius` fix above only matters
 when the panel is on.)
+
+
+## The 7.5 s freeze every minute was `nmcli dev wifi` (2026-10-03)
+
+Found with the stall log (`journalctl --user -u tideshell | grep stall`): `slow work ~7.4-7.7 s`, exactly 60 s apart, with
+nothing in front and the phone locked. Two clues decided it: the interval (a 60 s timer in the main loop) and a sampler
+that showed the main thread asleep in `poll()` (how `Command::output()` waits) with the child
+`nmcli -t -f ACTIVE,SSID,BSSID dev wifi` alive for the whole stall. `nmcli dev wifi` defaults to `--rescan auto`, which
+asks for a new scan when results are over 30 s old and waits for it; awake and recently scanned it takes 0.02 s (which
+is why timing it by hand found nothing), asleep and locked it took ~7.5 s. Fixed by reading cached results
+(`list --rescan no`) on a worker thread (`sensors::WifiPoller`), which also stops a Wi-Fi scan every minute from keeping
+the radio awake.
+
+Things this taught: (1) time a suspect under the CONDITION it fails in (screen off), not the condition it is tested in;
+(2) the phone's login shell is zsh and kills background jobs on logout even with `setsid` -- a long sampler needs
+`systemd-run --user --unit=NAME --property=StandardOutput=file:PATH sh script`; (3) `date +%N` does not exist in the
+busybox here: time with `/proc/uptime` differences over a loop.
+
+## Camera focus: what the field log showed (2026-10-03)
+
+`SNAPSHOT_CAM_AF_TRACE=1` (the phone wrapper sets it) writes `~/.cache/snapshot-cam-af.log`. First log, 15 taps: most
+searches read 0.2-0.5 across the whole lens range (smooth skin in dim light is sensor noise) and the ones that locked did
+so at contrast 1.3-1.6 on that noise, leaving the lens at an arbitrary spot (1023, 895, 446). `v4l2-ctl` takes ~7 ms per
+move, so a move being queued but not applied is NOT the cause. Fixed in tapfocus (median of 3 frames per probe,
+re-measure the landing, refuse if it does not reproduce). Not yet fixed: automatic (3x3) focus in `autofocus.rs` has the
+same driver. Focus stack and HDR found no V4L2 focus/exposure control on the camera node and silently took no photo
+(the lens is a separate sub-device): focus stack now drives the lens; HDR still needs the virtual-bracket path.
