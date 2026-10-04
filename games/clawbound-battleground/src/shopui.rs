@@ -61,11 +61,11 @@ fn bark(p: &egui::Painter, r: Rect, rounding: f32, tone: f32) {
             let wob = (h - 0.5) * 4.0;
             let a = Pos2::new(x, r.top() + 4.0 + h * 10.0);
             let b = Pos2::new(x + wob, r.bottom() - 4.0 - hash(r.bottom(), x) * 10.0);
-            p.line_segment([a, b], Stroke::new(1.0, BARK_DARK.linear_multiply(0.55 * tone)));
+            p.line_segment([a, b], Stroke::new(1.0_f32, BARK_DARK.linear_multiply(0.55 * tone)));
         }
         x += step * (0.6 + h);
     }
-    p.rect_stroke(r, rounding, Stroke::new(1.5, BARK_LIGHT.linear_multiply(tone)));
+    p.rect_stroke(r, rounding, Stroke::new(1.5_f32, BARK_LIGHT.linear_multiply(tone)));
 }
 
 /// A leaf, pointing along `dir`, `len` long.
@@ -74,8 +74,8 @@ fn leaf(p: &egui::Painter, at: Pos2, dir: Vec2, len: f32, fill: Color32) {
     let n = Vec2::new(-d.y, d.x) * 0.38;
     let tip = at + d;
     let pts = vec![at, at + d * 0.5 + n, tip, at + d * 0.5 - n];
-    p.add(Shape::convex_polygon(pts, fill, Stroke::new(1.0, fill.linear_multiply(0.6))));
-    p.line_segment([at, at + d * 0.8], Stroke::new(0.8, fill.linear_multiply(0.45)));
+    p.add(Shape::convex_polygon(pts, fill, Stroke::new(1.0_f32, fill.linear_multiply(0.6))));
+    p.line_segment([at, at + d * 0.8], Stroke::new(0.8_f32, fill.linear_multiply(0.45)));
 }
 
 /// A vine along the top and bottom edges of `r`, with leaves.
@@ -88,7 +88,7 @@ fn vine_rim(p: &egui::Painter, r: Rect) {
             x += 6.0;
         }
         if pts.len() > 1 {
-            p.add(Shape::line(pts.clone(), Stroke::new(2.0, VINE)));
+            p.add(Shape::line(pts.clone(), Stroke::new(2.0_f32, VINE)));
             for (k, q) in pts.iter().enumerate().step_by(5) {
                 let side = if k % 10 == 0 { 1.0 } else { -1.0 };
                 leaf(p, *q, Vec2::new(0.6 * side, flip * 1.0), 9.0, MOSS);
@@ -183,7 +183,7 @@ pub fn glyph(p: &egui::Painter, c: Pos2, s: f32, g: Glyph, col: Color32) {
                 })
                 .collect();
             p.add(Shape::convex_polygon(spark.clone(), col, Stroke::NONE));
-            p.add(Shape::closed_line(spark, Stroke::new(1.0, col)));
+            p.add(Shape::closed_line(spark, Stroke::new(1.0_f32, col)));
         }
         Glyph::Trophy => {
             let a = c + Vec2::new(-h * 0.7, h * 0.5);
@@ -205,7 +205,7 @@ fn gold_mark(p: &egui::Painter, at: Pos2, amount: f32, size: f32, col: Color32, 
     let w = galley.size().x + size * 0.9;
     let r = align.anchor_size(at, Vec2::new(w, size));
     p.circle_filled(Pos2::new(r.left() + size * 0.3, r.center().y), size * 0.3, GOLD);
-    p.circle_stroke(Pos2::new(r.left() + size * 0.3, r.center().y), size * 0.3, Stroke::new(1.0, GOLD.linear_multiply(0.5)));
+    p.circle_stroke(Pos2::new(r.left() + size * 0.3, r.center().y), size * 0.3, Stroke::new(1.0_f32, GOLD.linear_multiply(0.5)));
     p.galley(Pos2::new(r.left() + size * 0.8, r.center().y - galley.size().y * 0.5), galley, col);
     r
 }
@@ -319,7 +319,7 @@ fn shelves_row(ui: &mut egui::Ui, game: &Game, player: usize, st: &mut UiState, 
         let p = ui.painter();
         let stone = if sel { Color32::from_rgb(92, 84, 70) } else { Color32::from_rgb(58, 54, 48) };
         p.rect_filled(r.expand(t), 10.0, stone.linear_multiply(1.0 + 0.2 * t));
-        p.rect_stroke(r.expand(t), 10.0, Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { col } else { BARK_DARK }));
+        p.rect_stroke(r.expand(t), 10.0, Stroke::new(if sel { 2.0_f32 } else { 1.0_f32 }, if sel { col } else { BARK_DARK }));
         let gy = if named { r.top() + 22.0 } else { r.center().y };
         glyph(p, Pos2::new(r.center().x, gy), 22.0, d.glyph, if sel { col } else { col.linear_multiply(0.75) });
         if named {
@@ -367,7 +367,7 @@ fn shelf(ui: &mut egui::Ui, game: &mut Game, player: usize, st: &mut UiState, la
     let offers = shopview::offers(game, player, st.shop_tab);
     let search_id = egui::Id::new("shop_search");
     ui.visuals_mut().extreme_bg_color = BARK_DARK;
-    ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::new(1.0, BARK_LIGHT);
+    ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BARK_LIGHT);
     let sresp = ui.add(
         egui::TextEdit::singleline(&mut st.shop_pick.search)
             .id(search_id)
@@ -490,10 +490,10 @@ fn card(ui: &mut egui::Ui, game: &Game, player: usize, o: &Offer, size: Vec2, cu
         p.rect_filled(r, 8.0, MOSS.linear_multiply(0.5 * bought));
     }
     if suggested {
-        p.rect_stroke(r.expand(2.0), 10.0, Stroke::new(2.0, GOLD.linear_multiply(0.8)));
+        p.rect_stroke(r.expand(2.0), 10.0, Stroke::new(2.0_f32, GOLD.linear_multiply(0.8)));
     }
     if cursor {
-        p.rect_stroke(r, 8.0, Stroke::new(1.5, INK.linear_multiply(0.7)));
+        p.rect_stroke(r, 8.0, Stroke::new(1.5_f32, INK.linear_multiply(0.7)));
     }
     // the leaf tab in the shelf colour, with the shelf glyph on it
     let tab = Rect::from_min_size(r.left_top(), Vec2::new(30.0, r.height()));
@@ -591,7 +591,7 @@ fn study(ui: &mut egui::Ui, game: &Game, player: usize, st: &UiState) {
     }
     ui.add_space(8.0);
     let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(1.0, BARK_LIGHT));
+    ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(1.0_f32, BARK_LIGHT));
     ui.add_space(6.0);
 }
 
@@ -615,7 +615,7 @@ fn hoard_inner(ui: &mut egui::Ui, game: &mut Game, player: usize, st: &mut UiSta
     hoard_hint(ui);
     ui.add_space(8.0);
     let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(1.0, BARK_LIGHT));
+    ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(1.0_f32, BARK_LIGHT));
     ui.add_space(8.0);
     study(ui, game, player, st);
 }
@@ -697,7 +697,7 @@ fn hoard_block(ui: &mut egui::Ui, game: &mut Game, player: usize, st: &mut UiSta
         let held = game.gods[player].items.get(i).copied();
         // a hollow: darker, inset
         p.rect_filled(r, 12.0, BARK_DARK.linear_multiply(1.0 + 0.4 * t));
-        p.rect_stroke(r.shrink(1.0), 12.0, Stroke::new(1.0, BARK_LIGHT.linear_multiply(0.6)));
+        p.rect_stroke(r.shrink(1.0), 12.0, Stroke::new(1.0_f32, BARK_LIGHT.linear_multiply(0.6)));
         match held {
             None => {
                 p.text(r.left_center() + Vec2::new(14.0, 0.0), Align2::LEFT_CENTER, format!("{} · empty hollow", i + 1), FontId::proportional(12.0), INK_DIM.linear_multiply(0.7));
@@ -731,7 +731,7 @@ fn hoard_block(ui: &mut egui::Ui, game: &mut Game, player: usize, st: &mut UiSta
                     }
                 }
                 if armed {
-                    p.rect_stroke(r, 12.0, Stroke::new(2.0, EMBER));
+                    p.rect_stroke(r, 12.0, Stroke::new(2.0_f32, EMBER));
                 }
                 glow_hover(ui, &resp, EMBER.linear_multiply(0.6), 12.0);
                 if resp.clicked() {

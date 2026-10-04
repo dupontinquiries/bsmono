@@ -61,7 +61,7 @@ pub fn draw_reticle(p: &egui::Painter, rect: Rect, g: &Game, ads: f32) {
     let on_target = aim_on_enemy(g);
     let base = g.cosmetics.reticle_color.color();
     let col = if on_target { Color32::from_rgb(245, 90, 78) } else { base };
-    let stroke = Stroke::new(1.6, col);
+    let stroke = Stroke::new(1.6_f32, col);
     let len = 7.0;
     let gap = bloom;
     use crate::cosmetics::Reticle;
@@ -141,14 +141,14 @@ pub fn draw_scope(p: &egui::Painter, rect: Rect, ads: f32) {
     p.rect_filled(Rect::from_min_max(Pos2::new(rect.min.x, c.y + r), rect.max), 0.0, dark);
     p.rect_filled(Rect::from_min_max(Pos2::new(rect.min.x, c.y - r), Pos2::new(c.x - r, c.y + r)), 0.0, dark);
     p.rect_filled(Rect::from_min_max(Pos2::new(c.x + r, c.y - r), Pos2::new(rect.max.x, c.y + r)), 0.0, dark);
-    p.circle_stroke(c, r, Stroke::new(2.0, Color32::from_rgb(10, 10, 12)));
-    p.circle_stroke(c, r - 2.0, Stroke::new(1.0, Color32::from_rgb(40, 44, 50)));
+    p.circle_stroke(c, r, Stroke::new(2.0_f32, Color32::from_rgb(10, 10, 12)));
+    p.circle_stroke(c, r - 2.0, Stroke::new(1.0_f32, Color32::from_rgb(40, 44, 50)));
     // crosshair
-    let line = Stroke::new(1.0, Color32::from_rgb(20, 22, 26));
+    let line = Stroke::new(1.0_f32, Color32::from_rgb(20, 22, 26));
     p.line_segment([Pos2::new(c.x - r, c.y), Pos2::new(c.x + r, c.y)], line);
     p.line_segment([Pos2::new(c.x, c.y - r), Pos2::new(c.x, c.y + r)], line);
-    p.line_segment([Pos2::new(c.x - 16.0, c.y), Pos2::new(c.x + 16.0, c.y)], Stroke::new(1.6, Color32::from_rgb(180, 30, 30)));
-    p.line_segment([Pos2::new(c.x, c.y - 16.0), Pos2::new(c.x, c.y + 16.0)], Stroke::new(1.6, Color32::from_rgb(180, 30, 30)));
+    p.line_segment([Pos2::new(c.x - 16.0, c.y), Pos2::new(c.x + 16.0, c.y)], Stroke::new(1.6_f32, Color32::from_rgb(180, 30, 30)));
+    p.line_segment([Pos2::new(c.x, c.y - 16.0), Pos2::new(c.x, c.y + 16.0)], Stroke::new(1.6_f32, Color32::from_rgb(180, 30, 30)));
     p.circle_filled(c, 1.4, Color32::from_rgb(200, 40, 40));
 }
 
@@ -164,7 +164,7 @@ pub fn draw_hitmarker(p: &egui::Painter, rect: Rect, g: &Game) {
     } else {
         Color32::from_rgba_unmultiplied(235, 238, 242, (k * 230.0) as u8)
     };
-    let stroke = Stroke::new(2.0, col);
+    let stroke = Stroke::new(2.0_f32, col);
     let r0 = 7.0;
     let r1 = 12.0;
     for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
@@ -323,7 +323,7 @@ pub fn draw_hud(p: &egui::Painter, rect: Rect, g: &Game) {
     let frac = (pl.health / pl.max_health).clamp(0.0, 1.0);
     let fill = Rect::from_min_max(bar.min, Pos2::new(bar.min.x + bar_w * frac, bar.max.y));
     p.rect_filled(fill, 2.0, health_color(pl.health));
-    p.rect_stroke(bar, 2.0, Stroke::new(1.0, Color32::from_rgb(60, 68, 78)), egui::StrokeKind::Inside);
+    p.rect_stroke(bar, 2.0, Stroke::new(1.0_f32, Color32::from_rgb(60, 68, 78)), egui::StrokeKind::Inside);
     p.text(Pos2::new(bx, bbottom - bar_h - 6.0), Align2::LEFT_BOTTOM, format!("HEALTH  {}", pl.class.name().to_uppercase()), FontId::monospace(12.0), dim());
 
     // ── Super-ability charge bar, just above the health bar (only for classes with a super) ──────────────
@@ -335,7 +335,7 @@ pub fn draw_hud(p: &egui::Painter, rect: Rect, g: &Game) {
         let scol = if sc >= 1.0 { Color32::from_rgb(120, 220, 255) } else { Color32::from_rgb(70, 120, 160) };
         let sfill = Rect::from_min_max(sbar.min, Pos2::new(sbar.min.x + bar_w * sc, sbar.max.y));
         p.rect_filled(sfill, 2.0, scol);
-        p.rect_stroke(sbar, 2.0, Stroke::new(1.0, Color32::from_rgb(50, 70, 84)), egui::StrokeKind::Inside);
+        p.rect_stroke(sbar, 2.0, Stroke::new(1.0_f32, Color32::from_rgb(50, 70, 84)), egui::StrokeKind::Inside);
         let slabel = if sc >= 1.0 { "SUPER READY [X]".to_string() } else { "SUPER".to_string() };
         let slcol = if sc >= 1.0 { Color32::from_rgb(140, 230, 255) } else { dim() };
         p.text(Pos2::new(bx, sb_bottom - 10.0), Align2::LEFT_BOTTOM, slabel, FontId::monospace(11.0), slcol);
@@ -358,7 +358,7 @@ pub fn draw_hud(p: &egui::Painter, rect: Rect, g: &Game) {
         };
         let jfill = Rect::from_min_max(jbar.min, Pos2::new(jbar.min.x + bar_w * jc, jbar.max.y));
         p.rect_filled(jfill, 2.0, jcol);
-        p.rect_stroke(jbar, 2.0, Stroke::new(1.0, Color32::from_rgb(48, 78, 104)), egui::StrokeKind::Inside);
+        p.rect_stroke(jbar, 2.0, Stroke::new(1.0_f32, Color32::from_rgb(48, 78, 104)), egui::StrokeKind::Inside);
         let jlabel = if jc < 0.15 { "ION CHARGING" } else { "ION THRUST" };
         p.text(Pos2::new(bx, jb_bottom - 10.0), Align2::LEFT_BOTTOM, jlabel, FontId::monospace(11.0), Color32::from_rgb(120, 200, 255));
     }
@@ -409,7 +409,7 @@ pub fn draw_uav_markers(p: &egui::Painter, rect: Rect, g: &Game, cam: &FpsCam, c
                 p.add(egui::Shape::convex_polygon(
                     vec![Pos2::new(at.x, at.y - s), Pos2::new(at.x + s, at.y), Pos2::new(at.x, at.y + s), Pos2::new(at.x - s, at.y)],
                     Color32::from_rgba_unmultiplied(235, 80, 70, 180),
-                    Stroke::new(1.0, col),
+                    Stroke::new(1.0_f32, col),
                 ));
             }
             _ => {
@@ -445,8 +445,8 @@ pub fn draw_damage_arrows(p: &egui::Painter, rect: Rect, g: &Game) {
         let p0 = centre - tangent * 18.0;
         let p1 = centre + out * 12.0;
         let p2 = centre + tangent * 18.0;
-        p.line_segment([p0, p1], Stroke::new(4.0, col));
-        p.line_segment([p1, p2], Stroke::new(4.0, col));
+        p.line_segment([p0, p1], Stroke::new(4.0_f32, col));
+        p.line_segment([p1, p2], Stroke::new(4.0_f32, col));
     }
 }
 
@@ -511,7 +511,7 @@ pub fn draw_compass(p: &egui::Painter, rect: Rect, g: &Game) {
         p.text(Pos2::new(xx, top + 10.0), Align2::CENTER_CENTER, lbl, FontId::monospace(13.0), Color32::from_rgb(220, 226, 232));
     }
     // centre tick
-    p.line_segment([Pos2::new(cx, top), Pos2::new(cx, top + 20.0)], Stroke::new(1.5, Color32::from_rgb(255, 200, 90)));
+    p.line_segment([Pos2::new(cx, top), Pos2::new(cx, top + 20.0)], Stroke::new(1.5_f32, Color32::from_rgb(255, 200, 90)));
 }
 
 /// Kill feed: recent elimination lines fading out in the top-right, under the minimap.
@@ -534,7 +534,7 @@ pub fn draw_minimap(p: &egui::Painter, rect: Rect, g: &Game) {
     let size = 132.0;
     let map_rect = Rect::from_min_size(Pos2::new(rect.max.x - size - 16.0, rect.min.y + 16.0), Vec2::splat(size));
     p.rect_filled(map_rect, 4.0, Color32::from_rgba_unmultiplied(10, 12, 16, 180));
-    p.rect_stroke(map_rect, 4.0, Stroke::new(1.0, Color32::from_rgb(60, 70, 80)), egui::StrokeKind::Inside);
+    p.rect_stroke(map_rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(60, 70, 80)), egui::StrokeKind::Inside);
 
     let lvl = &g.level;
     let ts = lvl.ts();
@@ -578,7 +578,7 @@ pub fn draw_minimap(p: &egui::Painter, rect: Rect, g: &Game) {
     p.circle_filled(center, 3.0, Color32::from_rgb(120, 255, 140));
     let yaw = g.player.cam.yaw;
     let dir = Vec2::new(yaw.sin(), -yaw.cos());
-    p.line_segment([center, center + dir * 11.0], Stroke::new(1.5, Color32::from_rgb(120, 255, 140)));
+    p.line_segment([center, center + dir * 11.0], Stroke::new(1.5_f32, Color32::from_rgb(120, 255, 140)));
 }
 
 pub fn draw_center_banner(p: &egui::Painter, rect: Rect, text: &str, col: Color32) {

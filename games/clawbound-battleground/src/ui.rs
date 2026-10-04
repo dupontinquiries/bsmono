@@ -582,7 +582,7 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
                     p.rect_filled(Rect::from_min_size(cell.min, Vec2::new(cell.width() * fill, cell.height())), 2.0, col);
                 }
             }
-            p.rect_stroke(r, 6.0, Stroke::new(1.0, Color32::from_rgb(190, 160, 240)));
+            p.rect_stroke(r, 6.0, Stroke::new(1.0_f32, Color32::from_rgb(190, 160, 240)));
             let next = if capped {
                 "every ability at its top".to_string()
             } else {
@@ -648,7 +648,7 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
                     if lit {
                         p.circle_filled(at, 3.0, col);
                     } else {
-                        p.circle_stroke(at, 2.6, Stroke::new(1.0, col.linear_multiply(0.45)));
+                        p.circle_stroke(at, 2.6, Stroke::new(1.0_f32, col.linear_multiply(0.45)));
                     }
                 }
                 let tip = if rank == 0 {
@@ -1314,19 +1314,19 @@ pub fn draw_touch_pad(ctx: &egui::Context, pad: &crate::touch::TouchPad, game: &
 
     // stick
     if let Some((origin, knob)) = pad.stick_draw() {
-        painter.circle(to_px(origin), r_px(0.135), dim, Stroke::new(2.0, ring));
+        painter.circle(to_px(origin), r_px(0.135), dim, Stroke::new(2.0_f32, ring));
         painter.circle_filled(to_px(knob), r_px(0.05), Color32::from_rgba_premultiplied(230, 226, 216, 200));
     } else {
         // a faint hint where the thumb usually rests, breathing gently so
         // it reads as "tap here" rather than a static leftover mark
         let breathe = 0.5 + 0.5 * (t * 1.3).sin();
         let a = (50.0 + breathe * 35.0) as u8;
-        painter.circle_stroke(to_px(glam::Vec2::new(0.22, pad.extent.y - 0.30)), r_px(0.055 + breathe * 0.01), Stroke::new(1.0, Color32::from_rgba_premultiplied(230, 226, 216, a)));
+        painter.circle_stroke(to_px(glam::Vec2::new(0.22, pad.extent.y - 0.30)), r_px(0.055 + breathe * 0.01), Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(230, 226, 216, a)));
     }
     // attack: a quick press-scale via animate_bool, keyed to the button id
     let atk_t = ctx.animate_bool(egui::Id::new("touch_atk"), pad.attack_down());
     let atk_c = Color32::from_rgba_premultiplied((20.0 + atk_t * 180.0) as u8, (20.0 + atk_t * 60.0) as u8, (28.0 + atk_t * 32.0) as u8, (120.0 + atk_t * 80.0) as u8);
-    painter.circle(to_px(l.attack), r_px(crate::touch::ATK_R) * (1.0 + atk_t * 0.08), atk_c, Stroke::new(2.0, ring));
+    painter.circle(to_px(l.attack), r_px(crate::touch::ATK_R) * (1.0 + atk_t * 0.08), atk_c, Stroke::new(2.0_f32, ring));
     painter.text(to_px(l.attack), Align2::CENTER_CENTER, "ATK", FontId::proportional(r_px(0.06)), Color32::WHITE);
     // abilities: press-scale, a bright flash the instant one comes off
     // cooldown (so you notice without staring at the countdown), cooldown sweep
@@ -1358,7 +1358,7 @@ pub fn draw_touch_pad(ctx: &egui::Context, pad: &crate::touch::TouchPad, game: &
         painter.circle(to_px(*c), r, fill, Stroke::new(2.0 + flash * 1.5, if ab.ult { GOLD } else { ring }));
         // the coat she is wearing (`sentinel`): a white ring outside it
         if g.field_slot == Some(i as u32) {
-            painter.circle_stroke(to_px(*c), r * 1.16, Stroke::new(2.5, Color32::WHITE));
+            painter.circle_stroke(to_px(*c), r * 1.16, Stroke::new(2.5_f32, Color32::WHITE));
         }
         let label = if cd > 0.0 { format!("{:.0}", cd.ceil()) } else { format!("{}", i + 1) };
         painter.text(to_px(*c), Align2::CENTER_CENTER, label, FontId::proportional(r_px(0.05)), Color32::WHITE);
@@ -1384,15 +1384,15 @@ pub fn draw_touch_pad(ctx: &egui::Context, pad: &crate::touch::TouchPad, game: &
         }
     }
     // shop / board / menu — press feedback so taps feel acknowledged
-    painter.circle(to_px(l.shop), r_px(crate::touch::BTN_R * 0.8), dim, Stroke::new(1.5, ring));
+    painter.circle(to_px(l.shop), r_px(crate::touch::BTN_R * 0.8), dim, Stroke::new(1.5_f32, ring));
     painter.text(to_px(l.shop), Align2::CENTER_CENTER, "$", FontId::proportional(r_px(0.05)), GOLD);
-    painter.circle(to_px(l.leap), r_px(crate::touch::BTN_R * 0.8), dim, Stroke::new(1.5, ring));
+    painter.circle(to_px(l.leap), r_px(crate::touch::BTN_R * 0.8), dim, Stroke::new(1.5_f32, ring));
     painter.text(to_px(l.leap), Align2::CENTER_CENTER, "^", FontId::proportional(r_px(0.06)), GOLD);
     let board_t = ctx.animate_bool(egui::Id::new("touch_board_held"), pad.board_down());
     let board_fill = Color32::from_rgba_premultiplied((20.0 + board_t * 40.0) as u8, 20, 28, (120.0 + board_t * 60.0) as u8);
-    painter.circle(to_px(l.board), r_px(crate::touch::BTN_R * 0.8) / pad.scale * (1.0 + board_t * 0.08), board_fill, Stroke::new(1.5, ring));
+    painter.circle(to_px(l.board), r_px(crate::touch::BTN_R * 0.8) / pad.scale * (1.0 + board_t * 0.08), board_fill, Stroke::new(1.5_f32, ring));
     painter.text(to_px(l.board), Align2::CENTER_CENTER, "≡", FontId::proportional(r_px(0.045) / pad.scale), Color32::WHITE);
-    painter.circle(to_px(l.menu), r_px(crate::touch::BTN_R * 0.8) / pad.scale, dim, Stroke::new(1.5, ring));
+    painter.circle(to_px(l.menu), r_px(crate::touch::BTN_R * 0.8) / pad.scale, dim, Stroke::new(1.5_f32, ring));
     painter.text(to_px(l.menu), Align2::CENTER_CENTER, "⚙", FontId::proportional(r_px(0.045) / pad.scale), Color32::WHITE);
 }
 
@@ -1578,7 +1578,7 @@ pub fn map_picker(ui: &mut egui::Ui, choice: &mut crate::map::MapId) {
                 let t = hover_t(ui.ctx(), egui::Id::new("map_card").with(m.key()), resp.hovered());
                 let p = ui.painter();
                 p.rect_filled(rect, 8.0, if sel { Color32::from_rgb(58, 52, 36) } else { Color32::from_rgb(34, 33, 40).linear_multiply(1.0 + 0.3 * t) });
-                p.rect_stroke(rect, 8.0, Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { GOLD } else { Color32::from_rgb(80, 78, 70) }));
+                p.rect_stroke(rect, 8.0, Stroke::new(if sel { 2.0_f32 } else { 1.0_f32 }, if sel { GOLD } else { Color32::from_rgb(80, 78, 70) }));
                 let n = m.team_size();
                 p.text(rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, m.name(), FontId::proportional(15.0), if sel { GOLD } else { Color32::from_rgb(220, 216, 205) });
                 p.text(rect.right_top() + Vec2::new(-10.0, 9.0), Align2::RIGHT_TOP, format!("{n} v {n}"), FontId::proportional(12.0), Color32::from_rgb(180, 176, 165));
