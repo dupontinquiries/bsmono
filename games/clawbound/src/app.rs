@@ -74,7 +74,7 @@ fn icon_claw(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
     let c = rect.center();
     for dx in [-4.0f32, 0.0, 4.0] {
-        ui.painter().add(Shape::line_segment([pos2(c.x + dx - 2.0, c.y - 6.0), pos2(c.x + dx + 2.0, c.y + 6.0)], Stroke::new(2.2, color)));
+        ui.painter().add(Shape::line_segment([pos2(c.x + dx - 2.0, c.y - 6.0), pos2(c.x + dx + 2.0, c.y + 6.0)], Stroke::new(2.2_f32, color)));
     }
 }
 /// Draw the right icon for a `Power` buff badge.
@@ -97,7 +97,7 @@ fn icon_passive(ui: &mut egui::Ui, class: clawbound_rs::class::Class, color: egu
             for a in 0..4 {
                 let ang = a as f32 * std::f32::consts::FRAC_PI_2 + 0.2;
                 let (dx, dy) = (ang.cos() * 6.0, ang.sin() * 6.0);
-                p.add(Shape::line_segment([c, pos2(c.x + dx, c.y + dy)], Stroke::new(1.8, color)));
+                p.add(Shape::line_segment([c, pos2(c.x + dx, c.y + dy)], Stroke::new(1.8_f32, color)));
             }
         }
         Class::Squirrel => {
@@ -110,7 +110,7 @@ fn icon_passive(ui: &mut egui::Ui, class: clawbound_rs::class::Class, color: egu
             for (dy, r) in [(-3.0, 6.5), (2.0, 5.0), (6.0, 3.2)] {
                 p.add(Shape::Path(egui::epaint::PathShape::line(
                     (0..=8).map(|i| { let t = i as f32 / 8.0; pos2(c.x - r + t * 2.0 * r, c.y + dy + (t * std::f32::consts::PI).sin() * 1.6) }).collect(),
-                    Stroke::new(1.6, color))));
+                    Stroke::new(1.6_f32, color))));
             }
         }
         Class::Frog => {
@@ -119,7 +119,7 @@ fn icon_passive(ui: &mut egui::Ui, class: clawbound_rs::class::Class, color: egu
                 let t = i as f32 / 12.0 * std::f32::consts::PI;
                 pos2(c.x + (t.cos()) * 6.0, c.y - 6.0 + t.sin() * 7.0)
             }).collect();
-            p.add(Shape::Path(egui::epaint::PathShape::closed_line(pts, Stroke::new(1.6, color))));
+            p.add(Shape::Path(egui::epaint::PathShape::closed_line(pts, Stroke::new(1.6_f32, color))));
         }
         Class::Goat => {
             // Sure-Footed — a small mountain peak
@@ -128,7 +128,7 @@ fn icon_passive(ui: &mut egui::Ui, class: clawbound_rs::class::Class, color: egu
         Class::Hawk => {
             // Keen Eyes — an eye
             p.add(Shape::Path(egui::epaint::PathShape::closed_line(
-                vec![pos2(c.x - 7.0, c.y), pos2(c.x, c.y - 4.5), pos2(c.x + 7.0, c.y), pos2(c.x, c.y + 4.5)], Stroke::new(1.6, color))));
+                vec![pos2(c.x - 7.0, c.y), pos2(c.x, c.y - 4.5), pos2(c.x + 7.0, c.y), pos2(c.x, c.y + 4.5)], Stroke::new(1.6_f32, color))));
             p.add(Shape::Circle(CircleShape::filled(c, 2.0, color)));
         }
     }
@@ -146,12 +146,12 @@ fn icon_ultimate(ui: &mut egui::Ui, class: clawbound_rs::class::Class, color: eg
                 let t = i as f32 / 16.0 * std::f32::consts::PI * 1.6;
                 pos2(c.x + t.cos() * (2.0 + t * 1.3), c.y + t.sin() * (2.0 + t * 1.3))
             }).collect();
-            p.add(Shape::Path(egui::epaint::PathShape::line(pts, Stroke::new(1.6, color))));
+            p.add(Shape::Path(egui::epaint::PathShape::line(pts, Stroke::new(1.6_f32, color))));
         }
         Class::Squirrel => {
             // Scamper — motion streaks
             for dx in [-4.0f32, 0.0, 4.0] {
-                p.add(Shape::line_segment([pos2(c.x + dx - 5.0, c.y - 2.0), pos2(c.x + dx + 3.0, c.y - 2.0)], Stroke::new(1.8, color)));
+                p.add(Shape::line_segment([pos2(c.x + dx - 5.0, c.y - 2.0), pos2(c.x + dx + 3.0, c.y - 2.0)], Stroke::new(1.8_f32, color)));
             }
         }
         Class::Otter => {
@@ -162,20 +162,20 @@ fn icon_ultimate(ui: &mut egui::Ui, class: clawbound_rs::class::Class, color: eg
         Class::Frog => {
             // Bound — an arcing leap trajectory
             let pts: Vec<_> = (0..=10).map(|i| { let t = i as f32 / 10.0; pos2(c.x - 6.0 + t * 12.0, c.y + 5.0 - (t * std::f32::consts::PI).sin() * 9.0) }).collect();
-            p.add(Shape::Path(egui::epaint::PathShape::line(pts, Stroke::new(1.8, color))));
+            p.add(Shape::Path(egui::epaint::PathShape::line(pts, Stroke::new(1.8_f32, color))));
         }
         Class::Goat => {
             // Charge — a forward chevron burst
             for off in [0.0f32, 5.0] {
-                p.add(Shape::line_segment([pos2(c.x - 5.0 + off, c.y - 5.0), pos2(c.x + 2.0 + off, c.y)], Stroke::new(1.8, color)));
-                p.add(Shape::line_segment([pos2(c.x - 5.0 + off, c.y + 5.0), pos2(c.x + 2.0 + off, c.y)], Stroke::new(1.8, color)));
+                p.add(Shape::line_segment([pos2(c.x - 5.0 + off, c.y - 5.0), pos2(c.x + 2.0 + off, c.y)], Stroke::new(1.8_f32, color)));
+                p.add(Shape::line_segment([pos2(c.x - 5.0 + off, c.y + 5.0), pos2(c.x + 2.0 + off, c.y)], Stroke::new(1.8_f32, color)));
             }
         }
         Class::Hawk => {
             // Stoop — a sharp diving arrow
-            p.add(Shape::line_segment([pos2(c.x - 5.0, c.y - 5.0), pos2(c.x + 5.0, c.y + 5.0)], Stroke::new(2.0, color)));
-            p.add(Shape::line_segment([pos2(c.x + 5.0, c.y + 5.0), pos2(c.x - 1.0, c.y + 5.0)], Stroke::new(2.0, color)));
-            p.add(Shape::line_segment([pos2(c.x + 5.0, c.y + 5.0), pos2(c.x + 5.0, c.y - 1.0)], Stroke::new(2.0, color)));
+            p.add(Shape::line_segment([pos2(c.x - 5.0, c.y - 5.0), pos2(c.x + 5.0, c.y + 5.0)], Stroke::new(2.0_f32, color)));
+            p.add(Shape::line_segment([pos2(c.x + 5.0, c.y + 5.0), pos2(c.x - 1.0, c.y + 5.0)], Stroke::new(2.0_f32, color)));
+            p.add(Shape::line_segment([pos2(c.x + 5.0, c.y + 5.0), pos2(c.x + 5.0, c.y - 1.0)], Stroke::new(2.0_f32, color)));
         }
     }
 }
