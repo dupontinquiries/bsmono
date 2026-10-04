@@ -80,10 +80,43 @@ pub fn local_yday() -> u32 {
     }
 }
 
+/// `--rescan no`: read what NetworkManager already has. The default (`--rescan auto`) asks for a new scan when the
+/// results are over 30 s old and WAITS for it: on a sleeping, locked phone that took ~7.5 s every minute (the whole
+/// shell froze, found with the stall log), and a scan a minute keeps the radio awake besides.
+pub const WIFI_PLACE_ARGS: [&str; 8] = ["-t", "-f", "ACTIVE,SSID,BSSID", "dev", "wifi", "list", "--rescan", "no"];
+
+/// Asks for the connected Wi-Fi on a worker thread, so a slow `nmcli` can never stall the shell's loop:
+/// `request()` returns at once; the answer shows up in `take()` whenever it is ready.
+pub struct WifiPoller {
+    tx: std::sync::mpsc::Sender<()>,
+    rx: std::sync::mpsc::Receiver<Option<(String, String)>>,
+}
+
+impl WifiPoller {
+    pub fn new() -> WifiPoller { WifiPoller::with(wifi_place) }
+
+    pub fn with(f: impl Fn() -> Option<(String, String)> + Send + 'static) -> WifiPoller {
+        let (tx, req) = std::sync::mpsc::channel::<()>();
+        let (res_tx, rx) = std::sync::mpsc::channel();
+        let _ = std::thread::Builder::new().name("tideshell-wifi".into()).spawn(move || {
+            while req.recv().is_ok() {
+                while req.try_recv().is_ok() {} // several requests while busy are one request
+                if res_tx.send(f()).is_err() { break; }
+            }
+        });
+        WifiPoller { tx, rx }
+    }
+
+    pub fn request(&self) { let _ = self.tx.send(()); }
+
+    /// The newest answer since the last call, if one arrived: `Some(None)` is "asked, not on a known Wi-Fi".
+    pub fn take(&self) -> Option<Option<(String, String)>> { self.rx.try_iter().last() }
+}
+
 /// The BSSID and SSID of the connected WiFi from `nmcli`, if any
 /// (`nmcli -t -f ACTIVE,SSID,BSSID dev wifi`; BSSID colons are escaped).
 pub fn wifi_place() -> Option<(String, String)> {
-    let out = std::process::Command::new("nmcli").args(["-t", "-f", "ACTIVE,SSID,BSSID", "dev", "wifi"]).stdin(std::process::Stdio::null()).output().ok()?;
+    let out = std::process::Command::new("nmcli").args(WIFI_PLACE_ARGS).stdin(std::process::Stdio::null()).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1783,5 +1816,25 @@ mod hw_input_tests {
     fn a_virtual_keyboard_is_how_text_arrives_not_hardware() {
         let v = KB.replace("Logitech K380", "dotool virtual keyboard");
         assert_eq!(parse_hw_input(&v), (false, false));
+    }
+
+    #[test]
+    fn the_wifi_query_never_asks_networkmanager_to_rescan() {
+        let a = crate::sensors::WIFI_PLACE_ARGS;
+        let at = a.iter().position(|x| *x == "--rescan").expect("--rescan is given");
+        assert_eq!(a[at + 1], "no", "a rescan of stale results blocked ~7.5 s with the screen off");
+        assert!(a.contains(&"list"), "the `list` form takes --rescan");
+    }
+
+    #[test]
+    fn a_slow_wifi_query_never_blocks_the_caller() {
+        let p = crate::sensors::WifiPoller::with(|| { std::thread::sleep(std::time::Duration::from_millis(400)); Some(("aa:bb".into(), "home".into())) });
+        let t = std::time::Instant::now();
+        p.request();
+        assert!(t.elapsed() < std::time::Duration::from_millis(100), "request() waited for the query: {:?}", t.elapsed());
+        assert_eq!(p.take(), None, "nothing yet");
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        assert_eq!(p.take(), Some(Some(("aa:bb".to_string(), "home".to_string()))), "the answer arrived on its own");
+        assert_eq!(p.take(), None, "and is delivered once");
     }
 }

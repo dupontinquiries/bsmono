@@ -113,6 +113,10 @@ struct Shellbox {
     last_temp_poll: u64,
     strip_base_px: u32,
     last_place_poll: u64,
+    /// The Wi-Fi place query runs on its own thread (a slow nmcli froze the whole loop); see `WifiPoller`.
+    wifi: tideshell_egui::sensors::WifiPoller,
+    /// A landmark hint file is steering the place this minute, so a Wi-Fi answer must not override it.
+    place_hint_active: bool,
     last_fleet_poll: u64,
     last_color_note: u64,
 }
@@ -640,6 +644,8 @@ fn main() {
         last_temp_poll: 0,
         strip_base_px: 0,
         last_place_poll: 0,
+        wifi: tideshell_egui::sensors::WifiPoller::new(),
+        place_hint_active: false,
         last_fleet_poll: 0,
         last_color_note: 0,
     };
@@ -960,6 +966,12 @@ fn main() {
                 sb.shell.on_mic_level(l, now_ms);
             }
         }
+        // A Wi-Fi answer that arrived since the last pass (never blocks: see `WifiPoller`).
+        if let Some(answer) = sb.wifi.take() {
+            if let (false, Some((bssid, ssid))) = (sb.place_hint_active, answer) {
+                sb.shell.on_place(tideshell_core::ambience::PlaceKey::Wifi(bssid), &ssid);
+            }
+        }
         // Every 60 s: which WiFi we are on (a place), the landmark hint file
         // from snapclone, the calendar, and the places log if it changed.
         if now_ms.saturating_sub(sb.last_place_poll) >= 60_000 {
@@ -967,9 +979,11 @@ fn main() {
             sb.shell.set_date(tideshell_egui::sensors::local_yday());
             let hint = std::env::var_os("XDG_RUNTIME_DIR").map(|r| std::path::PathBuf::from(r).join("tideshell.place")).and_then(|p| std::fs::read_to_string(p).ok());
             if let Some((key, name)) = hint.as_deref().and_then(tideshell_core::ambience::PlaceKey::parse) {
+                sb.place_hint_active = true;
                 sb.shell.on_place(key, &name);
-            } else if let Some((bssid, ssid)) = tideshell_egui::sensors::wifi_place() {
-                sb.shell.on_place(tideshell_core::ambience::PlaceKey::Wifi(bssid), &ssid);
+            } else {
+                sb.place_hint_active = false;
+                sb.wifi.request(); // answered on a worker thread; applied below as soon as it arrives
             }
             if sb.shell.take_ambience_dirty() {
                 if let Some(p) = Shellbox::places_path() {
