@@ -1,0 +1,11 @@
+[package]
+name = "penlog"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only evdev logger for a tablet digitizer: axis ranges, pen event rate, tool and hover/pressure ranges. std only."
+
+[workspace]
+
+[profile.release]
+opt-level = "s"
+strip = true
