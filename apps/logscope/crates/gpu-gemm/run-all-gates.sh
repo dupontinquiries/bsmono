@@ -28,7 +28,7 @@ GATES_ARCH="gemma qwen2 qwen3 llama4-kqnorm mla-block swa branch kvtree"
 GATES_MOE="iq1s iq1s-kernel moe-fusion moe-raw moe-repin moe-stream moe-prefetch passfuse"
 # the hybrid (Gated DeltaNet) family, the fused-kernel rewrite and native IQ4_XS — added 2026-10-04;
 # fused-v2 takes a GGUF for its whole-model half (the fixture gen-all.sh writes)
-GATES_HYBRID="deltanet-load prefill-parity rope-kv iq4xs"
+GATES_HYBRID="deltanet-load prefill-parity rope-kv deltanet-carry iq4xs"
 GATES_PERF="autotune autotune-cache submit stream-slots residency perf prefill prefill-attn"
 GATES_SYS="vram mmap zerocopy loadpath worker"
 GATES_VISION="vit-block vae-conv vae-resblock dit-block dit-primitives dit-conditioning"

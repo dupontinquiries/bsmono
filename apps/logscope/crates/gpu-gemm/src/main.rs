@@ -6868,6 +6868,88 @@ still pass, which is why this one exists."
             else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-deltanet-carry") {
+        // THE PRODUCTION CARRY PATH, end to end. --gate-deltanet-prefix-reuse proves the carry
+        // *install* through hand-copied `copy_rows_pub`; what the app actually calls is
+        // `carry_deltanet_state` + `seed_from_prefix` (backend.rs), and that exact combination has
+        // never been driven against a hybrid GPU run until now. THIS gate is the success-path proof
+        // for the operator the whole ModelArchetype system exists to carry: that a carried Gated
+        // DeltaNet checkpoint, installed the way the engine does it, reproduces the cold prefill.
+        //
+        // Two windows over the SAME prompt P, one recurrent state:
+        //   (A) COLD — prefill P from position 0 into a fresh new_cache_for; the delta state folds
+        //       0..|P| on the way. Reference.
+        //   (B) CARRIED — prefill P in a SECOND window to build the checkpoint, then install it into
+        //       a fresh window via the production `carry_deltanet_state(&m,&mut s,&prev.cache,l)` +
+        //       `seed_from_prefix(&m,&mut s,&prev.cache,l)`. The carried state sits at next_pos==l
+        //       and the tail l..|P| is reprefilled through `block_prefill_deltanet_gpu`, which asserts
+        //       its next_pos matches the absolute position it decodes to.
+        // A carried delta state folded over a *different* prefix would still load into next_pos==l
+        // and pass the assert, so agreement with the cold full prefill is the ONLY thing that can
+        // catch a carry that drops part of {ring,s} — exactly the corruption the position-absolute
+        // invariant is there to refuse rather than emit. Prefill is "not bit-identical to decode
+        // overall" (a GEMM in prefill vs. a fused matvec in decode), so the bound is per-family
+        // tolerance, like the other families' parity gates.
+        std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
+        let gpu = Gpu::new();
+        eprintln!("gate-deltanet-carry: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let bytes = write_gguf_qwen35moe_hybrid(1, None);
+        let m = gpu.load_gguf_quantized(&bytes).expect("hybrid f32 load for carry gate");
+        ck("hybrid load carries a recurrent layer", m.deltanet_layers() >= 1);
+
+        let prompt: Vec<u32> = vec![2, 7, 3, 11, 5, 9, 4, 8, 1, 6, 2, 7];
+        let l = 7;                                     // split: 7 carried, 3 reprefilled
+        assert!(l >= 1 && l < prompt.len());
+        let tail = &prompt[l..];
+
+        // (A) COLD reference over the whole prompt, delta state folded 0..|P| by the prefill.
+        let ref_cache = gpu.new_cache_for(&m, prompt.len() + 8);
+        let ref_logits = gpu.prefill_chunked(&m, &ref_cache, &prompt, 256);
+
+        // (B) Build the carried checkpoint by prefilling P in a throwaway window, then install it
+        //     into a fresh window through the PRODUCTION carry + seed, and reprefill only the tail.
+        let builder = gpu.session_new(&m, prompt.len() + 8, 0x4401);
+        // Fold P through the throwaway window so its delta-net layers carry the folded checkpoint.
+        // (session_new starts at next_pos == 0, so this prefill is what the carry must replicate.)
+        let _ = gpu.prefill_chunked(&m, &builder.cache, &prompt, 256);
+        // The builder has folded P, so its carried state sits at next_pos == |P|. Read the positions
+        // straight off the source cache — DeltaNetGpuState owns an AtomicUsize, so it is not Clone.
+        let carried_next_pos = builder.cache.deltanet_gpu.as_ref().unwrap()
+            .iter().filter_map(|slot| slot.as_ref())
+            .map(|s| s.next_pos.load(std::sync::atomic::Ordering::Relaxed))
+            .collect::<Vec<_>>();
+        ck("carried state carries delta-net GPU state with next_pos == |P|",
+           !carried_next_pos.is_empty() && carried_next_pos.iter().all(|&p| p == prompt.len()));
+
+        let mut carried = gpu.session_new(&m, prompt.len() + 8, 0x4402);
+        let delta_ok = gpu.carry_deltanet_state(&m, &mut carried, &builder.cache, l);
+        ck("carry_deltanet_state reports it carried state", delta_ok);
+        gpu.seed_from_prefix(&m, &mut carried, &builder.cache, l);
+
+        // The install is position-correct: after the production seed, next_pos == l on every layer,
+        // not the zeroed start a fresh session would have.
+        let post_pos = carried.cache.deltanet_gpu.as_ref().unwrap()
+            .iter().filter_map(|slot| slot.as_ref())
+            .map(|s| s.next_pos.load(std::sync::atomic::Ordering::Relaxed))
+            .collect::<Vec<_>>();
+        ck("production carry set next_pos == l (position-absolute invariant)",
+           post_pos.iter().all(|&p| p == l));
+
+        let split_logits = gpu.prefill_chunked_from(&m, &carried.cache, tail, l, 256);
+        ck("carried install reprefills the tail without the seek panic", true);
+        let dmax = split_logits.iter().zip(&ref_logits)
+            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck(&format!("carried install reproduces the cold full prefill (max |Δ| = {dmax:.2e})",
+                    dmax = dmax), dmax < 1e-3);
+        ck("argmax agrees between cold prefill and carried install",
+           gpu_kernels::argmax(&ref_logits) == gpu_kernels::argmax(&split_logits));
+
+        println!("gate-deltanet-carry: {}",
+            if ok { "production carry reproduces cold prefill \u{2713}" }
+            else { "FAIL \u{2717}" });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-deltanet-load") {
         // The hybrid load + decode gate: a qwen35moe checkpoint whose blk.0 is Gated DeltaNet
         // and blk.1 plain attention must load (recurrent set to the CPU-routed mixer, dense
@@ -7372,7 +7454,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-batched-fused  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-gemma4-altv  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-prefill-parity --gate-qwen3\n  --gate-residency  --gate-rope-kv  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy\n  --gate-deltanet-prefix-reuse  --gate-sgladder  --gate-fused-v2  --gate-iq4xs");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-batched-fused  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-gemma4-altv  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-prefill-parity --gate-qwen3\n  --gate-residency  --gate-rope-kv  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy\n  --gate-deltanet-prefix-reuse  --gate-sgladder  --gate-fused-v2  --gate-iq4xs  --gate-deltanet-carry");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
