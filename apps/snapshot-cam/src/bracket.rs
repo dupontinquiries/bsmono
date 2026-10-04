@@ -43,7 +43,7 @@ impl Mode {
     pub fn available(self, ctl: Option<&Controls>) -> Result<(), String> {
         let has = |r: Role| ctl.is_some_and(|c| c.get(r).is_some());
         match self {
-            Mode::Hdr if !has(Role::Exposure) => Err("HDR needs the camera's exposure control (V4L2); use burst merge".into()),
+            // HDR with no exposure control is not an error: it is the software HDR (see `Sequence::soft`)
             Mode::Focus if !has(Role::Focus) => Err("focus stacking needs the camera's focus control (V4L2)".into()),
             _ => Ok(()),
         }
@@ -69,6 +69,9 @@ pub struct Sequence {
     settle: u32,
     last_seq: Option<u64>,
     pub frames: Vec<RawFrame>,
+    /// HDR without an exposure control (libcamera owns the sensor's exposure here, so real brackets are impossible): a
+    /// burst of identical exposures, averaged to cut shadow noise, then tone-fused from virtual brackets (fusion.rs).
+    pub soft: bool,
 }
 
 /// What the shell should do after feeding a frame.
@@ -93,6 +96,7 @@ impl Sequence {
         let steps: Vec<Vec<(String, i64)>> = match mode {
             Mode::Single | Mode::WbBracket => vec![vec![]],
             Mode::Burst => vec![vec![]; BURST],
+            Mode::Hdr if !ctl.is_some_and(|c| c.get(Role::Exposure).is_some()) => vec![vec![]; BURST],
             Mode::Hdr => {
                 let c = ctl.unwrap();
                 keep(c, Role::AutoExposure, &mut restore);
@@ -112,7 +116,8 @@ impl Sequence {
         // Restore the automatic control LAST, so a manual value restored
         // after it does not switch auto off again.
         restore.reverse();
-        Ok(Sequence { mode, steps, restore, idx: 0, settle: 0, last_seq: None, frames: vec![] })
+        let soft = mode == Mode::Hdr && !ctl.is_some_and(|c| c.get(Role::Exposure).is_some());
+        Ok(Sequence { mode, steps, restore, idx: 0, settle: 0, last_seq: None, frames: vec![], soft })
     }
 
     /// The planned steps (each a list of control writes), for tests of what a mode would do.
@@ -236,9 +241,21 @@ mod tests {
 
     #[test]
     fn modes_without_their_control_say_what_is_missing() {
-        assert!(Sequence::plan(Mode::Hdr, None).unwrap_err().contains("exposure"));
+        assert!(Sequence::plan(Mode::Hdr, None).unwrap().soft, "HDR without an exposure control is the software HDR, not an error");
         assert!(Sequence::plan(Mode::Focus, None).unwrap_err().contains("focus"));
         assert!(Sequence::plan(Mode::Burst, None).is_ok());
         for m in Mode::ALL { assert_eq!(Mode::from_conf(m.to_conf()), m); }
+    }
+
+    #[test]
+    fn software_hdr_takes_a_burst_of_one_exposure_and_real_hdr_still_brackets() {
+        let mut soft = Sequence::plan(Mode::Hdr, None).unwrap();
+        assert!(soft.soft && soft.start().is_empty(), "no control to set: nothing is applied");
+        for seq in 1..=BURST as u64 { let _ = soft.on_frame(&frame(seq)); }
+        assert_eq!(soft.frames.len(), BURST, "a burst of identical exposures to average");
+        assert!(soft.restore().is_empty(), "and nothing to put back");
+        // with an exposure control it is the real bracket, unchanged
+        let real = Sequence::plan(Mode::Hdr, Some(&ctl())).unwrap();
+        assert!(!real.soft && real.steps.len() == HDR_STOPS.len());
     }
 }

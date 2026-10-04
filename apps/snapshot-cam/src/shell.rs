@@ -209,6 +209,8 @@ pub struct Cam {
     bottom_h: f32,
     /// Where last frame's controls began (screen y): taps at or below it are the buttons', not the picture's.
     controls_top: f32,
+    /// Set for ONE save: develop the frame and tone-fuse it even when the fusion setting is off (the software HDR).
+    force_fusion: bool,
 }
 
 impl Cam {
@@ -288,6 +290,7 @@ impl Cam {
             roll_open: false,
             bottom_h: 0.0,
             controls_top: f32::INFINITY,
+            force_fusion: false,
         }
     }
 
@@ -333,7 +336,8 @@ impl Cam {
         // file holds, and nothing is upscaled to pretend otherwise.
         let tone = self.pro.auto_tone.then(|| crate::autotone::measure(&full.rgba, full.width, full.height));
         let scene = crate::fusion::stats(&full.rgba, full.width, full.height).map(|s| crate::fusion::judge(&s).label());
-        let developed = self.pro.develops() || gains.is_some() || tone.is_some();
+        let fuse = std::mem::take(&mut self.force_fusion);
+        let developed = self.pro.develops() || gains.is_some() || tone.is_some() || fuse;
         let f = if developed {
             let mut p = self.pro.params(self.zoom.window(), full.width, full.height, None);
             if let Some(g) = gains { p.gains = g; }
@@ -345,7 +349,7 @@ impl Cam {
                 p.gains = [p.gains[0] * g[0], p.gains[1] * g[1], p.gains[2] * g[2]];
             }
             let mut px = develop::render(&full.rgba, full.width, full.height, &p);
-            if self.pro.fusion && gains.is_none() { px = crate::fusion::fuse_brackets(&px, p.out_w, p.out_h); }
+            if (self.pro.fusion || fuse) && gains.is_none() { px = crate::fusion::fuse_brackets(&px, p.out_w, p.out_h); }
             capture_kit::RawFrame { width: p.out_w, height: p.out_h, captured_ms: full.captured_ms, seq: full.seq, rgba: px.into() }
         } else if self.zoom.is_zoomed() { full.crop(self.zoom.window()) } else { full };
         let now = now_ms();
@@ -1425,6 +1429,39 @@ mod tests {
     }
 
     #[test]
+    fn the_software_hdr_forces_the_tone_fusion_for_one_save_even_with_the_fusion_setting_off() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let (mut cam, _t) = live_pattern(d.path(), &ctx, egui::vec2(360.0, 720.0));
+        assert!(!cam.pro.fusion);
+        let (w, h) = (96u32, 64u32);
+        let mut px = Vec::new();
+        for y in 0..h { for x in 0..w {
+            let tex = if (x / 2 + y / 2) % 2 == 0 { 1.0 } else { 0.7 };
+            let l = if x < w / 2 { 0.03 * tex } else { (0.5f32 * tex).min(1.0) };
+            let v = crate::develop::to_srgb(l);
+            px.extend_from_slice(&[v, v, v, 255]);
+        } }
+        let frame = || capture_kit::RawFrame { width: w, height: h, captured_ms: 0, seq: 1, rgba: px.clone().into() };
+        let left_mean = |f: &str| {
+            let img = image::open(d.path().join(f)).unwrap().to_luma8();
+            let mut s = 0u64; let mut n = 0u64;
+            for y in 0..h { for x in 4..(w / 2 - 4) { s += img.get_pixel(x, y).0[0] as u64; n += 1; } }
+            s as f64 / n as f64
+        };
+        cam.save_frame(&ctx, frame(), None, None);
+        let plain = cam.roll.shots()[0].clone();
+        cam.force_fusion = true; // what the merge sets for the software HDR's averaged frame
+        cam.save_frame(&ctx, frame(), None, None);
+        let hdr = cam.roll.shots()[0].clone();
+        assert!(left_mean(&hdr.file) > left_mean(&plain.file) + 4.0, "the dim half came up with fusion off: {} -> {}", left_mean(&plain.file), left_mean(&hdr.file));
+        assert!(!cam.force_fusion, "the force is for one save");
+        cam.save_frame(&ctx, frame(), None, None);
+        let after = cam.roll.shots()[0].clone();
+        assert!((left_mean(&after.file) - left_mean(&plain.file)).abs() < 1.0, "the next ordinary photo is not fused: {} vs {}", left_mean(&after.file), left_mean(&plain.file));
+    }
+
+    #[test]
     fn an_anamorphic_lens_with_ev_saves_a_desqueezed_brighter_photo() {
         let d = tempfile::tempdir().unwrap();
         let ctx = egui::Context::default();
@@ -1502,10 +1539,14 @@ mod tests {
         let files: Vec<String> = cam.roll.shots()[..3].iter().map(|s| s.file.clone()).collect();
         let (b0, b2) = (blue(&files[2]), blue(&files[0]));
         assert!(b0 > b2 + 3.0, "the 4500K variant is bluer than the 6500K one: {b0} vs {b2}");
-        // HDR without camera controls is refused, and says why.
+        // HDR without an exposure control (libcamera owns it here) is the software HDR: a burst, averaged, then
+        // tone-fused. It used to be refused with a note and took no photo.
         cam.flow.mode = crate::bracket::Mode::Hdr;
         cam.press_shutter(&ctx);
-        assert!(cam.flow.sequence.is_none() && cam.note.contains("exposure control"), "{}", cam.note);
+        assert!(cam.flow.sequence.as_ref().is_some_and(|s| s.soft), "software HDR started: {}", cam.note);
+        until(&mut cam, &mut t, 6, "software hdr");
+        assert!(cam.note.contains("software HDR from 6 frames"), "{}", cam.note);
+        assert!(!cam.force_fusion, "and the forced fusion was spent on that one save");
     }
 
     #[test]

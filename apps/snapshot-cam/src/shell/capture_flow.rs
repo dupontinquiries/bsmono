@@ -30,6 +30,8 @@ pub struct Flow {
     pub seq_ctl: Option<crate::hwctl::Controls>,
     /// The merge running on its thread: the result, and what it was.
     merging: Option<(Receiver<Result<RawFrame, String>>, String)>,
+    /// The merge running is the software HDR: its result is saved with the tone fusion forced on.
+    merging_soft: bool,
     /// The controls a sequence was started from, for the note.
     pub last_merge: Option<String>,
 }
@@ -152,8 +154,12 @@ impl Cam {
                 let what = what.clone();
                 self.flow.merging = None;
                 match r {
-                    Ok(f) => self.save_frame(ctx, f, None, Some(what)),
-                    Err(e) => self.note = format!("merge failed: {e}"),
+                    Ok(f) => {
+                        // the software HDR's averaged frame is developed, then tone-fused whatever the fusion setting says
+                        self.force_fusion = std::mem::take(&mut self.flow.merging_soft);
+                        self.save_frame(ctx, f, None, Some(what));
+                    }
+                    Err(e) => { self.flow.merging_soft = false; self.note = format!("merge failed: {e}"); }
                 }
             }
         }
@@ -171,7 +177,9 @@ impl Cam {
             return;
         }
         let n = frames.len();
+        let soft = s.soft;
         let what = match (s.mode, &self.flow.last_merge) {
+            (Mode::Hdr, _) if soft => format!("software HDR from {n} frames (averaged, then tone-fused)"),
             (Mode::Hdr, Some(l)) => format!("HDR from {n} exposures ({l})"),
             (Mode::Focus, _) => format!("focus stack of {n}"),
             (Mode::Burst, _) => format!("burst merge of {n}"),
@@ -187,11 +195,12 @@ impl Cam {
             }
             let refs: Vec<&[u8]> = frames.iter().map(|f| &f.rgba[..]).collect();
             let st = stack::Frames { w, h, rgba: refs };
-            let px = match mode { Mode::Hdr => stack::fuse_exposures(&st), Mode::Focus => stack::stack_focus(&st), _ => stack::average(&st) };
+            let px = match mode { Mode::Hdr if soft => stack::average(&st), Mode::Hdr => stack::fuse_exposures(&st), Mode::Focus => stack::stack_focus(&st), _ => stack::average(&st) };
             let _ = tx.send(Ok(RawFrame { width: w, height: h, captured_ms: frames[0].captured_ms, seq: frames[0].seq, rgba: px.into() }));
         }).ok();
         self.note = format!("merging {what}…");
         self.flow.merging = Some((rx, what));
+        self.flow.merging_soft = soft;
     }
 
     /// Measure the cover from the current frame (a grey card in the
