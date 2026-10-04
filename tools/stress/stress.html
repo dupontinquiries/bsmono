@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8"><title>stress</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{margin:0;background:#111;color:#ddd;font:14px monospace}
+#bar{position:sticky;top:0;background:#000;padding:6px;z-index:9}
+#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:2px}
+video,canvas{width:100%;display:block;background:#222}
+</style>
+<div id="bar">videos=<span id="n"></span> canvases=<span id="c"></span> fps=<b id="fps">-</b> worst-frame=<span id="worst">-</span>ms
+ | ?v=10&c=0&clip=clip.mp4 &nbsp; <button onclick="location.search='?v=20&c=4'">heavy</button></div>
+<div id="grid"></div>
+<script>
+// All load is local: one generated clip played N times (muted, looping) plus optional canvas animations.
+// Query: v = videos (default 10), c = busy canvases (default 0), clip = file next to this page.
+const q=new URLSearchParams(location.search), V=+(q.get('v')??10), C=+(q.get('c')??0), clip=q.get('clip')||'clip.mp4';
+const g=document.getElementById('grid');
+for(let i=0;i<V;i++){const v=document.createElement('video');v.src=clip;v.muted=true;v.loop=true;v.playsInline=true;v.autoplay=true;
+  v.currentTime=Math.random()*10;g.appendChild(v);v.play().catch(()=>{});}
+const cv=[];
+for(let i=0;i<C;i++){const c=document.createElement('canvas');c.width=640;c.height=360;g.appendChild(c);cv.push(c.getContext('2d'));}
+n.textContent=V;document.getElementById('c').textContent=C;
+let last=performance.now(),frames=0,t0=last,worst=0;
+function tick(t){
+  const dt=t-last;last=t;frames++;if(dt>worst)worst=dt;
+  for(const x of cv){ // deliberately wasteful: many gradients and a pixel readback
+    for(let k=0;k<40;k++){const gr=x.createRadialGradient(Math.random()*640,Math.random()*360,0,320,180,300);
+      gr.addColorStop(0,`hsl(${(t/10+k*9)%360} 90% 55%)`);gr.addColorStop(1,'#000');x.fillStyle=gr;x.fillRect(0,0,640,360);}
+    x.getImageData(0,0,64,64);
+  }
+  if(t-t0>1000){fps.textContent=(frames*1000/(t-t0)).toFixed(1);document.getElementById('worst').textContent=worst.toFixed(0);frames=0;t0=t;worst=0;}
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
