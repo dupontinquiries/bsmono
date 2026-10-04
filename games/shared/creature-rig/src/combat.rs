@@ -314,9 +314,20 @@ mod tests {
 
         c.begin_strike(0.5);
         assert_eq!(c.state(true).0, MotionState::Walking, "a lunging creature keeps walking");
+        // `progress` is 0 at the START of a timer (the direction strike_curve
+        // expects: anticipation first), so the overlay reads 0.0 on the frame
+        // the strike begins and climbs from the first tick. The assertion
+        // used to come before any tick and could never pass — the test and
+        // the timer landed in the same commit (1f11f2004) and disagreed.
         let mut m = MotionInput::default();
         c.apply(&mut m, true);
-        assert!(m.strike > 0.0, "but the strike overlay is set");
+        assert_eq!(m.strike, 0.0, "the first frame is the anticipation's start");
+        c.tick(1.0 / 60.0);
+        c.apply(&mut m, true);
+        assert!(m.strike > 0.0 && m.strike < 0.1, "but the strike overlay is set once it is under way: {}", m.strike);
+        run(&mut c, 0.6);
+        c.apply(&mut m, true);
+        assert_eq!(m.strike, 0.0, "and gone when the strike is over");
     }
 
     /// Dying outranks everything -- a creature hit while dying must not snap
