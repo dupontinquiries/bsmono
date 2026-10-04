@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Train and test a gaze-to-screen model on the phone: dots to look at, the front camera, a small network trained on the device from what it saw, then a live test of how well it predicts where you look."
 
-[[bin]]
-name = "gaze-trainer"
-path = "src/main.rs"
-required-features = ["app"]
+# No [[bin]] yet: 7b2633a5e committed the library ("NOT built: the window") with a bin target
+# pointing at a src/main.rs that is not in the tree — uncommitted work does not travel — so every
+# cargo command on this crate failed target resolution ("can't find bin `gaze-trainer`"), tests
+# included. When src/main.rs lands, cargo picks it up by convention; declare the target then,
+# with `required-features = ["app"]`, as the fleet's other apps do.
 
 [features]
 # The library (features, dataset, models, evaluation, the dot schedule) is feature-free and tests without a display or a
