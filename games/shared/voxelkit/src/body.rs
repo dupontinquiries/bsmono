@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 
 use creature_rig::anim_rig::{RigPart, Role};
-use voxel_tools::solid::{rasterize, Solid};
+use voxel_tools::solid::{cell_centre, rasterize, Solid};
 
 /// One labelled piece of a body.
 #[derive(Debug, Clone)]
@@ -87,6 +87,38 @@ pub struct BuiltBody {
 }
 
 /// Bounding box of a rasterised part, in world units: `(centre, half)`.
+/// Rasterise a solid authored in WORLD units at `voxel` world units per cell.
+///
+/// `voxel_tools::rasterize` samples unit cells, so the plan's `voxel` was not
+/// reaching the rasterisation at all: a torso authored six units wide at
+/// voxel 0.5 came out six CELLS wide, which `bounds_of` then scaled to three
+/// world units — every half-extent halved — and a part smaller than a unit
+/// cell (the one-cell test) rasterised to nothing and failed the build as
+/// empty. Cell (x, y, z) covers world [x·voxel, (x+1)·voxel), sampled at its
+/// centre, which at voxel 1 is exactly what `rasterize` does.
+fn rasterize_at(s: &Solid, voxel: f32) -> BTreeMap<(i32, i32, i32), u16> {
+    if voxel == 1.0 {
+        return rasterize(s);
+    }
+    let mut out = BTreeMap::new();
+    let Some((lo, hi)) = s.bounds() else { return out };
+    let cell = |w: i32, up: bool| -> i32 {
+        let v = w as f32 / voxel;
+        if up { v.ceil() as i32 } else { v.floor() as i32 }
+    };
+    for x in cell(lo[0], false)..=cell(hi[0], true) {
+        for y in cell(lo[1], false)..=cell(hi[1], true) {
+            for z in cell(lo[2], false)..=cell(hi[2], true) {
+                let c = cell_centre(x, y, z);
+                if let Some(m) = s.sample([c[0] * voxel, c[1] * voxel, c[2] * voxel]) {
+                    out.insert((x, y, z), m.block);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn bounds_of(cells: &BTreeMap<(i32, i32, i32), u16>, voxel: f32) -> Option<([f32; 3], [f32; 3])> {
     let mut lo = [i32::MAX; 3];
     let mut hi = [i32::MIN; 3];
@@ -167,7 +199,7 @@ impl BodyPlan {
             return Err(PlanError::LegCount(self.leg_count()));
         }
 
-        let torso_cells = rasterize(torso);
+        let torso_cells = rasterize_at(torso, self.voxel);
         let (torso_centre, torso_half) =
             bounds_of(&torso_cells, self.voxel).ok_or_else(|| PlanError::EmptyPart("torso".into()))?;
 
@@ -177,7 +209,7 @@ impl BodyPlan {
         let mut limbs: Vec<(u8, Role, [f32; 3], [f32; 3], String)> = Vec::new();
 
         for (i, p) in self.parts.iter().enumerate() {
-            let c = rasterize(&p.solid);
+            let c = rasterize_at(&p.solid, self.voxel);
             let (centre, half) =
                 bounds_of(&c, self.voxel).ok_or_else(|| PlanError::EmptyPart(p.name.clone()))?;
             // Body-local: every part is measured from the torso's centre, so
@@ -276,6 +308,35 @@ mod tests {
         assert!((a.rig[a_fl].offset[2] - s.rig[0].offset[2]).abs() < 1e-3);
     }
 
+    /// The voxel size sets how FINE the rasterisation is, not how big the
+    /// creature is: the same plan at voxel 1 and voxel 0.5 has the same
+    /// world-unit rig, to within half a coarse cell. Before `rasterize_at`
+    /// the fine plan's torso came out half as wide (six cells × 0.5).
+    #[test]
+    fn the_voxel_size_does_not_change_the_rigs_world_size() {
+        let plan = |voxel: f32| {
+            BodyPlan::new("cat", voxel)
+                .with_torso(boxx([-3.0, 0.0, -2.0], [3.0, 3.0, 2.0]))
+                .part(Role::Leg, "fl", boxx([1.5, -2.0, 1.0], [2.5, 0.0, 2.0]))
+                .part(Role::Leg, "fr", boxx([1.5, -2.0, -2.0], [2.5, 0.0, -1.0]))
+                .part(Role::Leg, "hl", boxx([-2.5, -2.0, 1.0], [-1.5, 0.0, 2.0]))
+                .part(Role::Leg, "hr", boxx([-2.5, -2.0, -2.0], [-1.5, 0.0, -1.0]))
+                .build(true)
+                .unwrap()
+        };
+        let (coarse, fine) = (plan(1.0), plan(0.5));
+        for i in 0..3 {
+            assert!((coarse.torso_half[i] - fine.torso_half[i]).abs() <= 0.5, "torso half {i}: {:?} vs {:?}", coarse.torso_half, fine.torso_half);
+            assert!((coarse.torso_half[i] - [3.0, 1.5, 2.0][i]).abs() <= 0.5, "the torso is six by three by four world units: {:?}", coarse.torso_half);
+        }
+        for (c, f) in coarse.rig.iter().zip(&fine.rig) {
+            for i in 0..3 {
+                assert!((c.offset[i] - f.offset[i]).abs() <= 0.5, "offset {i}: {:?} vs {:?}", c.offset, f.offset);
+                assert!((c.half[i] - f.half[i]).abs() <= 0.5, "half {i}: {:?} vs {:?}", c.half, f.half);
+            }
+        }
+    }
+
     /// One occupied cell spans one voxel, not zero. A zero half-extent would
     /// give the rig a leg of length zero to divide by.
     #[test]
@@ -290,9 +351,15 @@ mod tests {
         assert!(b.torso_half.iter().all(|h| *h > 0.0));
     }
 
-    /// Voxel size scales the geometry; the rig works in world units.
+    /// The voxel size is RESOLUTION, not scale: a solid is authored in world
+    /// units and a finer voxel only rasterises it in more, smaller cells, so
+    /// the torso's half-extent is the same number at any voxel size. (This
+    /// test used to assert the opposite — `coarse == fine * 2` — which read
+    /// the solids as authored in voxels; that contradicted the field's own
+    /// doc, "world units per voxel; sets how fine the rasterisation is", and
+    /// the one-cell test beside it, which could never pass under it.)
     #[test]
-    fn voxel_size_scales_the_anatomy() {
+    fn voxel_size_is_resolution_not_scale() {
         let mk = |v: f32| {
             BodyPlan::new("s", v)
                 .with_torso(boxx([0.0, 0.0, 0.0], [4.0, 4.0, 4.0]))
@@ -300,9 +367,10 @@ mod tests {
                 .unwrap()
                 .torso_half[0]
         };
-        let coarse = mk(1.0);
-        let fine = mk(0.5);
-        assert!((coarse - fine * 2.0).abs() < 1e-3, "{coarse} vs {fine}");
+        let (coarse, fine, finer) = (mk(1.0), mk(0.5), mk(0.25));
+        assert!((coarse - 2.0).abs() < 1e-3, "four world units across: {coarse}");
+        assert!((fine - 2.0).abs() < 1e-3, "{coarse} vs {fine}");
+        assert!((finer - 2.0).abs() < 1e-3, "{coarse} vs {finer}");
     }
 
     /// A part that rasterises to nothing must be refused. Silently becoming a
