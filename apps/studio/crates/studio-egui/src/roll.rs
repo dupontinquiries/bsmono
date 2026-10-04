@@ -378,7 +378,7 @@ pub fn roll(ui: &mut egui::Ui, pattern: &Pattern, channel: usize,
         // (key 0) slightly heavier still — home has to be findable at a
         // glance or every melody starts with counting rows.
         if (key as i32).rem_euclid(12) == 0 {
-            let w = if key == 0 { 1.5 } else { 1.0 };
+            let w = if key == 0 { 1.5_f32 } else { 1.0_f32 };
             painter.line_segment([egui::pos2(rect.left() + LABEL_W, y),
                                   egui::pos2(rect.right(), y)],
                                  egui::Stroke::new(w, c.text_weak));
@@ -434,18 +434,18 @@ pub fn roll(ui: &mut egui::Ui, pattern: &Pattern, channel: usize,
             // The slide marker: a small notch on the note's leading edge,
             // where the glide actually happens.
             painter.line_segment([nr.left_top(), egui::pos2(nr.left() + 4.0, nr.center().y)],
-                                 egui::Stroke::new(1.5, c.text));
+                                 egui::Stroke::new(1.5_f32, c.text));
             painter.line_segment([egui::pos2(nr.left() + 4.0, nr.center().y), nr.left_bottom()],
-                                 egui::Stroke::new(1.5, c.text));
+                                 egui::Stroke::new(1.5_f32, c.text));
         }
         if state.selected == Some((n.start, n.key)) {
-            painter.rect_stroke(nr.expand(1.0), 2.0, egui::Stroke::new(1.5, c.text), egui::StrokeKind::Outside);
+            painter.rect_stroke(nr.expand(1.0), 2.0, egui::Stroke::new(1.5_f32, c.text), egui::StrokeKind::Outside);
         }
     }
     if let Some(Gesture::Move { start, key, to, .. }) = state.gesture {
         let len = pattern.note_at(channel, key, start).map(|n| n.len).unwrap_or(1);
         if let Some(g) = note_rect(to.0, to.1, len) {
-            painter.rect_stroke(g, 2.0, egui::Stroke::new(1.5, c.accent), egui::StrokeKind::Inside);
+            painter.rect_stroke(g, 2.0, egui::Stroke::new(1.5_f32, c.accent), egui::StrokeKind::Inside);
         }
     }
 

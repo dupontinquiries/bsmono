@@ -437,7 +437,7 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
             p.image(ta.id(), left, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(s, 1.0)), egui::Color32::WHITE);
             p.image(tb.id(), right, egui::Rect::from_min_max(egui::pos2(s, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
             p.line_segment([egui::pos2(left.right(), rect.top()), egui::pos2(left.right(), rect.bottom())],
-                           egui::Stroke::new(2.0, ui.visuals().hyperlink_color));
+                           egui::Stroke::new(2.0_f32, ui.visuals().hyperlink_color));
             p.text(egui::pos2(rect.left() + 6.0, rect.top() + 4.0), egui::Align2::LEFT_TOP, "A", egui::FontId::proportional(14.0), egui::Color32::WHITE);
             p.text(egui::pos2(rect.right() - 6.0, rect.top() + 4.0), egui::Align2::RIGHT_TOP, "B", egui::FontId::proportional(14.0), egui::Color32::WHITE);
         }

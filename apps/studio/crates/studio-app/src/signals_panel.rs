@@ -117,7 +117,7 @@ impl Panel {
                     egui::pos2(rect.min.x + x as f32, rect.max.y - v * rect.height())
                 }).collect();
                 let c = if lane.on { ui.visuals().selection.bg_fill } else { ui.visuals().weak_text_color() };
-                p.add(egui::Shape::line(pts, egui::Stroke::new(1.0, c)));
+                p.add(egui::Shape::line(pts, egui::Stroke::new(1.0_f32, c)));
             });
         }
         ui.horizontal(|ui| {

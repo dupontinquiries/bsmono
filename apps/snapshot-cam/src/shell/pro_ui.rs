@@ -22,7 +22,7 @@ impl Cam {
             if let Some(t) = &self.overlay { p.image(t.id(), shown, uv, Color32::WHITE); }
         }
         if o.grid {
-            let s = Stroke::new(1.0, Color32::from_white_alpha(90));
+            let s = Stroke::new(1.0_f32, Color32::from_white_alpha(90));
             for k in [1.0 / 3.0, 2.0 / 3.0] {
                 let x = shown.left() + shown.width() * k;
                 let y = shown.top() + shown.height() * k;
@@ -276,6 +276,6 @@ fn histogram(p: &egui::Painter, a: &develop::Analysis, r: Rect) {
         let pts: Vec<Pos2> = a.hist[ch].iter().enumerate().map(|(i, v)| {
             Pos2::new(inner.left() + (i as f32 + 0.5) * bw, inner.bottom() - (*v as f32 / peak).sqrt() * inner.height())
         }).collect();
-        p.add(egui::Shape::line(pts, Stroke::new(1.0, col)));
+        p.add(egui::Shape::line(pts, Stroke::new(1.0_f32, col)));
     }
 }

@@ -51,7 +51,7 @@ pub fn slot_slider(ui: &mut egui::Ui, slots: &Slots, value: usize) -> usize {
 
     // the rail
     p.line_segment([pos2(x_of(0), y), pos2(x_of(n - 1), y)],
-                   Stroke::new(1.0, crate::theme::DIM().gamma_multiply(0.5)));
+                   Stroke::new(1.0_f32, crate::theme::DIM().gamma_multiply(0.5)));
 
     let mut out = value.clamp(slots.min, usable);
     for i in 0..n {
@@ -64,8 +64,8 @@ pub fn slot_slider(ui: &mut egui::Ui, slots: &Slots, value: usize) -> usize {
         // X marks, per the operator's sketch: the position is a thing you land ON, not a
         // continuum you slide through — the count is discrete and the control should say so.
         let r = 4.0;
-        p.line_segment([pos2(x - r, y - r), pos2(x + r, y + r)], Stroke::new(1.6, col));
-        p.line_segment([pos2(x - r, y + r), pos2(x + r, y - r)], Stroke::new(1.6, col));
+        p.line_segment([pos2(x - r, y - r), pos2(x + r, y + r)], Stroke::new(1.6_f32, col));
+        p.line_segment([pos2(x - r, y + r), pos2(x + r, y - r)], Stroke::new(1.6_f32, col));
     }
 
     // the detent: a caret under the last reachable position, with the reason beside it
@@ -102,14 +102,14 @@ fn dilation_cell(ui: &mut egui::Ui, cur: u8, inert: bool) -> (Response, Option<u
     let k = DILATIONS.len();
     let x_of = |i: usize| rect.left() + 5.0 + (rect.width() - 10.0) * i as f32 / (k - 1) as f32;
     p.line_segment([pos2(x_of(0), rect.center().y), pos2(x_of(k - 1), rect.center().y)],
-                   Stroke::new(1.0, crate::theme::DIM().gamma_multiply(0.4)));
+                   Stroke::new(1.0_f32, crate::theme::DIM().gamma_multiply(0.4)));
     for (i, d) in DILATIONS.iter().enumerate() {
         let on = *d == cur;
         let x = x_of(i);
         let col = if on { crate::theme::accent() }
                   else { crate::theme::DIM().gamma_multiply(0.55) };
         let h = if on { 6.0 } else { 3.0 };
-        p.line_segment([pos2(x, rect.center().y - h), pos2(x, rect.center().y + h)], Stroke::new(if on { 2.0 } else { 1.0 }, col));
+        p.line_segment([pos2(x, rect.center().y - h), pos2(x, rect.center().y + h)], Stroke::new(if on { 2.0_f32 } else { 1.0_f32 }, col));
     }
     let mut picked = None;
     if resp.clicked() {
@@ -260,7 +260,7 @@ click here to go back to broadcasting.").clicked() {
                 let mut x = a;
                 while x < b {
                     p.line_segment([egui::pos2(x, y), egui::pos2((x + 3.0).min(b), y)],
-                                   egui::Stroke::new(1.0, crate::theme::DIM().gamma_multiply(0.35)));
+                                   egui::Stroke::new(1.0_f32, crate::theme::DIM().gamma_multiply(0.35)));
                     x += step;
                 }
             }

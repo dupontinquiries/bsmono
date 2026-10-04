@@ -2013,7 +2013,7 @@ untick resume or use another checkpoint dir"));
             }).collect();
             p.rect_filled(rect, 2.0, egui::Color32::from_black_alpha(40));
             for w in pts.windows(2) {
-                p.line_segment([w[0], w[1]], egui::Stroke::new(1.5, egui::Color32::LIGHT_BLUE));
+                p.line_segment([w[0], w[1]], egui::Stroke::new(1.5_f32, egui::Color32::LIGHT_BLUE));
             }
             ui.label(egui::RichText::new(format!("loss {lo:.5} … {hi:.5}")).small());
         }

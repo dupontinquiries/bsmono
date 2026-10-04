@@ -48,7 +48,7 @@ pub fn card<R>(ui: &mut Ui, c: &PaletteColors, add: impl FnOnce(&mut Ui) -> R) -
 pub fn well<R>(ui: &mut Ui, c: &PaletteColors, add: impl FnOnce(&mut Ui) -> R) -> R {
     let r = egui::Frame::new()
         .fill(uikit_egui::callout::mix(c.bg_base, egui::Color32::BLACK, 0.35))
-        .stroke(egui::Stroke::new(1.0, uikit_egui::callout::mix(c.bg_base, c.border, 0.6)))
+        .stroke(egui::Stroke::new(1.0_f32, uikit_egui::callout::mix(c.bg_base, c.border, 0.6)))
         .corner_radius(egui::CornerRadius::same(RADIUS_SM as u8))
         .inner_margin(egui::Margin::same(SPACE_SM as i8))
         .show(ui, |ui| {

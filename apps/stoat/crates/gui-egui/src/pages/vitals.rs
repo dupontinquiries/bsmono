@@ -64,7 +64,7 @@ fn plot(ui: &mut Ui, c: &PaletteColors, values: &[f32], unit: &str, kind: Kind) 
                 p.rect_filled(egui::Rect::from_min_max(egui::pos2(x(i) - step * 0.5, y(*v)), egui::pos2(x(i) + step * 0.5, inner.max.y)), 0.0, soft);
             }
             let pts: Vec<egui::Pos2> = values.iter().enumerate().map(|(i, v)| egui::pos2(x(i), y(*v))).collect();
-            p.add(egui::Shape::line(pts, egui::Stroke::new(1.5, c.accent)));
+            p.add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, c.accent)));
         }
         Kind::Bars { hitch_over } => {
             let bw = (inner.width() / values.len() as f32).max(1.0);

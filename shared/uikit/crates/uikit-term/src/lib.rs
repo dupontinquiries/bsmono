@@ -2324,7 +2324,7 @@ impl App {
                 ui.painter().rect_stroke(
                     rect,
                     egui::CornerRadius::same(2),
-                    egui::Stroke::new(if active { 2.0 } else { 1.0 }, col),
+                    egui::Stroke::new(if active { 2.0_f32 } else { 1.0_f32 }, col),
                     egui::StrokeKind::Inside,
                 );
             }

@@ -122,7 +122,7 @@ pub fn paint(ui: &mut egui::Ui, project: &studio_core::Project, colors: &uikit_e
 
     for e in &target.edges {
         let (Some(&(ax, ay, _)), Some(&(bx, by, _))) = (resolved.get(&e.a), resolved.get(&e.b)) else { continue };
-        painter.line_segment([egui::pos2(ax, ay), egui::pos2(bx, by)], egui::Stroke::new(1.5, colors.text_weak));
+        painter.line_segment([egui::pos2(ax, ay), egui::pos2(bx, by)], egui::Stroke::new(1.5_f32, colors.text_weak));
         let mid = egui::pos2((ax + bx) * 0.5, (ay + by) * 0.5);
         let label = e.shared.iter().map(|c| c.0.to_string()).collect::<Vec<_>>().join(",");
         painter.text(mid, egui::Align2::CENTER_CENTER, format!("clip {label}"), egui::FontId::proportional(11.0), colors.text_weak);
@@ -134,7 +134,7 @@ pub fn paint(ui: &mut egui::Ui, project: &studio_core::Project, colors: &uikit_e
             let Some(g) = project.groups.get(gid) else { continue };
             let fill = if t.shared_clips.is_empty() { colors.accent } else { colors.warning };
             painter.circle_filled(egui::pos2(x, y), r, fill);
-            painter.circle_stroke(egui::pos2(x, y), r, egui::Stroke::new(1.0, colors.text));
+            painter.circle_stroke(egui::pos2(x, y), r, egui::Stroke::new(1.0_f32, colors.text));
             painter.text(egui::pos2(x, y), egui::Align2::CENTER_CENTER, &g.name, egui::FontId::proportional(12.0), colors.text);
         }
     }

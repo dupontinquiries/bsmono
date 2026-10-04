@@ -7041,7 +7041,7 @@ impl ZkShareUi {
                                     }
                                 }
                                 if r.public {
-                                    ui.painter().rect_stroke(resp.rect.expand(1.0), 4.0, egui::Stroke::new(1.0, uikit_egui::glass::tint(c.accent, 90)), egui::StrokeKind::Outside);
+                                    ui.painter().rect_stroke(resp.rect.expand(1.0), 4.0, egui::Stroke::new(1.0_f32, uikit_egui::glass::tint(c.accent, 90)), egui::StrokeKind::Outside);
                                 }
                             }
                         });

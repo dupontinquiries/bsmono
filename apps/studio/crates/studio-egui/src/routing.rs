@@ -240,11 +240,11 @@ pub fn routing_map(ui: &mut egui::Ui, project: &Project, c: &uikit_egui::Palette
         let a = egui::pos2(a.x + NODE_W * 0.5, a.y);
         let b = egui::pos2(b.x - NODE_W * 0.5, b.y);
         match e.send {
-            None => { painter.line_segment([a, b], egui::Stroke::new(1.5, c.accent)); }
+            None => { painter.line_segment([a, b], egui::Stroke::new(1.5_f32, c.accent)); }
             Some(pre) => {
                 let col = if pre { c.warning } else { c.text_weak };
                 painter.add(egui::Shape::dashed_line(&[a, b],
-                    egui::Stroke::new(1.0, col), 5.0, 4.0));
+                    egui::Stroke::new(1.0_f32, col), 5.0, 4.0));
             }
         }
     }
@@ -268,7 +268,7 @@ pub fn routing_map(ui: &mut egui::Ui, project: &Project, c: &uikit_egui::Palette
             Endpoint::Master => c.accent.gamma_multiply(0.35),
         };
         painter.rect_filled(r, 4.0, fill);
-        painter.rect_stroke(r, 4.0, egui::Stroke::new(1.0, c.text_weak),
+        painter.rect_stroke(r, 4.0, egui::Stroke::new(1.0_f32, c.text_weak),
                             egui::StrokeKind::Inside);
         painter.text(r.center(), egui::Align2::CENTER_CENTER, name_of(e),
                      egui::FontId::proportional(11.0), c.text);

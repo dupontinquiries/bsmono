@@ -191,7 +191,7 @@ pub fn show(ui: &mut egui::Ui, ov: &Overview, playhead: Ticks,
         let (x0, x1) = (x_of(s.start), x_of(s.end));
         let col = egui::Rect::from_min_max(egui::pos2(x0, rect.min.y), egui::pos2(x1, rect.max.y));
         if si % 2 == 1 { p.rect_filled(col, 0.0, c.bg_card); }
-        p.line_segment([egui::pos2(x0, rect.min.y), egui::pos2(x0, rect.max.y)], egui::Stroke::new(1.0, c.border));
+        p.line_segment([egui::pos2(x0, rect.min.y), egui::pos2(x0, rect.max.y)], egui::Stroke::new(1.0_f32, c.border));
         // names that fit, otherwise nothing: an overlapping name is worse than none
         let name: String = s.name.chars().take(((x1 - x0 - 6.0) / 6.0).max(0.0) as usize).collect();
         if name.chars().count() >= 3 {
@@ -217,7 +217,7 @@ pub fn show(ui: &mut egui::Ui, ov: &Overview, playhead: Ticks,
         }
     }
     let px = x_of(playhead);
-    p.line_segment([egui::pos2(px, rect.min.y), egui::pos2(px, rect.max.y)], egui::Stroke::new(1.5, c.danger));
+    p.line_segment([egui::pos2(px, rect.min.y), egui::pos2(px, rect.max.y)], egui::Stroke::new(1.5_f32, c.danger));
     if resp.clicked() {
         if let Some(pos) = resp.interact_pointer_pos() {
             jump = ov.sections.iter().find(|s| pos.x >= x_of(s.start) && pos.x < x_of(s.end)).map(|s| s.start);

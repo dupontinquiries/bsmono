@@ -90,7 +90,7 @@ impl Window {
         for (i, p) in self.points.pts.iter().enumerate() {
             let c = egui::pos2(rect.min.x + p.0 * rect.width(), rect.min.y + p.1 * rect.height());
             painter.circle_filled(c, r, egui::Color32::from_rgb(255, 60, 180));
-            if self.points.selected == Some(i) { painter.circle_stroke(c, r + 4.0, egui::Stroke::new(2.0, egui::Color32::WHITE)); }
+            if self.points.selected == Some(i) { painter.circle_stroke(c, r + 4.0, egui::Stroke::new(2.0_f32, egui::Color32::WHITE)); }
         }
         ui.small("tap to add · tap a point to select it · drag a point to move it");
         let mut go = None;

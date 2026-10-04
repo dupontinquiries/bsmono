@@ -894,7 +894,7 @@ impl Cam {
             let (p0, p1) = (to_screen(rect[0], rect[1]), to_screen(rect[2], rect[3]));
             let r = egui::Rect::from_two_pos(p0, p1).shrink(6.0);
             let col = egui::Color32::from_rgba_unmultiplied(90, 220, 110, (230.0 * a) as u8);
-            let st = egui::Stroke::new(2.5, col);
+            let st = egui::Stroke::new(2.5_f32, col);
             let l = (r.width().min(r.height()) * 0.18).max(8.0);
             for (c, dx, dy) in [(r.left_top(), 1.0, 1.0), (r.right_top(), -1.0, 1.0), (r.left_bottom(), 1.0, -1.0), (r.right_bottom(), -1.0, -1.0)] {
                 ui.painter().line_segment([c, c + egui::vec2(dx * l, 0.0)], st);
@@ -910,7 +910,7 @@ impl Cam {
             crate::tapfocus::Ring::Failed => (egui::Color32::from_rgb(230, 80, 70), 1.0),
         };
         let col = egui::Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (255.0 * a * pulse) as u8);
-        ui.painter().rect_stroke(egui::Rect::from_center_size(at, egui::vec2(64.0, 64.0)), 6.0, egui::Stroke::new(2.5, col), egui::StrokeKind::Middle);
+        ui.painter().rect_stroke(egui::Rect::from_center_size(at, egui::vec2(64.0, 64.0)), 6.0, egui::Stroke::new(2.5_f32, col), egui::StrokeKind::Middle);
         ctx.request_repaint();
     }
 

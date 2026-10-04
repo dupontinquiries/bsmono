@@ -555,7 +555,7 @@ impl ShellView {
         }
         let c = inset.center_bottom() - Vec2::new(0.0, 22.0);
         let d = if side == Side::Left { -1.0 } else { 1.0 };
-        let s = Stroke::new(2.5, Color32::WHITE);
+        let s = Stroke::new(2.5_f32, Color32::WHITE);
         p.line_segment([c + Vec2::new(-6.0 * d, -9.0), c + Vec2::new(6.0 * d, 0.0)], s);
         p.line_segment([c + Vec2::new(6.0 * d, 0.0), c + Vec2::new(-6.0 * d, 9.0)], s);
         let resp = ui.interact(r, Id::new(("ts-peek", side == Side::Left)), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -594,8 +594,8 @@ impl ShellView {
         let (top, bottom) = (r.top() + 30.0, r.bottom() - 10.0);
         let mid = (top + bottom) / 2.0;
         let ly = mid - tone * (bottom - top) / 2.0;
-        pc.line_segment([Pos2::new(r.left() + 10.0, ly), Pos2::new(r.right() - 10.0, ly)], Stroke::new(2.0, with_alpha(pal.text, 0.7)));
-        pc.line_segment([Pos2::new(r.left() + 10.0, mid), Pos2::new(r.right() - 10.0, mid)], Stroke::new(1.0, with_alpha(pal.text_weak, 0.35)));
+        pc.line_segment([Pos2::new(r.left() + 10.0, ly), Pos2::new(r.right() - 10.0, ly)], Stroke::new(2.0_f32, with_alpha(pal.text, 0.7)));
+        pc.line_segment([Pos2::new(r.left() + 10.0, mid), Pos2::new(r.right() - 10.0, mid)], Stroke::new(1.0_f32, with_alpha(pal.text_weak, 0.35)));
         let label = if tone > 0.15 { "cut through" } else if tone < -0.15 { "soft" } else { "flat" };
         pc.text(r.left_top() + Vec2::new(16.0, 14.0), Align2::LEFT_CENTER, format!("Volume  {:.0}%  ·  {label}", v * 100.0), FontId::proportional(13.0), pal.text);
         pc.text(r.right_top() + Vec2::new(-14.0, 14.0), Align2::RIGHT_CENTER, "loud place", FontId::proportional(10.0), pal.text_weak);
@@ -1120,7 +1120,7 @@ impl ShellView {
                 if let Some((x, y)) = shell.world.project(a.dir) {
                     let at = c + Vec2::new(x, y);
                     if r.contains(at) {
-                        p.circle_stroke(at, 14.0, Stroke::new(2.0, Color32::from_white_alpha((alpha * 220.0) as u8)));
+                        p.circle_stroke(at, 14.0, Stroke::new(2.0_f32, Color32::from_white_alpha((alpha * 220.0) as u8)));
                         p.circle_filled(at, 3.0, Color32::from_white_alpha((alpha * 220.0) as u8));
                         p.text(at + Vec2::new(0.0, 24.0), Align2::CENTER_CENTER, &a.label, FontId::proportional(12.0), Color32::from_white_alpha((alpha * 220.0) as u8));
                     }
@@ -1149,7 +1149,7 @@ impl ShellView {
         // Hint and chevron travel with the cover (the first version added the
         // drag back in and left them pinned over the revealed app).
         let c = top + Vec2::new(size.x / 2.0, size.y - 90.0);
-        let chev = Stroke::new(2.5, white(0.8));
+        let chev = Stroke::new(2.5_f32, white(0.8));
         p.line_segment([c + Vec2::new(-14.0, -22.0), c + Vec2::new(0.0, -34.0)], chev);
         p.line_segment([c + Vec2::new(0.0, -34.0), c + Vec2::new(14.0, -22.0)], chev);
         p.text(c, Align2::CENTER_CENTER, "Swipe up to unlock", FontId::proportional(15.0), white(0.75));
@@ -1216,20 +1216,20 @@ impl ShellView {
             }
             ClockStyle::Analog => {
                 let r = 84.0;
-                p.circle_stroke(c, r, Stroke::new(2.0, white(0.85)));
+                p.circle_stroke(c, r, Stroke::new(2.0_f32, white(0.85)));
                 for i in 0..12 {
                     let a = i as f32 / 12.0 * std::f32::consts::TAU;
                     let (s, co) = (a.sin(), -a.cos());
                     let major = i % 3 == 0;
                     let inner = if major { r - 14.0 } else { r - 8.0 };
-                    p.line_segment([c + Vec2::new(s, co) * inner, c + Vec2::new(s, co) * (r - 3.0)], Stroke::new(if major { 3.0 } else { 1.5 }, white(0.8)));
+                    p.line_segment([c + Vec2::new(s, co) * inner, c + Vec2::new(s, co) * (r - 3.0)], Stroke::new(if major { 3.0_f32 } else { 1.5_f32 }, white(0.8)));
                 }
                 match hands(info.time, f) {
                     Some((ha, ma)) => {
                         let dir = |a: f32| Vec2::new(a.sin(), -a.cos());
-                        p.line_segment([c, c + dir(ha) * r * 0.5], Stroke::new(5.0, white(1.0)));
+                        p.line_segment([c, c + dir(ha) * r * 0.5], Stroke::new(5.0_f32, white(1.0)));
                         if let Some(ma) = ma {
-                            p.line_segment([c, c + dir(ma) * r * 0.8], Stroke::new(3.0, white(1.0)));
+                            p.line_segment([c, c + dir(ma) * r * 0.8], Stroke::new(3.0_f32, white(1.0)));
                         }
                         p.circle_filled(c, 5.0, white(1.0));
                     }
@@ -1271,11 +1271,11 @@ impl ShellView {
         for t in &g.ticks {
             let y = y_at(t.at);
             let (x0, x1) = if t.major { (left.left() - 3.0, right.right() + 3.0) } else { (left.left(), right.right()) };
-            p.line_segment([Pos2::new(x0, y), Pos2::new(x1, y)], Stroke::new(1.0, with_alpha(pal.text, if t.major { 0.55 } else { 0.25 })));
+            p.line_segment([Pos2::new(x0, y), Pos2::new(x1, y)], Stroke::new(1.0_f32, with_alpha(pal.text, if t.major { 0.55 } else { 0.25 })));
         }
         // now
         let y = y_at(g.now);
-        p.line_segment([Pos2::new(left.left() - 4.0, y), Pos2::new(right.right() + 4.0, y)], Stroke::new(2.0, pal.text));
+        p.line_segment([Pos2::new(left.left() - 4.0, y), Pos2::new(right.right() + 4.0, y)], Stroke::new(2.0_f32, pal.text));
         p.add(egui::Shape::convex_polygon(
             vec![Pos2::new(left.left() - 6.0, y - 3.0), Pos2::new(left.left() - 6.0, y + 3.0), Pos2::new(left.left() - 2.0, y)],
             pal.text,
@@ -1288,16 +1288,16 @@ impl ShellView {
     fn bar_analog_clock(p: &egui::Painter, c: Pos2, r: f32, t: tideshell_core::clock::LocalTime, f: tideshell_core::clock::Fuzzy, col: Color32) {
         use tideshell_core::clock::{hands, weekday_name};
         let dir = |a: f32| Vec2::new(a.sin(), -a.cos());
-        p.circle_stroke(c, r, Stroke::new(1.5, col));
+        p.circle_stroke(c, r, Stroke::new(1.5_f32, col));
         match hands(t, f) {
             Some((ha, ma)) => {
                 for i in 0..4 {
                     let d = dir(i as f32 * std::f32::consts::FRAC_PI_2);
-                    p.line_segment([c + d * (r - 4.0), c + d * (r - 1.0)], Stroke::new(1.5, col));
+                    p.line_segment([c + d * (r - 4.0), c + d * (r - 1.0)], Stroke::new(1.5_f32, col));
                 }
-                p.line_segment([c, c + dir(ha) * r * 0.5], Stroke::new(3.0, col));
+                p.line_segment([c, c + dir(ha) * r * 0.5], Stroke::new(3.0_f32, col));
                 if let Some(ma) = ma {
-                    p.line_segment([c, c + dir(ma) * r * 0.8], Stroke::new(2.0, col));
+                    p.line_segment([c, c + dir(ma) * r * 0.8], Stroke::new(2.0_f32, col));
                 }
                 p.circle_filled(c, 2.0, col);
             }
@@ -1485,7 +1485,7 @@ impl ShellView {
     fn battery_icon(p: &egui::Painter, c: Pos2, w: f32, level: Option<f32>, charging: bool, pal: &PaletteColors) {
         let h = w * 0.5;
         let body = Rect::from_center_size(c - Vec2::new(w * 0.04, 0.0), Vec2::new(w, h));
-        p.rect_stroke(body, cr(3), Stroke::new(1.6, pal.text), egui::StrokeKind::Inside);
+        p.rect_stroke(body, cr(3), Stroke::new(1.6_f32, pal.text), egui::StrokeKind::Inside);
         p.rect_filled(Rect::from_center_size(Pos2::new(body.right() + w * 0.06, c.y), Vec2::new(w * 0.1, h * 0.4)), cr(1), pal.text);
         match level {
             Some(l) => {
@@ -1501,7 +1501,7 @@ impl ShellView {
                 }
             }
             None => {
-                p.line_segment([body.center() - Vec2::new(w * 0.15, 0.0), body.center() + Vec2::new(w * 0.15, 0.0)], Stroke::new(2.0, pal.text_weak));
+                p.line_segment([body.center() - Vec2::new(w * 0.15, 0.0), body.center() + Vec2::new(w * 0.15, 0.0)], Stroke::new(2.0_f32, pal.text_weak));
             }
         }
     }
@@ -1584,13 +1584,13 @@ impl ShellView {
             if relative {
                 // Centre tick = the auto level; the travel spans the band.
                 let cx = r.center().x;
-                pc.line_segment([Pos2::new(cx, r.top() + 8.0), Pos2::new(cx, r.bottom() - 8.0)], Stroke::new(1.5, with_alpha(pal.text, 0.5)));
+                pc.line_segment([Pos2::new(cx, r.top() + 8.0), Pos2::new(cx, r.bottom() - 8.0)], Stroke::new(1.5_f32, with_alpha(pal.text, 0.5)));
                 // Absolute 0..100% track under the slider: where the band sits.
                 let t = Rect::from_min_size(Pos2::new(r.left() + 14.0, r.bottom() + 3.0), Vec2::new(r.width() - 28.0, 4.0));
                 let at = |x: f32| t.left() + t.width() * x.clamp(0.0, 1.0);
                 pc.rect_filled(t, cr(2), with_alpha(pal.text_weak, 0.25));
                 pc.rect_filled(Rect::from_min_max(Pos2::new(at(band.low), t.top()), Pos2::new(at(band.high), t.bottom())), cr(2), with_alpha(pal.accent, 0.8));
-                pc.line_segment([Pos2::new(at(band.center), t.top() - 2.0), Pos2::new(at(band.center), t.bottom() + 2.0)], Stroke::new(1.5, pal.text));
+                pc.line_segment([Pos2::new(at(band.center), t.top() - 2.0), Pos2::new(at(band.center), t.bottom() + 2.0)], Stroke::new(1.5_f32, pal.text));
                 if let Some(a) = band.applied {
                     pc.circle_filled(Pos2::new(at(a), t.center().y), 3.5, pal.text);
                 }

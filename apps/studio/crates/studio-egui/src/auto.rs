@@ -134,7 +134,7 @@ pub fn strip(ui: &mut egui::Ui, points: &[(Ticks, f32)], view: &View,
     // to say at a glance is "above or below what the fader already does".
     let unity_y = value_to_y(1.0, top, h);
     painter.line_segment([egui::pos2(lane_left, unity_y), egui::pos2(rect.right(), unity_y)],
-                         egui::Stroke::new(1.0, c.text_weak.gamma_multiply(0.5)));
+                         egui::Stroke::new(1.0_f32, c.text_weak.gamma_multiply(0.5)));
     painter.text(egui::pos2(rect.left() + 4.0, unity_y),
                  egui::Align2::LEFT_CENTER, "1.0",
                  egui::FontId::proportional(10.0), c.text_weak);
@@ -158,17 +158,17 @@ pub fn strip(ui: &mut egui::Ui, points: &[(Ticks, f32)], view: &View,
         let y0 = value_to_y(first.1, top, h);
         painter.line_segment([egui::pos2(hold_left, y0),
                               egui::pos2(view.time_to_x(first.0, rect.left()).max(hold_left), y0)],
-                             egui::Stroke::new(1.5, c.accent));
+                             egui::Stroke::new(1.5_f32, c.accent));
         for w in shown.windows(2) {
             painter.line_segment(
                 [egui::pos2(view.time_to_x(w[0].0, rect.left()), value_to_y(w[0].1, top, h)),
                  egui::pos2(view.time_to_x(w[1].0, rect.left()), value_to_y(w[1].1, top, h))],
-                egui::Stroke::new(1.5, c.accent));
+                egui::Stroke::new(1.5_f32, c.accent));
         }
         let yn = value_to_y(last.1, top, h);
         painter.line_segment([egui::pos2(view.time_to_x(last.0, rect.left()).min(hold_right), yn),
                               egui::pos2(hold_right, yn)],
-                             egui::Stroke::new(1.5, c.accent));
+                             egui::Stroke::new(1.5_f32, c.accent));
     } else {
         // No points: the lane is a transparent ride at unity. Saying so
         // beats an empty strip that reads as broken.
@@ -186,7 +186,7 @@ pub fn strip(ui: &mut egui::Ui, points: &[(Ticks, f32)], view: &View,
         let x = view.time_to_x(ph, rect.left());
         if x >= lane_left {
             painter.line_segment([egui::pos2(x, top), egui::pos2(x, top + h)],
-                                 egui::Stroke::new(1.5, c.warning));
+                                 egui::Stroke::new(1.5_f32, c.warning));
         }
     }
 

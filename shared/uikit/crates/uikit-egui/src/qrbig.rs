@@ -156,7 +156,7 @@ pub fn paint_appearing(painter: &egui::Painter, rect: Rect, m: &Matrix, pixels_p
     painter.rect_stroke(
         rect,
         CornerRadius::same(crate::qr::CARD_RADIUS),
-        egui::Stroke::new(1.0, Color32::from_white_alpha(crate::glass::GlassAlphas::HAIRLINE)),
+        egui::Stroke::new(1.0_f32, Color32::from_white_alpha(crate::glass::GlassAlphas::HAIRLINE)),
         egui::StrokeKind::Inside,
     );
     let quiet = 4.0;

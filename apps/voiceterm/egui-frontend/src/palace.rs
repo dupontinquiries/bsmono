@@ -442,7 +442,7 @@ pub fn palace_ui(ui: &mut Ui, palace: &mut Palace, topo: &Topology, focus: &str,
                 if j < *i { continue; } // each edge once
                 if let Some((_, s2, d2)) = projected.iter().find(|(k, _, _)| *k == j) {
                     let a = fade(d.max(*d2));
-                    p.line_segment([*s, *s2], Stroke::new(1.0, Color32::from_rgba_unmultiplied(colors.border.r(), colors.border.g(), colors.border.b(), a)));
+                    p.line_segment([*s, *s2], Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(colors.border.r(), colors.border.g(), colors.border.b(), a)));
                 }
             }
         }
@@ -458,7 +458,7 @@ pub fn palace_ui(ui: &mut Ui, palace: &mut Palace, topo: &Topology, focus: &str,
         let col = Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), fade(*d));
         p.circle_filled(*s, r, col);
         if is_cursor {
-            p.circle_stroke(*s, r + 3.0, Stroke::new(2.0, colors.glow));
+            p.circle_stroke(*s, r + 3.0, Stroke::new(2.0_f32, colors.glow));
         }
         if *d < 18.0 {
             let font = egui::FontId::proportional((rect.height() * 0.03 / d * 4.0).clamp(9.0, 18.0));

@@ -168,7 +168,7 @@ pub fn show(ui: &mut egui::Ui, p: &Preview, status: &str, frame: Option<&egui::T
             painter.image(t.id(), r, uv, Color32::WHITE);
         }
         None => {
-            painter.rect_stroke(r, 6.0, egui::Stroke::new(1.0, Color32::from_gray(60)),
+            painter.rect_stroke(r, 6.0, egui::Stroke::new(1.0_f32, Color32::from_gray(60)),
                                 egui::StrokeKind::Inside);
             painter.text(
                 r.center(),

@@ -524,7 +524,7 @@ pub fn timeline(
             let selected = selection.contains(&clip.id);
             let base = match track.kind { TrackKind::Video => colors.accent, TrackKind::Audio => colors.success };
             painter.rect_filled(r, 3.0, base.gamma_multiply(if selected { 0.9 } else { 0.55 }));
-            painter.rect_stroke(r, 3.0, Stroke::new(if selected { 2.0 } else { 1.0 },
+            painter.rect_stroke(r, 3.0, Stroke::new(if selected { 2.0_f32 } else { 1.0_f32 },
                 if selected { colors.accent } else { colors.border }), egui::StrokeKind::Inside);
             // a clip somebody ELSE is inside gets a warning edge — this is the
             // whole point of the presence channel: stop the collision, don't
@@ -690,7 +690,7 @@ pub fn timeline(
                 if let Some(row) = rows.iter().position(|r| *r == track) {
                     let ghost = view.clip_rect(t, drag.len, row, origin).intersect(rect);
                     painter.rect_filled(ghost, 3.0, colors.accent.gamma_multiply(0.35));
-                    painter.rect_stroke(ghost, 3.0, Stroke::new(1.0, colors.accent), egui::StrokeKind::Inside);
+                    painter.rect_stroke(ghost, 3.0, Stroke::new(1.0_f32, colors.accent), egui::StrokeKind::Inside);
                 }
             }
         }
@@ -768,7 +768,7 @@ pub fn timeline(
         let r = a.union(b);
         if r.max.x < origin.x + view.gutter || r.min.x > rect.max.x { continue; }
         painter.rect_filled(r, 4.0, colors.bg_raised.gamma_multiply(0.95));
-        painter.rect_stroke(r, 4.0, Stroke::new(1.5, colors.accent), egui::StrokeKind::Inside);
+        painter.rect_stroke(r, 4.0, Stroke::new(1.5_f32, colors.accent), egui::StrokeKind::Inside);
         let chev = Rect::from_min_size(r.min, egui::vec2(18.0, r.height().min(18.0)));
         painter.text(chev.center(), egui::Align2::CENTER_CENTER, "▸",
                      egui::FontId::proportional(12.0), colors.accent);

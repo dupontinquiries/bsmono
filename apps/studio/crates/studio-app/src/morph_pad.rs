@@ -164,7 +164,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PadState,
                                               egui::Sense::click_and_drag());
     let p = ui.painter();
     p.rect_filled(rect, 4.0, c.bg_base);
-    p.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, c.border), egui::StrokeKind::Inside);
+    p.rect_stroke(rect, 4.0, egui::Stroke::new(1.0_f32, c.border), egui::StrokeKind::Inside);
     // Corner labels, so the field says which sound lives where.
     let corners = [rect.left_top(), rect.right_top(), rect.left_bottom(), rect.right_bottom()];
     let aligns = [egui::Align2::LEFT_TOP, egui::Align2::RIGHT_TOP,
@@ -181,7 +181,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PadState,
     let puck = egui::pos2(rect.left() + state.x * rect.width(),
                           rect.top() + (1.0 - state.y) * rect.height());
     p.circle_filled(puck, 6.0, c.accent);
-    p.circle_stroke(puck, 6.0, egui::Stroke::new(1.5, c.text));
+    p.circle_stroke(puck, 6.0, egui::Stroke::new(1.5_f32, c.text));
 
     if let Some(pos) = resp.interact_pointer_pos() {
         if resp.dragged() || resp.clicked() {

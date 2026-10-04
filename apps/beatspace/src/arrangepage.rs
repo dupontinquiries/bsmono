@@ -530,12 +530,12 @@ impl ArrangeView {
                 }
                 let is_bar = s == 0 && b % bpb == 0;
                 let col = if is_bar { Color32::from_gray(70) } else if s == 0 { Color32::from_gray(40) } else { Color32::from_gray(30) };
-                painter.line_segment([egui::pos2(x, area.top() + self.ruler_h), egui::pos2(x, lanes_bottom)], Stroke::new(1.0, col));
+                painter.line_segment([egui::pos2(x, area.top() + self.ruler_h), egui::pos2(x, lanes_bottom)], Stroke::new(1.0_f32, col));
                 if is_bar {
-                    painter.line_segment([egui::pos2(x, area.top() + 4.0), egui::pos2(x, area.top() + self.ruler_h)], Stroke::new(1.0, Color32::from_gray(110)));
+                    painter.line_segment([egui::pos2(x, area.top() + 4.0), egui::pos2(x, area.top() + self.ruler_h)], Stroke::new(1.0_f32, Color32::from_gray(110)));
                     painter.text(egui::pos2(x + 3.0, area.top() + 3.0), egui::Align2::LEFT_TOP, format!("{}", b / bpb + 1), egui::FontId::proportional(11.0), Color32::from_gray(160));
                 } else if s == 0 && px >= 24.0 {
-                    painter.line_segment([egui::pos2(x, area.top() + self.ruler_h - 6.0), egui::pos2(x, area.top() + self.ruler_h)], Stroke::new(1.0, Color32::from_gray(80)));
+                    painter.line_segment([egui::pos2(x, area.top() + self.ruler_h - 6.0), egui::pos2(x, area.top() + self.ruler_h)], Stroke::new(1.0_f32, Color32::from_gray(80)));
                 }
             }
         }
@@ -549,7 +549,7 @@ impl ArrangeView {
             if row.top() > area.bottom() {
                 break;
             }
-            painter.line_segment([egui::pos2(area.left(), row.bottom()), egui::pos2(area.right(), row.bottom())], Stroke::new(1.0, Color32::from_gray(38)));
+            painter.line_segment([egui::pos2(area.left(), row.bottom()), egui::pos2(area.right(), row.bottom())], Stroke::new(1.0_f32, Color32::from_gray(38)));
             // Header.
             let hdr = Rect::from_min_max(row.left_top(), egui::pos2(area.left() + self.header_w - 4.0, row.bottom()));
             painter.rect_filled(hdr, 0.0, Color32::from_gray(26));
@@ -615,13 +615,13 @@ impl ArrangeView {
                         let v = pk[idx].clamp(0.0, 1.0);
                         let x = r.left() + c as f32 * 2.0;
                         let hh = v * (r.height() * 0.5 - 4.0);
-                        clip_painter.line_segment([egui::pos2(x, r.center().y - hh), egui::pos2(x, r.center().y + hh)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 70)));
+                        clip_painter.line_segment([egui::pos2(x, r.center().y - hh), egui::pos2(x, r.center().y + hh)], Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 70)));
                     }
                 }
                 // Fades: a line from the corner down to the handle, and a
                 // dim wedge under it. Handles are small squares on the top
                 // edge; the select tool grabs them.
-                let line = Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 255, 255, 140));
+                let line = Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 140));
                 let dim = Color32::from_rgba_unmultiplied(0, 0, 0, 70);
                 if fade_in > 0.0 {
                     let hx = self.x_of(start + fade_in, area).min(r.right());
@@ -645,7 +645,7 @@ impl ArrangeView {
                     None => io.library.name(clip.source).to_string(),
                 };
                 clip_painter.text(r.left_top() + Vec2::new(10.0, 3.0), egui::Align2::LEFT_TOP, label, egui::FontId::proportional(11.0), Color32::from_gray(235));
-                let stroke = if selected { Stroke::new(2.0, Color32::from_rgb(255, 220, 120)) } else { Stroke::new(1.0, Color32::from_gray(15)) };
+                let stroke = if selected { Stroke::new(2.0_f32, Color32::from_rgb(255, 220, 120)) } else { Stroke::new(1.0_f32, Color32::from_gray(15)) };
                 clip_painter.rect_stroke(r, 4.0, stroke, StrokeKind::Inside);
             }
         }
@@ -682,7 +682,7 @@ impl ArrangeView {
                     egui::pos2(self.x_of(from_beat.max(*to_beat), area), self.track_top(b + 1, area)),
                 );
                 painter.with_clip_rect(lane).rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(255, 220, 120, 30));
-                painter.with_clip_rect(lane).rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(255, 220, 120)), StrokeKind::Inside);
+                painter.with_clip_rect(lane).rect_stroke(r, 0.0, Stroke::new(1.0_f32, Color32::from_rgb(255, 220, 120)), StrokeKind::Inside);
             }
             Preview::Loop { from, to } => {
                 let r = Rect::from_min_max(egui::pos2(self.x_of(from.min(*to), area), area.top()), egui::pos2(self.x_of(from.max(*to), area), lanes_bottom));
@@ -693,7 +693,7 @@ impl ArrangeView {
         // Playhead.
         let x = self.x_of(self.playhead, area);
         if x >= lane.left() && x <= lane.right() {
-            painter.line_segment([egui::pos2(x, area.top()), egui::pos2(x, lanes_bottom)], Stroke::new(2.0, Color32::from_rgb(255, 120, 90)));
+            painter.line_segment([egui::pos2(x, area.top()), egui::pos2(x, lanes_bottom)], Stroke::new(2.0_f32, Color32::from_rgb(255, 120, 90)));
         }
         // Follow while playing when the playhead leaves the view.
         if io.playing && (self.playhead < self.scroll_beats || self.playhead > self.scroll_beats + visible_beats - 1.0) {

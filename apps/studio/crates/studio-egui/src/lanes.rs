@@ -174,7 +174,7 @@ pub fn lane(
             let mid = col.bottom() - 2.0 - (h - 4.0) * 0.5;
             painter.line_segment(
                 [egui::pos2(col.left(), mid), egui::pos2(col.right(), mid)],
-                egui::Stroke::new(1.0, c.border),
+                egui::Stroke::new(1.0_f32, c.border),
             );
         }
     }

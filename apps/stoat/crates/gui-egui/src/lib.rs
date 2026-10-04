@@ -218,7 +218,7 @@ pub fn draw(ui: &mut Ui, st: &mut ShellState, view: &mut View, c: &PaletteColors
             if i > 0 {
                 // Columns are separate pages side by side; say so with a rule in the gutter.
                 let gx = x - GUTTER * 0.5;
-                ui.painter().vline(gx, body.y_range(), egui::Stroke::new(1.0, uikit_egui::callout::mix(c.bg_base, c.border, 0.6)));
+                ui.painter().vline(gx, body.y_range(), egui::Stroke::new(1.0_f32, uikit_egui::callout::mix(c.bg_base, c.border, 0.6)));
             }
             ui.scope_builder(UiBuilder::new().max_rect(r), |ui| {
                 ui.push_id(("stoat-page", page), |ui| {

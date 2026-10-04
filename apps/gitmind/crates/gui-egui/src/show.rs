@@ -215,7 +215,7 @@ pub fn task_log(ui: &mut egui::Ui, salt: &str, lines: &[String], min_height: f32
         // The resize grip: drag the bottom edge.
         let (grip, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::drag());
         let c = if resp.hovered() || resp.dragged() { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
-        ui.painter().line_segment([grip.center() - egui::vec2(18.0, 0.0), grip.center() + egui::vec2(18.0, 0.0)], egui::Stroke::new(2.0, c));
+        ui.painter().line_segment([grip.center() - egui::vec2(18.0, 0.0), grip.center() + egui::vec2(18.0, 0.0)], egui::Stroke::new(2.0_f32, c));
         if resp.hovered() || resp.dragged() { ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical); }
         if resp.dragged() {
             st.height = Some((height + resp.drag_delta().y).clamp(80.0, screen_h * 0.9));

@@ -2212,7 +2212,7 @@ impl Chat {
                             let pulse = 150 + (40.0 * (t * 2.2).sin()) as i16;
                             let col = egui::Color32::from_rgba_unmultiplied(acc.r(), acc.g(), acc.b(), pulse.clamp(90, 200) as u8);
                             let c = egui::pos2(sx, sy);
-                            p.circle_stroke(c, px, egui::Stroke::new(1.4, col));
+                            p.circle_stroke(c, px, egui::Stroke::new(1.4_f32, col));
                             p.circle_filled(c, 1.6, col);
                         }
                     }

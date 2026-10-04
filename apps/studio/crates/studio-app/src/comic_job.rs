@@ -228,7 +228,7 @@ impl SetupWindow {
                             egui::Rect::from_min_max(egui::pos2(rr.max.x, rr.min.y), egui::pos2(rect.max.x, rr.max.y))] {
                     ui.painter().rect_filled(out, 0.0, egui::Color32::from_black_alpha(150));
                 }
-                ui.painter().rect_stroke(rr, 0.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 60, 180)), egui::StrokeKind::Inside);
+                ui.painter().rect_stroke(rr, 0.0, egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 60, 180)), egui::StrokeKind::Inside);
                 // said on screen, not in a tooltip: there is no hover on a touchscreen
                 ui.small("tap a person to centre on them · drag to move · pinch to resize");
             }
