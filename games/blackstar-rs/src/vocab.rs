@@ -179,7 +179,14 @@ mod tests {
         ("hot rod", 0),
         // Matrix of Leadership -> the Charge: what you are charged with, and
         // a word a machine culture would already own.
-        ("Matrix", 0),
+        //
+        // 1, not 0: `gltf::scene::Transform::Matrix` in rig.rs is the gltf
+        // crate's enum variant, a library's identifier and not vocabulary. The
+        // rename sweep rewrote it to `Transform::the Charge { matrix }` and the
+        // rigpose example stopped compiling (C20_TODO "rig.rs:96 is
+        // corrupted"). The census cannot tell an API name from a mark any more
+        // than a use from a mention, so this floor is where that one lives.
+        ("Matrix", 1),
         // NOT counted: lowercase `prime` and `matrix`. Both have honest
         // non-licensed uses here — `prime` is a Troop id and a player class,
         // `matrix` is linear algebra in a 3D engine — so a raw count would be

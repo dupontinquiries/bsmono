@@ -93,7 +93,7 @@ pub struct Rig {
 
 fn decompose(n: &gltf::Node) -> (Vec3, Quat, Vec3) {
     match n.transform() {
-        gltf::scene::Transform::the Charge { matrix } => {
+        gltf::scene::Transform::Matrix { matrix } => {
             let m = Mat4::from_cols_array_2d(&matrix);
             let (s, r, t) = m.to_scale_rotation_translation();
             (t, r, s)
