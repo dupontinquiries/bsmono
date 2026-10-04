@@ -1627,8 +1627,8 @@ impl Shell {
     /// The bar's widgets for the current layout (empty in pull-down).
     pub fn bar_widgets(&self) -> &[BarWidget] {
         match self.prefs.layout {
-            Layout::RightBar => &self.prefs.bar_widgets,
-            Layout::Thin => crate::prefs::thin_widgets(),
+            // the thin bar is the thick bar's widgets at half the width: the person's own list, not a different one
+            Layout::RightBar | Layout::Thin => &self.prefs.bar_widgets,
             Layout::PullDown => &[],
         }
     }

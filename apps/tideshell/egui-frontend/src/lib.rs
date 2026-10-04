@@ -1906,7 +1906,7 @@ impl ShellView {
                     ui.radio_value(&mut draft.switcher_style, Style::Deck, "Deck");
                 });
                 ui.separator();
-                ui.add_enabled_ui(draft.layout == Layout::RightBar, |ui| {
+                ui.add_enabled_ui(draft.layout.has_bar(), |ui| {
                     ui.label("Bar widgets (top to bottom)");
                     let mut op: Option<(usize, i32)> = None;
                     egui::ScrollArea::vertical().id_salt("ts-bar-edit").max_height(260.0).show(ui, |ui| {
@@ -2112,7 +2112,9 @@ mod tests {
     fn overlay_is_unmapped_when_idle_and_input_follows_what_is_shown() {
         use tideshell_core::prefs::ShellPrefs;
         let view = ShellView::default();
-        let mut sh = Shell::new(ShellPrefs::default(), (408.0, 900.0));
+        let mut p = ShellPrefs::default();
+        p.layout = tideshell_core::prefs::Layout::PullDown; // the default is a bar now; this test is about the top-only layout
+        let mut sh = Shell::new(p, (408.0, 900.0));
         assert!(!view.needs_overlay(&sh), "idle pull-down shell needs no overlay");
         assert_eq!(view.input_rects(&sh), Some(vec![]), "and takes no input");
         sh.toggle_mode(tideshell_core::hold::HoldOption::Trackpad);
@@ -2141,7 +2143,8 @@ mod tests {
         p.layout = Layout::Thin;
         let sh = Shell::new(p.clone(), (408.0, 900.0));
         assert_eq!(ShellView::bar_geometry(&sh), Some((32, 32)), "half of the configured 64");
-        assert!(!sh.bar_widgets().is_empty(), "the thin bar draws its own widget list");
+        assert_eq!(sh.bar_widgets(), &sh.prefs.bar_widgets[..], "the thin bar draws the person's own widgets, at half the width");
+        assert!(!sh.bar_widgets().is_empty());
         p.layout = Layout::PullDown;
         assert_eq!(ShellView::bar_geometry(&Shell::new(p, (408.0, 900.0))), None);
     }

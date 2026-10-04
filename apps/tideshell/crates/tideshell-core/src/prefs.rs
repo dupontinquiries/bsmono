@@ -14,8 +14,8 @@ use crate::switcher::Style;
 pub enum Layout {
     /// ONLY the top: swipe down for the control-center drawer, no bar.
     PullDown,
-    /// A thin right-hand bar (half the thick bar's width) that is the switcher: the running windows, the
-    /// switcher and hatch, with narrower carousel peeks. The top drawer stays.
+    /// The same bar and the same widgets as the thick one (the owner's own list: spacers, clock, battery, hatch...), at
+    /// half the width, with narrower carousel peeks. The top drawer stays.
     Thin,
     /// A persistent right-hand bar of mixable widgets (the thick bar); the top edge is inert.
     RightBar,
@@ -24,14 +24,6 @@ pub enum Layout {
 /// The thick bar is 5% narrower than it was; the thin bar is half the thick bar's old width.
 pub const THICK_SCALE: f32 = 0.95;
 pub const THIN_SCALE: f32 = 0.5;
-/// What the thin bar holds: the running windows as the switcher, the switcher button, hatch, settings.
-pub const THIN_WIDGETS: &str = "running,spacer,switcher,hatch,settings";
-
-/// The thin bar's widgets, parsed once.
-pub fn thin_widgets() -> &'static [BarWidget] {
-    static W: std::sync::OnceLock<Vec<BarWidget>> = std::sync::OnceLock::new();
-    W.get_or_init(|| bar::parse_widgets(THIN_WIDGETS).0)
-}
 
 impl Layout {
     pub fn token(self) -> &'static str {
@@ -142,7 +134,7 @@ pub struct ShellPrefs {
 impl Default for ShellPrefs {
     fn default() -> Self {
         ShellPrefs {
-            layout: Layout::PullDown,
+            layout: Layout::Thin,
             bar_widgets: bar::parse_widgets(bar::DEFAULT_WIDGETS).0,
             bar_width: 64.0,
             switcher_style: Style::Grid,
@@ -476,6 +468,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_fresh_config_gets_the_thin_bar_and_a_saved_choice_is_kept() {
+        assert_eq!(ShellPrefs::default().layout, Layout::Thin, "the default layout");
+        for l in [Layout::PullDown, Layout::RightBar] {
+            let mut p = ShellPrefs::default();
+            p.apply_kv([("shell.layout", l.token())]);
+            assert_eq!(p.layout, l, "an explicit {} in the file wins over the default", l.token());
+        }
+    }
+
+    #[test]
+    fn the_thin_and_thick_bars_draw_the_same_widgets_and_top_only_none() {
+        use crate::shell::Shell;
+        let mut p = ShellPrefs::default();
+        p.bar_widgets = bar::parse_widgets("battery,clock,spacer,hatch,spacer").0;
+        assert_eq!(p.bar_widgets.len(), 5, "a custom list with spacers");
+        let widgets = |l: Layout| { let mut q = p.clone(); q.layout = l; Shell::new(q, (408.0, 900.0)).bar_widgets().to_vec() };
+        assert_eq!(widgets(Layout::Thin), p.bar_widgets, "the owner\'s list, not a built-in one");
+        assert_eq!(widgets(Layout::RightBar), p.bar_widgets);
+        assert!(widgets(Layout::PullDown).is_empty());
+    }
+
+    #[test]
     fn the_three_layouts_round_trip_and_widths_follow_the_ask() {
         for l in [Layout::PullDown, Layout::Thin, Layout::RightBar] {
             let mut p = ShellPrefs::default();
@@ -496,14 +510,6 @@ mod tests {
         assert!(p.apply_kv([("shell.layout", "wide")]).len() == 1, "an unknown layout is rejected");
     }
 
-    #[test]
-    fn the_thin_bar_is_the_switcher() {
-        let (ws, errs) = bar::parse_widgets(THIN_WIDGETS);
-        assert!(errs.is_empty(), "{errs:?}");
-        assert!(ws.contains(&BarWidget::Running) && ws.contains(&BarWidget::Switcher));
-        assert!(!ws.contains(&BarWidget::Clock) && !ws.iter().any(|w| matches!(w, BarWidget::Slider(_))), "reduced: no clock or sliders");
-        assert_eq!(thin_widgets(), &ws[..]);
-    }
 
     #[test]
     fn round_trip_through_kv() {
@@ -547,7 +553,7 @@ mod tests {
         let mut p = ShellPrefs::default();
         let errs = p.apply_kv([("shell.layout", "sideways"), ("shell.switcher.style", "deck"), ("shell.hold_ms", "5"), ("other.key", "x")]);
         assert_eq!(errs.len(), 2, "{errs:?}");
-        assert_eq!(p.layout, Layout::PullDown);
+        assert_eq!(p.layout, Layout::Thin, "a bad layout leaves the default (the thin bar) alone");
         assert_eq!(p.switcher_style, Style::Deck);
         assert_eq!(p.hold_ms, 420);
     }
