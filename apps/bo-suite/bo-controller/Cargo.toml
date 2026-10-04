@@ -50,6 +50,7 @@ bo-cast = { path = "../bo-cast" }
 # gap, unrelated to the media extraction; fixed here since it's now blocking
 # any build of this binary.
 bo-mux = { path = "../bo-mux" }
+math-kit = { path = "../../../shared/math-kit" }
 # audiopus — actively-maintained libopus binding with a cleaner streaming
 # API. Used by the new stem_split + podcast_diar paths. The older `opus`
 # crate stays for direct use here (track_server.rs's live OggOpus

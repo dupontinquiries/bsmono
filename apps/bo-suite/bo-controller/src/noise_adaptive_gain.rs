@@ -72,12 +72,22 @@ const CURVE: &[(f32, f32)] = &[
 /// (a single car door slam) barely move the needle.
 pub const SMOOTHING_ALPHA: f32 = 0.1;
 
+/// The commanded gain moves through a PD follower (`math_kit::pd`) after the curve, in milli-gain units so its
+/// exact-landing tolerance is 0.001. Gains kp + kd < 1 (no overshoot); the cap bounds how far one 0.5 s tick may
+/// move the master gain, so a door slam that gets past the EWMA cannot make the next clip jump in level.
+const PD_UNITS: f64 = 1000.0;
+const PD_KP: f64 = 0.5;
+const PD_KD: f64 = 0.3;
+/// 0.03 of gain per tick: the full 0.7 -> 1.4 range takes about 12 s.
+const PD_MAX_STEP: f64 = 30.0;
+
 /// Stateful adapter. Owns the smoothed-ratio EWMA + the previous
 /// commanded gain (so we can avoid spamming SetSceneGain commands
 /// when nothing has changed).
 #[derive(Debug, Clone)]
 pub struct NoiseAdaptiveGain {
     smoothed_ratio: f32,
+    pd: math_kit::pd::Pd,
     /// Last gain we sent. Used to suppress repeated identical
     /// commands; the controller polls at 2 Hz so without this
     /// dedup we'd send ~120 SetSceneGain msgs/min even at
@@ -95,6 +105,7 @@ impl Default for NoiseAdaptiveGain {
     fn default() -> Self {
         Self {
             smoothed_ratio: 10.0,   // nominal (= unity gain at start)
+            pd: math_kit::pd::Pd::new(PD_UNITS, PD_KP, PD_KD, PD_MAX_STEP),
             last_sent_gain: 1.0,
             send_threshold: 0.02,
         }
@@ -108,6 +119,7 @@ impl NoiseAdaptiveGain {
     /// session starts from neutral.
     pub fn reset(&mut self) {
         self.smoothed_ratio = 10.0;
+        self.pd.reset(PD_UNITS);
         self.last_sent_gain = 1.0;
     }
 
@@ -125,7 +137,7 @@ impl NoiseAdaptiveGain {
         let clean = if ratio.is_finite() && ratio >= 0.0 { ratio } else { 0.0 };
         self.smoothed_ratio =
             SMOOTHING_ALPHA * clean + (1.0 - SMOOTHING_ALPHA) * self.smoothed_ratio;
-        let g = curve_lookup(self.smoothed_ratio);
+        let g = (self.pd.step(curve_lookup(self.smoothed_ratio) as f64 * PD_UNITS).0 / PD_UNITS) as f32;
         let delta = (g - self.last_sent_gain).abs() / self.last_sent_gain.max(0.01);
         if delta > self.send_threshold {
             self.last_sent_gain = g;
@@ -139,7 +151,7 @@ impl NoiseAdaptiveGain {
     pub fn smoothed_ratio(&self) -> f32 { self.smoothed_ratio }
 
     /// Current gain that would be commanded (regardless of dedup).
-    pub fn current_gain(&self) -> f32 { curve_lookup(self.smoothed_ratio) }
+    pub fn current_gain(&self) -> f32 { (self.pd.position() / PD_UNITS) as f32 }
 }
 
 /// Piecewise-linear lookup on the CURVE table. Clamps to endpoints
@@ -268,5 +280,29 @@ mod tests {
         g.reset();
         assert!((g.smoothed_ratio() - 10.0).abs() < 0.01);
         assert!((g.current_gain() - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_sudden_loud_burst_moves_the_commanded_gain_by_at_most_the_cap_per_tick() {
+        let mut g = NoiseAdaptiveGain::new();
+        for _ in 0..200 { g.observe(5.0); } // settled quiet (0.85)
+        let mut last = g.current_gain();
+        let mut biggest = 0.0f32;
+        for _ in 0..200 {
+            g.observe(500.0); // a held, extreme burst: the smoothed ratio climbs, the gain must not leap
+            biggest = biggest.max((g.current_gain() - last).abs());
+            last = g.current_gain();
+        }
+        assert!(biggest <= 0.0301, "one tick moved the gain by {biggest}");
+        assert!(biggest > 0.01, "the cap was never reached, so this test cannot tell: {biggest}");
+        assert!((g.current_gain() - 1.40).abs() < 1e-3, "and it still arrives: {}", g.current_gain());
+    }
+
+    #[test]
+    fn the_pd_stage_never_passes_the_curves_own_ceiling_or_floor() {
+        let mut g = NoiseAdaptiveGain::new();
+        for r in [500.0, 0.0, 500.0, 2.0, 80.0, 0.0] {
+            for _ in 0..60 { g.observe(r); assert!(g.current_gain() >= 0.70 - 1e-3 && g.current_gain() <= 1.40 + 1e-3, "{}", g.current_gain()); }
+        }
     }
 }
