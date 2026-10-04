@@ -937,13 +937,19 @@ fn main() {
             }
         }
         // COSMIC's own brightness pop-up fires on every backlight write, ours included: keep cosmic-osd
-        // stopped (see quiet_osd.rs). A scan of /proc every 10 s, which also catches a respawn.
-        if now_ms.saturating_sub(sb.osd_checked_at) >= 10_000 {
+        // stopped (see quiet_osd.rs). A scan of /proc every second, which also catches a respawn before it can draw;
+        // the first scan kills what was running (it may be showing a pill that stopping would freeze on screen).
+        if now_ms.saturating_sub(sb.osd_checked_at) >= 1_000 {
+            let first_scan = sb.osd_checked_at == 0;
             sb.osd_checked_at = now_ms;
             if tideshell_egui::quiet_osd::enabled() {
-                let n = tideshell_egui::quiet_osd::quiet();
-                if n > 0 {
-                    sb.shell.note(format!("stopped cosmic-osd ({n}): its brightness pop-up is replaced by tideshell's own"));
+                let (stopped, killed) = tideshell_egui::quiet_osd::quiet(first_scan);
+                if killed > 0 {
+                    // the respawn is stopped on the next quick look, not a second later
+                    sb.osd_checked_at = now_ms.saturating_sub(900);
+                }
+                if stopped + killed > 0 {
+                    sb.shell.note(format!("quieted cosmic-osd ({stopped} stopped, {killed} restarted): its brightness pop-up is replaced by tideshell's own"));
                 }
             }
         }
