@@ -499,7 +499,38 @@ mod live_tests {
         //   Fn rows            logscope-egui panel_rows, active tab-panel row slice vs runcard::rows(),
         //                      builds a run-status card's label/value rows — generic UI term, different
         //                      widgets
-        const CEILING: usize = 393;
+        //
+        // 422, raised from 393. Red on arrival in the c21 session: the c20 landing brought the
+        // logscope-hive crate (matrix, endpoint, directive, plan, counter, ledger, from_spec) and
+        // logscope-fan's hero.rs / deploy.rs, and 29 of their public names already existed in a
+        // sibling crate. Diffed by name+kind against the tree at 2bab28f97 (the 393 commit) with a
+        // Python mirror of items_in; the count itself is this scan's. All 29 audited, all two ideas
+        // under one name -- a crate-local vocabulary (Request/Reply/Event/Record/Route/Limits/
+        // Machine/Trace, count/now/ok/probe/upsert/names/recheck/ensure) colliding with another
+        // crate's. The ones worth a second look:
+        //
+        //   Struct Capability   fan enlist, what a machine OFFERS {kind, models, slots}   vs hive
+        //                       matrix, what a box MEASURED {ttft_ms, tok_s} -- the same fleet
+        //                       machine described by two registries; two facets, not one struct
+        //                       twice, but the split between enlist and matrix is the one to
+        //                       watch if either grows a field the other has
+        //   Struct Confinement  logscope, which sandbox MECHANISMS are in force (AppArmor,
+        //                       bubblewrap)  vs fan deploy, a worker's lane + tool whitelist --
+        //                       OS confinement vs agent confinement, a shared word only
+        //   Fn may_write        logscope guardrails, is this PATH under an allowed prefix  vs fan
+        //                       deploy, does this LANE hold a writing tool -- two checks a write
+        //                       passes in sequence, neither implements the other
+        //   Fn names            fan hero.rs Heroes::names vs fan roster.rs Roster::names -- the
+        //                       same one-liner over two different spec lists (hero specs with a
+        //                       state machine; worker specs); the lists are different types
+        //   Fn for_arch         gpu-gemm archcfg (the whole per-architecture config) vs imrope
+        //                       (only the rope-section layout, Option) -- the second is a
+        //                       sub-table of the first's domain, keyed the same way; fine
+        //   Fn probe x3         logscope probe.rs (a PATH's storage tier), hive endpoint (an HTTP
+        //                       endpoint's health), hive matrix (health + a smoke generation, which
+        //                       CALLS endpoint::probe first) -- the matrix one wraps the endpoint
+        //                       one rather than re-implementing it
+        const CEILING: usize = 422;
         assert!(d.len() <= CEILING,
             "{} duplicate names, ceiling {CEILING}. A new one appeared — either two ideas sharing a \
 name, which is fine and wants the ceiling raised deliberately, or one idea implemented twice, which \
