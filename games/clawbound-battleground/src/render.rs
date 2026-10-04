@@ -1514,7 +1514,9 @@ impl Renderer {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.04, g: 0.05, b: 0.09, a: 1.0,
                         }),
-                        store: wgpu::StoreOp::Store,
+                        // the samples are resolved into `resolve_view` and never read again: on a tiler (the phone's Adreno)
+                        // Discard keeps them in tile memory instead of writing ~100 MB a frame at native resolution
+                        store: wgpu::StoreOp::Discard,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -1747,7 +1749,7 @@ impl Renderer {
                     resolve_target: Some(&resolve_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.06, b: 0.10, a: 1.0 }),
-                        store: wgpu::StoreOp::Store,
+                        store: wgpu::StoreOp::Discard, // resolved, never read again
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
