@@ -34,6 +34,9 @@ pub struct AppEntry {
     pub name: String,
     /// GenericName or Comment — whichever the file has, for ranking + tooltips.
     pub description: String,
+    /// `Keywords=` (localised), space-joined: what the app is for, in words the name does not contain ("browser"
+    /// finds Firefox). Ranked below the name and above the description.
+    pub keywords: String,
     pub icon: String,
     pub exec: String,
     pub terminal: bool,
@@ -153,6 +156,7 @@ pub fn parse_entry(id: &str, path: &Path, text: &str, locales: &[String]) -> Opt
         id: id.to_string(),
         name,
         description,
+        keywords: localized(&map, "Keywords", locales).map(|k| k.split(';').map(str::trim).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ")).unwrap_or_default(),
         icon: map.get("Icon").cloned().unwrap_or_default(),
         exec,
         terminal: parse_bool(map.get("Terminal")),
@@ -263,6 +267,15 @@ mod tests {
         assert_eq!(e.name, "Files");
         assert_eq!(e.icon, "org.gnome.Nautilus");
         assert!(!e.terminal);
+    }
+
+    #[test]
+    fn keywords_are_split_trimmed_localised_and_absent_means_empty() {
+        let t = "[Desktop Entry]\nType=Application\nName=Fox\nExec=fox\nKeywords=web; browser ;;internet\nKeywords[fr]=toile;navigateur\n";
+        assert_eq!(parse_entry("fox", Path::new("x"), t, &[]).unwrap().keywords, "web browser internet");
+        assert_eq!(parse_entry("fox", Path::new("x"), t, &["fr".to_string()]).unwrap().keywords, "toile navigateur");
+        let none = "[Desktop Entry]\nType=Application\nName=Fox\nExec=fox\n";
+        assert_eq!(parse_entry("fox", Path::new("x"), none, &[]).unwrap().keywords, "");
     }
 
     #[test]
