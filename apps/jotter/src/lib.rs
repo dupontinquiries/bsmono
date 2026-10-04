@@ -18,3 +18,7 @@ pub mod note;
 pub mod pairing;
 pub mod share;
 pub mod trust;
+
+/// The app: notes list, a touch canvas, devices and QR screens (feature `app`).
+#[cfg(feature = "app")]
+pub mod app;

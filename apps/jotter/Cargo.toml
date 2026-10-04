@@ -13,8 +13,18 @@ path = "src/lib.rs"
 name = "jotter"
 path = "src/bin/jotter.rs"
 
+# The writing app for an e-ink tablet: the same `app` module drawn by eink-kit's CPU rasteriser (no eframe, no winit).
+# Build: --no-default-features --features eink
+[[bin]]
+name = "jotter-eink"
+path = "src/bin/jotter_eink.rs"
+required-features = ["eink"]
+
 [features]
 default = ["scan"]
+# The egui app module (notes list, touch canvas, devices, QR screens).
+app = ["dep:egui"]
+eink = ["app", "dep:eink-kit"]
 # Decoding a QR from a photo or screenshot (a phone or laptop scanning the tablet's code). Off for the tablet build.
 scan = ["dep:rqrr", "dep:image"]
 
@@ -27,6 +37,8 @@ ink-kit = { path = "../../shared/ink-kit" }
 qrcodegen = "1.8"
 zeroize = "1"
 rqrr = { version = "0.11", optional = true }
+egui = { version = "0.34", optional = true, default-features = false, features = ["default_fonts"] }
+eink-kit = { path = "../../shared/eink-kit", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
 
 [dev-dependencies]
