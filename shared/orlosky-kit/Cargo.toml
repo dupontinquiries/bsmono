@@ -1,0 +1,9 @@
+[package]
+name = "orlosky-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Jason Orlosky's eye-tracking algorithms (JEOresearch/EyeTracker, MIT, https://github.com/JEOresearch/EyeTracker; his videos: https://www.youtube.com/@jeoresearch) ported to Rust, one kit for all of his work, on 8-bit grey frames and with no dependencies. Today: the lightweight pupil detector. The sclera-based gaze system built on top of it is a separate kit, gaze-kit."
+
+[lib]
+path = "src/lib.rs"
