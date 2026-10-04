@@ -424,9 +424,9 @@ impl Palette {
     /// the sheet should be.
     pub fn hold_move_banded(&mut self, geom: &Geom, from: (f32, f32), x: f32, y: f32) -> Band {
         let band = self.hold_band(geom, from, x, y);
-        if band == Band::Search {
-            self.expanded = true;
-        }
+        // The sheet must not move under a thumb that is still down: reaching the search only ARMS the expansion
+        // (the tile grid and the keyboard come on release, in `hold_release_banded`). Expanding here reflowed the
+        // whole sheet away from the finger the moment it glided over the search bar.
         self.hold_fade = match band {
             Band::Dismissing(t) => 1.0 - t,
             _ => 1.0,
@@ -447,6 +447,9 @@ impl Palette {
     pub fn hold_release_banded(&mut self, geom: &Geom, from: (f32, f32), x: f32, y: f32) -> (Option<PaletteAction>, bool) {
         let band = self.hold_move_banded(geom, from, x, y);
         self.hold_fade = 1.0;
+        if band == Band::Search {
+            self.expanded = true; // lifted over the search: now the grid and the keyboard
+        }
         match band {
             Band::Dismissing(_) => (None, true),
             _ => {
@@ -704,6 +707,37 @@ mod tests {
         assert_eq!(g.hit(x3 + w3 / 2.0, y3 + h3 / 2.0, 5), Hit::Row(3));
         assert_eq!(g.hit(x3 + w3 / 2.0, y3 + h3 / 2.0, 2), Hit::Sheet, "past the last result");
         assert!(g.rows_visible() >= 4, "{}", g.rows_visible());
+    }
+
+    #[test]
+    fn the_sheet_does_not_move_while_the_thumb_is_down_over_the_search() {
+        let screen = (408.0, 900.0);
+        let (mut p, _) = open();
+        p.open_by_hold();
+        let before = p.geom(screen);
+        let from = (200.0, 890.0);
+        let g0 = p.geom(screen);
+        let y = g0.search_y() + 4.0;
+        // glide up over the search bar, finger still down, for many moves
+        for k in 0..20 {
+            let band = p.hold_move_banded(&p.geom(screen), from, 200.0 + k as f32, y);
+            assert_eq!(band, Band::Search, "the thumb is on the search band");
+            assert!(!p.expanded, "still the short sheet at move {k}");
+            assert_eq!(p.geom(screen).sheet_top, before.sheet_top, "the sheet did not move under the thumb at move {k}");
+            assert_eq!(p.geom(screen).search_y(), before.search_y());
+        }
+        // lifting over the search expands it (the grid and the keyboard come then)
+        let (pick, leave) = p.hold_release_banded(&p.geom(screen), from, 210.0, y);
+        assert!(p.expanded, "lifted over the search: expanded");
+        assert!(pick.is_none() && !leave, "and it selects nothing");
+        // gliding over the search and then back onto a mode before lifting does not expand
+        let (mut q, _) = open();
+        q.open_by_hold();
+        let g = q.geom(screen);
+        q.hold_move_banded(&g, from, 200.0, g.search_y() + 4.0);
+        let mode = g.mode_rect(1);
+        let (_, _) = q.hold_release_banded(&g, from, mode.0 + mode.2 / 2.0, mode.1 + mode.3 / 2.0);
+        assert!(!q.expanded, "left the search before lifting: not expanded");
     }
 
     #[test]

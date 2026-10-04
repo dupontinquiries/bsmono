@@ -1791,10 +1791,14 @@ mod tests {
         let (x, y, w, h) = short.mode_rect(1);
         sh.on_edge_touch(TouchEvent::Move { slot: 0, x: x + w / 2.0, y: y + h / 2.0, t: 600 });
         assert!(!sh.palette.expanded, "a mode button is not the search");
-        // Onto the search bar: the list opens in full, the search stays where the thumb is.
+        // Onto the search bar with the thumb still down: NOTHING moves (the sheet reflowing under a held thumb was
+        // the bug); lifting there opens the list in full, and the search stays where the thumb was.
         let sy = short.search_y() + crate::palette::SEARCH_H / 2.0;
         sh.on_edge_touch(TouchEvent::Move { slot: 0, x: 204.0, y: sy, t: 700 });
-        assert!(sh.palette.expanded);
+        assert!(!sh.palette.expanded, "still down: the short sheet");
+        assert_eq!(sh.palette.geom(S).search_y(), short.search_y());
+        sh.on_edge_touch(TouchEvent::Up { slot: 0, t: 800 });
+        assert!(sh.palette.expanded, "lifted over the search: the list opens in full");
         let full = sh.palette.geom(S);
         assert!(full.rows_visible() > short.rows_visible());
         assert_eq!(full.search_y(), short.search_y(), "the search does not move under the thumb");

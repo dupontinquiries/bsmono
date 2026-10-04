@@ -182,6 +182,8 @@ struct Surf {
     /// prepare() only emits requests when something changed (it was
     /// sending set_destination on every frame, seen in WAYLAND_DEBUG).
     sent: Option<(i32, (u32, u32))>,
+    /// The bottom margin last asked of the compositor (the overlay ends this far above the screen's edge).
+    margin_bottom: i32,
     /// ext-background-effect: the compositor blurs what is BEHIND this surface over the region set.
     /// Created on first use; `blur_for` is the surface size the region was set for (None = no blur).
     blur: Option<ExtBackgroundEffectSurfaceV1>,
@@ -496,7 +498,7 @@ impl Io {
             (None, None)
         };
         wl.commit();
-        self.st.surfs.push(Surf { role, wl, layer, size: (0, 0), configured: false, fresh: false, scale: 1, closed: false, frac, frac_scale: None, viewport, sent: None, blur: None, blur_for: None, alpha: None, alpha_last: None });
+        self.st.surfs.push(Surf { role, wl, layer, size: (0, 0), configured: false, fresh: false, scale: 1, closed: false, frac, frac_scale: None, viewport, sent: None, margin_bottom: 0, blur: None, blur_for: None, alpha: None, alpha_last: None });
         if role == Role::Right && !self.right_enabled {
             self.set_input_region(Role::Right, Some(&[]));
         }
@@ -583,6 +585,21 @@ impl Io {
     /// Ask the compositor to blur what is behind `role`'s surface (all of it), or stop. Cheap to call every
     /// loop: it acts only when the wish or the surface size changed.
     ///
+    /// End `role`'s surface `px` above the bottom of the screen (0 = to the edge). The on-screen keyboard is another
+    /// overlay-layer surface; whichever of the two was created later is drawn on top, so after Tideshell restarts
+    /// its scrim covers the keyboard. Leaving the strip the keyboard occupies out of the overlay makes the order
+    /// not matter, and the sheet then simply ends where the keyboard begins.
+    pub fn set_bottom_margin(&mut self, role: Role, px: i32) {
+        let Some(i) = self.st.surfs.iter().position(|s| s.role == role) else { return };
+        let px = px.max(0);
+        if self.st.surfs[i].margin_bottom == px {
+            return;
+        }
+        self.st.surfs[i].margin_bottom = px;
+        self.st.surfs[i].layer.set_margin(0, 0, px, 0);
+        self.st.surfs[i].wl.commit();
+    }
+
     /// `keep_right` px along the right edge are left unblurred: the bar lives there on its own surface and
     /// stays in use under the switcher, so it must not look like part of the blurred backdrop.
     pub fn set_blur(&mut self, role: Role, on: bool, keep_right: u32) {

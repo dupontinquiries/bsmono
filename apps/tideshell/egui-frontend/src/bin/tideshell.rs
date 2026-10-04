@@ -57,6 +57,7 @@ struct Shellbox {
     hw_checked_at: u64,
     osd_checked_at: u64,
     kb_geom_at: u64,
+    kb_px: f32,
     radios_at: u64,
     /// What the on-screen keyboard was last told: `show` for the palette's search field.
     told_board_show: bool,
@@ -588,6 +589,7 @@ fn main() {
         hw_checked_at: 0,
         osd_checked_at: 0,
         kb_geom_at: 0,
+        kb_px: 0.0,
         radios_at: 0,
         told_board_show: false,
         fleet_sleep: settings_kit::SleepPrefs::default(),
@@ -914,14 +916,19 @@ fn main() {
                 sb.shell.drawer.set_system_state(k, on);
             }
         }
-        // Where the keyboard is, so the sheet's controls sit above it (rusty-board publishes its height).
+        // The on-screen keyboard: rusty-board publishes its height; the overlay ENDS above it (it is the keyboard's
+        // twin on the same layer and the later-created one is drawn on top, so a full-screen scrim could hide it),
+        // and the sheet lays itself out in what is left. Not while the thumb is still down: nothing may move under it.
         if sb.shell.palette.open && now_ms.saturating_sub(sb.kb_geom_at) >= 200 {
             sb.kb_geom_at = now_ms;
-            sb.shell.palette.kb_inset = tideshell_egui::effects::read_keyboard_inset();
+            sb.kb_px = tideshell_egui::effects::read_keyboard_inset();
         } else if !sb.shell.palette.open {
-            sb.shell.palette.kb_inset = 0.0;
+            sb.kb_px = 0.0;
         }
-        let want_board = sb.shell.palette.open && sb.shell.palette.expanded && !sb.hw_keyboard;
+        let kb_margin = if sb.shell.palette.open && sb.shell.palette.expanded && !sb.shell.palette.is_holding() { sb.kb_px as i32 } else { 0 };
+        io.set_bottom_margin(tideshell_egui::layer::Role::Overlay, kb_margin);
+        sb.shell.palette.kb_inset = 0.0;
+        let want_board = sb.shell.palette.open && sb.shell.palette.expanded && !sb.shell.palette.is_holding() && !sb.hw_keyboard;
         if want_board != sb.told_board_show {
             let _ = tideshell_egui::effects::send_keyboard_command(if want_board { "show" } else { "hide" });
             sb.told_board_show = want_board;
