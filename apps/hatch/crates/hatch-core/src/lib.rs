@@ -34,6 +34,9 @@ pub struct SystemAction {
     pub argv: &'static [&'static str],
 }
 
+/// How far a virtual entry's score is pushed down, so an app's own NAME hit (10 000 + prefix) always outranks its actions.
+const VIRTUAL_PENALTY: i64 = 3_000;
+
 /// The built-in system actions. `loginctl`/`systemctl` because they exist on
 /// every systemd target we ship to; pmOS-without-systemd would override via
 /// config in a later pass — the ids are the stable contract.
@@ -112,6 +115,7 @@ impl Launcher {
     }
 
     fn assemble(config: Config, entries: Vec<AppEntry>) -> Launcher {
+        let entries = Launcher::with_virtual(entries);
         let mut l = Launcher {
             config,
             entries,
@@ -125,10 +129,17 @@ impl Launcher {
         l
     }
 
+    /// The apps plus the searchable non-app entries made from them (see `entry::virtual_entries`).
+    fn with_virtual(mut apps: Vec<AppEntry>) -> Vec<AppEntry> {
+        let v = entry::virtual_entries(&apps);
+        apps.extend(v);
+        apps
+    }
+
     /// Re-scan installed applications unconditionally.
     pub fn refresh(&mut self) {
         let dirs = entry::application_dirs();
-        self.entries = entry::scan(&dirs);
+        self.entries = Launcher::with_virtual(entry::scan(&dirs));
         let _ = self.watch.changed(&dirs); // resynchronise, don't re-report
         self.rerank();
     }
@@ -172,7 +183,12 @@ impl Launcher {
             .entries
             .iter()
             .enumerate()
-            .filter_map(|(i, e)| rank::score(&self.query, e, self.standing(&e.id)).map(|s| (s, i)))
+            // virtual entries (an app's actions, Lock) only show for a search, and rank below an app's own name hit
+            .filter(|(_, e)| e.kind == entry::EntryKind::App || !self.query.trim().is_empty())
+            .filter_map(|(i, e)| {
+                let penalty = if e.kind == entry::EntryKind::App { 0 } else { VIRTUAL_PENALTY };
+                rank::score(&self.query, e, self.standing(&e.id)).map(|s| (s - penalty, i))
+            })
             .collect();
         // Stable tie-break on name so equal scores don't shuffle between
         // keystrokes — a grid that reorders under a still finger reads as
@@ -219,6 +235,8 @@ impl Launcher {
     /// The new order takes effect at the next natural settling point (a query
     /// change, a re-summon, a refresh) via [`Launcher::resettle`].
     pub fn toggle_favorite(&mut self, id: &str) {
+        // only apps are favourites: a virtual entry's id would be saved and never resolved
+        if !self.entries.iter().any(|e| e.id == id && e.kind == entry::EntryKind::App) { return; }
         if let Some(pos) = self.favorites.iter().position(|f| f == id) {
             self.favorites.remove(pos);
         } else {
@@ -241,6 +259,12 @@ impl Launcher {
             .find(|e| e.id == id)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "unknown entry"))?
             .clone();
+        // a search result that is not an app: run what it stands for, through the same paths as the menus
+        match &e.kind {
+            entry::EntryKind::Action { parent, action } => return self.activate_action(parent, action),
+            entry::EntryKind::System(sys) => return self.run_system_action(sys),
+            entry::EntryKind::App => {}
+        }
         let argv = exec::split_exec(&e.exec);
         let pid = exec::spawn_in(&argv, e.terminal, &self.config.terminal_wrap, e.workdir.as_deref())?;
         let _ = store::record_recent(id);
@@ -443,5 +467,69 @@ mod tests {
         let l = Launcher::with_entries(cfg, vec![]);
         let ids: Vec<_> = l.system_actions().iter().map(|a| a.id).collect();
         assert_eq!(ids, vec!["poweroff", "lock"], "unknown ids are dropped, order kept");
+    }
+
+    // ---- searching actions and functions, not only app names ----
+
+    fn firefox() -> AppEntry {
+        let mut f = e("Firefox");
+        f.description = "Web Browser".into();
+        f.exec = "true".into();
+        f.actions = vec![
+            entry::DesktopAction { id: "new-window".into(), name: "New Window".into(), exec: "true".into() },
+            entry::DesktopAction { id: "new-private-window".into(), name: "New Private Window".into(), exec: "true".into() },
+        ];
+        f
+    }
+
+    fn names(l: &Launcher) -> Vec<String> { l.results().map(|r| r.name.clone()).collect() }
+
+    #[test]
+    fn a_search_finds_an_apps_actions_and_lock_but_browsing_still_shows_only_apps() {
+        let _g = crate::testenv::scoped_config_home("virtual-search");
+        let mut l = Launcher::with_entries(Config::default(), vec![firefox(), e("Files")]);
+        assert_eq!(names(&l), vec!["Files", "Firefox"], "no query: only the apps, no actions, no Lock");
+        l.set_query("private");
+        assert_eq!(names(&l).first().map(String::as_str), Some("New Private Window \u{b7} Firefox"), "{:?}", names(&l));
+        l.set_query("lock");
+        assert!(names(&l).iter().any(|n| n == "Lock screen"), "{:?}", names(&l));
+        l.set_query("");
+        assert_eq!(names(&l).len(), 2, "back to apps only once the query is cleared");
+    }
+
+    #[test]
+    fn an_apps_own_name_outranks_its_actions() {
+        let _g = crate::testenv::scoped_config_home("virtual-rank");
+        let mut l = Launcher::with_entries(Config::default(), vec![firefox()]);
+        l.set_query("fire");
+        let n = names(&l);
+        assert_eq!(n[0], "Firefox", "{n:?}");
+        assert!(n.len() > 1, "its actions are still findable: {n:?}");
+    }
+
+    #[test]
+    fn power_functions_are_not_searchable_so_a_partial_query_and_enter_cannot_reboot() {
+        let _g = crate::testenv::scoped_config_home("virtual-power");
+        let mut l = Launcher::with_entries(Config::default(), vec![firefox()]);
+        for q in ["restart", "reboot", "shut", "shutdown", "power off", "log out", "logout", "poweroff"] {
+            l.set_query(q);
+            assert!(l.results().all(|r| !matches!(r.kind, entry::EntryKind::System(_))), "{q:?} must not surface a system function: {:?}", names(&l));
+            assert!(l.results().all(|r| !r.exec.contains("systemctl") && !r.exec.contains("terminate-user")), "{q:?}");
+        }
+    }
+
+    #[test]
+    fn activating_a_virtual_entry_runs_the_apps_action_and_it_is_never_a_favourite() {
+        let _g = crate::testenv::scoped_config_home("virtual-activate");
+        let mut l = Launcher::with_entries(Config::default(), vec![firefox()]);
+        l.set_query("private");
+        let id = l.result_at(0).unwrap().id.clone();
+        assert_eq!(id, "firefox#new-private-window");
+        assert!(l.activate(&id).is_ok(), "ran the action through activate_action");
+        l.toggle_favorite(&id);
+        assert!(!l.is_favorite(&id), "a virtual id would be saved and never resolved");
+        l.toggle_favorite("firefox");
+        assert!(l.is_favorite("firefox"), "an app still can be");
+        assert!(l.activate("nope#nothing").is_err());
     }
 }

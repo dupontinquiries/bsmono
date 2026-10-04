@@ -25,6 +25,52 @@ pub struct DesktopAction {
 }
 
 /// One launchable application.
+/// What an entry launches. A search also finds things that are not apps: an app's own `[Desktop Action]` items and a
+/// few system functions, as VIRTUAL entries that carry the parent's icon and keywords.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EntryKind {
+    #[default]
+    App,
+    /// `action` of the app with id `parent` ("New Private Window" of Firefox).
+    Action { parent: String, action: String },
+    /// A system function by its id in `SYSTEM_ACTIONS` ("lock").
+    System(String),
+}
+
+/// The searchable non-app entries for `apps`: each app's actions, and Lock. Shut down, Restart and Log out are NOT here
+/// on purpose: a partial query plus Enter must never be able to reboot a phone; they stay on the system row.
+pub fn virtual_entries(apps: &[AppEntry]) -> Vec<AppEntry> {
+    let mut out = Vec::new();
+    for app in apps.iter().filter(|a| a.kind == EntryKind::App) {
+        for act in &app.actions {
+            out.push(AppEntry {
+                id: format!("{}#{}", app.id, act.id),
+                name: format!("{} \u{b7} {}", act.name, app.name),
+                description: app.name.clone(),
+                keywords: app.keywords.clone(),
+                icon: app.icon.clone(),
+                exec: act.exec.clone(),
+                terminal: app.terminal,
+                workdir: app.workdir.clone(),
+                actions: Vec::new(),
+                path: app.path.clone(),
+                kind: EntryKind::Action { parent: app.id.clone(), action: act.id.clone() },
+            });
+        }
+    }
+    out.push(AppEntry {
+        id: "system#lock".into(),
+        name: "Lock screen".into(),
+        description: "System".into(),
+        keywords: "lock secure session".into(),
+        icon: "system-lock-screen".into(),
+        exec: "loginctl lock-session".into(),
+        kind: EntryKind::System("lock".into()),
+        ..Default::default()
+    });
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct AppEntry {
     /// The desktop-file id: relative path under `applications/` with `/`
@@ -48,6 +94,8 @@ pub struct AppEntry {
     pub actions: Vec<DesktopAction>,
     /// The file this came from, for debugging "why is this entry weird".
     pub path: PathBuf,
+    /// An app, or a virtual entry (an app's action, a system function) that only a search shows.
+    pub kind: EntryKind,
 }
 
 /// The locale suffixes to try, most specific first: `de_DE`, then `de`.
@@ -163,6 +211,7 @@ pub fn parse_entry(id: &str, path: &Path, text: &str, locales: &[String]) -> Opt
         workdir: map.get("Path").filter(|p| !p.is_empty()).map(PathBuf::from),
         actions: parse_actions(text, &map, locales),
         path: path.to_path_buf(),
+        kind: EntryKind::App,
     })
 }
 
