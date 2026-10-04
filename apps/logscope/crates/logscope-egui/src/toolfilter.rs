@@ -23,10 +23,13 @@ pub struct ToolFenceFilter<'a> {
 }
 
 impl<'a> ToolFenceFilter<'a> {
-    /// `names` is the run's tool whitelist; empty means any name.
-    pub fn new(tok: &'a gpu_kernels::tokenizer::Tokenizer, names: &[String]) -> Self {
+    /// `names` is the run's tool whitelist; empty means any name. `nonce` is the taint gate's run
+    /// token, which the acceptor then allows (exactly, optionally) on the fence opener.
+    pub fn new(tok: &'a gpu_kernels::tokenizer::Tokenizer, names: &[String], nonce: Option<&str>) -> Self {
         let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-        Self { acc: ToolFence::new(&refs), tok, cache: std::collections::HashMap::new(), rejected: 0, exhausted_steps: 0 }
+        let mut acc = ToolFence::new(&refs);
+        if let Some(n) = nonce { acc = acc.with_nonce(n); }
+        Self { acc, tok, cache: std::collections::HashMap::new(), rejected: 0, exhausted_steps: 0 }
     }
 
     /// True once a complete, well-formed call has been emitted.

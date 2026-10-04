@@ -1329,10 +1329,14 @@ impl Chat {
 
 /// The GBNF for a run's tool whitelist, or None when the operator turned it off. Fans pass an
 /// empty list and get the whole runtime menu, since their workers' whitelists differ per bee.
-fn tool_grammar_for(tools: &[String]) -> Option<String> {
+fn tool_grammar_for(tools: &[String], gate: &crate::taint::ToolGate) -> Option<String> {
     if std::env::var("LOGSCOPE_TOOL_GRAMMAR").as_deref() == Ok("0") { return None; }
     let names: Vec<&str> = if tools.is_empty() { crate::workspace_exec::RUNTIME_TOOLS.to_vec() } else { tools.iter().map(|s| s.as_str()).collect() };
-    Some(crate::llm_remote::tool_fence_grammar(&names))
+    // The gate's run token goes INTO the grammar: the prompt teaches ```tool nonce="…" and the gate
+    // refuses a fence without it, so a grammar that forbade the attribute vetoed every authored
+    // call (template_kit::constrain's module note has the mechanics).
+    let nonce = match gate { crate::taint::ToolGate::Required(n) => Some(n.as_str().to_string()), crate::taint::ToolGate::Open => None };
+    Some(crate::llm_remote::tool_fence_grammar_nonced(&names, nonce.as_deref()))
 }
 
 impl Chat {
@@ -3583,7 +3587,7 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
             crate::engprofile::suggest(&task)
         } else { self.profiles_manual.clone() };
         let profile_names: Vec<&str> = cfg.profiles.iter().map(|p| p.profile().name).collect();
-        self.agent_grammar = tool_grammar_for(&cfg.tools);
+        self.agent_grammar = tool_grammar_for(&cfg.tools, &cfg.gate);
         let (run, first) = crate::workspace_exec::AgentRun::start(work_dir, &task, cfg);
         let guided = run.phase().is_some();
         self.agent_run = Some(run);
@@ -3695,8 +3699,8 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
                         }
                     }
                 }
-                self.agent_grammar = tool_grammar_for(&[]);
-                self.agent_grammar = tool_grammar_for(&[]);
+                self.agent_grammar = tool_grammar_for(&[], &cfg.gate);
+                self.agent_grammar = tool_grammar_for(&[], &cfg.gate);
         self.agent_fan = Some(fan);
                 let ready = if self.lanes_ready { "decoding in parallel" } else { "queued (lanes still loading)" };
                 self.note = format!("{label}: {n} branches — {launched} {ready} on {lane_n} lane(s)");
@@ -3705,7 +3709,7 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
                     crate::workspace_exec::FanStep::Submit { prompt, .. } => {
                         self.agent_pending_submit = Some(prompt);
                         let n = fan.len();
-                        self.agent_grammar = tool_grammar_for(&[]);
+                        self.agent_grammar = tool_grammar_for(&[], &cfg.gate);
                 self.agent_fan = Some(fan);
                         self.note = format!("{label}: {n} branches spinning up — planning… (tip: :lanes 2 runs them in parallel)");
                     }

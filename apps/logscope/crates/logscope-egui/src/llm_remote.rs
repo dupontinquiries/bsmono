@@ -76,12 +76,23 @@ impl Llm for RemoteLlm {
 /// GBNF for the harness's own contract: any prose (no triple backtick), then optionally ONE fenced
 /// `tool` block whose object opens with `"tool": <name>` and continues as JSON. Names are the
 /// whitelist; everything else about the call is checked by `parse_tools_reported` as before.
-pub fn tool_fence_grammar(names: &[&str]) -> String {
+///
+/// `nonce` is the taint gate's run token: when Some, the opener may carry ` nonce="…"` (the exact
+/// token, optional — see template_kit::constrain's module note on why not required). Without it
+/// the grammar forbade the attribute the prompt teaches and the gate demands, so under llama-server
+/// every authored call was either forced token-less (and refused) or impossible.
+pub fn tool_fence_grammar(names: &[&str]) -> String { tool_fence_grammar_nonced(names, None) }
+pub fn tool_fence_grammar_nonced(names: &[&str], nonce: Option<&str>) -> String {
     let name = names.iter().map(|n| format!("\"\\\"{n}\\\"\"")).collect::<Vec<_>>().join(" | ");
+    // The engine reads the token back off this line (backend::grammar_nonce), so its shape is a contract.
+    let nonce_rule = match nonce {
+        Some(n) => format!("nonce ::= \" nonce=\\\"{n}\\\"\"\n"),
+        None => "nonce ::= \"\"\n".to_string(),
+    };
     format!(r##"root ::= prose call? prose
 prose ::= ( [^`] | "`" [^`] | "``" [^`] )*
-call ::= "```tool\n{{" ws "\"tool\"" ws ":" ws name ( ws "," ws pair )* ws "}}\n```"
-name ::= {name}
+call ::= "```tool" nonce? [ \n] ws "{{" ws "\"tool\"" ws ":" ws name ( ws "," ws pair )* ws "}}\n```"
+{nonce_rule}name ::= {name}
 pair ::= string ws ":" ws value
 value ::= object | array | string | number | "true" | "false" | "null"
 object ::= "{{" ws ( pair ( ws "," ws pair )* )? ws "}}"
@@ -102,6 +113,14 @@ mod tests {
         assert!(g.contains("\"\\\"read_file\\\"\" | \"\\\"run\\\"\""), "{g}");
         assert!(!g.contains("write_file"));
         assert!(g.contains("```tool"));
+        assert!(g.contains("nonce ::= \"\""), "no token → the attribute rule is empty: {g}");
+    }
+
+    #[test]
+    fn the_run_token_rides_on_the_grammar_as_an_optional_literal() {
+        let g = tool_fence_grammar_nonced(&["run"], Some("a25dbeef"));
+        assert!(g.contains("nonce ::= \" nonce=\\\"a25dbeef\\\"\""), "{g}");
+        assert!(g.contains("\"```tool\" nonce?"), "optional, on the opener: {g}");
     }
 
     #[test]

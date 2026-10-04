@@ -170,6 +170,19 @@ pub(crate) mod engine {
     /// The tool names a generated GBNF allows: the quoted literals on its `name ::=` alternation,
     /// e.g. `name ::= "\"read_file\"" | "\"run\""` → ["read_file", "run"]. Empty when the grammar
     /// is not one of ours, which the acceptor reads as "any name".
+    /// The run token the harness put on the grammar's `nonce ::=` line (`tool_fence_grammar_nonced`),
+    /// or None for a token-less grammar / one that is not ours. Same read-back contract as the names.
+    pub(crate) fn grammar_nonce(gbnf: &str) -> Option<String> {
+        let line = gbnf.lines().find(|l| l.trim_start().starts_with("nonce ::="))?;
+        let (_, rhs) = line.split_once("::=")?;
+        // the literal is `" nonce=\"TOKEN\""` — one outer quote each side, the inner ones escaped;
+        // an empty literal `""` is "no token". Exactly one quote stripped per side: trim_end_matches
+        // would eat the escaped inner quote too and leave the backslash on the token.
+        let rhs = rhs.trim();
+        let inner = rhs.strip_prefix('"')?.strip_suffix('"')?;
+        let tok = inner.trim().strip_prefix("nonce=\\\"")?.strip_suffix("\\\"")?;
+        if tok.is_empty() { None } else { Some(tok.to_string()) }
+    }
     pub(crate) fn grammar_tool_names(gbnf: &str) -> Vec<String> {
         let Some(line) = gbnf.lines().find(|l| l.trim_start().starts_with("name ::=")) else { return Vec::new() };
         // Everything after `::=` — otherwise the rule's own name rides along with the first alternative.
@@ -1076,7 +1089,7 @@ would mislead every later load",
         fn tool_filter<'t>(&self, tok: &'t Tokenizer, p: &GenParams) -> Option<crate::toolfilter::ToolFenceFilter<'t>> {
             let g = p.grammar.as_deref()?;
             let names = grammar_tool_names(g);
-            Some(crate::toolfilter::ToolFenceFilter::new(tok, &names))
+            Some(crate::toolfilter::ToolFenceFilter::new(tok, &names, grammar_nonce(g).as_deref()))
         }
         pub fn generate(&mut self, prompt: &str, p: &GenParams, cancel: &dyn Fn() -> bool, on: &mut dyn FnMut(&str) -> bool) -> Result<usize, String> {
             let toks = self.tok.encode(prompt);
@@ -3958,6 +3971,18 @@ mod grammar_names_tests {
         assert_eq!(names, vec!["read_file".to_string(), "run".to_string()], "grammar was:\n{g}");
         // a grammar that is not ours constrains the fence but names nothing
         assert!(grammar_tool_names("root ::= \"x\"").is_empty());
+    }
+
+    /// The run token rides the same grammar text the names do, and comes back out intact; a
+    /// grammar without one yields None rather than an empty token the acceptor would then demand.
+    #[cfg(feature = "wgpu-engine")]
+    #[test]
+    fn the_run_token_is_read_back_out_of_the_harness_grammar() {
+        use crate::backend::engine::grammar_nonce;
+        let g = crate::llm_remote::tool_fence_grammar_nonced(&["run"], Some("a25dbeef0011"));
+        assert_eq!(grammar_nonce(&g).as_deref(), Some("a25dbeef0011"), "grammar was:\n{g}");
+        assert_eq!(grammar_nonce(&crate::llm_remote::tool_fence_grammar(&["run"])), None);
+        assert_eq!(grammar_nonce("root ::= \"x\""), None);
     }
 }
 

@@ -7,8 +7,18 @@
 //! one shape the harness needs, which is small enough to be obviously correct:
 //!
 //! ```text
-//! <prose, no backtick-fence> [ ```tool\n{ "tool": "<whitelisted>", ...json... }\n``` ] <prose>
+//! <prose, no backtick-fence> [ ```tool[ nonce="<run token>"]\n{ "tool": "<whitelisted>", ...json... }\n``` ] <prose>
 //! ```
+//!
+//! The optional ` nonce="…"` attribute on the opener is the taint gate's run token
+//! (logscope-egui `taint.rs`): the prompt tells the model to put it on every fence it authors, and
+//! the gate refuses a fence without it. This acceptor used to allow only whitespace between `tool`
+//! and `{`, so with both on — the default — every character of the attribute was vetoed, and the
+//! call went through only when the model's whole top-k was attribute text (exhaustion, the override
+//! path) or was lost when a newline was among the candidates. When a nonce is configured
+//! (`with_nonce`) the attribute is accepted exactly, and still OPTIONAL: forcing it would stamp the
+//! token onto a fence the model is merely quoting, which is the one thing the gate exists to tell
+//! apart. With no nonce configured the attribute is rejected, as before.
 //!
 //! It works on CHARACTERS, not tokens, so it is tokenizer-independent. The sampler asks
 //! `would_accept(candidate_text)` for each of its top-k candidates and drops the ones that cannot
@@ -24,6 +34,10 @@ enum S {
     Prose { ticks: u8 },
     /// Inside "```tool" after the ticks: matching the word.
     Word { matched: usize },
+    /// One space after the word: either the ` nonce="…"` attribute starts, or more whitespace / the object.
+    AfterWord,
+    /// Matching the attribute text `nonce="<token>"` character by character.
+    Attr { matched: usize },
     /// After ```tool, before the object opens.
     PreObject,
     /// Inside the JSON object. `depth` counts braces/brackets, `in_str`/`esc` track strings.
@@ -45,13 +59,24 @@ pub struct ToolFence {
     violated: bool,
     /// Only one call per reply; a second fence is rejected. Set false to allow several.
     pub single_call: bool,
+    /// The attribute text accepted after the word (`nonce="…"`), when a run token is configured.
+    attr: Option<String>,
 }
 
 const WORD: &str = "tool";
 
 impl ToolFence {
     pub fn new(names: &[&str]) -> ToolFence {
-        ToolFence { state: S::Prose { ticks: 0 }, names: names.iter().map(|s| s.to_string()).collect(), json: String::new(), violated: false, single_call: true }
+        ToolFence { state: S::Prose { ticks: 0 }, names: names.iter().map(|s| s.to_string()).collect(), json: String::new(), violated: false, single_call: true, attr: None }
+    }
+    /// Accept ` nonce="<token>"` on the opener (optional, exact). See the module note.
+    pub fn with_nonce(mut self, token: &str) -> ToolFence {
+        self.attr = Some(format!("nonce=\"{token}\""));
+        self
+    }
+    /// The configured run token, if any.
+    pub fn nonce(&self) -> Option<&str> {
+        self.attr.as_deref().and_then(|a| a.strip_prefix("nonce=\"")).and_then(|a| a.strip_suffix('"'))
     }
 
     /// True once a token was forced through that the grammar rejected.
@@ -92,8 +117,26 @@ impl ToolFence {
                 let w = WORD.as_bytes();
                 if matched < w.len() {
                     if c as u32 == w[matched] as u32 { S::Word { matched: matched + 1 } } else { return false; }
-                } else if c == '\n' || c == ' ' || c == '\r' { S::PreObject }
+                } else if c == ' ' { S::AfterWord }
+                else if c == '\n' || c == '\r' { S::PreObject }
                 else { return false; }
+            }
+            S::AfterWord => match c {
+                // the attribute can only start here, right after the single space
+                'n' if self.attr.is_some() => S::Attr { matched: 1 },
+                '{' => { self.json.clear(); self.json.push('{'); S::Json { depth: 1, in_str: false, esc: false } }
+                ' ' | '\n' | '\r' | '\t' => S::PreObject,
+                _ => return false,
+            },
+            S::Attr { matched } => {
+                let a = self.attr.as_deref().unwrap_or("");
+                let want = a.chars().nth(matched);
+                match want {
+                    Some(w) if w == c => {
+                        if matched + 1 == a.chars().count() { S::PreObject } else { S::Attr { matched: matched + 1 } }
+                    }
+                    _ => return false,
+                }
             }
             S::PreObject => match c {
                 '{' => { self.json.clear(); self.json.push('{'); S::Json { depth: 1, in_str: false, esc: false } }
@@ -246,6 +289,40 @@ mod tests {
         assert!(!a.push_str("```tool\n{\"tool\": \"read_file\"}\n```"));
         let mut b = acc(); b.single_call = false;
         assert!(b.push_str("```tool\n{\"tool\": \"read_file\"}\n```\n```tool\n{\"tool\": \"write_file\"}\n```"));
+    }
+
+    /// The gate and the grammar used to contradict each other: the prompt teaches
+    /// ```tool nonce="…" and the gate refuses a fence without it, while this acceptor allowed only
+    /// whitespace between `tool` and `{`. With a token configured the exact attribute is legal —
+    /// and nothing else is: a wrong token is refused at its first wrong character, and the
+    /// attribute cannot start anywhere but after the single space.
+    #[test]
+    fn the_run_token_attribute_is_accepted_exactly_when_configured() {
+        let mut a = acc().with_nonce("a25dbeef");
+        assert!(a.push_str("```tool nonce=\"a25dbeef\"\n{\"tool\": \"read_file\", \"path\": \"a.rs\"}\n```"));
+        assert!(a.complete() && !a.violated());
+        // the one-line form, object right after the attribute
+        let mut b = acc().with_nonce("a25dbeef");
+        assert!(b.push_str("```tool nonce=\"a25dbeef\" {\"tool\": \"read_file\"}\n```"));
+        assert!(b.complete());
+        // a wrong token dies at the first wrong character, not at the end
+        let c = acc().with_nonce("a25dbeef");
+        assert!(c.would_accept("```tool nonce=\"a25d"));
+        assert!(!c.would_accept("```tool nonce=\"a25X"));
+        assert!(!c.would_accept("```tool nonce=\"a25dbeef\"x"), "nothing but whitespace or the object may follow it");
+        // and the plain form stays legal: the attribute is optional (forcing it would stamp the token
+        // onto a quoted fence, which is what the token exists to distinguish)
+        let mut d = acc().with_nonce("a25dbeef");
+        assert!(d.push_str("```tool\n{\"tool\": \"read_file\"}\n```"));
+        assert!(d.complete());
+    }
+
+    #[test]
+    fn without_a_token_the_attribute_is_still_refused() {
+        let a = acc();
+        assert!(!a.would_accept("```tool nonce=\"a25dbeef\"\n{"));
+        assert!(a.would_accept("```tool \n{"), "a space then newline was always fine");
+        assert_eq!(acc().with_nonce("ff00").nonce(), Some("ff00"));
     }
 
     #[test]
