@@ -20,7 +20,7 @@
 use capture_kit::focus;
 use capture_kit::RawFrame;
 
-use crate::tapfocus::{trace, Lens, AVG_FRAMES, FRESH_FRAMES, NUDGE, SETTLE_MS, TIMEOUT_MS, VERIFY_RATIO};
+use crate::tapfocus::{settle_ms_for, trace, Lens, AVG_FRAMES, FRESH_FRAMES, NUDGE, TIMEOUT_MS, VERIFY_RATIO};
 
 pub const GRID_W: usize = 3;
 pub const GRID_H: usize = 3;
@@ -28,7 +28,7 @@ pub const N_REGIONS: usize = GRID_W * GRID_H;
 /// Lens positions in the coarse sweep.
 pub const COARSE: usize = 11;
 /// A region's best must beat its own mean by this to count as having a subject.
-pub const MIN_CONTRAST: f64 = 1.25;
+pub const MIN_CONTRAST: f64 = 2.0;
 /// A region counts only if its best sharpness is at least this share of the sharpest region's: the
 /// edge pixels of a textured neighbour bleed a little detail across a border, and a region normalised
 /// by its own best would otherwise count that sliver as a whole subject.
@@ -298,7 +298,7 @@ impl AutoSearch {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Probe { pos: i64, issued_ms: u64, issued_seq: u64 }
+struct Probe { pos: i64, settle_ms: u64, issued_ms: u64, issued_seq: u64 }
 
 /// The driver: like `tapfocus::TapFocus` but for the whole grid.
 pub struct AutoRun {
@@ -312,6 +312,9 @@ pub struct AutoRun {
     seen: Vec<(i64, Vec<f64>)>,
     /// After the search: the landing is re-measured before the lens is called locked (see `tapfocus::VERIFY_RATIO`).
     verify: Option<Verify>,
+    /// Where the lens was last commanded and its range, for the travel time of the next move.
+    last_pos: Option<i64>,
+    range: (i64, i64, i64),
     /// The last result and when, for drawing.
     pub result: Option<(AutoVerdict, u64)>,
 }
@@ -326,7 +329,7 @@ fn median(v: &mut [f64]) -> f64 {
 }
 
 impl Default for AutoRun {
-    fn default() -> Self { AutoRun { search: None, probe: None, started_ms: 0, previous: None, acc: Vec::new(), seen: Vec::new(), verify: None, result: None } }
+    fn default() -> Self { AutoRun { search: None, probe: None, started_ms: 0, previous: None, acc: Vec::new(), seen: Vec::new(), verify: None, last_pos: None, range: (0, 1023, 1), result: None } }
 }
 
 pub const RESULT_SHOW_MS: u64 = 1_200;
@@ -342,6 +345,8 @@ impl AutoRun {
         self.verify = None;
         self.started_ms = now_ms;
         self.previous = lens.current();
+        self.last_pos = self.previous;
+        self.range = range;
         self.result = None;
     }
 
@@ -360,7 +365,9 @@ impl AutoRun {
                     AStep::Probe(p) => {
                         if let Err(e) = lens.move_to(p) { return self.finish(AutoVerdict::Failed(e), now_ms); }
                         self.acc.clear();
-                        self.probe = Some(Probe { pos: p, issued_ms: now_ms, issued_seq: f.seq });
+                        let settle_ms = settle_ms_for(self.last_pos, p, self.range);
+                        self.last_pos = Some(p);
+                        self.probe = Some(Probe { pos: p, settle_ms, issued_ms: now_ms, issued_seq: f.seq });
                         return None;
                     }
                     AStep::Done(Some((p, r))) => {
@@ -377,7 +384,7 @@ impl AutoRun {
                         self.probe = None;
                         self.verify = Some(Verify {
                             region: r, want, acc: Vec::new(), best: (p, 0.0),
-                            probe: Some(Probe { pos: p, issued_ms: now_ms, issued_seq: f.seq }),
+                            probe: Some(Probe { pos: p, settle_ms: settle_ms_for(self.last_pos, p, self.range), issued_ms: now_ms, issued_seq: f.seq }),
                             todo: vec![p - 2 * NUDGE, p + 2 * NUDGE, p - NUDGE, p + NUDGE],
                         });
                         return None;
@@ -388,7 +395,11 @@ impl AutoRun {
                     }
                 },
                 Some(pr) => {
-                    let settled = now_ms.saturating_sub(pr.issued_ms) >= SETTLE_MS && f.seq >= pr.issued_seq + FRESH_FRAMES;
+                    let settled = now_ms.saturating_sub(pr.issued_ms) >= pr.settle_ms && f.seq >= pr.issued_seq + FRESH_FRAMES;
+                    if trace() && f.pixels_plausible() {
+                        let sc = region_scores(f);
+                        eprintln!("af-auto: pos={} +{}ms seq+{} centre={:.3} settled={settled}", pr.pos, now_ms.saturating_sub(pr.issued_ms), f.seq.saturating_sub(pr.issued_seq), sc.get(4).copied().unwrap_or(0.0));
+                    }
                     if !settled { return None; }
                     if !f.pixels_plausible() { return None; }
                     self.acc.push(region_scores(f));
@@ -408,7 +419,7 @@ impl AutoRun {
     fn verify_frame(&mut self, f: &RawFrame, now_ms: u64, lens: &mut dyn Lens) -> Option<AutoVerdict> {
         let v = self.verify.as_mut()?;
         let pr = v.probe?;
-        let settled = now_ms.saturating_sub(pr.issued_ms) >= SETTLE_MS && f.seq >= pr.issued_seq + FRESH_FRAMES;
+        let settled = now_ms.saturating_sub(pr.issued_ms) >= pr.settle_ms && f.seq >= pr.issued_seq + FRESH_FRAMES;
         if !settled || !f.pixels_plausible() { return None; }
         v.acc.push(region_scores(f).get(v.region).copied().unwrap_or(0.0));
         if v.acc.len() < AVG_FRAMES { return None; }
@@ -423,7 +434,9 @@ impl AutoRun {
         }
         if let Some(next) = v.todo.pop() {
             if let Err(e) = lens.move_to(next) { return self.finish(AutoVerdict::Failed(e), now_ms); }
-            v.probe = Some(Probe { pos: next, issued_ms: now_ms, issued_seq: f.seq });
+            let settle_ms = settle_ms_for(self.last_pos, next, self.range);
+            self.last_pos = Some(next);
+            v.probe = Some(Probe { pos: next, settle_ms, issued_ms: now_ms, issued_seq: f.seq });
             return None;
         }
         // Nothing near the answer reproduced the peak: noise, or the scene moved. Do not leave the lens somewhere blurry.

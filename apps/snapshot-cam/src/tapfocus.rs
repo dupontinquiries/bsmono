@@ -21,6 +21,18 @@ use capture_kit::RawFrame;
 /// The frame must be this many frames past the move, and this long after it.
 pub const FRESH_FRAMES: u64 = 2;
 pub const SETTLE_MS: u64 = 150;
+/// A full-range lens jump takes about this much longer to arrive than a small step (a voice coil moves at a finite
+/// speed). The first field log showed a search's first probe, after a ~1000-step jump back to 0, scoring 18-20 and the
+/// same position scoring 0.5-2.5 when the search came back to it: the first frames were still the OLD position.
+pub const TRAVEL_MS_FULL: u64 = 300;
+
+/// How long to wait before scoring a probe at `to`, given where the lens was commanded before (`None` = unknown: assume
+/// the longest trip): the fixed settle, plus travel time in proportion to the distance over the lens's range.
+pub fn settle_ms_for(from: Option<i64>, to: i64, range: (i64, i64, i64)) -> u64 {
+    let span = (range.1 - range.0).max(1) as u64;
+    let d = from.map(|f| (to - f).unsigned_abs()).unwrap_or(span).min(span);
+    SETTLE_MS + d * TRAVEL_MS_FULL / span
+}
 /// The whole search.
 pub const TIMEOUT_MS: u64 = 12_000;
 /// A probe is the MEDIAN of this many settled frames: one frame of a smooth face is mostly sensor noise (scores
@@ -32,6 +44,9 @@ pub const AVG_FRAMES: usize = 3;
 pub const VERIFY_RATIO: f64 = 0.85;
 /// How far (lens steps) to nudge either side when the landing does not reproduce the peak.
 pub const NUDGE: i64 = 10;
+/// The best score must be at least this many times the average over the sweep. The kit's own bar (1.25) let noise
+/// through: in the first field log pure-noise searches reached 1.29, 1.42 and 1.56, real subjects 2.7 and up.
+pub const MIN_PEAK_CONTRAST: f64 = 2.0;
 /// The scored region: a square of this fraction of each axis, centred on the tap.
 pub const ROI_SIZE: f32 = 0.18;
 /// How long the result is shown over the picture.
@@ -71,6 +86,8 @@ pub enum Verdict {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Probe {
     pos: i64,
+    /// How long to wait after the move before a frame counts (`settle_ms_for`).
+    settle_ms: u64,
     issued_ms: u64,
     issued_seq: u64,
 }
@@ -102,10 +119,13 @@ pub struct TapFocus {
     /// Where the tap was on the picture (fractions of the drawn picture) and the last verdict with its time.
     pub tapped_at: Option<[f32; 2]>,
     result: Option<(Verdict, u64)>,
+    /// Where the lens was last commanded and its range, for the travel time of the next move.
+    last_pos: Option<i64>,
+    range: (i64, i64, i64),
 }
 
 impl Default for TapFocus {
-    fn default() -> Self { TapFocus { state: State::Idle, tapped_at: None, result: None } }
+    fn default() -> Self { TapFocus { state: State::Idle, tapped_at: None, result: None, last_pos: None, range: (0, 1023, 1) } }
 }
 
 impl TapFocus {
@@ -117,6 +137,8 @@ impl TapFocus {
         self.state = State::Searching { search: Search::new(min, max, step), roi, probe: None, started_ms: now_ms, previous: lens.current(), acc: Vec::new() };
         self.tapped_at = Some(tap);
         self.result = None;
+        self.last_pos = lens.current();
+        self.range = act.range;
     }
 
     pub fn cancel(&mut self) {
@@ -148,14 +170,16 @@ impl TapFocus {
                     Step::Probe(p) => {
                         if let Err(e) = lens.move_to(p) { verdict = Some(Verdict::Failed(e)); break; }
                         acc.clear();
-                        *probe = Some(Probe { pos: p, issued_ms: now_ms, issued_seq: f.seq });
+                        let settle_ms = settle_ms_for(self.last_pos, p, self.range);
+                        self.last_pos = Some(p);
+                        *probe = Some(Probe { pos: p, settle_ms, issued_ms: now_ms, issued_seq: f.seq });
                         return None; // the frames in flight are the old position's
                     }
                     Step::Done(o) => {
                         if trace() { eprintln!("af: DONE position={:?} peak={:.3} contrast={:.2} probes={}", o.position, o.peak, o.contrast, o.probes); }
                         match o.position {
-                            Some(p) => verify = Some((p, o.peak, o.contrast)),
-                            None => {
+                            Some(p) if o.contrast >= MIN_PEAK_CONTRAST => verify = Some((p, o.peak, o.contrast)),
+                            _ => {
                                 // refuse: back to where the lens was, when it can say
                                 if let Some(prev) = *previous { let _ = lens.move_to(prev); }
                                 verdict = Some(Verdict::Refused);
@@ -165,7 +189,7 @@ impl TapFocus {
                     }
                 },
                 Some(pr) => {
-                    let settled = now_ms.saturating_sub(pr.issued_ms) >= SETTLE_MS && f.seq >= pr.issued_seq + FRESH_FRAMES;
+                    let settled = now_ms.saturating_sub(pr.issued_ms) >= pr.settle_ms && f.seq >= pr.issued_seq + FRESH_FRAMES;
                     if trace() {
                         if let Some(s) = focus::sharpness(f, *roi) {
                             eprintln!("af: pos={} +{}ms seq+{} score={:.3} settled={settled}", pr.pos, now_ms.saturating_sub(pr.issued_ms), f.seq.saturating_sub(pr.issued_seq), s);
@@ -192,14 +216,16 @@ impl TapFocus {
         let first = todo.pop().unwrap();
         if let Err(e) = lens.move_to(first) { return self.finish(Verdict::Failed(e), now_ms); }
         let started_ms = match &self.state { State::Searching { started_ms, .. } => *started_ms, _ => now_ms };
-        self.state = State::Verifying { roi, want: peak, contrast, probe: Some(Probe { pos: first, issued_ms: now_ms, issued_seq: f.seq }), started_ms, previous, acc: Vec::new(), best: (p, 0.0), todo };
+        let settle_ms = settle_ms_for(self.last_pos, first, self.range);
+        self.last_pos = Some(first);
+        self.state = State::Verifying { roi, want: peak, contrast, probe: Some(Probe { pos: first, settle_ms, issued_ms: now_ms, issued_seq: f.seq }), started_ms, previous, acc: Vec::new(), best: (p, 0.0), todo };
         None
     }
 
     fn verify_frame(&mut self, f: &RawFrame, now_ms: u64, lens: &mut dyn Lens) -> Option<Verdict> {
         let State::Verifying { roi, want, contrast, probe, previous, acc, best, todo, .. } = &mut self.state else { return None };
         let Some(pr) = *probe else { return None };
-        let settled = now_ms.saturating_sub(pr.issued_ms) >= SETTLE_MS && f.seq >= pr.issued_seq + FRESH_FRAMES;
+        let settled = now_ms.saturating_sub(pr.issued_ms) >= pr.settle_ms && f.seq >= pr.issued_seq + FRESH_FRAMES;
         if !settled { return None; }
         let Some(score) = focus::sharpness(f, *roi) else { return None };
         acc.push(score);
@@ -215,7 +241,9 @@ impl TapFocus {
         }
         if let Some(next) = todo.pop() {
             if let Err(e) = lens.move_to(next) { return self.finish(Verdict::Failed(e), now_ms); }
-            *probe = Some(Probe { pos: next, issued_ms: now_ms, issued_seq: f.seq });
+            let settle_ms = settle_ms_for(self.last_pos, next, self.range);
+            self.last_pos = Some(next);
+            *probe = Some(Probe { pos: next, settle_ms, issued_ms: now_ms, issued_seq: f.seq });
             return None;
         }
         // Nothing near the answer reproduced the peak: it was noise, or the scene moved. Do not leave the lens
@@ -617,5 +645,58 @@ mod tests {
         assert_eq!(ctl.device, act.device, "and it is the motor's own device that is driven");
         // a current position outside the range is brought inside, never passed on
         assert_eq!(lens_controls(&act, 5000).get(crate::hwctl::Role::Focus).unwrap().value, act.range.1);
+    }
+
+    /// A lens that takes time to arrive: it moves toward its target at `speed` steps per ms, and frames show where the
+    /// glass is at that moment (plus the usual pipeline lag in frames).
+    struct SlowLens { target: i64, eff: f64, speed: f64, last_ms: u64, history: Vec<i64>, lag: usize, moves: Vec<i64> }
+    impl SlowLens {
+        fn new(pos: i64, speed: f64, lag: usize) -> SlowLens { SlowLens { target: pos, eff: pos as f64, speed, last_ms: 0, history: vec![], lag, moves: vec![] } }
+        fn advance(&mut self, t_ms: u64) {
+            let dt = (t_ms - self.last_ms) as f64;
+            self.last_ms = t_ms;
+            let d = self.target as f64 - self.eff;
+            self.eff += d.signum() * d.abs().min(self.speed * dt);
+            self.history.push(self.eff.round() as i64);
+        }
+        fn seen(&self) -> i64 { let n = self.history.len(); self.history[n.saturating_sub(1 + self.lag)] }
+    }
+    impl Lens for SlowLens {
+        fn move_to(&mut self, pos: i64) -> Result<(), String> { self.target = pos; self.moves.push(pos); Ok(()) }
+        fn current(&mut self) -> Option<i64> { Some(self.target) }
+    }
+
+    #[test]
+    fn a_slow_lens_started_far_from_the_subject_still_gets_a_correct_lock() {
+        // 2.5 steps/ms: the 1023-step trip to the start of the sweep takes ~410 ms, well over the fixed 150 ms settle.
+        // A REGRESSION GUARD, not proof the travel-time wait matters: removing TRAVEL_MS_FULL leaves this passing,
+        // because the median of 3 frames already discards the one frame that catches the lens crossing the peak.
+        // The wait is a margin whose size (300 ms) is a guess until the automatic focus's per-frame trace
+        // (`af-auto: pos=.. +ms ..`) shows the real motor's settle curve.
+        for (peak, start, width) in [(575, 1000, 50.0), (575, 1023, 50.0), (300, 900, 90.0), (700, 20, 90.0)] {
+            let scene = Scene { left_peak: peak, right_peak: peak, flat: false, width, noise: 0, drift_at: u64::MAX, drift: 0 };
+            let mut lens = SlowLens::new(start, 2.5, 2);
+            let mut tf = TapFocus::default();
+            tf.begin([0.2, 0.2, 0.8, 0.8], [0.5, 0.5], &act(), &mut lens, 0);
+            let mut verdict = None;
+            for seq in 0..700u64 {
+                let t = seq * 33;
+                lens.advance(t);
+                let f = frame(&scene, lens.seen(), seq);
+                if let Some(v) = tf.on_frame(&f, t, &mut lens) { verdict = Some(v); break; }
+            }
+            let Some(Verdict::Locked { pos, .. }) = verdict else { panic!("peak {peak} start {start}: {verdict:?}") };
+            assert!((pos - peak).abs() <= 45, "peak {peak} start {start}: locked at {pos}");
+        }
+    }
+
+    #[test]
+    fn the_settle_time_grows_with_the_distance_and_is_the_plain_settle_for_a_small_step() {
+        let r = (0, 1023, 1);
+        assert_eq!(settle_ms_for(Some(500), 500, r), SETTLE_MS, "no move");
+        assert!(settle_ms_for(Some(500), 510, r) <= SETTLE_MS + 3, "a nudge");
+        assert!(settle_ms_for(Some(0), 1023, r) >= SETTLE_MS + TRAVEL_MS_FULL - 2, "a full-range jump");
+        assert_eq!(settle_ms_for(None, 100, r), SETTLE_MS + TRAVEL_MS_FULL, "unknown start: assume the longest trip");
+        assert!(settle_ms_for(Some(0), 255, r) < settle_ms_for(Some(0), 900, r), "farther takes longer");
     }
 }
