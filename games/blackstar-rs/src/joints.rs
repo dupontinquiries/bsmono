@@ -173,9 +173,17 @@ mod tests {
 }"#;
 
     fn parsed() -> Vec<Joint> {
-        let p = std::env::temp_dir().join("joints_test.json");
+        // One file PER CALL. Six tests share this fixture and cargo runs them in parallel;
+        // `fs::write` truncates before it writes, so a test loading the shared path while
+        // another was rewriting it read an empty file, got an empty list, and panicked
+        // indexing it (the c21 games sweep: "the len is 0 but the index is 3").
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("joints_test_{}_{n}.json", std::process::id()));
         std::fs::write(&p, SAMPLE).unwrap();
-        load(&p)
+        let j = load(&p);
+        let _ = std::fs::remove_file(&p);
+        j
     }
 
     #[test]
