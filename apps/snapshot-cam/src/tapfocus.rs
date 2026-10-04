@@ -44,6 +44,12 @@ pub const AVG_FRAMES: usize = 3;
 pub const VERIFY_RATIO: f64 = 0.85;
 /// How far (lens steps) to nudge either side when the landing does not reproduce the peak.
 pub const NUDGE: i64 = 10;
+/// The lens positions to try beside `p` when re-measuring (a stack: the LAST is tried first): +-NUDGE, then +-2 NUDGE,
+/// never outside the lens's range (the field log showed -10 and -20 tried for a peak at 0) and never `p` itself.
+pub fn nudges(p: i64, range: (i64, i64, i64)) -> Vec<i64> {
+    [p - 2 * NUDGE, p + 2 * NUDGE, p - NUDGE, p + NUDGE].into_iter().filter(|x| *x >= range.0 && *x <= range.1 && *x != p).collect()
+}
+
 /// The best score must be at least this many times the average over the sweep. The kit's own bar (1.25) let noise
 /// through: in the first field log pure-noise searches reached 1.29, 1.42 and 1.56, real subjects 2.7 and up.
 pub const MIN_PEAK_CONTRAST: f64 = 2.0;
@@ -212,8 +218,8 @@ impl TapFocus {
         // Re-measure where the lens is about to be left: the first stop is the answer itself, then nudges either side.
         let roi = *roi;
         let previous = *previous;
-        let mut todo = vec![p - 2 * NUDGE, p + 2 * NUDGE, p - NUDGE, p + NUDGE, p];
-        let first = todo.pop().unwrap();
+        let first = p;
+        let todo = nudges(p, self.range);
         if let Err(e) = lens.move_to(first) { return self.finish(Verdict::Failed(e), now_ms); }
         let started_ms = match &self.state { State::Searching { started_ms, .. } => *started_ms, _ => now_ms };
         let settle_ms = settle_ms_for(self.last_pos, first, self.range);
@@ -698,5 +704,19 @@ mod tests {
         assert!(settle_ms_for(Some(0), 1023, r) >= SETTLE_MS + TRAVEL_MS_FULL - 2, "a full-range jump");
         assert_eq!(settle_ms_for(None, 100, r), SETTLE_MS + TRAVEL_MS_FULL, "unknown start: assume the longest trip");
         assert!(settle_ms_for(Some(0), 255, r) < settle_ms_for(Some(0), 900, r), "farther takes longer");
+    }
+
+    #[test]
+    fn the_re_measure_never_asks_for_a_lens_position_outside_the_range() {
+        let r = (0, 1023, 1);
+        assert_eq!(nudges(500, r).len(), 4, "in the middle: both sides, two steps each");
+        assert!(nudges(500, r).contains(&510) && nudges(500, r).contains(&480));
+        for p in [0, 3, 10, 1023, 1015] {
+            let n = nudges(p, r);
+            assert!(n.iter().all(|x| *x >= 0 && *x <= 1023 && *x != p), "p={p}: {n:?}");
+        }
+        assert_eq!(nudges(0, r), vec![20, 10], "at the near end only the far side exists");
+        assert_eq!(nudges(1023, r), vec![1003, 1013], "at the far end only the near side exists");
+        assert!(nudges(7, r).iter().all(|x| *x >= 0), "-3 is dropped");
     }
 }

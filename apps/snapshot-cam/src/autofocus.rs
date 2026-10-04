@@ -20,7 +20,7 @@
 use capture_kit::focus;
 use capture_kit::RawFrame;
 
-use crate::tapfocus::{settle_ms_for, trace, Lens, AVG_FRAMES, FRESH_FRAMES, NUDGE, TIMEOUT_MS, VERIFY_RATIO};
+use crate::tapfocus::{nudges, settle_ms_for, trace, Lens, AVG_FRAMES, FRESH_FRAMES, TIMEOUT_MS, VERIFY_RATIO};
 
 pub const GRID_W: usize = 3;
 pub const GRID_H: usize = 3;
@@ -385,7 +385,7 @@ impl AutoRun {
                         self.verify = Some(Verify {
                             region: r, want, acc: Vec::new(), best: (p, 0.0),
                             probe: Some(Probe { pos: p, settle_ms: settle_ms_for(self.last_pos, p, self.range), issued_ms: now_ms, issued_seq: f.seq }),
-                            todo: vec![p - 2 * NUDGE, p + 2 * NUDGE, p - NUDGE, p + NUDGE],
+                            todo: nudges(p, self.range),
                         });
                         return None;
                     }
