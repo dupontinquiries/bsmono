@@ -134,8 +134,16 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// Both tests point `XDG_CONFIG_HOME` at their own temp dir, and the variable is process-wide:
+    /// run in parallel (cargo's default), one test's `remove_var` lands between the other's
+    /// `persist` and its reload, so the reload reads defaults ("1", not the "2.5" just written) --
+    /// and the orphaned `persist` goes to the REAL ~/.config. The c21 fleet sweep hit exactly that.
+    /// Held for the whole of each test, so the variable means one thing at a time.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn persists_and_reloads_across_restart() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // isolate config to a temp XDG_CONFIG_HOME
         let dir = std::env::temp_dir().join(format!("settingsd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -164,6 +172,7 @@ mod tests {
     fn live_fanout_still_works() {
         use ipc_kit::Client;
         use std::time::Duration;
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("settingsd-fan-{}", std::process::id()));
         std::env::set_var("XDG_CONFIG_HOME", &dir);
         let name = format!("settingsd-test-{}", std::process::id());
