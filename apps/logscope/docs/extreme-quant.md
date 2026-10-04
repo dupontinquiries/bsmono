@@ -2,9 +2,12 @@
 
 ## Short answer
 
-Not AQLM or QuIP#. The accessible version of the same idea is llama.cpp's **IQ family**, and we read
-`IQ1_S` (ggml type 19) but **not `IQ2_XXS` (16), `IQ2_XS` (17) or `IQ3_XXS` (18)** — which are the ones
-people actually publish.
+Not AQLM or QuIP#. The accessible version of the same idea is llama.cpp's **IQ family**, and as of
+2026-10-04 we read every member ggml defines — `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS` (the last to land,
+`iq2xs.rs`), `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS` — by dequantizing at load. (This paragraph
+used to say `IQ2_XXS`, `IQ2_XS` and `IQ3_XXS` were unread; that was true when it was written.) READING
+is not RESIDENCY: every one of them is requantized to int8 or q4 on the device, so the file-size win is
+a download-and-disk win only, except IQ1_S's opt-in native path (decode-only).
 
 ## Why not AQLM or QuIP#
 

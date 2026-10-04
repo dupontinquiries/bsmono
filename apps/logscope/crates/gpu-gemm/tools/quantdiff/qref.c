@@ -19,6 +19,8 @@ int main(int argc, char** argv) {
     D("q5_k",  dequantize_row_q5_K)
     D("q6_k",  dequantize_row_q6_K)
     D("iq2_xxs", dequantize_row_iq2_xxs)
+    D("iq2_xs", dequantize_row_iq2_xs)
+    D("iq1_s", dequantize_row_iq1_s)
     D("iq2_s", dequantize_row_iq2_s)
     D("iq3_xxs", dequantize_row_iq3_xxs)
     D("iq3_s", dequantize_row_iq3_s)

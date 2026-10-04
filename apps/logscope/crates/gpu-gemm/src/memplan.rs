@@ -1328,11 +1328,11 @@ mod sub4_tests {
         // Q2_K NOW READS. It gained a dequantizer, and asserting the positive here means this
         // test fails again if that regresses rather than silently passing on a stale premise.
         assert!(crate::gguf::dequantize(10, &[0u8; 84], 256).is_ok(), "Q2_K reads now");
-assert!(crate::gguf::dequantize(17, &[0u8; 74], 256).is_err(),
-            "IQ2_XS still lacks a decoder. RETARGETED A THIRD TIME — Q2_K, then Q3_K, then IQ2_XXS \
-each gained one. The old message here claimed IQ2_XXS needed a 2048-entry grid; fetching \
-ggml-common.h showed it is 256, which is the kind of thing a guess gets wrong and a download does \
-            not");
+        // IQ2_XS NOW READS TOO (iq2xs.rs, checked against gguf-py) — the fourth retarget of this
+        // line: Q2_K, Q3_K, IQ2_XXS and now IQ2_XS each gained a decoder. The old message here
+        // claimed IQ2_XXS needed a 2048-entry grid; fetching ggml-common.h showed it is 256,
+        // which is the kind of thing a guess gets wrong and a download does not.
+        assert!(crate::gguf::dequantize(17, &[0u8; 74], 256).is_ok(), "IQ2_XS reads now");
     }
 
     #[test]

@@ -539,7 +539,8 @@ pub fn ggml_type_name(t: u32) -> &'static str {
     match t {
         0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1", 6 => "Q5_0", 7 => "Q5_1",
         8 => "Q8_0", 9 => "Q8_1", 10 => "Q2_K", 11 => "Q3_K", 12 => "Q4_K", 13 => "Q5_K",
-        14 => "Q6_K", 15 => "Q8_K", 16 => "IQ2_XXS", 20 => "IQ4_NL", 21 => "IQ3_S",
+        14 => "Q6_K", 15 => "Q8_K", 16 => "IQ2_XXS", 17 => "IQ2_XS", 18 => "IQ3_XXS", 19 => "IQ1_S",
+        20 => "IQ4_NL", 21 => "IQ3_S", 22 => "IQ2_S", 23 => "IQ4_XS", 29 => "IQ1_M", 39 => "MXFP4",
         _ => "?",
     }
 }
@@ -1058,6 +1059,7 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
         39 => return crate::mxfp4::dequant_mxfp4(data, n),
         22 => return crate::iq23::dequant_iq2_s(data, n),
         16 => return crate::iq2xxs::dequant_iq2_xxs(data, n),
+        17 => return crate::iq2xs::dequant_iq2_xs(data, n),
         29 => return crate::iq1m::dequant_iq1_m(data, n),
         19 => {
             // IQ1_S: 50-byte super-block of 256 weights = f16 `d`, 32 nibble-index bytes `qs`, and
@@ -1765,9 +1767,15 @@ mod iq4_wiring_tests {
         // one this list started in.
         // ONLY IQ2_XS (17) REMAINS, and it is not in a UD-IQ1_S Scout at all. Every type in that
         // checkpoint now reads.
-        for t in [17] {
-            assert!(dequantize(t, &vec![0u8; 512], 256).is_err(), "type {t} must stay refused");
+        // AND NOW NONE REMAIN: iq2xs.rs decodes 17 (checked against gguf-py). What this test
+        // guards has inverted — every i-quant ggml defines reads here, and a regression would be
+        // one of them silently refusing again. Positive assertion, every type, zero block.
+        for (t, bytes) in [(16u32, 66usize), (17, 74), (18, 98), (19, 50), (20, 18 * 8), (21, 110), (22, 82), (23, 136), (29, 56)] {
+            assert!(dequantize(t, &vec![0u8; bytes], 256).is_ok(), "type {t} ({}) must read", type_name(t));
+            assert_eq!(type_nbytes(t, 256), Some(bytes), "type_nbytes({t}) disagrees with its decoder's block");
         }
+        // a type ggml does not define stays refused
+        assert!(dequantize(4, &vec![0u8; 512], 256).is_err());
     }
 
     #[test]
@@ -1776,6 +1784,7 @@ mod iq4_wiring_tests {
         // disagree the report was wrong about the bytes it counted.
         assert_eq!(type_nbytes(20, 32), Some(crate::iq4::IQ4_NL_BLOCK));
         assert_eq!(type_nbytes(23, 256), Some(crate::iq4::IQ4_XS_BLOCK));
+        assert_eq!(type_nbytes(17, 256), Some(crate::iq2xs::IQ2_XS_BLOCK));
     }
 }
 
