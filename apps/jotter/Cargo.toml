@@ -1,0 +1,33 @@
+[package]
+name = "jotter"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Handwritten notes that follow you: write by touch (made for the reMarkable, runs anywhere egui does), pair with a phone or laptop by QR, and sync only with the devices you trust. The headless core (identity, QR pairing, the trusted-device list, a mergeable note format, the mega-QR mosaic) is tested without a display."
+
+[lib]
+path = "src/lib.rs"
+
+# `jotter`: make a pairing QR, scan one from an image, show a note as a mega QR (ASCII or PNG).
+[[bin]]
+name = "jotter"
+path = "src/bin/jotter.rs"
+
+[features]
+default = ["scan"]
+# Decoding a QR from a photo or screenshot (a phone or laptop scanning the tablet's code). Off for the tablet build.
+scan = ["dep:rqrr", "dep:image"]
+
+[dependencies]
+# Ed25519 signatures, X25519, HKDF, AES-GCM: the keys of a trusted device.
+crypto-kit = { path = "../../shared/crypto-kit" }
+# Strokes (id, style, points) and their text format.
+ink-kit = { path = "../../shared/ink-kit" }
+# A REAL QR encoder (Nayuki), the one the UI kit's qrbig uses.
+qrcodegen = "1.8"
+zeroize = "1"
+rqrr = { version = "0.11", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
+
+[dev-dependencies]
+tempfile = "3.8"

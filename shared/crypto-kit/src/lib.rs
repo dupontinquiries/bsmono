@@ -48,6 +48,11 @@ pub fn x25519_keypair() -> (Zeroizing<[u8; PRIV_KEY_LEN]>, [u8; PUB_KEY_LEN]) {
     (Zeroizing::new(secret.to_bytes()), public.to_bytes())
 }
 
+/// The public key for an X25519 secret (what `x25519_keypair` pairs it with): for a secret loaded from storage.
+pub fn x25519_public_from_secret(secret: &[u8; PRIV_KEY_LEN]) -> [u8; PUB_KEY_LEN] {
+    PublicKey::from(&StaticSecret::from(*secret)).to_bytes()
+}
+
 /// X25519 Diffie–Hellman shared secret.
 pub fn x25519_shared(
     my_secret: &[u8; PRIV_KEY_LEN],
@@ -179,6 +184,14 @@ pub fn open(key: &[u8; KEY_LEN], sealed: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_public_key_is_recoverable_from_a_stored_x25519_secret() {
+        let (secret, public) = x25519_keypair();
+        assert_eq!(x25519_public_from_secret(&secret), public);
+        let (s2, _) = x25519_keypair();
+        assert_ne!(x25519_public_from_secret(&s2), public);
+    }
 
     #[test]
     fn aead_seal_open_roundtrip_and_tamper() {
