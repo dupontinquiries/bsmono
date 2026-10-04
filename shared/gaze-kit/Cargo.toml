@@ -7,6 +7,11 @@ description = "Turning eye measurements into a cursor that reads well: a One Eur
 
 [dependencies]
 orlosky-kit = { path = "../orlosky-kit" }
+# the face detector's ONNX runtime, pure Rust; off by default so the rest of the kit stays dependency-free
+tract-onnx = { version = "0.21", optional = true }
+
+[features]
+yunet = ["dep:tract-onnx"]
 
 [lib]
 path = "src/lib.rs"

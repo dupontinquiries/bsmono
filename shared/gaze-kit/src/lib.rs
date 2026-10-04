@@ -1,6 +1,8 @@
 //! gaze-kit: from eye measurements to a cursor that reads well. See `gate` (refuse a blink or a lid), `filter` (One Euro), `calib` (affine calibration).
 
 pub mod calib;
+#[cfg(feature = "yunet")]
+pub mod facefind;
 pub mod filter;
 pub mod gate;
 
