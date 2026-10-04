@@ -3257,6 +3257,17 @@ fn lin_row_view(l: &Lin, row0: usize, rows: usize) -> Option<Lin> {
                 n: rows, k: q.k,
             }))
         }
+        // IQ4_XS rows are 136-byte multiples: word-aligned always, 256-aligned (a storage
+        // binding's offset rule) only when row0 * row_bytes is — the caller's alignment rule.
+        LinKind::Iq4xs(q) => {
+            let row_bytes = Iq4xsWeight::row_bytes(q.k)? as u64;
+            let (off, len) = (row0 as u64 * row_bytes, rows as u64 * row_bytes);
+            if off % 256 != 0 { return None; }
+            Some(Lin::iq4xs(Iq4xsWeight {
+                blocks: tview(&q.blocks, off, len, 1, (len / 4) as usize),
+                n: rows, k: q.k,
+            }))
+        }
         LinKind::Q8(w) => {
             let kb = w.k / 32;
             Some(Lin { kind: LinKind::Q8(QWeight {
@@ -3804,12 +3815,79 @@ impl Iq1Weight {
     }
 }
 
-enum LinKind { F32(Tensor), Q8(QWeight), Q4(Q4Weight), Iq1(Iq1Weight) }
+/// A weight held as IQ4_XS, in the file's own bytes: 136-byte blocks of 256 weights (f16 `d`,
+/// `scales_h` u16, four `scales_l` bytes, 128 nibble bytes), 4.25 bits per weight.
+///
+/// **Residency is the point.** Every other i-quant is read by dequantizing to f32 and
+/// requantizing to int8 (9 bpw) or q4 (4.5 + conversion loss): an IQ4_XS file — the quant people
+/// publish for a 9B that should fit a phone — more than doubled on the device. These blocks go
+/// to the GPU unmodified; `MATVEC_IQ4XS` decodes them in the matvec (decode, m == 1), and for a
+/// batch `iq4xs_to_q8` widens them to int8 on the GPU first — EXACTLY, because an IQ4_XS value is
+/// `dl · kvalues[nib]` with `kvalues` in -127..=113, which an int8 code with scale `dl` holds bit
+/// for bit — and the int8 GEMM runs. So unlike IQ1_S's native path this one is not decode-only.
+///
+/// Rows are word-aligned (136 is a multiple of 4), so a row view is a plain word offset.
+pub struct Iq4xsWeight {
+    /// The file's IQ4_XS blocks, uploaded unmodified.
+    pub blocks: Tensor,
+    pub n: usize,
+    pub k: usize,
+}
+impl Iq4xsWeight {
+    /// Bytes per 256-weight block.
+    pub const BLOCK_BYTES: usize = 136;
+    pub fn bytes(&self) -> usize { (self.n * self.k / 256) * Self::BLOCK_BYTES }
+    /// Bytes of one row of a k-wide IQ4_XS matrix, or None when k is not block-aligned.
+    pub fn row_bytes(k: usize) -> Option<usize> { if k % 256 == 0 { Some(k / 256 * Self::BLOCK_BYTES) } else { None } }
+}
+/// The concatenation of several IQ4_XS tensors' RAW BLOCKS as one native weight: rows are
+/// independent in this format and every part shares `k`, so stacking the files' bytes in order
+/// is the fused matrix (q‖k‖v, gate‖up, the DeltaNet qkv‖gate‖β‖α) with no decode and no
+/// conversion. None unless native is on, the static mmap is available, every named tensor
+/// exists, is type 23, has width `k`, and the rows sum to `n_total` — a part of another type
+/// (a Q8_0 β in an otherwise IQ4_XS file, say) sends the whole fusion down the converting path.
+fn iq4xs_native_concat(gpu: &Gpu, g: &gguf::Gguf, sset: Option<&gguf::ShardSet<'static>>, names: &[String], n_total: usize, k: usize) -> Option<Lin> {
+    if !iq4xs_native() || k % 256 != 0 { return None; }
+    let sset = sset?;
+    let mut raw: Vec<u8> = Vec::new();
+    let mut rows_sum = 0usize;
+    for name in names {
+        let t = g.tensor(name)?;
+        if t.ggml_type != 23 || t.dims.first().copied() != Some(k as u64) { return None; }
+        let rows = t.dims.iter().skip(1).product::<u64>() as usize;
+        let nbytes = gguf::type_nbytes(23, rows * k)?;
+        raw.extend_from_slice(sset.slice(t.offset, nbytes)?);
+        rows_sum += rows;
+    }
+    if rows_sum != n_total { return None; }
+    IQ4XS_NATIVE_LOADS.fetch_add(names.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    Some(Lin::iq4xs(gpu.iq4xs_weight_from_bytes(&raw, n_total, k)))
+}
+
+/// Native IQ4_XS residency is the default; `LOGSCOPE_IQ4XS_NATIVE=0` converts to int8/q4 as
+/// before (the path every ledger row was measured on). Read once; `set_iq4xs_native` overrides
+/// in-process so `--gate-iq4xs` can load one file both ways and compare logits.
+pub fn iq4xs_native() -> bool {
+    use std::sync::atomic::Ordering;
+    match IQ4XS_NATIVE.load(Ordering::Relaxed) {
+        1 => true, 2 => false,
+        _ => { let on = std::env::var("LOGSCOPE_IQ4XS_NATIVE").as_deref() != Ok("0"); IQ4XS_NATIVE.store(if on { 1 } else { 2 }, Ordering::Relaxed); on }
+    }
+}
+static IQ4XS_NATIVE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Tensors the loader kept as native IQ4_XS blocks (so a gate can prove a load took the path).
+pub static IQ4XS_NATIVE_LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn set_iq4xs_native(on: bool) { IQ4XS_NATIVE.store(if on { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed); }
+
+enum LinKind { F32(Tensor), Q8(QWeight), Q4(Q4Weight), Iq1(Iq1Weight), Iq4xs(Iq4xsWeight) }
 impl Lin {
     pub fn f32(t: Tensor) -> Self { Lin { kind: LinKind::F32(t), bias: None } }
     pub fn q8(q: QWeight) -> Self { Lin { kind: LinKind::Q8(q), bias: None } }
     /// Hold a weight as IQ1_S without converting it.
     pub fn iq1(q: Iq1Weight) -> Self { Lin { kind: LinKind::Iq1(q), bias: None } }
+    /// Hold a weight as IQ4_XS without converting it (4.25 bpw resident; see `Iq4xsWeight`).
+    pub fn iq4xs(q: Iq4xsWeight) -> Self { Lin { kind: LinKind::Iq4xs(q), bias: None } }
+    pub fn is_iq4xs(&self) -> bool { matches!(self.kind, LinKind::Iq4xs(_)) }
     pub fn q4(q: Q4Weight) -> Self { Lin { kind: LinKind::Q4(q), bias: None } }
     pub fn with_bias(mut self, b: Option<Tensor>) -> Self { self.bias = b; self }
     /// Is this weight held as resident q4? Used to key tuning verdicts by precision.
@@ -3825,10 +3903,11 @@ impl Lin {
             LinKind::Q8(q) => q.n * q.k + (q.n * q.k / 32) * 4,
             LinKind::Q4(q) => q.n * q.k / 2 + (q.n * q.k / 32) * 4,
             LinKind::Iq1(q) => q.bytes(),
+            LinKind::Iq4xs(q) => q.bytes(),
         }
     }
     pub fn kind_name(&self) -> &'static str {
-        match &self.kind { LinKind::F32(_) => "f32", LinKind::Q8(_) => "int8", LinKind::Q4(_) => "q4", LinKind::Iq1(_) => "iq1_s" }
+        match &self.kind { LinKind::F32(_) => "f32", LinKind::Q8(_) => "int8", LinKind::Q4(_) => "q4", LinKind::Iq1(_) => "iq1_s", LinKind::Iq4xs(_) => "iq4_xs" }
     }
     fn has_bias(&self) -> bool { self.bias.is_some() }
     pub fn apply(&self, gpu: &Gpu, a: &Tensor, m: usize) -> Tensor {
@@ -3838,6 +3917,9 @@ impl Lin {
             // Native: the source blocks go straight to MATVEC_IQ1_S with no dequantize pass, which
             // is the whole reason this variant exists.
             LinKind::Iq1(q) => gpu.linear_iq1_s_t(a, q, m),
+            // Native blocks at decode; for a batch the blocks are first widened to int8 on the
+            // GPU (exact — see `iq4xs_to_q8`) and the int8 GEMM runs, so prefill works too.
+            LinKind::Iq4xs(q) => gpu.linear_iq4xs_t(a, q, m),
             LinKind::Q4(q) => gpu.linear_q4_0_t(a, q, m),
         };
         match &self.bias { Some(b) => gpu.add_bias_t(&out, b), None => out }
@@ -3859,6 +3941,8 @@ impl Lin {
             // and one extra dispatch — worth far less than the memory this variant saves, and
             // inventing a fused kernel to avoid it would be optimising the wrong thing.
             LinKind::Iq1(_) => {}
+                // Same for IQ4_XS: matvec then add, two dispatches, no fused epilogue yet.
+                LinKind::Iq4xs(_) => {}
                 LinKind::Q4(q) => return gpu.linear_q4_0_add(a, q, resid),
                 LinKind::F32(_) => {}
             }
@@ -7807,6 +7891,9 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
             // Untested against a real IQ1_S MoE checkpoint: nothing builds an Iq1 stack yet, so
             // this arm is reachable only once the loader stops converting them.
             LinKind::Iq1(q) => (&q.blocks, self.iq1s_grid_tensor(), q.k, MOE_MATVEC_IQ1_S),
+            // No MoE matvec reads IQ4_XS blocks yet; the loader keeps expert stacks on the
+            // converting path (make_lin), so this arm is unreachable today. Decline, never clamp.
+            LinKind::Iq4xs(_) => return None,
             LinKind::F32(_) => {
                 static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -7848,6 +7935,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
             // Untested against a real IQ1_S MoE checkpoint: nothing builds an Iq1 stack yet, so
             // this arm is reachable only once the loader stops converting them.
             LinKind::Iq1(q) => (&q.blocks, self.iq1s_grid_tensor(), q.k, MOE_MATVEC_IQ1_S),
+            LinKind::Iq4xs(_) => return None,
             LinKind::F32(_) => return None,
         };
         if !moe_gpu_routable(m.cfg.n_used, m.cfg.n_group) { return None; } // see moe_gpu_routable: decline, never clamp
@@ -11077,6 +11165,8 @@ impl Model {
     /// Nonzero means decode routes those layers through the CPU-routed block_decode_deltanet and
     /// the cache MUST come from new_cache_for; used by --gate-deltanet-load.
     pub fn deltanet_layers(&self) -> usize { self.layers.iter().filter(|b| b.deltanet.is_some()).count() }
+    /// How many of those carry the GPU-resident weight set (the default route; None means the CPU mixer).
+    pub fn deltanet_gpu_layers(&self) -> usize { self.layers.iter().filter(|b| b.deltanet_gpu.is_some()).count() }
     /// This model's context/state/prompts shape — the answer to "what does a carry-forward mean for
     /// me". Hybrids (delta layers present) are `Archetype::Hybrid` so the recurrent-state carry is
     /// planned by recurrent-stream prefix, not whole-prompt token equality; transformers are
@@ -12734,6 +12824,28 @@ LOGSCOPE_NO_Q4_0_TRANSCODE=1 restores the old path");
                     }
                 }
             }
+            // IQ4_XS NATIVE, the default: the file's 136-byte blocks go up unmodified and
+            // MATVEC_IQ4XS / IQ4XS_TO_Q8 read them (see Iq4xsWeight). The converting path below
+            // turned a 4.25 bpw file into 9 bpw int8 on the device; LOGSCOPE_IQ4XS_NATIVE=0 gets
+            // that back. Only for tensors the static mmap can serve (the app's load path).
+            if quantize && t.ggml_type == 23 && k % 256 == 0 && iq4xs_native() {
+                let count = t.dims.iter().product::<u64>() as usize;
+                if count == n * k {
+                    if let (Some(nbytes), Some(sset)) = (gguf::type_nbytes(23, count), static_set.as_ref()) {
+                        if let Some(raw) = sset.slice(t.offset, nbytes) {
+                            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("loader: IQ4_XS tensors held NATIVELY (4.25 bpw resident; MATVEC_IQ4XS at decode, widened to int8 on the GPU for prefill). LOGSCOPE_IQ4XS_NATIVE=0 converts to int8 as before; --gate-iq4xs checks the kernels on this device.");
+                            }
+                            let blocks = Tensor {
+                                buf: self.upload_bytes(raw, "iq4xs"),
+                                rows: 1, cols: raw.len() / 4, pool: None, site: (0, 0), view: None, bid: 0 };
+                            IQ4XS_NATIVE_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(Lin::iq4xs(Iq4xsWeight { blocks, n, k }));
+                        }
+                    }
+                }
+            }
             if quantize && q4_mode && t.ggml_type == 12 && k % 256 == 0
                 && std::env::var("LOGSCOPE_NO_Q4K_GPU").is_err() {
                 let count = t.dims.iter().product::<u64>() as usize;
@@ -12955,8 +13067,16 @@ loader assumes. Other families that ship a fused qkv are still unverified");
                             let raw = set.slice(t.offset, nb)?;
                             Some(Lin::q4(self.q4_0_upload_transcode(raw, attn_dim + 2 * kv, d)?))
                         });
-                    match tc {
-                        Some(l) => {
+                    // IQ4_XS native fused q‖k‖v: the three tensors' blocks stacked (plain split
+                    // layout only — the gated q‖gate interleave and v-from-k keep the converting path).
+                    let native = if q && q_gate.is_none() && !block_v_from_k && g.tensor(&format!("blk.{i}.attn_q.weight")).is_some() {
+                        iq4xs_native_concat(self, &g, static_set.as_ref(),
+                            &[format!("blk.{i}.attn_q.weight"), format!("blk.{i}.attn_k.weight"), format!("blk.{i}.attn_v.weight")],
+                            attn_dim + 2 * kv, d)
+                    } else { None };
+                    match (tc, native) {
+                        (_, Some(l)) => l,
+                        (Some(l), None) => {
                             LOAD_FAST_WEIGHTS.fetch_add(((attn_dim + 2 * kv) * d) as u64,
                                 std::sync::atomic::Ordering::Relaxed);
                             l
@@ -12965,7 +13085,7 @@ loader assumes. Other families that ship a fused qkv are still unverified");
                         // rows on V-from-K ones. Declaring the classic width here while the
                         // concat carried more was exactly the bug the gated cross-check caught
                         // (9.55e-3): the gate slice read past the projection's real output.
-                        None => self.make_lin(&qkv, qkv.len() / d, d, q, q4_mode),
+                        (None, None) => self.make_lin(&qkv, qkv.len() / d, d, q, q4_mode),
                     }
                 };
                 if has_qkv_bias {
@@ -13052,11 +13172,17 @@ LOGSCOPE_NO_GU_SLICE=1 restores the old path");
                             Lin::q8(w)
                         }
                         None => {
+                            // IQ4_XS native gate‖up: the two tensors' blocks stacked.
+                            if let Some(l) = if q { iq4xs_native_concat(self, &g, static_set.as_ref(),
+                                &[format!("blk.{i}.ffn_gate.weight"), format!("blk.{i}.ffn_up.weight")], 2 * h, d) } else { None } {
+                                l
+                            } else {
                             let gt = fetch(&format!("blk.{i}.ffn_gate.weight"))?;
                             let u = fetch(&format!("blk.{i}.ffn_up.weight"))?;
                             let mut gu = Vec::with_capacity(gt.len() + u.len());
                             gu.extend_from_slice(&gt); gu.extend_from_slice(&u);
                             self.make_lin(&gu, 2 * h, d, q, q4_mode)
+                            }
                         }
                     }
                 },
@@ -13614,18 +13740,29 @@ scale {} ({}), shared {}, weight applied to {}",
                         d_conv: g.get_u32(&format!("{pfx}.ssm.conv_kernel")).unwrap_or(0) as usize,
                     };
                     let (cd, vd, hv) = (dn_dims.conv_dim(), dn_dims.value_dim(), dn_dims.h_v);
-                    let mut all = fetch(&format!("blk.{i}.attn_qkv.weight"))?;
-                    all.extend_from_slice(&fetch(&format!("blk.{i}.attn_gate.weight"))?);
-                    all.extend_from_slice(&fetch(&format!("blk.{i}.ssm_beta.weight"))?);
-                    all.extend_from_slice(&fetch(&format!("blk.{i}.ssm_alpha.weight"))?);
-                    let w_all = self.make_lin(&all, cd + vd + 2 * hv, d, q, q4_mode);
-                    drop(all);
+                    // IQ4_XS native qkv‖gate‖β‖α when all four parts are IQ4_XS (β/α are tiny and
+                    // a quantizer may keep them in another type; then the fusion converts as before).
+                    let w_all = match if q { iq4xs_native_concat(self, &g, static_set.as_ref(),
+                        &[format!("blk.{i}.attn_qkv.weight"), format!("blk.{i}.attn_gate.weight"), format!("blk.{i}.ssm_beta.weight"), format!("blk.{i}.ssm_alpha.weight")],
+                        cd + vd + 2 * hv, d) } else { None } {
+                        Some(l) => l,
+                        None => {
+                            let mut all = fetch(&format!("blk.{i}.attn_qkv.weight"))?;
+                            all.extend_from_slice(&fetch(&format!("blk.{i}.attn_gate.weight"))?);
+                            all.extend_from_slice(&fetch(&format!("blk.{i}.ssm_beta.weight"))?);
+                            all.extend_from_slice(&fetch(&format!("blk.{i}.ssm_alpha.weight"))?);
+                            self.make_lin(&all, cd + vd + 2 * hv, d, q, q4_mode)
+                        }
+                    };
                     let mut cp = fetch(&format!("blk.{i}.ssm_conv1d.weight"))?;
                     cp.extend_from_slice(&fetch(&format!("blk.{i}.ssm_dt.bias"))?);
                     cp.extend_from_slice(&fetch(&format!("blk.{i}.ssm_a"))?);
                     Some(Box::new(DeltaNetGpuWeights {
                         w_all,
-                        wout: self.make_lin(&fetch(&format!("blk.{i}.ssm_out.weight"))?, d, vd, q, q4_mode),
+                        wout: match if q { iq4xs_native_concat(self, &g, static_set.as_ref(), &[format!("blk.{i}.ssm_out.weight")], d, vd) } else { None } {
+                            Some(l) => l,
+                            None => self.make_lin(&fetch(&format!("blk.{i}.ssm_out.weight"))?, d, vd, q, q4_mode),
+                        },
                         conv_params: self.upload(&cp, 1, cd * dn_dims.d_conv + 2 * hv),
                         norm: self.upload(&fetch(&format!("blk.{i}.ssm_norm.weight"))?, 1, dn_dims.s),
                     }))
@@ -14084,6 +14221,8 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
             // requantized — the file's bytes ARE the resident form, so a cache copy would duplicate
             // the checkpoint for no gain.
             LinKind::Iq1(_) => { return; }
+            // Same rule as IQ1_S: the file's bytes are the resident form, nothing to cache.
+            LinKind::Iq4xs(_) => { return; }
             LinKind::Q8(q) => { o.push(1); o.extend_from_slice(&(q.n as u32).to_le_bytes()); o.extend_from_slice(&(q.k as u32).to_le_bytes());
                 self.dump_tensor(o, &q.qw); self.dump_tensor(o, &q.qs); }
             LinKind::Q4(q) => { o.push(2); o.extend_from_slice(&(q.n as u32).to_le_bytes()); o.extend_from_slice(&(q.k as u32).to_le_bytes());
@@ -16332,6 +16471,43 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
             // of the work — the second half of the same shifted-layout mistake.
             bytemuck::cast_slice(&dims), (gx, (w.n as u32).div_ceil(gx), 1));
         out
+    }
+
+    /// IQ4_XS native linear: decode (m == 1) reads the blocks in `MATVEC_IQ4XS` (tiled like the
+    /// int8 V2 kernels, `decode_cfg_for`'s tile); a batch widens the blocks to int8 on the GPU
+    /// (`iq4xs_to_q8`, exact) and runs the int8 GEMM. Unlike IQ1_S's native path this serves
+    /// every `m`, which is what lets the loader keep IQ4_XS native by default.
+    pub fn linear_iq4xs_t(&self, a: &Tensor, w: &Iq4xsWeight, m: usize) -> Tensor {
+        if m == 1 { return self.matvec_iq4xs(a, w, self.decode_cfg_for(w.n, w.k).tile); }
+        let q = self.iq4xs_to_q8(w);
+        self.linear_q8_0_t(a, &q, m)
+    }
+    /// The native decode matvec with an explicit tile (1..=8 output rows per 128-thread workgroup).
+    pub fn matvec_iq4xs(&self, a: &Tensor, w: &Iq4xsWeight, tile: u32) -> Tensor {
+        let out = self.alloc(1, w.n);
+        let (gx, gy, t) = Self::fused_v2_grid(w.n, tile);
+        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 256) as u32, gx, t, 0, 0];
+        self.dispatch(MATVEC_IQ4XS, &[a, &w.blocks], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+        out
+    }
+    /// Upload raw IQ4_XS blocks (a gate's fixture, or anything that is not the static mmap).
+    pub fn iq4xs_weight_from_bytes(&self, raw: &[u8], n: usize, k: usize) -> Iq4xsWeight {
+        assert!(k % 256 == 0 && raw.len() == n * k / 256 * Iq4xsWeight::BLOCK_BYTES, "IQ4_XS bytes do not match n={n} k={k}");
+        let blocks = Tensor { buf: self.upload_bytes(raw, "iq4xs"), rows: 1, cols: raw.len() / 4, pool: None, site: (0, 0), view: None, bid: 0 };
+        Iq4xsWeight { blocks, n, k }
+    }
+    /// Widen IQ4_XS blocks to the resident int8 form on the GPU — a transient `QWeight` from the
+    /// pool, EXACT (code = kvalues[nib], scale = dl). n·k·9/8 bytes for the call's duration.
+    pub fn iq4xs_to_q8(&self, w: &Iq4xsWeight) -> QWeight {
+        let (n, k) = (w.n, w.k);
+        let nsb = k / 32;
+        let qw = self.alloc(1, n * k / 4);      // words of codes (upload_i8_codes_resident's shape)
+        let qs = self.alloc(n, nsb);
+        let total = (n * nsb) as u32;
+        let dims = [n as u32, k as u32, (k / 256) as u32, total, 0, 0, 0, 0];
+        // qw is an OUTPUT alongside qs: dispatch_rw treats bindings from `rw_from` as read_write
+        self.dispatch_rw(IQ4XS_TO_Q8, &[&w.blocks, &qw], 1, &qs, bytemuck::cast_slice(&dims), wg1(total));
+        QWeight { qw, qs, n, k }
     }
 
     pub fn id_probe(&self, n: usize) -> Vec<f32> {
@@ -20710,6 +20886,124 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     c[row] = acc0 + acc1;
 }
 "#;
+
+// ── IQ4_XS, read natively ─────────────────────────────────────────────────────────────────────
+//
+// Block (ggml `block_iq4_xs`, 136 B / 256 weights, 34 words): word 0 = f16 `d` | `scales_h` << 16;
+// word 1 = `scales_l[0..4]`; words 2..34 = 128 nibble bytes, 16 per 32-weight sub-block. Sub-block
+// `ib` of a block: 6-bit scale `ls = scales_l nibble (ib) | scales_h bits (2ib..2ib+2) << 4`,
+// `dl = d · (ls − 32)`; byte j of its 16 holds weight j in the LOW nibble and weight j+16 in the
+// HIGH one; a nibble indexes `kvalues_iq4nl`. Ported from llama.cpp dequantize_row_iq4_xs and
+// pinned against this crate's CPU decoder (`iq4::dequant_iq4_xs`) by --gate-iq4xs.
+//
+// Honeykrisp rules (lane-broadcast-fault.md, driver-quirk-hardening.md): scalar `array<u32>` loads
+// only, `extractBits` for every lane-varying field (a shift by a lane-varying amount returns zero
+// there), no vec4 byte reads. Rows are word-aligned, so no byte-offset reads at all.
+const MATVEC_IQ4XS: &str = r#"
+// MATVEC_IQ4XS
+struct D { m:u32,n:u32,k:u32,nblk:u32,gx:u32,tile:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;       // activations [k]
+@group(0)@binding(1) var<storage,read> w: array<u32>;       // IQ4_XS blocks, 34 words per 256
+@group(0)@binding(2) var<storage,read_write> c: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+var<workgroup> red: array<f32,1024>; // tile(≤8) x 128 threads
+fn f16(h: u32) -> f32 {
+  let sgn = f32(1 - i32((h >> 15u) & 1u) * 2);
+  let exp = (h >> 10u) & 0x1Fu;
+  let man = h & 0x3FFu;
+  if (exp == 0u) { return sgn * f32(man) * 5.9604645e-8; }
+  if (exp == 31u) { return sgn * 65504.0; }
+  return sgn * exp2(f32(i32(exp) - 15)) * (1.0 + f32(man) / 1024.0);
+}
+@compute @workgroup_size(128,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col0=(wg.y*d.gx+wg.x)*d.tile; let tid=lid.x;
+  if(col0>=d.n){ return; }
+  var kv = array<f32,16>(-127.0,-104.0,-83.0,-65.0,-49.0,-35.0,-22.0,-10.0,1.0,13.0,25.0,38.0,53.0,69.0,89.0,113.0);
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  let nsb=d.k/32u;                      // 32-weight sub-blocks per row
+  var sb=tid;
+  loop {
+    if(sb>=nsb){break;}
+    let b=sb>>3u; let ib=sb&7u;
+    // this sub-block's activations, once, reused across the tile
+    var av: array<f32,32>;
+    let abase=sb*32u;
+    for(var j=0u;j<32u;j=j+1u){ av[j]=a[abase+j]; }
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      let col=col0+ci;
+      if(col<d.n){
+        let blk=(col*d.nblk+b)*34u;
+        let h0=w[blk]; let h1=w[blk+1u];
+        let dsc=f16(h0&0xFFFFu);
+        let ls=extractBits(h1, 4u*ib, 4u) | (extractBits(h0, 16u+2u*ib, 2u)<<4u);
+        let dl=dsc*f32(i32(ls)-32);
+        var sum=0.0;
+        for(var wi=0u;wi<4u;wi=wi+1u){
+          let word=w[blk+2u+ib*4u+wi];
+          for(var j=0u;j<4u;j=j+1u){
+            let byte=extractBits(word, 8u*j, 8u);
+            sum=sum+av[4u*wi+j]*kv[byte&15u]+av[16u+4u*wi+j]*kv[byte>>4u];
+          }
+        }
+        acc[ci]=acc[ci]+dl*sum;
+      }
+    }
+    sb=sb+128u;
+  }
+  for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*128u+tid]=acc[ci]; }
+  workgroupBarrier();
+  for(var s=64u;s>0u;s=s>>1u){
+    if(tid<s){ for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*128u+tid]=red[ci*128u+tid]+red[ci*128u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var ci=0u;ci<d.tile;ci=ci+1u){ let col=col0+ci; if(col<d.n){ c[col]=red[ci*128u]; } } }
+}"#;
+
+// IQ4_XS → the resident int8 form (`QWeight`: codes packed 4 per word, one f32 scale per 32), one
+// thread per 32-weight sub-block. EXACT: code = kvalues[nib] (−127..=113 fits an int8), scale = dl.
+// This is what lets a batch (prefill) run on the int8 GEMM while decode reads the blocks natively.
+const IQ4XS_TO_Q8: &str = r#"
+// IQ4XS_TO_Q8
+struct D { n:u32,k:u32,nblk:u32,total:u32,qs_off:u32,_a:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> w: array<u32>;         // IQ4_XS blocks
+@group(0)@binding(1) var<storage,read_write> qw: array<u32>;  // int8 codes, 4 per word [n*k/4]
+@group(0)@binding(2) var<storage,read_write> qs: array<f32>;  // scales [n*k/32]
+@group(0)@binding(3) var<uniform> d: D;
+fn f16(h: u32) -> f32 {
+  let sgn = f32(1 - i32((h >> 15u) & 1u) * 2);
+  let exp = (h >> 10u) & 0x1Fu;
+  let man = h & 0x3FFu;
+  if (exp == 0u) { return sgn * f32(man) * 5.9604645e-8; }
+  if (exp == 31u) { return sgn * 65504.0; }
+  return sgn * exp2(f32(i32(exp) - 15)) * (1.0 + f32(man) / 1024.0);
+}
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nw:vec3<u32>){
+  let id=g.x+g.y*nw.x*64u;
+  if(id>=d.total){ return; }
+  let nsb=d.k/32u;
+  let row=id/nsb; let sb=id%nsb;
+  let b=sb>>3u; let ib=sb&7u;
+  var kv = array<i32,16>(-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113);
+  let blk=(row*d.nblk+b)*34u;
+  let h0=w[blk]; let h1=w[blk+1u];
+  let dsc=f16(h0&0xFFFFu);
+  let ls=extractBits(h1, 4u*ib, 4u) | (extractBits(h0, 16u+2u*ib, 2u)<<4u);
+  qs[row*nsb+sb]=dsc*f32(i32(ls)-32);
+  let obase=(row*d.k+sb*32u)/4u;      // first output word of this sub-block (8 words)
+  for(var wi=0u;wi<4u;wi=wi+1u){
+    let word=w[blk+2u+ib*4u+wi];
+    var lo=0u; var hi=0u;
+    for(var j=0u;j<4u;j=j+1u){
+      let byte=extractBits(word, 8u*j, 8u);
+      lo=lo|((u32(kv[byte&15u])&0xFFu)<<(8u*j));
+      hi=hi|((u32(kv[byte>>4u])&0xFFu)<<(8u*j));
+    }
+    qw[obase+wi]=lo;        // weights 4wi..4wi+3
+    qw[obase+4u+wi]=hi;     // weights 16+4wi..
+  }
+}"#;
 
 /// `dst[i] = f32(src[i])` — one distinct word per thread, no shift, no shared index.
 ///

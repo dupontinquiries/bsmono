@@ -331,6 +331,113 @@ fn enc_q8_0(w: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Encode f32 weights as IQ4_XS blocks (ggml type 23): per 256-weight block an f16 `d`, per
+/// 32-weight sub-block a 6-bit scale, each weight the nearest `kvalues_iq4nl` entry. NOT llama.cpp's
+/// quantizer (no error search; `d` from the block's largest sub-block, the scale bias unused on the
+/// negative side) — a VALID encoding whose decode is well defined, which is all a correctness gate
+/// needs: the question is whether the GPU reads what the CPU decoder reads, not how good the fit is.
+fn enc_iq4_xs(w: &[f32]) -> Vec<u8> {
+    use gpu_kernels::iq4::KVALUES_IQ4NL;
+    assert!(w.len() % 256 == 0);
+    let mut out = Vec::with_capacity(w.len() / 256 * 136);
+    for blk in w.chunks(256) {
+        // per sub-block target scale: largest magnitude lands on ±127
+        let s: Vec<f32> = blk.chunks(32).map(|sb| sb.iter().fold(0f32, |m, &x| m.max(x.abs())) / 127.0).collect();
+        let smax = s.iter().cloned().fold(0f32, f32::max);
+        // ls − 32 reaches 31, so d = smax/31 uses the scale's full range — but kept a NORMAL f16:
+        // f32_to_f16 flushes subnormals (< 6.1e-5) to zero, and a fixture of amplitude 0.12 landed
+        // exactly there (d = 3e-5 → 0 → every weight 0 → every logit 0, which read as "the two load
+        // paths agree perfectly"). A larger d just means a smaller ls; the encoding stays valid.
+        // (the floor is 2^-14 EXACTLY — the literal 6.1035e-5 is a hair below it and flushed too)
+        let d = f16_round(if smax > 0.0 { (smax / 31.0).max(1.0 / 16384.0) } else { 1.0 });
+        let mut scales_h = 0u16; let mut scales_l = [0u8; 4]; let mut qs = [0u8; 128];
+        for (ib, sb) in blk.chunks(32).enumerate() {
+            let ls = if d > 0.0 { ((s[ib] / d).round() as i32).clamp(0, 31) } else { 0 } + 32;
+            scales_l[ib / 2] |= ((ls & 0xF) as u8) << (4 * (ib % 2));
+            scales_h |= (((ls >> 4) & 3) as u16) << (2 * ib);
+            let dl = d * (ls - 32) as f32;
+            for j in 0..16 {
+                let nib = |x: f32| -> u8 {
+                    if dl == 0.0 { return 8; } // kvalue 1, the smallest magnitude
+                    (0..16).min_by(|&p, &q| ((x - dl * KVALUES_IQ4NL[p] as f32).abs()).partial_cmp(&(x - dl * KVALUES_IQ4NL[q] as f32).abs()).unwrap()).unwrap() as u8
+                };
+                qs[ib * 16 + j] = nib(sb[j]) | (nib(sb[16 + j]) << 4);
+            }
+        }
+        out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        out.extend_from_slice(&scales_h.to_le_bytes());
+        out.extend_from_slice(&scales_l);
+        out.extend_from_slice(&qs);
+    }
+    out
+}
+/// `d` as the f16 the block will carry (round-trip), so the encoder quantizes against the decoded scale.
+fn f16_round(d: f32) -> f32 {
+    let h = f32_to_f16(d);
+    let (sign, exp, mant) = (((h >> 15) & 1) as u32, ((h >> 10) & 0x1F) as u32, (h & 0x3FF) as u32);
+    let bits = if exp == 0 { if mant == 0 { sign << 31 } else { let (mut e, mut m) = (-14i32, mant); while m & 0x400 == 0 { m <<= 1; e -= 1; } (sign << 31) | (((e + 127) as u32) << 23) | ((m & 0x3FF) << 13) } }
+        else if exp == 0x1F { (sign << 31) | 0x7F80_0000 | (mant << 13) } else { (sign << 31) | ((exp + 112) << 23) | (mant << 13) };
+    f32::from_bits(bits)
+}
+/// write_gguf_q8_0 with every projection matrix (k a multiple of 256) as IQ4_XS: the native-residency
+/// fixture for --gate-iq4xs. Norms and the embedding stay f32.
+fn write_gguf_iq4xs(m: &HostModel) -> Vec<u8> {
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
+    let iqt = |w: &[f32]| (23u32, enc_iq4_xs(w));
+    let kv = m.n_kv_heads * (m.d / m.n_heads); // GQA: k/v are [kv, d], not [d, d]
+    let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+    let (et, eb) = f32t(&m.embed); ts.push(("token_embd.weight".into(), mat(m.vocab, m.d), et, eb));
+    for (i, b) in m.layers.iter().enumerate() {
+        let (t, by) = f32t(&b.g1); ts.push((format!("blk.{i}.attn_norm.weight"), v1(m.d), t, by));
+        let (t, by) = iqt(&b.wq); ts.push((format!("blk.{i}.attn_q.weight"), mat(m.d, m.d), t, by));
+        let (t, by) = iqt(&b.wk); ts.push((format!("blk.{i}.attn_k.weight"), mat(kv, m.d), t, by));
+        let (t, by) = iqt(&b.wv); ts.push((format!("blk.{i}.attn_v.weight"), mat(kv, m.d), t, by));
+        let (t, by) = iqt(&b.wo); ts.push((format!("blk.{i}.attn_output.weight"), mat(m.d, m.d), t, by));
+        let (t, by) = f32t(&b.g2); ts.push((format!("blk.{i}.ffn_norm.weight"), v1(m.d), t, by));
+        let (t, by) = iqt(&b.wgate); ts.push((format!("blk.{i}.ffn_gate.weight"), mat(m.h, m.d), t, by));
+        let (t, by) = iqt(&b.wup); ts.push((format!("blk.{i}.ffn_up.weight"), mat(m.h, m.d), t, by));
+        let (t, by) = iqt(&b.wdown); ts.push((format!("blk.{i}.ffn_down.weight"), mat(m.d, m.h), t, by));
+    }
+    let (t, by) = f32t(&m.out_norm); ts.push(("output_norm.weight".into(), v1(m.d), t, by));
+    let (t, by) = iqt(&m.output); ts.push(("output.weight".into(), mat(m.vocab, m.d), t, by));
+    gguf_llama_bytes(m, ts)
+}
+/// The GGUF container around a llama-arch tensor list — write_gguf_q8_0's tail, shared.
+fn gguf_llama_bytes(m: &HostModel, ts: Vec<(String, Vec<u64>, u32, Vec<u8>)>) -> Vec<u8> {
+    let mut offs = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, _, by) in &ts { offs.push(off); off = align32(off + by.len() as u64); }
+    let mut b = Vec::new();
+    let s = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 9);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "llama");
+    s(&mut b, "llama.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
+    s(&mut b, "llama.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
+    s(&mut b, "llama.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
+    s(&mut b, "llama.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
+    s(&mut b, "llama.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
+    s(&mut b, "llama.vocab_size"); u32b(&mut b, 4); u32b(&mut b, m.vocab as u32);
+    s(&mut b, "llama.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, m.base);
+    s(&mut b, "llama.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
+    for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
+        s(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, *ty); u64b(&mut b, offs[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, _, by)) in ts.iter().enumerate() {
+        while (b.len() as u64) < data_off + offs[i] { b.push(0); }
+        b.extend_from_slice(by);
+    }
+    b
+}
+
 /// Synthetic 1-layer deepseek2 checkpoint with q-compressed MLA (q_lora_rank > 0):
 /// attn_q_a(+norm)/attn_q_b + attn_kv_a_mqa(+norm)/attn_kv_b + attn_output, and NO
 /// attn_q/k/v — exactly the tensor shape of GLM-4.7-Flash, which the loader once
@@ -529,6 +636,124 @@ fn write_gguf_qwen35moe_hybrid_state(shexp: u8, out_scale: Option<f32>, sections
         sput(&mut b, "qwen35moe.rope.dimension_sections"); u32b(&mut b, 9); u32b(&mut b, 5); u64b(&mut b, 4);
         for v in sec { b.extend_from_slice(&v.to_le_bytes()); }
     }
+    sput(&mut b, "qwen35moe.block_count"); u32b(&mut b, 4); u32b(&mut b, 2);
+    sput(&mut b, "qwen35moe.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
+    sput(&mut b, "qwen35moe.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, kvh as u32);
+    sput(&mut b, "qwen35moe.embedding_length"); u32b(&mut b, 4); u32b(&mut b, d as u32);
+    sput(&mut b, "qwen35moe.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, h as u32);
+    sput(&mut b, "qwen35moe.vocab_size"); u32b(&mut b, 4); u32b(&mut b, vocab as u32);
+    sput(&mut b, "qwen35moe.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, 10000.0);
+    sput(&mut b, "qwen35moe.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, 1e-5);
+    sput(&mut b, "qwen35moe.ssm.conv_kernel"); u32b(&mut b, 4); u32b(&mut b, dconv as u32);
+    sput(&mut b, "qwen35moe.ssm.state_size"); u32b(&mut b, 4); u32b(&mut b, sst as u32);
+    sput(&mut b, "qwen35moe.ssm.group_count"); u32b(&mut b, 4); u32b(&mut b, hk as u32);
+    sput(&mut b, "qwen35moe.ssm.time_step_rank"); u32b(&mut b, 4); u32b(&mut b, hv as u32);
+    sput(&mut b, "qwen35moe.expert_count"); u32b(&mut b, 4); u32b(&mut b, nexp as u32);
+    sput(&mut b, "qwen35moe.expert_used_count"); u32b(&mut b, 4); u32b(&mut b, nused as u32);
+    sput(&mut b, "qwen35moe.expert_feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, ffe as u32);
+    for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
+        sput(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, *ty); u64b(&mut b, offs[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, _, by)) in ts.iter().enumerate() {
+        while (b.len() as u64) < data_off + offs[i] { b.push(0); }
+        b.extend_from_slice(by);
+    }
+    b
+}
+
+/// Snap f32 weights onto the int8 grid the resident quantizer uses (per 32-block scale amax/127,
+/// code = round(w/scale)), so `quantize_q8_resident` reproduces them EXACTLY and a quantized load
+/// of these tensors equals the f32 load up to multiplication order. For fixtures whose point is
+/// to compare two load paths and whose other tensors would otherwise carry int8 rounding.
+fn snap_int8(w: &[f32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(w.len());
+    for blk in w.chunks(32) {
+        let amax = blk.iter().fold(0f32, |m, &x| m.max(x.abs()));
+        let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+        for &x in blk { out.push(((x / scale).round().clamp(-127.0, 127.0)) * scale); }
+    }
+    out
+}
+
+/// The qwen35moe hybrid at IQ4_XS: the shape write_gguf_qwen35moe_hybrid_state writes, scaled so
+/// every projection the loader can hold natively has k % 256 == 0 (d = 256, state 64 × 4 value
+/// heads = 256, head_dim 64 × 4 heads = 256, ff 256), with those projections encoded as IQ4_XS
+/// and every tensor that stays on the converting path (the gated q‖gate pair and its k/v, the MoE
+/// experts and the shared expert) snapped to the int8 grid — so a quantized load of this
+/// file equals its f32 load up to accumulation order, and --gate-iq4xs's hybrid half is a kernel
+/// check rather than a measurement of int8 rounding. blk.0 is Gated DeltaNet (qkv‖gate‖β‖α and
+/// ssm_out native), blk.1 gated attention + MoE (attn_output native).
+fn write_gguf_qwen35moe_hybrid_iq4xs() -> Vec<u8> {
+    let (d, vocab, h) = (256usize, 32usize, 256usize);
+    let (heads, kvh, hd) = (4usize, 2usize, 64usize);
+    let (hk, hv, dconv, sst) = (2usize, 4usize, 4usize, 64usize);
+    let (nexp, nused, ffe, sff) = (2usize, 1usize, 32usize, 256usize);
+    let (key_dim, value_dim) = (hk * sst, hv * sst);
+    let conv_dim = 2 * key_dim + value_dim;
+    let mk = |seed: u32, n: usize| -> Vec<f32> {
+        let mut v = Vec::with_capacity(n); let mut x = seed | 1;
+        for _ in 0..n { x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            let u = (x >> 9) as f32 / (1u32 << 23) as f32;
+            v.push((u * 2.0 - 1.0) * 0.12); }
+        v };
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
+    let iqt = |w: &[f32]| (23u32, enc_iq4_xs(w));
+    let i8t = |w: &[f32]| f32t(&snap_int8(w));
+    let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+    let mut push = |name: String, dims: Vec<u64>, (t, by): (u32, Vec<u8>)| { ts.push((name, dims, t, by)); };
+    push("token_embd.weight".into(), mat(vocab, d), f32t(&mk(11, vocab * d)));
+    // blk.0 — Gated DeltaNet, every projection IQ4_XS
+    push("blk.0.attn_norm.weight".into(), v1(d), f32t(&vec![1.0; d]));
+    push("blk.0.attn_qkv.weight".into(), mat(conv_dim, d), iqt(&mk(21, conv_dim * d)));
+    push("blk.0.attn_gate.weight".into(), mat(value_dim, d), iqt(&mk(22, value_dim * d)));
+    push("blk.0.ssm_conv1d.weight".into(), vec![dconv as u64, conv_dim as u64], f32t(&mk(23, conv_dim * dconv)));
+    push("blk.0.ssm_dt.bias".into(), v1(hv), f32t(&vec![0.1; hv]));
+    push("blk.0.ssm_a".into(), v1(hv), f32t(&vec![-0.7; hv]));
+    push("blk.0.ssm_beta.weight".into(), mat(hv, d), iqt(&mk(24, hv * d)));
+    push("blk.0.ssm_alpha.weight".into(), mat(hv, d), iqt(&mk(25, hv * d)));
+    push("blk.0.ssm_norm.weight".into(), v1(sst), f32t(&vec![1.0; sst]));
+    push("blk.0.ssm_out.weight".into(), mat(d, value_dim), iqt(&mk(26, d * value_dim)));
+    push("blk.0.post_attention_norm.weight".into(), v1(d), f32t(&vec![1.0; d]));
+    push("blk.0.ffn_gate.weight".into(), mat(h, d), iqt(&mk(31, h * d)));
+    push("blk.0.ffn_up.weight".into(), mat(h, d), iqt(&mk(32, h * d)));
+    push("blk.0.ffn_down.weight".into(), mat(d, h), iqt(&mk(33, d * h)));
+    // blk.1 — gated attention (q‖gate interleave: converting path, int8-exact) + MoE (int8-exact)
+    push("blk.1.attn_norm.weight".into(), v1(d), f32t(&vec![1.0; d]));
+    push("blk.1.attn_q.weight".into(), mat(heads * hd * 2, d), i8t(&mk(41, heads * hd * 2 * d)));
+    push("blk.1.attn_k.weight".into(), mat(kvh * hd, d), i8t(&mk(42, kvh * hd * d)));
+    push("blk.1.attn_v.weight".into(), mat(kvh * hd, d), i8t(&mk(43, kvh * hd * d)));
+    push("blk.1.attn_output.weight".into(), mat(d, heads * hd), iqt(&mk(44, d * heads * hd)));
+    push("blk.1.attn_q_norm.weight".into(), v1(hd), f32t(&vec![1.0; hd]));
+    push("blk.1.attn_k_norm.weight".into(), v1(hd), f32t(&vec![1.0; hd]));
+    push("blk.1.post_attention_norm.weight".into(), v1(d), f32t(&vec![1.0; d]));
+    push("blk.1.ffn_gate_inp.weight".into(), mat(nexp, d), f32t(&mk(50, nexp * d)));
+    push("blk.1.ffn_gate_exps.weight".into(), vec![d as u64, ffe as u64, nexp as u64], i8t(&mk(51, nexp * ffe * d)));
+    push("blk.1.ffn_up_exps.weight".into(), vec![d as u64, ffe as u64, nexp as u64], i8t(&mk(52, nexp * ffe * d)));
+    push("blk.1.ffn_down_exps.weight".into(), vec![ffe as u64, d as u64, nexp as u64], i8t(&mk(53, nexp * d * ffe)));
+    // the shared expert is assembled from f32 fetches (no native route yet): int8-exact
+    push("blk.1.ffn_gate_shexp.weight".into(), mat(sff, d), i8t(&mk(54, sff * d)));
+    push("blk.1.ffn_up_shexp.weight".into(), mat(sff, d), i8t(&mk(55, sff * d)));
+    push("blk.1.ffn_down_shexp.weight".into(), mat(d, sff), i8t(&mk(56, d * sff)));
+    push("blk.1.ffn_gate_inp_shexp.weight".into(), v1(d), f32t(&vec![0.0; d]));
+    push("output_norm.weight".into(), v1(d), f32t(&vec![1.0; d]));
+    push("output.weight".into(), mat(vocab, d), iqt(&mk(61, vocab * d)));
+
+    let mut offs = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, _, by) in &ts { offs.push(off); off = align32(off + by.len() as u64); }
+    let mut b = Vec::new();
+    let sput = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 16);
+    sput(&mut b, "general.architecture"); u32b(&mut b, 8); sput(&mut b, "qwen35moe");
     sput(&mut b, "qwen35moe.block_count"); u32b(&mut b, 4); u32b(&mut b, 2);
     sput(&mut b, "qwen35moe.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
     sput(&mut b, "qwen35moe.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, kvh as u32);
@@ -4800,6 +5025,154 @@ everywhere: it looks like a hardware problem"
         println!("gate-fused-v2: {}", if kernels_ok && model_ok { "PASS ✓" } else { "FAIL" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-iq4xs") {
+        // The native IQ4_XS path against the CPU decoder this crate already trusts
+        // (iq4::dequant_iq4_xs, itself checked against llama.cpp by quantdiff): the decode matvec
+        // at every tile on ragged shapes, the GPU widening to int8 (must be EXACT — code and scale
+        // bit for bit), a batched forward through that widening, and a whole model loaded both
+        // ways (native vs the converting path) with its logits compared.
+        let gpu = Gpu::new();
+        println!("gate-iq4xs: adapter = {}", gpu.adapter_name);
+        let mut ok = true;
+        let rel = |got: &[f32], want: &[f32]| -> f32 {
+            let scale = want.iter().fold(1f32, |m, v| m.max(v.abs()));
+            maxerr(got, want) / scale
+        };
+        for &(n, k) in &[(5usize, 256usize), (96, 512), (257, 1024), (1000, 4096)] {
+            let w = rnd(n * k, 21 + n);
+            let raw = enc_iq4_xs(&w);
+            let deq = gpu_kernels::iq4::dequant_iq4_xs(&raw, n * k).expect("cpu decode");
+            let act = rnd(k, 23 + k);
+            let want: Vec<f32> = (0..n).map(|r| (0..k).map(|c| deq[r * k + c] * act[c]).sum()).collect();
+            let wt = gpu.iq4xs_weight_from_bytes(&raw, n, k);
+            let a = gpu.upload(&act, 1, k);
+            for tile in [1u32, 3, 4, 8] {
+                let got = gpu.download(&gpu.matvec_iq4xs(&a, &wt, tile));
+                let e = rel(&got, &want);
+                if e > 1e-4 || !got.iter().all(|x| x.is_finite()) { ok = false; println!("  n={n} k={k} tile={tile}: MATVEC_IQ4XS vs cpu rel {e:.2e}  got[..3]={:?} want[..3]={:?}", &got[..3], &want[..3]); }
+            }
+            // widening: exact
+            let q = gpu.iq4xs_to_q8(&wt);
+            let codes = gpu.download_u32(&q.qw);
+            let scales = gpu.download(&q.qs);
+            let mut bad_codes = 0usize; let mut bad_scales = 0usize;
+            for r in 0..n { for c in 0..k {
+                let code = ((codes[(r * k + c) / 4] >> ((c % 4) * 8)) & 0xFF) as u8 as i8 as f32;
+                let sc = scales[r * (k / 32) + c / 32];
+                // the decoded value must be reproduced exactly: code·scale == dequant
+                if code * sc != deq[r * k + c] { bad_codes += 1; }
+            } }
+            // and the scale must be the sub-block's dl, which the CPU decoder exposes through a
+            // weight whose nibble is kvalue 1 (index 8): dl·1
+            for r in 0..n { for sb in 0..k / 32 {
+                let sc = scales[r * (k / 32) + sb];
+                let any = (0..32).find(|j| { let code = ((codes[(r * k + sb * 32 + j) / 4] >> ((j % 4) * 8)) & 0xFF) as u8 as i8; code != 0 });
+                if let Some(j) = any {
+                    let code = ((codes[(r * k + sb * 32 + j) / 4] >> ((j % 4) * 8)) & 0xFF) as u8 as i8 as f32;
+                    if (deq[r * k + sb * 32 + j] / code - sc).abs() > sc.abs() * 1e-6 + 1e-12 { bad_scales += 1; }
+                }
+            } }
+            if bad_codes > 0 || bad_scales > 0 { ok = false; println!("  n={n} k={k}: IQ4XS_TO_Q8 not exact — {bad_codes} code·scale mismatches, {bad_scales} scale mismatches"); }
+            // batched forward through the widening
+            let m = 5usize;
+            let am = rnd(m * k, 29 + k);
+            let mut want_m = vec![0f32; m * n];
+            for i in 0..m { for r in 0..n { want_m[i * n + r] = (0..k).map(|c| deq[r * k + c] * am[i * k + c]).sum(); } }
+            let got_m = gpu.download(&gpu.linear_iq4xs_t(&gpu.upload(&am, m, k), &wt, m));
+            let em = rel(&got_m, &want_m);
+            if em > 1e-4 { ok = false; println!("  n={n} k={k} m={m}: batched (widen + int8 GEMM) vs cpu rel {em:.2e}"); }
+            println!("  n={n} k={k}: matvec tiles 1/3/4/8, widening ({bad_codes}+{bad_scales} mismatches), batched m=5 rel {em:.2e}");
+        }
+        // whole model: native vs converting, same file
+        let hm = gen_model(256, 512, 2, 64, 4, 2);
+        let bytes: &'static [u8] = Box::leak(write_gguf_iq4xs(&hm).into_boxed_slice());
+        // three loads of one file: native blocks, the converting int8 path, and plain f32 (the
+        // dequantized weights exactly). Native must match f32 to accumulation order — that is the
+        // claim. int8 is shown for scale: requantizing a dequantized IQ4_XS value is lossless only
+        // when its sub-block holds a ±127 code, so int8-vs-f32 carries real rounding (percent-level
+        // on random weights through two layers) and is NOT the oracle.
+        let run = |mode: u8| -> (Vec<Vec<f32>>, u64) {
+            gpu_kernels::set_iq4xs_native(mode == 1);
+            let before = gpu_kernels::IQ4XS_NATIVE_LOADS.load(std::sync::atomic::Ordering::Relaxed);
+            let model = if mode == 2 { gpu.load_gguf(bytes).expect("f32 load") } else { gpu.load_gguf_quantized_parts_static(&[bytes]).expect("load iq4xs fixture") };
+            let loads = gpu_kernels::IQ4XS_NATIVE_LOADS.load(std::sync::atomic::Ordering::Relaxed) - before;
+            let cache = gpu.new_cache_for(&model, 32);
+            let prompt: Vec<u32> = (0..5u32).map(|j| (j * 7 + 3) % model.vocab as u32).collect();
+            let mut out = vec![gpu.prefill_batched(&model, &cache, &prompt)];
+            let mut pos = prompt.len();
+            for t in 0..6u32 { out.push(gpu.decode_step(&model, &cache, (t * 11 + 1) % model.vocab as u32, pos)); pos += 1; }
+            (out, loads)
+        };
+        let (conv, conv_loads) = run(0);
+        let (nat, nat_loads) = run(1);
+        let (f32m, _) = run(2);
+        gpu_kernels::set_iq4xs_native(true);
+        let am = |v: &[f32]| v.iter().enumerate().fold((0usize, f32::MIN), |m, (i, &z)| if z > m.1 { (i, z) } else { m }).0;
+        // NaN would read as agreement: (x-y).abs() is NaN, fold(0, max) drops it, rel = 0. The
+        // first hybrid run reported 0.00e0 for exactly that reason. Non-finite anywhere = infinite diff.
+        let cmp = |a: &[Vec<f32>], b: &[Vec<f32>]| -> (f32, usize) {
+            let mut worst = 0f32; let mut agree = 0;
+            for (x, y) in a.iter().zip(b) {
+                if !x.iter().all(|v| v.is_finite()) || !y.iter().all(|v| v.is_finite()) { worst = f32::INFINITY; continue; }
+                worst = worst.max(rel(y, x)); if am(x) == am(y) { agree += 1; }
+            }
+            (worst, agree)
+        };
+        let steps = nat.len();
+        let (w_nat, a_nat) = cmp(&f32m, &nat);
+        let (w_conv, a_conv) = cmp(&f32m, &conv);
+        let covered = nat_loads > 0 && conv_loads == 0;
+        println!("  model (llama d=256 h=512, 2 layers, every projection IQ4_XS): native kept {nat_loads} tensors (converting run {conv_loads}); {steps} steps (prefill + 6 decode):");
+        println!("    native   vs f32: worst logit rel diff {w_nat:.2e}, argmax agrees {a_nat}/{steps}   ← the claim (same numbers, accumulation order only)");
+        println!("    int8conv vs f32: worst logit rel diff {w_conv:.2e}, argmax agrees {a_conv}/{steps}   (what the converting path costs: int8 re-rounding)");
+        if !(w_nat < 1e-3 && a_nat == steps && covered) { ok = false; }
+        // The architecture Ornith is: Gated DeltaNet qkv‖gate‖β‖α and ssm_out native (the concat
+        // path), gated attention's output native, the rest int8-exact — against the f32 load.
+        std::env::set_var("LOGSCOPE_MOE_INT8", "1");   // the fixture's experts are int8-exact, not q4-exact
+        std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
+        {   // encoder sanity at the hybrid fixture's amplitude (0.12): the first version's f16 `d`
+            // underflowed to zero there, every weight decoded to 0, every logit was 0 in BOTH loads,
+            // and the comparison read "0.00e0 — perfect agreement". A fixture has to be checked for
+            // being a fixture before it can check anything.
+            let w: Vec<f32> = rnd(1024, 5).iter().map(|x| x * 0.12).collect();
+            let deq = gpu_kernels::iq4::dequant_iq4_xs(&enc_iq4_xs(&w), 1024).unwrap();
+            let err = w.iter().zip(&deq).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let mx = deq.iter().fold(0f32, |m, v| m.max(v.abs()));
+            println!("  encoder @0.12 amplitude: max |decoded| {mx:.4}, max |w − decoded| {err:.4} (must be a real encoding: non-zero, error well under the amplitude)");
+            if !(mx > 0.05 && err < 0.05) { ok = false; }
+        }
+        let hb: &'static [u8] = Box::leak(write_gguf_qwen35moe_hybrid_iq4xs().into_boxed_slice());
+        let _ = std::fs::write("/tmp/tiny-qwen35moe-hybrid-iq4xs.gguf", hb); // for decode-census / kernel-validate by hand
+        let hrun = |mode: u8| -> (Vec<Vec<f32>>, u64) {
+            gpu_kernels::set_iq4xs_native(mode == 1);
+            let before = gpu_kernels::IQ4XS_NATIVE_LOADS.load(std::sync::atomic::Ordering::Relaxed);
+            let model = if mode == 2 { gpu.load_gguf(hb).expect("f32 hybrid load") } else { gpu.load_gguf_quantized_parts_static(&[hb]).expect("load iq4xs hybrid") };
+            let loads = gpu_kernels::IQ4XS_NATIVE_LOADS.load(std::sync::atomic::Ordering::Relaxed) - before;
+            let cache = gpu.new_cache_for(&model, 32);
+            let prompt: Vec<u32> = (0..5u32).map(|j| (j * 7 + 3) % model.vocab as u32).collect();
+            let mut out = vec![gpu.prefill_batched(&model, &cache, &prompt)];
+            let mut pos = prompt.len();
+            for t in 0..6u32 { out.push(gpu.decode_step(&model, &cache, (t * 11 + 1) % model.vocab as u32, pos)); pos += 1; }
+            let (wb, wk) = model.decode_weight_bytes();
+            let spread = out[0].iter().fold(0f32, |m, v| m.max(v.abs()));
+            println!("    load mode {mode} ({}): decode weight bytes {wb} ({wk}), DeltaNet layers {} on the GPU path, |logit| max {spread:.3}",
+                ["int8-converting", "native", "f32"][mode as usize], model.deltanet_gpu_layers());
+            // a model whose logits are all zero compares equal to anything: refuse that fixture
+            if spread == 0.0 { println!("    FIXTURE PRODUCES ALL-ZERO LOGITS — the comparison below would be vacuous"); }
+            (out, loads)
+        };
+        let (hn, hn_loads) = hrun(1);
+        let (hf, _) = hrun(2);
+        gpu_kernels::set_iq4xs_native(true);
+        let (w_h, a_h) = cmp(&hf, &hn);
+        // blk.0: qkv‖gate‖β‖α (4 names) + ssm_out + gate‖up (2) + down = 8; blk.1: attn_output;
+        // output → 10 native tensors (the gated q‖gate pair, the experts and the shared expert
+        // are assembled from f32 and stay int8: the fixture makes those int8-exact)
+        println!("  hybrid (qwen35moe d=256: DeltaNet + gated attention + MoE): native kept {hn_loads} tensors; {} steps: native vs f32 worst logit rel diff {w_h:.2e}, argmax agrees {a_h}/{}", hn.len(), hn.len());
+        if !(w_h < 1e-3 && a_h == hn.len() && hn_loads == 10) { ok = false; }
+        println!("gate-iq4xs: {}", if ok { "PASS ✓" } else { "FAIL" });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-iq1s-kernel") {
         let gpu = Gpu::new();
         println!("gate-iq1s-kernel: adapter = {}", gpu.adapter_name);
@@ -6999,7 +7372,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-batched-fused  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-gemma4-altv  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-prefill-parity --gate-qwen3\n  --gate-residency  --gate-rope-kv  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy\n  --gate-deltanet-prefix-reuse  --gate-sgladder  --gate-fused-v2");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-batched-fused  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-gemma4-altv  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-prefill-parity --gate-qwen3\n  --gate-residency  --gate-rope-kv  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy\n  --gate-deltanet-prefix-reuse  --gate-sgladder  --gate-fused-v2  --gate-iq4xs");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }

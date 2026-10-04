@@ -362,6 +362,12 @@ pub fn estimate_resident_from_tensors(rows: impl Iterator<Item = TensorPlanRow>,
                 // a type_nbytes miss for a type we just matched would be a table bug; price the
                 // exact 50-bytes-per-256 rather than silently pricing zero
                 .unwrap_or(params / 256 * 50);
+        } else if crate::iq4xs_native() && ggml_type == 23 && row_len % 256 == 0 {
+            // IQ4_XS native (lib.rs, the default): the file's 136-byte blocks are the resident form.
+            // Priced as int8 before this line, an IQ4_XS 9B read as ~9.7 GB and was refused or
+            // streamed on a device that fits its real 4.9 GB.
+            e.native_view_bytes += crate::gguf::type_nbytes(23, params as usize)
+                .map(|b| b as u64).unwrap_or(params / 256 * 136);
         } else {
             e.int8_rest_bytes += (params as f64 * int8_bpp) as u64;
             e.q4_rest_bytes += (params as f64 * q4_bpp) as u64;
@@ -793,6 +799,25 @@ mod resident_estimate_tests {
         assert_eq!(e.native_view_bytes, 256 * 50);
         assert_eq!(e.int8_rest_bytes, 0, "nothing double-counted");
         assert_eq!(e.plan_int8(), e.plan_q4(), "native bytes are residency-independent");
+    }
+
+    /// IQ4_XS, native by default: priced at 136 bytes per 256 weights, not int8; with the lever
+    /// off (`set_iq4xs_native(false)`) it is int8 like every other converting type; a misaligned
+    /// row never qualifies.
+    #[test]
+    fn iq4xs_tensors_are_priced_at_their_blocks_when_native() {
+        crate::set_iq4xs_native(true);
+        let rows = vec![(false, 256u64 * 4096, 23u32, 4096u64)];
+        let e = estimate_resident_from_tensors(rows.clone().into_iter(), true);
+        assert_eq!(e.native_view_bytes, 256 * 4096 / 256 * 136);
+        assert_eq!(e.int8_rest_bytes, 0);
+        crate::set_iq4xs_native(false);
+        let off = estimate_resident_from_tensors(rows.into_iter(), true);
+        assert_eq!(off.native_view_bytes, 0);
+        assert!(off.int8_rest_bytes > 256 * 4096, "int8 pricing when the lever is off: {}", off.int8_rest_bytes);
+        crate::set_iq4xs_native(true);
+        let mis = estimate_resident_from_tensors(vec![(false, 100u64 * 4096, 23u32, 100u64)].into_iter(), true);
+        assert_eq!(mis.native_view_bytes, 0, "a 100-wide row is not block-aligned");
     }
 
     #[test]

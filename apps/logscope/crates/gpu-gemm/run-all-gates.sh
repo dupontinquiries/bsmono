@@ -20,20 +20,25 @@ fi
 
 BIN=target/release/kernel-validate
 
-# ---- the 52 kernel-validate gates -------------------------------------------------------------
+# ---- the 57 kernel-validate gates -------------------------------------------------------------
 # Ordered cheap-to-expensive so a broken environment shows up in seconds rather than minutes.
 GATES_FAST="arch memplan store rubric quanttables quant-survey cpuops moe-cpu"
 GATES_CORE="bytes q4k q4resident q6k q8direct quantref matvec qkv gemm-spec"
 GATES_ARCH="gemma qwen2 qwen3 llama4-kqnorm mla-block swa branch kvtree"
 GATES_MOE="iq1s iq1s-kernel moe-fusion moe-raw moe-repin moe-stream moe-prefetch passfuse"
+# the hybrid (Gated DeltaNet) family, the fused-kernel rewrite and native IQ4_XS — added 2026-10-04;
+# fused-v2 takes a GGUF for its whole-model half (the fixture gen-all.sh writes)
+GATES_HYBRID="deltanet-load prefill-parity rope-kv iq4xs"
 GATES_PERF="autotune autotune-cache submit stream-slots residency perf prefill prefill-attn"
 GATES_SYS="vram mmap zerocopy loadpath worker"
 GATES_VISION="vit-block vae-conv vae-resblock dit-block dit-primitives dit-conditioning"
 
-for g in $GATES_FAST $GATES_CORE $GATES_ARCH $GATES_MOE $GATES_PERF $GATES_SYS $GATES_VISION; do
+for g in $GATES_FAST $GATES_CORE $GATES_ARCH $GATES_MOE $GATES_HYBRID $GATES_PERF $GATES_SYS $GATES_VISION; do
     say "--gate-$g"
     timeout 600 "$BIN" "--gate-$g" 2>&1 | tee -a "$LOG"
 done
+say "--gate-fused-v2 /tmp/tiny-qwen3.gguf"
+timeout 600 "$BIN" --gate-fused-v2 /tmp/tiny-qwen3.gguf 2>&1 | tee -a "$LOG"
 
 # ---- standalone gate binaries ------------------------------------------------------------------
 # gate-policy and gate-rowstats are pure CPU. gate-bidir-attn and gate-rnd1 need a GPU; gate-rnd1
