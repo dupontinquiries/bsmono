@@ -2016,7 +2016,22 @@ pub fn parse_tools(text: &str) -> Vec<Tool> { parse_tools_reported(text).0 }
 /// reply was cut off while thinking — is removed to the end, which is the safe reading: nothing
 /// after the open tag was an action. Returns the input unchanged when there is no such block.
 pub fn strip_thinking(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.contains("<think>") { return std::borrow::Cow::Borrowed(text); }
+    // A `</think>` with no `<think>` before it: the OPENER was in the prompt. Qwen3.5-family chat
+    // templates end the generation prompt with `<think>\n` in thinking mode (Ornith-1.5 among them —
+    // the model continues the thought), so the reply carries only the close, and everything before
+    // it is reasoning. Three splitters here and in template-kit looked only for the opener and let a
+    // call drafted inside the thought run; logscope-fan's decompose.rs had this case right.
+    let first_open = text.find("<think>");
+    if let Some(c) = text.find("</think>") {
+        if first_open.map_or(true, |o| c < o) {
+            let after = &text[c + "</think>".len()..];
+            return match strip_thinking(after) {
+                std::borrow::Cow::Borrowed(b) => std::borrow::Cow::Owned(b.to_string()),
+                owned => owned,
+            };
+        }
+    }
+    if first_open.is_none() { return std::borrow::Cow::Borrowed(text); }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(a) = rest.find("<think>") {
@@ -5154,6 +5169,22 @@ That is this machine, not the allowlist.", tldr.output.trim());
         let (tools, _) = parse_tools_reported("<think>plan: ```tool\n{\"tool\":\"run\",\"argv\":[\"ls\"]}\n```");
         assert!(tools.is_empty());
         assert_eq!(strip_thinking("no thinking here"), "no thinking here");
+    }
+
+    /// The opener in the PROMPT: Qwen3.5-family templates end the generation prompt with
+    /// `<think>\n` in thinking mode, so the reply carries only `</think>`. Before, the splitter
+    /// looked for the opener, found none, and a call drafted inside the thought ran.
+    #[test]
+    fn a_reply_that_only_closes_a_think_block_is_reasoning_up_to_the_close() {
+        let t = "maybe run it:\n```tool\n{\"tool\":\"run\",\"argv\":[\"rm\",\"-rf\",\"x\"]}\n```\nno.</think>\n```tool\n{\"tool\":\"read_file\",\"path\":\"a.rs\"}\n```";
+        assert_eq!(strip_thinking(t), "\n```tool\n{\"tool\":\"read_file\",\"path\":\"a.rs\"}\n```");
+        let (tools, bad) = parse_tools_reported(t);
+        assert_eq!(tools, vec![Tool::ReadFile { path: "a.rs".into() }], "{bad:?}");
+        // a close followed by a second, properly opened block: both stripped
+        assert_eq!(strip_thinking("x</think>a<think>y</think>b"), "ab");
+        // the ordinary case is unchanged, and a close AFTER an opener is that opener's close
+        assert_eq!(strip_thinking("<think>y</think>b"), "b");
+        assert_eq!(strip_thinking("plain</think> tail"), " tail");
     }
 
     #[test]

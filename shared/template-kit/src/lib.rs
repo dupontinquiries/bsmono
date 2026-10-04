@@ -59,6 +59,10 @@ impl Tool {
     pub fn new(name: &str, description: &str, parameters: serde_json::Value) -> Tool { Tool { kind: "function".into(), function: ToolSpec { name: name.into(), description: description.into(), parameters } } }
 }
 
+/// Whether thinking is on for rendered prompts: `LOGSCOPE_THINKING=0` turns it off (the only
+/// place the app reads it; `render_thinking` takes it explicitly).
+pub fn thinking_enabled() -> bool { std::env::var("LOGSCOPE_THINKING").as_deref() != Ok("0") }
+
 pub struct Renderer { env: Environment<'static> }
 
 impl Renderer {
@@ -76,9 +80,18 @@ impl Renderer {
     /// The prompt the model was trained to see. `tools` may be empty; `add_generation_prompt` puts
     /// the assistant header on the end (true for every turn the model must answer).
     pub fn render(&self, messages: &[Message], tools: &[Tool], add_generation_prompt: bool) -> Result<String, String> {
+        self.render_thinking(messages, tools, add_generation_prompt, thinking_enabled())
+    }
+
+    /// `render` with the Qwen3 / Qwen3.5 / Ornith family's `enable_thinking` switch explicit. Their
+    /// templates read it to decide whether the generation prompt ends in `<think>\n` (the model
+    /// continues a thought) or a closed empty block (`<think>\n\n</think>\n\n` — no thinking). It was
+    /// never passed, so it was undefined and the templates took their default (thinking ON).
+    /// Templates that do not read it are unaffected by its presence.
+    pub fn render_thinking(&self, messages: &[Message], tools: &[Tool], add_generation_prompt: bool, enable_thinking: bool) -> Result<String, String> {
         let t = self.env.get_template("chat").map_err(|e| e.to_string())?;
         let ctx = minijinja::context! { messages => messages, tools => if tools.is_empty() { Value::from(()) } else { Value::from_serialize(tools) },
-            add_generation_prompt => add_generation_prompt, bos_token => "", eos_token => "" };
+            add_generation_prompt => add_generation_prompt, bos_token => "", eos_token => "", enable_thinking => enable_thinking };
         t.render(ctx).map_err(|e| format!("render: {e}"))
     }
 
@@ -213,6 +226,35 @@ mod tests {
         assert!(s.result_frame.contains("<tool_response>"), "{s:?}");
         let g = tool_call_grammar(&s, &["read_file", "run"]);
         assert!(g.contains("<tool_call>") && g.contains("\\\"read_file\\\""), "{g}");
+    }
+
+    /// Qwen3.5 / Ornith-1.5 shape: the generation prompt depends on `enable_thinking`. Before this
+    /// variable was passed the templates saw it undefined and always took the thinking branch.
+    #[test]
+    fn enable_thinking_reaches_the_template() {
+        const QWEN35_TAIL: &str = r##"{%- for message in messages %}{{- '<|im_start|>' + message.role + '
+' + message.content + '<|im_end|>
+' }}{%- endfor %}{%- if add_generation_prompt %}{{- '<|im_start|>assistant
+' }}{%- if enable_thinking is defined and enable_thinking is false %}{{- '<think>
+
+</think>
+
+' }}{%- else %}{{- '<think>
+' }}{%- endif %}{%- endif %}"##;
+        let r = Renderer::new(QWEN35_TAIL).unwrap();
+        let on = r.render_thinking(&[Message::user("q")], &[], true, true).unwrap();
+        assert!(on.ends_with("<|im_start|>assistant
+<think>
+"), "thinking on → the opener is in the PROMPT (so the reply carries only </think>): {on:?}");
+        let off = r.render_thinking(&[Message::user("q")], &[], true, false).unwrap();
+        assert!(off.ends_with("<think>
+
+</think>
+
+"), "thinking off → a closed empty block: {off:?}");
+        // a template that never reads it renders the same either way
+        let r2 = Renderer::new(QWEN_LIKE).unwrap();
+        assert_eq!(r2.render_thinking(&[Message::user("q")], &[], true, true).unwrap(), r2.render_thinking(&[Message::user("q")], &[], true, false).unwrap());
     }
 
     #[test]
