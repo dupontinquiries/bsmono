@@ -7,7 +7,9 @@ are.
 Orientation, not rules: [NEWCOMER_DEVELOPER.md](NEWCOMER_DEVELOPER.md) for the
 build system, [LAYOUT.md](LAYOUT.md) for the taxonomy,
 [docs/agents/INDEX.md](docs/agents/INDEX.md) for the doc catalog,
-[maintenance/C20UNIFIED_TODO.md](maintenance/C20UNIFIED_TODO.md) for the newest open threads,
+[maintenance/C21_TODO.md](maintenance/C21_TODO.md) for the newest open threads (the c21
+session: logscope gates and kernels, the apps sweep, the games sweep, the f32-fallback lint), then
+[maintenance/C20UNIFIED_TODO.md](maintenance/C20UNIFIED_TODO.md) behind it,
 with [maintenance/C20_TODO.md](maintenance/C20_TODO.md) (a DIFFERENT session's: it came with
 the blackstar-rs drop), [maintenance/C19_TODO.md](maintenance/C19_TODO.md) and
 [maintenance/C18_TODO.md](maintenance/C18_TODO.md) behind them;
@@ -90,8 +92,15 @@ all install cleanly. `apt-get update` FIRST — the baked lists are stale and ba
 installs 404 — and clear the `deb.nodesource.com` entry, which 403s and makes
 the whole update look failed.
 
+c21 added to the installable list: `openssh-client openssh-server` plus `mkdir -p /run/sshd`
+(gitmind's cockpit tests shell out to `ssh-keygen` and `sshd -t`), the ffmpeg headers
+`libavutil-dev libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev libswscale-dev
+libswresample-dev` with `clang libclang-dev` (vidkit-player; 239 tests, its first sandbox run),
+and `libpcsclite-dev` (card-diagnoser).
+
 Still genuinely absent: Qt6, `/dev/dri` (so lavapipe is the only device, CPU
-and slow).
+and slow), and `gtk4-layer-shell` (rusty-board's default features; check it with
+`--no-default-features --features dbus,input-modes,llm` instead).
 
 **GTK4/libadwaita are NOT absent**, though this section said so until c19:
 `libgtk-4-dev` (4.14.5) and `libadwaita-1-dev` (1.5.0) install from apt, gtk4-rs
