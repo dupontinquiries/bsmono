@@ -6,6 +6,7 @@ mod simconvo;
 fn rnd(n: usize, seed: usize) -> Vec<f32> {
     (0..n).map(|i| (((i * 1103515245 + seed * 12345 + 7) % 1000) as f32) / 500.0 - 1.0).collect()
 }
+fn wgpu_query_cap() -> u32 { wgpu::QUERY_SET_MAX_QUERIES / 2 }
 fn maxerr(a: &[f32], b: &[f32]) -> f32 { a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max) }
 
 fn cpu_gemm(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
@@ -7021,22 +7022,85 @@ still pass, which is why this one exists."
         // new_cache_for, not new_cache: a hybrid (Gated DeltaNet) model needs its per-layer recurrent state
         // slots, and the raw cache made `--bench` panic on Ornith/Qwen3.5 before measuring anything.
         let cache = gpu.new_cache_for(&model, ctx + n + 16);
-        // prefill `ctx` tokens so decode attends a realistic-depth KV cache (the app runs at 500+)
+        // prefill `ctx` tokens so decode attends a realistic-depth KV cache (the app runs at 500+).
+        // TIMED, through the chunked path the app runs (prefill_chunk_for_streaming → prefill_chunked;
+        // LOGSCOPE_PREFILL_CHUNK overrides, 512 is the app's dense default): no tool in this tree
+        // reported a prompt-processing rate before — bench.sh's only prefill figure was llama-bench's.
+        // On a Gated DeltaNet hybrid the recurrence runs token-serially inside one dispatch per head,
+        // so this is the number that says whether a long prompt is the real wall.
         let warm: Vec<u32> = (0..ctx.max(1)).map(|j| (j as u32) % model.vocab as u32).collect();
-        let _ = gpu.prefill_batched(&model, &cache, &warm);
+        let chunk: usize = std::env::var("LOGSCOPE_PREFILL_CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(512).max(1);
+        gpu_kernels::gpu_counters_reset();
+        let tp = std::time::Instant::now();
+        let _ = gpu.prefill_chunked(&model, &cache, &warm, chunk);
+        let prefill_s = tp.elapsed().as_secs_f64();
+        let pre_disp = gpu_kernels::GPU_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed);
+        let pre_sub = gpu_kernels::GPU_SUBMITS.load(std::sync::atomic::Ordering::Relaxed);
+        let pre_sync = gpu_kernels::gpu_sync_ns();
+        let pre_ts = gpu.gpu_timestamps_take(); // prefill's per-kernel GPU time (empty unless LOGSCOPE_GPU_TIMESTAMPS=1)
         let _ = gpu.decode_step(&model, &cache, 5, warm.len()); // warm decode pipelines (not counted)
+        let _ = gpu.gpu_timestamps_take();
         gpu_kernels::gpu_counters_reset();
         let t = std::time::Instant::now();
         let mut pos = warm.len() + 1;
         for _ in 0..n { let _ = gpu.decode_step(&model, &cache, 6, pos); pos += 1; }
         let wall = t.elapsed().as_secs_f64();
+        let dec_ts = gpu.gpu_timestamps_take();
         let ms = |x: u64| (x as f64 / n as f64) / 1e6;
+        let ld = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed) as f64 / n as f64;
         println!("bench: {n} decode steps at ctx≈{} → {:.2} tok/s ({:.1}ms/token)", ctx + n / 2, n as f64 / wall, wall * 1000.0 / n as f64);
         println!("  per token: resource-setup {:.2}ms (bind groups+dims, CPU) | gpu-sync {:.2}ms (poll waiting for GPU) | other {:.2}ms",
             ms(gpu_kernels::gpu_setup_ns()), ms(gpu_kernels::gpu_sync_ns()),
             (wall * 1000.0 / n as f64) - ms(gpu_kernels::gpu_setup_ns()) - ms(gpu_kernels::gpu_sync_ns()));
-        println!("  (1 submit/token; ~210 dispatches/token. Run at ctx 8 vs 512 to separate the matmul floor from attention-over-KV growth.)");
-        println!("  → gpu-sync ≈ all of wall ⇒ GPU-bound: fix is fewer/bigger dispatches (fuse QKV+residual) and a dedicated m=1 mat-vec kernel. resource-setup large ⇒ cache bind groups.");
+        // COUNTED, not quoted. This line used to be the fixed string "(1 submit/token; ~210
+        // dispatches/token)" — the 210 came from a 1B run whose counter double-counted, and the
+        // ledger's e2 verdict ("moot: already 1 submit/token") rested on it. The code says ~8
+        // submits (FLUSH_EVERY=32 passes) and 202 dispatches for a 32-layer hybrid; this prints
+        // what this run did.
+        println!("  per token (counted): {:.0} dispatches | {:.0} passes | {:.1} submits | {:.1} copies | {:.1} polls",
+            ld(&gpu_kernels::GPU_DISPATCHES), ld(&gpu_kernels::GPU_PASSES_OPENED), ld(&gpu_kernels::GPU_SUBMITS),
+            ld(&gpu_kernels::GPU_COPIES), ld(&gpu_kernels::GPU_POLLS));
+        // The bandwidth denominator the engine actually reads, not the file size (int8 is 9 bits/weight;
+        // a Q4_K_M file is 4.5): perf-loop's "28 GB/s effective" for Ornith-9B was ~45.
+        let (wbytes, wkind) = model.decode_weight_bytes();
+        let gbs = wbytes as f64 / (wall / n as f64) / 1e9;
+        let wsz = if wbytes >= 100_000_000 { format!("{:.2} GB", wbytes as f64 / 1e9) } else { format!("{:.1} MB", wbytes as f64 / 1e6) };
+        println!("  weights read per token: {wsz} ({wkind}-resident, decode path) → {gbs:.1} GB/s effective over wall; {:.1} GB/s over gpu-sync alone",
+            wbytes as f64 / (gpu_kernels::gpu_sync_ns() as f64 / n as f64 / 1e9).max(1e-9) / 1e9);
+        println!("  levers: fused kernels {} (LOGSCOPE_FUSED_V2), decode tile {}, FUSE_NORM {}, FUSED_QKV {}",
+            if gpu_kernels::fused_v2_enabled() { "V2 word-per-thread" } else { "V1 byte-per-thread" },
+            std::env::var("LOGSCOPE_DECODE_TILE").unwrap_or_else(|_| "autotune/profile".into()),
+            std::env::var("LOGSCOPE_FUSE_NORM").unwrap_or_else(|_| "on".into()),
+            std::env::var("LOGSCOPE_FUSED_QKV").unwrap_or_else(|_| "on".into()));
+        println!("  prefill: {} tokens in chunks of {chunk} → {:.1} tok/s ({:.2}ms/token) | {} dispatches, {} submits, gpu-sync {:.0}ms",
+            warm.len(), warm.len() as f64 / prefill_s, prefill_s * 1000.0 / warm.len() as f64, pre_disp, pre_sub, pre_sync as f64 / 1e6);
+        println!("  (Run at ctx 8 vs 512 to separate the matmul floor from attention-over-KV growth; a prefill rate needs ctx ≥ 512 to mean anything.)");
+        // Per-kernel GPU time, from timestamp queries around every pass (LOGSCOPE_GPU_TIMESTAMPS=1).
+        // The sum is time INSIDE passes; gpu-sync minus the sum is what the GPU spent between them
+        // (launch, barriers, scheduling) — the split that decides whether the next fix is a kernel
+        // or the dispatch count.
+        let table = |title: &str, unit: &str, ts: &[(String, u64, u64)], per: f64, host_ms: f64| {
+            if ts.is_empty() { return; }
+            let total_ns: u64 = ts.iter().map(|t| t.2).sum();
+            let inside = total_ns as f64 / per / 1e6;
+            let gap = host_ms - inside;
+            println!("  {title}: GPU time inside passes {inside:.2}ms per {unit} vs {host_ms:.2}ms host-measured gpu-sync → {}",
+                if gap >= 0.0 { format!("{gap:.2}ms between passes (launch/barrier/scheduling)") } else { format!("GPU work overlapped host encoding by {:.2}ms", -gap) });
+            println!("    {:>8}  {:>8}  {:>6}  {:>9}  kernel", format!("ms/{unit}"), format!("disp/{unit}"), "%gpu", "µs/disp");
+            for (label, count, ns) in ts.iter().take(16) {
+                println!("    {:>8.3}  {:>8.1}  {:>5.1}%  {:>9.1}  {}", *ns as f64 / per / 1e6, *count as f64 / per,
+                    100.0 * *ns as f64 / total_ns.max(1) as f64, *ns as f64 / (*count).max(1) as f64 / 1e3, label);
+            }
+            let untimed = gpu_kernels::TS_UNTIMED_PASSES.load(std::sync::atomic::Ordering::Relaxed);
+            if untimed > 0 { println!("    ({untimed} passes ran untimed: a frame exceeded {} passes)", wgpu_query_cap()); }
+        };
+        if gpu.timestamps {
+            table("decode per-kernel", "tok", &dec_ts, n as f64, ms(gpu_kernels::gpu_sync_ns()));
+            table(&format!("prefill per-kernel ({} tokens)", warm.len()), "prompt", &pre_ts, 1.0, pre_sync as f64 / 1e6);
+        } else {
+            println!("  (LOGSCOPE_GPU_TIMESTAMPS=1 adds a per-kernel GPU time table from timestamp queries — which kernel, not just that the GPU was busy)");
+        }
+        println!("  → gpu-sync ≈ all of wall ⇒ GPU-bound: the GB/s line above against the part's spec says how far the kernels are from the memory roof (LOGSCOPE_GPU_TIMESTAMPS=1 for the per-kernel split). resource-setup large ⇒ cache bind groups.");
         return;
     }
     if let Some(i) = args.iter().position(|a| a == "--workers") {
@@ -8589,9 +8653,9 @@ gpu argmax {ga} (margin {gm:.3e}) | cross-impl max|Δlogit| {xe:.3e}{}",
             // fused, default kernel set
             let got = gpu.download(&gpu.linear_q8_0_norm(&a, &nwt, &qw, k, eps));
             check("fused rmsnorm+matvec == rmsnorm then matvec", maxerr(&got, &want), 1e-5);
-            // the original kernel: bit-identical, and that exactness is the claim
+            // the original kernel, same bar (it was never bit-identical either — see above)
             let got_v1 = gpu.download(&gpu.linear_q8_0_norm_v1(&a, &nwt, &qw, eps));
-            check("fused rmsnorm+matvec (v1) is BIT-IDENTICAL to the chain", maxerr(&got_v1, &want), 0.0);
+            check("fused rmsnorm+matvec (v1) == chain", maxerr(&got_v1, &want), 1e-5);
         }
 
         // KV tier round-trip fidelity (the AnchorPool Cold path): a prefix demoted to int8, its

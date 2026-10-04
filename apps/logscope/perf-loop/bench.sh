@@ -60,14 +60,39 @@ def bench(name):
     p = re.search(r"resource-setup ([0-9.]+)ms.*gpu-sync ([0-9.]+)ms.*other ([0-9.]+)ms", t)
     a = re.search(r"adapter = (.+)", t)
     if not m: return None
-    return {"tok_s": float(m[1]), "ms_per_token": float(m[2]),
-            "setup_ms": float(p[1]) if p else None, "sync_ms": float(p[2]) if p else None,
-            "other_ms": float(p[3]) if p else None, "adapter": a[1].strip() if a else None}
+    out = {"tok_s": float(m[1]), "ms_per_token": float(m[2]),
+           "setup_ms": float(p[1]) if p else None, "sync_ms": float(p[2]) if p else None,
+           "other_ms": float(p[3]) if p else None, "adapter": a[1].strip() if a else None}
+    # Counted per-token commands (the bench used to print a fixed "~210 dispatches" string).
+    c = re.search(r"per token \(counted\): ([0-9.]+) dispatches \| ([0-9.]+) passes \| ([0-9.]+) submits \| ([0-9.]+) copies \| ([0-9.]+) polls", t)
+    if c: out.update(dispatches=float(c[1]), passes=float(c[2]), submits=float(c[3]), copies=float(c[4]), polls=float(c[5]))
+    # Bandwidth over the bytes the ENGINE reads (int8/q4 resident), not the GGUF file size.
+    w = re.search(r"weights read per token: ([0-9.]+) (GB|MB) \((\w+)-resident.*?→ ([0-9.]+) GB/s effective over wall; ([0-9.]+) GB/s over gpu-sync", t)
+    if w:
+        out.update(weight_gb_per_token=float(w[1]) * (1 if w[2] == "GB" else 1e-3), resident_kind=w[3],
+                   gbs_over_wall=float(w[4]), gbs_over_sync=float(w[5]))
+    pf = re.search(r"prefill: (\d+) tokens in chunks of (\d+) → ([0-9.]+) tok/s \(([0-9.]+)ms/token\)", t)
+    if pf: out.update(prefill_tokens=int(pf[1]), prefill_chunk=int(pf[2]), prefill_tok_s=float(pf[3]), prefill_ms_per_token=float(pf[4]))
+    # Per-kernel GPU time table (LOGSCOPE_GPU_TIMESTAMPS=1): [(kernel, ms/tok, disp/tok, %gpu)]
+    k = re.search(r"decode per-kernel: GPU time inside passes ([0-9.]+)ms per tok.*?\n(.*?)(?=\n  [^ ]|\Z)", t, re.S)
+    if k:
+        rows = re.findall(r"^\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)%\s+([0-9.]+)\s+(\S.*)$", k[2], re.M)
+        out["gpu_ms_inside_passes"] = float(k[1])
+        out["kernels"] = [{"kernel": r5.strip(), "ms_per_token": float(r1), "dispatches": float(r2), "pct": float(r3), "us_per_dispatch": float(r4)} for r1, r2, r3, r4, r5 in rows]
+    return out
 r["decode_ctx8"], r["decode_ctx512"] = bench("bench-ctx8"), bench("bench-ctx512")
+# PEAK: this is an M2 MAX (~400 GB/s), not the M2 Ultra (~800) the 745 figure was written for —
+# docs/agents/APPLE_M2_GPU_STACK.md. BENCH_PEAK_GBS overrides for another part.
+peak = float(os.environ.get("BENCH_PEAK_GBS", "400"))
+r["peak_gbs"] = peak
 if r["model_bytes"] and r["decode_ctx512"]:
     active_gib = r["model_bytes"] * r["active_fraction"] / 2**30
-    r["effective_gibs_ctx512"] = round(active_gib / (r["decode_ctx512"]["ms_per_token"] / 1000), 1)
-    r["roofline_tok_s_745"] = round(745 / active_gib, 1)
+    r["effective_gibs_ctx512_file"] = round(active_gib / (r["decode_ctx512"]["ms_per_token"] / 1000), 1)   # file-size denominator (legacy)
+    r["roofline_tok_s_745"] = round(745 / active_gib, 1)   # legacy column, kept so old rows compare
+    d = r["decode_ctx512"]
+    if d.get("weight_gb_per_token"):
+        r["roofline_tok_s_peak"] = round(peak / d["weight_gb_per_token"], 1)
+        r["pct_of_peak"] = round(100 * d["gbs_over_wall"] / peak, 1)
 lb = raw("llama-bench")
 try:
     j = json.loads(lb[lb.index("["):]) if "[" in lb else []
@@ -77,5 +102,12 @@ except Exception:
 json.dump(r, open(f"{out}.json", "w"), indent=1)
 print(f"wrote {out}.json")
 d = r["decode_ctx512"]
-print(f"  decode@512: {d['tok_s']} tok/s  sync {d['sync_ms']} ms/tok" if d else "  (no model run)")
+if d:
+    print(f"  decode@512: {d['tok_s']} tok/s  sync {d['sync_ms']} ms/tok  | {d.get('dispatches', '?')} dispatches/tok, {d.get('submits', '?')} submits/tok"
+          + (f" | {d['gbs_over_wall']} GB/s over {d['weight_gb_per_token']} GB/tok ({r.get('pct_of_peak', '?')}% of {peak:.0f})" if d.get('weight_gb_per_token') else "")
+          + (f" | prefill {d['prefill_tok_s']} tok/s" if d.get('prefill_tok_s') else ""))
+    if d.get("kernels"):
+        print("  top kernels (GPU ms/tok): " + ", ".join(f"{k['kernel']} {k['ms_per_token']}" for k in d["kernels"][:5]))
+else:
+    print("  (no model run)")
 PY

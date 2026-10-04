@@ -1,3 +1,4 @@
+// ATTENTION_MH_EXT_PAR
 // `nswa`/`swaty` add sliding-window attention. Unlike decode — where a single query position gives one
 // contiguous range — every query ROW here has its own window, so the bound is computed per row from that
 // row's global position. It is still a range rather than a mask, because both windowing rules are

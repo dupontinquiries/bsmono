@@ -30,8 +30,26 @@ target: bench.sh <tag> → results/<ts>-<tag>.json + raw/*.log                  
 - **NOISE**: within ±3%. Re-run once; two NOISE results = discard the hypothesis, not the run.
 - **DISCARD**: slower, or a gate regressed. Correctness beats speed every time; a faster wrong kernel is a bug.
 The JSON also carries `sync_ms` vs `setup_ms` (GPU-bound vs CPU-bound), per-kernel GiB/s from `--gate-perf`,
-the llama-bench reference on the same GGUF (`engine/ref tg`), and `roofline_tok_s_745` (active bytes at 745 GiB/s).
+the llama-bench reference on the same GGUF (`engine/ref tg`), and `roofline_tok_s_745` (active bytes at 745 GiB/s —
+the M2 ULTRA figure; this box is an M2 Max at ~400, see `docs/agents/APPLE_M2_GPU_STACK.md`, so prefer the next
+paragraph's numbers and keep that column only to compare old rows).
 The two numbers that matter long-term are **engine/ref** (how far from Metal-llama.cpp) and **% of roofline**.
+
+Since 2026-10-04 `--bench` COUNTS rather than quotes, and the JSON gains (all under `decode_ctx512` /
+`decode_ctx8`): `dispatches`, `passes`, `submits`, `copies`, `polls` per token (the old line said
+"1 submit/token; ~210 dispatches/token" as a constant string — the code says ~8 and 202 for a 32-layer
+hybrid); `weight_gb_per_token` and `gbs_over_wall` / `gbs_over_sync` over the bytes the ENGINE reads
+(int8-resident is 9 bits/weight: the ledger's "28 GB/s effective" for Ornith-9B divided a Q4_K_M file
+size by the token time and was really ~45); `prefill_tok_s` for the `ctx` tokens through the app's chunked
+path (the first prompt-processing rate any tool here reports; needs `--bench <m> 64 512`, not ctx 8);
+and `pct_of_peak` / `roofline_tok_s_peak` against `BENCH_PEAK_GBS` (default 400). With
+`LOGSCOPE_GPU_TIMESTAMPS=1` in the env the bench adds a per-kernel GPU-time table from timestamp queries
+(`kernels` in the JSON: ms/token, dispatches, %, µs/dispatch per shader) and the split between time inside
+passes and time between them — which kernel, not just that the GPU was busy. Timestamps are requested from
+the device only under that flag, so the default device is the one every earlier row measured.
+`LOGSCOPE_FUSED_V2=0` is the A/B for the word-per-thread rewrite of the three fused decode kernels
+(`--gate-fused-v2` is its correctness gate); `bench e7-fusedv1` with it set against the baseline is the
+first experiment to run.
 
 ## Keep / commit / ledger
 On KEEP: commit with the tag in the message, append one line to `LEDGER.md`

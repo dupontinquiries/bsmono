@@ -1,3 +1,4 @@
+// MOE_TOPK
 // `mode` selects the WEIGHTING, not the selection: 0 = softmax over the chosen k, 1 = sigmoid of each
 // logit. Selection is identical either way because sigmoid is monotonic, so top-k by raw logit picks the
 // same experts — which is why this is a small change rather than a second kernel.

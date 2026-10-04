@@ -1081,6 +1081,12 @@ pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pub adapter_name: String,
+    /// Per-pass GPU timestamps are being recorded (LOGSCOPE_GPU_TIMESTAMPS=1 and the adapter has
+    /// TIMESTAMP_QUERY). See `gpu_timestamps_take`.
+    pub timestamps: bool,
+    /// Resolved-but-unread timestamp buffers, one per submitted frame: (readback buffer, the
+    /// shader-source id of every timed pass in order). Drained by `gpu_timestamps_take`.
+    ts_pending: Mutex<Vec<TsReadback>>,
     pipelines: Mutex<HashMap<(usize, u32), Pipe>>,
     /// When `Some`, ops record into this one command encoder instead of each submitting
     /// its own. A whole decode token's ~250 ops then flush in ONE submit (see `begin_frame`/
@@ -1670,7 +1676,20 @@ struct Frame { enc: wgpu::CommandEncoder, pending: Vec<Pending>, keep: Vec<Keep>
     /// Pass-count flushing inside one is pure submit tax — the display-duration rationale for
     /// flush_every applies to INTERACTIVE frames sharing the GPU. Batch frames flush on the
     /// retain cap (the memory bound) and at end_frame/download only.
-    batch: bool }
+    batch: bool,
+    /// Timestamp query set for this frame's passes (Some only when `Gpu.timestamps`): pass i
+    /// writes queries 2i (begin) and 2i+1 (end); `labels[i]` is the pipeline id it ran (the
+    /// dispatch histogram's key, so `shader_label` names it).
+    ts: Option<FrameTs> }
+struct FrameTs { qs: wgpu::QuerySet, labels: Vec<usize> }
+/// Passes a frame can time: QUERY_SET_MAX_QUERIES / 2. A frame flushes every 32 passes by default,
+/// so this is only reached by batch frames; passes past it run untimed and are counted.
+const TS_MAX_PASSES: usize = (wgpu::QUERY_SET_MAX_QUERIES / 2) as usize;
+/// A submitted frame's timestamps, waiting to be read: the MAP_READ copy of the resolved queries
+/// and the label of each timed pass.
+struct TsReadback { buf: wgpu::Buffer, labels: Vec<usize> }
+/// Passes that ran untimed because their frame's query set was full.
+pub static TS_UNTIMED_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Default passes-per-submit. Frame batching collapsed a token to a single ~129ms submit, which on a
 /// shared GPU (display + compute) starves the compositor and shows as screen artifacts. Flushing every N
 /// passes bounds each submit's duration so the display is serviced between chunks, while still batching
@@ -1824,7 +1843,19 @@ impl Gpu {
         // far below its advertised limits — scoped budget clamp lives behind this, so macOS/Metal keeps
         // its full addressable range (bigger dense residencies stay reachable there).
         let conservative_vma = backend == wgpu::Backend::Vulkan && info.name.contains("Apple");
-        let req_features = if want_subgroup { wgpu::Features::SUBGROUP } else { wgpu::Features::empty() };
+        let mut req_features = if want_subgroup { wgpu::Features::SUBGROUP } else { wgpu::Features::empty() };
+        // Per-pass GPU timestamps, opt-in: this crate had no GPU-side timing at all — every "ms"
+        // it reports is host wall-clock around a blocking poll, which says the GPU was busy for
+        // 190 of 197 ms on an Ornith token and nothing about WHICH of the ~200 dispatches. Honeykrisp
+        // reports timestampComputeAndGraphics with a 1 ns period; lavapipe reports it too (the
+        // mechanism can be checked here, the numbers cannot). Requested only when asked for, so the
+        // default device is byte-for-byte the one every ledger row was measured on.
+        let want_ts = std::env::var("LOGSCOPE_GPU_TIMESTAMPS").as_deref() == Ok("1")
+            && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        if want_ts { req_features |= wgpu::Features::TIMESTAMP_QUERY; }
+        else if std::env::var("LOGSCOPE_GPU_TIMESTAMPS").as_deref() == Ok("1") {
+            eprintln!("wgpu-engine: LOGSCOPE_GPU_TIMESTAMPS=1 but this adapter has no TIMESTAMP_QUERY — per-kernel GPU timing unavailable, host timing only");
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("kernels"), required_features: req_features,
             required_limits: adapter.limits(), experimental_features: wgpu::ExperimentalFeatures::default(),
@@ -1911,7 +1942,7 @@ impl Gpu {
         // objects than the window is allowed to assume are free.
         let dims_cap = dims_cap_for(governor.lock().unwrap().budget().soft_object_cap);
         let dims_ring_cap = dims_ring_cap_for(governor.lock().unwrap().budget().soft_object_cap);
-        let gpu = Self { device, queue, adapter_name, dev_errors, iq1_grid: std::sync::OnceLock::new(), pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), dims_cap, dims_ring_cap, bg_cache: Mutex::new(HashMap::new()), bg_shape: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_verdict: std::sync::OnceLock::new(), sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), rope_dims: std::sync::atomic::AtomicU32::new(0), attn_qscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), staging: Mutex::new(Default::default()), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let gpu = Self { device, queue, adapter_name, timestamps: want_ts, ts_pending: Mutex::new(Vec::new()), dev_errors, iq1_grid: std::sync::OnceLock::new(), pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), dims_cap, dims_ring_cap, bg_cache: Mutex::new(HashMap::new()), bg_shape: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_verdict: std::sync::OnceLock::new(), sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), rope_dims: std::sync::atomic::AtomicU32::new(0), attn_qscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), staging: Mutex::new(Default::default()), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -2125,7 +2156,7 @@ impl Gpu {
         // of times, so labelling only on creation would work by luck and fail the moment the cache
         // was warmed before the histogram was enabled.
         if let Some(p) = self.pipelines.lock().unwrap().get(&key) {
-            if dispatch_hist_on() { register_shader_label(std::sync::Arc::as_ptr(&p) as usize, shader); }
+            if dispatch_hist_on() || self.timestamps { register_shader_label(std::sync::Arc::as_ptr(&p) as usize, shader); }
             return p.clone();
         }
         let dev = &self.device;
@@ -2156,7 +2187,7 @@ line: {head:?}. Compiler: {e}");
         }
         let p: Pipe = Arc::new((bgl, pipeline));
         self.pipelines.lock().unwrap().insert(key, p.clone());
-        if dispatch_hist_on() { register_shader_label(std::sync::Arc::as_ptr(&p) as usize, shader); }
+        if dispatch_hist_on() || self.timestamps { register_shader_label(std::sync::Arc::as_ptr(&p) as usize, shader); }
         p
     }
 
@@ -2737,7 +2768,7 @@ line: {head:?}. Compiler: {e}");
             // the model would produce output from a partially-executed layer, which is the exact
             // class of failure this codebase has spent a session learning to distrust.
             let mut frame = frame;
-            Self::drain_pending(&mut frame);
+            self.drain_pending(&mut frame);
             frame.enc.copy_buffer_to_buffer(&t.buf, t.view.map(|(o, _)| o).unwrap_or(0), &staging, 0, bytes);
             // TAGGED: a readback, flushing the open frame first. Six of eight submit callers incremented nothing, which is
             // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
@@ -3499,6 +3530,15 @@ fn register_shader_label(id: usize, src: &str) {
             if let Some(name) = entry.filter(|n| !n.is_empty() && *n != "main") {
                 return name.chars().take(64).collect();
             }
+            // The convention is a `// NAME` line (SCREAMING_CASE) at the top of each shader; take
+            // the first such token in the leading comment lines before falling back to prose. The
+            // prose fallback labelled MOE_TOPK "`mode` selects the WEIGHTING, not the selection: 0
+            // = softmax ove" in the timestamp table.
+            let named = src.lines().map(|l| l.trim()).take(6)
+                .filter(|l| l.starts_with("//"))
+                .filter_map(|l| l.trim_start_matches('/').trim().split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next())
+                .find(|w| w.len() >= 4 && w.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') && w.chars().any(|c| c.is_ascii_uppercase()));
+            if let Some(w) = named { return w.to_string(); }
             let comment = src.lines().map(|l| l.trim())
                 .find(|l| l.starts_with("//") && l.len() > 4)
                 .map(|l| l.trim_start_matches("//").trim());
@@ -3773,6 +3813,22 @@ impl Lin {
     pub fn with_bias(mut self, b: Option<Tensor>) -> Self { self.bias = b; self }
     /// Is this weight held as resident q4? Used to key tuning verdicts by precision.
     pub fn is_q4(&self) -> bool { matches!(self.kind, LinKind::Q4(_)) }
+    /// Bytes a mat-vec over this weight READS from device memory, in the form it is actually held:
+    /// int8 is n·k codes + n·k/32 f32 scales (9 bits/weight — NOT the GGUF's Q4_K 4.5), q4 is
+    /// n·k/2 + scales, f32 is 4n·k, IQ1_S its own blocks. This is the denominator a bandwidth
+    /// figure needs; dividing by the GGUF file size (perf-loop/bench.sh) under-reports a
+    /// Q4_K_M→int8 load by 2×.
+    pub fn device_bytes(&self) -> usize {
+        match &self.kind {
+            LinKind::F32(t) => t.rows * t.cols * 4,
+            LinKind::Q8(q) => q.n * q.k + (q.n * q.k / 32) * 4,
+            LinKind::Q4(q) => q.n * q.k / 2 + (q.n * q.k / 32) * 4,
+            LinKind::Iq1(q) => q.bytes(),
+        }
+    }
+    pub fn kind_name(&self) -> &'static str {
+        match &self.kind { LinKind::F32(_) => "f32", LinKind::Q8(_) => "int8", LinKind::Q4(_) => "q4", LinKind::Iq1(_) => "iq1_s" }
+    }
     fn has_bias(&self) -> bool { self.bias.is_some() }
     pub fn apply(&self, gpu: &Gpu, a: &Tensor, m: usize) -> Tensor {
         let out = match &self.kind {
@@ -4075,7 +4131,7 @@ see prefill_chunked_from for the pattern.", std::panic::Location::caller().file(
             // the model would produce output from a partially-executed layer, which is the exact
             // class of failure this codebase has spent a session learning to distrust.
             let mut frame = frame;
-            Self::drain_pending(&mut frame);
+            self.drain_pending(&mut frame);
             SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             frame.enc.copy_buffer_to_buffer(&t.buf, t.view.map(|(o, _)| o).unwrap_or(0), &staging, 0, bytes);
             self.submit(frame.enc);
@@ -4453,7 +4509,66 @@ see prefill_chunked_from for the pattern.", std::panic::Location::caller().file(
     ///
     /// Order is preserved by the Vec, and WebGPU inserts memory barriers between dispatches inside a
     /// pass — which `--gate-passfuse` confirmed this driver honours rather than assuming from spec.
-    fn drain_pending(frame: &mut Frame) {
+    /// A fresh frame: its encoder, and a timestamp query set when per-pass timing is on.
+    fn new_frame(&self, batch: bool) -> Frame {
+        let ts = if self.timestamps {
+            Some(FrameTs { qs: self.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("frame-ts"), ty: wgpu::QueryType::Timestamp, count: wgpu::QUERY_SET_MAX_QUERIES }),
+                labels: Vec::new() })
+        } else { None };
+        Frame { enc: self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }),
+                pending: Vec::new(), keep: Vec::new(), passes: 0, batch, ts }
+    }
+    /// Everything that must be encoded into a frame BEFORE it is submitted: the queued fused
+    /// dispatches (drain), then the resolve + copy of its timestamp queries into a readback buffer
+    /// that `gpu_timestamps_take` maps later. Every submit site and every direct encoder write
+    /// calls it (the pending_drain_tests scanners hold them to that by name).
+    fn drain_pending(&self, frame: &mut Frame) {
+        Self::drain_queued(frame);
+        let Some(ts) = frame.ts.as_mut() else { return };
+        if ts.labels.is_empty() { return }
+        let n = ts.labels.len() as u32;
+        let bytes = (2 * n as u64) * 8;
+        let resolve = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("ts-resolve"), size: bytes,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("ts-readback"), size: bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        // (drain_pending: the queued dispatches were drained above, so these two encoder writes
+        // land AFTER every timed pass — the scanner's rule, satisfied here by construction.)
+        frame.enc.resolve_query_set(&ts.qs, 0..2 * n, &resolve, 0);
+        frame.enc.copy_buffer_to_buffer(&resolve, 0, &readback, 0, bytes);
+        let labels = std::mem::take(&mut ts.labels);
+        self.ts_pending.lock().unwrap().push(TsReadback { buf: readback, labels });
+    }
+    /// Read every timestamp buffer submitted so far: per shader, (dispatch count, GPU ns). Blocks
+    /// on the device (every pending submit completes), so call it between tokens or after a loop,
+    /// never inside one. Empty when timestamps are off. Labels come from the shader source, same
+    /// as the dispatch histogram's.
+    pub fn gpu_timestamps_take(&self) -> Vec<(String, u64, u64)> {
+        let pending: Vec<TsReadback> = std::mem::take(&mut *self.ts_pending.lock().unwrap());
+        if pending.is_empty() { return Vec::new() }
+        let period = self.queue.get_timestamp_period() as f64; // ns per tick
+        for p in &pending { p.buf.slice(..).map_async(wgpu::MapMode::Read, |_| {}); }
+        let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let mut acc: std::collections::HashMap<usize, (u64, u64)> = std::collections::HashMap::new();
+        for p in &pending {
+            let data = p.buf.slice(..).get_mapped_range();
+            let ticks: &[u64] = bytemuck::cast_slice(&data);
+            for (i, &label) in p.labels.iter().enumerate() {
+                let (t0, t1) = (ticks[2 * i], ticks[2 * i + 1]);
+                let ns = if t1 >= t0 { ((t1 - t0) as f64 * period) as u64 } else { 0 };
+                let e = acc.entry(label).or_insert((0, 0));
+                e.0 += 1; e.1 += ns;
+            }
+            drop(data);
+            p.buf.unmap();
+        }
+        let mut out: Vec<(String, u64, u64)> = acc.into_iter()
+            .map(|(id, (c, ns))| (shader_label(id).unwrap_or_else(|| format!("shader@{id:#x}")), c, ns)).collect();
+        out.sort_by_key(|(_, _, ns)| std::cmp::Reverse(*ns));
+        out
+    }
+    fn drain_queued(frame: &mut Frame) {
         if frame.pending.is_empty() { return }
         GPU_PASSES_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); let mut pass = frame.enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("fused"), timestamp_writes: None });
@@ -4488,7 +4603,7 @@ see prefill_chunked_from for the pattern.", std::panic::Location::caller().file(
             // maps had already run, so the code was correct and read as though the drop were
             // load-bearing. An if-let says the same thing and cannot be misread.
             if let Some(mut frame) = g.take() {
-                Self::drain_pending(&mut frame);
+                self.drain_pending(&mut frame);
                 SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.submit(frame.enc);
                 self.retain_keep(frame.keep);
@@ -4510,7 +4625,7 @@ see prefill_chunked_from for the pattern.", std::panic::Location::caller().file(
             // the model would produce output from a partially-executed layer, which is the exact
             // class of failure this codebase has spent a session learning to distrust.
             let mut frame = frame;
-            Self::drain_pending(&mut frame);
+            self.drain_pending(&mut frame);
             // TAGGED: the explicit end_frame path. Six of eight submit callers incremented nothing, which is
             // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
             SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4557,7 +4672,7 @@ see prefill_chunked_from for the pattern.", std::panic::Location::caller().file(
             // a buffer A had already been told to fill.
             //
             // Silent under fusion-off, because nothing is ever queued.
-            Self::drain_pending(f);
+            self.drain_pending(f);
             f.enc.clear_buffer(&t.buf, 0, Some(bytes));
         } else {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("zero") });
@@ -4671,11 +4786,11 @@ see prefill_chunked_from for the pattern.", std::panic::Location::caller().file(
         // reason the explanation is up here instead.
         if let Some(prev) = fr.take() {
             let mut prev = prev;
-            Self::drain_pending(&mut prev);
+            self.drain_pending(&mut prev);
             SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(prev.enc);
         }
-        *fr = Some(Frame { enc: self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), pending: Vec::new(), keep: Vec::new(), passes: 0, batch: false });
+        *fr = Some(self.new_frame(false));
     }
     /// Flush the open frame (one submit for all its recorded ops). No-op if none is open.
     /// begin_frame, then mark the fresh frame as BATCH (see Frame.batch). For framed steps
@@ -4695,7 +4810,7 @@ see prefill_chunked_from for the pattern.", std::panic::Location::caller().file(
             // the model would produce output from a partially-executed layer, which is the exact
             // class of failure this codebase has spent a session learning to distrust.
             let mut frame = frame;
-            Self::drain_pending(&mut frame);
+            self.drain_pending(&mut frame);
             SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(frame.enc); self.retain_keep(frame.keep);
         }
@@ -4804,7 +4919,7 @@ make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
                 }
                 GPU_SETUP_NS.fetch_add(t_setup.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         note_timing_thread();
-                self.record_dispatch(pipeline, &bg, wg, None);
+                self.record_dispatch(pipeline, &bg, wg, None, pipe_ptr);
                 return;
             }
         }
@@ -4868,7 +4983,7 @@ make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
         GPU_SETUP_NS.fetch_add(t_setup.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         note_timing_thread();
         mark_dispatch(pipe_ptr, wg, dims.first().map(|b| *b as u32).unwrap_or(0));
-        self.record_dispatch(pipeline, &bg, wg, Some(&dbuf));
+        self.record_dispatch(pipeline, &bg, wg, Some(&dbuf), pipe_ptr);
     }
 
     /// Record one compute dispatch into the open frame (or submit standalone if no frame is open). The bind
@@ -4884,7 +4999,7 @@ make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
     /// heap allocations for keep-alives, and a pair of Arc clones. Individually trivial; this runs
     /// 11698 times for 71 tokens on a 1B, so the question is arithmetic rather than intuition — and
     /// unanswerable while it is the one phase nobody times.
-    fn record_dispatch(&self, pipeline: &wgpu::ComputePipeline, bg: &std::sync::Arc<wgpu::BindGroup>, wg: (u32, u32, u32), dbuf: Option<&std::sync::Arc<wgpu::Buffer>>) {
+    fn record_dispatch(&self, pipeline: &wgpu::ComputePipeline, bg: &std::sync::Arc<wgpu::BindGroup>, wg: (u32, u32, u32), dbuf: Option<&std::sync::Arc<wgpu::Buffer>>, pipe_ptr: usize) {
         let t_enc = std::time::Instant::now();
         let dev = &self.device;
         let mut fr = self.frame.lock().unwrap();
@@ -4912,7 +5027,20 @@ make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
                 if pass_fuse_enabled() {
                     frame.pending.push((pipeline.clone(), bg.clone(), wg));
                 } else {
-                GPU_PASSES_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); let mut pass = frame.enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+                GPU_PASSES_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Per-pass timestamps when the frame carries a query set: begin/end around this one
+                // dispatch, labelled by the shader source so the readback can say WHICH kernel.
+                let tw = match frame.ts.as_mut() {
+                    Some(t) if t.labels.len() < TS_MAX_PASSES => {
+                        let i = t.labels.len() as u32;
+                        t.labels.push(pipe_ptr);
+                        Some(wgpu::ComputePassTimestampWrites { query_set: &t.qs,
+                            beginning_of_pass_write_index: Some(2 * i), end_of_pass_write_index: Some(2 * i + 1) })
+                    }
+                    Some(_) => { TS_UNTIMED_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); None }
+                    None => None,
+                };
+                let mut pass = frame.enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: tw });
                 pass.set_pipeline(pipeline); pass.set_bind_group(0, bg.as_ref(), &[]);
                 GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 pass.dispatch_workgroups(wg.0, wg.1, wg.2);
@@ -4974,10 +5102,10 @@ make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
                 // exactly the layout that made the profile's attribution shortfall possible.
                 if over_flush { SUBMIT_BY_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                 else { SUBMIT_BY_RETAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-                Self::drain_pending(&mut old); // 723: this closer once submitted with pending queued — fused batches DROPPED
+                self.drain_pending(&mut old); // 723: this closer once submitted with pending queued — fused batches DROPPED
                 self.submit(old.enc);
                 self.retain_keep(old.keep);
-                *fr = Some(Frame { enc: dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), pending: Vec::new(), keep: Vec::new(), passes: 0, batch: was_batch });
+                *fr = Some(self.new_frame(was_batch));
                 drop(fr);
                 if over_retain && self.pending_keep.lock().unwrap().len() >= DIMS_RETAIN_CAP {
                     crate::counted_poll(&self.device);
@@ -9438,6 +9566,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // moe::route's Softmax path: global softmax renormalized to the top-k == softmax over the selected).
 // Output selw: [0..k) = expert index (u32), [k..2k) = combine weight (f32 bitcast to u32).
 const MOE_TOPK: &str = r#"
+// MOE_TOPK
 // `mode` selects the WEIGHTING, not the selection: 0 = softmax over the chosen k, 1 = sigmoid of each
 // logit. Selection is identical either way because sigmoid is monotonic, so top-k by raw logit picks the
 // same experts — which is why this is a small change rather than a second kernel.
@@ -10955,6 +11084,38 @@ impl Model {
     /// external classification.
     pub fn archetype(&self) -> crate::archetype::Archetype {
         crate::archetype::Archetype::classify(self)
+    }
+    /// Weight bytes ONE decode token reads from device memory, in the form the weights are held
+    /// (`Lin::device_bytes`), summed over what the decode path actually touches: per attention
+    /// layer the fused qkv (or q‖k‖v), o_proj and the dense FFN; per Gated DeltaNet layer the
+    /// stacked in-projection, ssm_out and the FFN; per MoE layer the router, the shared expert and
+    /// `n_used` of `n_routed` expert slices (an AVERAGE — routing decides which); plus the LM head.
+    /// Excludes the embedding row, norms, conv/A/dt params and the K/V cache, all small. Also
+    /// returns the kind of the FIRST big projection so a report can say "int8" or "q4" next to it.
+    /// This is the denominator for "GB/s effective": the ledger's 28 GB/s for Ornith-9B divided a
+    /// Q4_K_M FILE size by the token time while the engine was reading int8 (9 bits/weight), so it
+    /// under-reported by ~2×.
+    pub fn decode_weight_bytes(&self) -> (usize, &'static str) {
+        let mut total = 0usize;
+        let mut kind: Option<&'static str> = None;
+        let mut add = |l: &Lin| { total += l.device_bytes(); if kind.is_none() { kind = Some(l.kind_name()); } };
+        let mut moe_total = 0usize;
+        for b in &self.layers {
+            if let Some(dg) = &b.deltanet_gpu { add(&dg.w_all); add(&dg.wout); }
+            else if b.deltanet.is_some() { /* CPU-routed mixer: host weights, not device traffic */ }
+            else if fused_qkv_enabled() && b.post_attn.is_none() { add(&b.wqkv); add(&b.wo); }
+            else { add(&b.wq); add(&b.wk); add(&b.wv); add(&b.wo); }
+            if let Some(m) = b.moe.as_deref() {
+                add(&m.router);
+                if let Some((g, d)) = &m.shared { add(g); add(d); }
+                let n = m.cfg.n_routed.max(1) as usize;
+                let used = (m.cfg.n_used as usize).clamp(1, n);
+                let per_expert = (m.stacked_gu.device_bytes() + m.stacked_down.device_bytes()) / n;
+                moe_total += per_expert * used;
+            } else { add(&b.wgate_up); add(&b.wdown); }
+        }
+        add(&self.output);
+        (total + moe_total, kind.unwrap_or("?"))
     }
     /// How many blocks carry a gated attention output (per-head sigmoid gate split out of a
     /// double-width q projection at load). Used by --gate-deltanet-load.
@@ -14491,6 +14652,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // still covering causal rows up to 2048 in one workgroup; longer rows fall back to the serial kernel
 // (correct, slower) until a split-K causal prefill lands. `SCTILE` must match the array size below.
 const ATTENTION_MH_EXT_PAR: &str = r#"
+// ATTENTION_MH_EXT_PAR
 // `nswa`/`swaty` add sliding-window attention. Unlike decode — where a single query position gives one
 // contiguous range — every query ROW here has its own window, so the bound is computed per row from that
 // row's global position. It is still a range rather than a mask, because both windowing rules are
@@ -15742,7 +15904,7 @@ impl Gpu {
             // out of a tensor that a queued dispatch has not yet filled reads
             // whatever was there before — a stale or uninitialised cache entry,
             // which is fluent wrong output rather than a crash.
-            Self::drain_pending(frame);
+            self.drain_pending(frame);
             frame.enc.copy_buffer_to_buffer(&src.buf, src_off, &dst.buf, dst_off, bytes);
         } else {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
