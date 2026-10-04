@@ -333,6 +333,9 @@ pub struct V4l2Lens {
     err: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     device: String,
     prog: String,
+    /// Where the lens was last told to go (-1: never). `current` answers from it, so asking costs nothing
+    /// (it used to spawn `v4l2-ctl`, too slow to ask every frame for a slider).
+    wanted: std::sync::atomic::AtomicI64,
 }
 
 impl V4l2Lens {
@@ -360,7 +363,7 @@ impl V4l2Lens {
                 }
             }
         }).ok();
-        V4l2Lens { tx, err, device, prog }
+        V4l2Lens { tx, err, device, prog, wanted: std::sync::atomic::AtomicI64::new(-1) }
     }
 }
 
@@ -404,9 +407,12 @@ impl lensmove::FocusWrite for IoctlFocus {
 impl Lens for V4l2Lens {
     fn move_to(&mut self, pos: i64) -> Result<(), String> {
         if let Some(e) = self.err.lock().unwrap().take() { return Err(e); }
+        self.wanted.store(pos, std::sync::atomic::Ordering::Relaxed);
         self.tx.send(pos).map_err(|_| "the lens worker stopped".to_string())
     }
     fn current(&mut self) -> Option<i64> {
+        let w = self.wanted.load(std::sync::atomic::Ordering::Relaxed);
+        if w >= 0 { return Some(w); }
         let out = std::process::Command::new(&self.prog).args(["-d", &self.device, "--get-ctrl", "focus_absolute"]).output().ok()?;
         String::from_utf8_lossy(&out.stdout).split(':').nth(1)?.trim().parse().ok()
     }
@@ -779,5 +785,16 @@ mod tests {
         assert_eq!(V4L2_CID_FOCUS_ABSOLUTE, 0x009A_090A);
         assert_eq!(std::mem::size_of::<V4l2Control>(), 8);
         assert!(IoctlFocus::open("/dev/v4l-subdev-that-does-not-exist").is_err());
+    }
+
+    #[test]
+    fn the_real_lens_answers_where_it_was_told_to_go_without_running_anything() {
+        // the program does not exist, so any attempt to spawn it for `current` would answer None
+        let mut lens = V4l2Lens::new("/nonexistent/v4l2-ctl".into(), "/dev/v4l-subdev-that-does-not-exist".into());
+        assert_eq!(lens.current(), None, "never moved and nothing to ask");
+        lens.move_to(321).unwrap();
+        assert_eq!(lens.current(), Some(321));
+        lens.move_to(7).unwrap();
+        assert_eq!(lens.current(), Some(7));
     }
 }

@@ -187,6 +187,8 @@ impl Cam {
                 (None, Some(None)) | (None, None) => "the source is not a V4L2 device (PipeWire, a gst: override or the test pattern)".into(),
                 (None, Some(Some(d))) => format!("{d}: none"),
             };
+            // A phone's voice-coil lens is its own device, not a control on the camera's node: a fine-tune slider for it.
+            if self.lens_fine_row(ui) { return; }
             ui.add(egui::Label::new(egui::RichText::new(format!("camera controls: {why}")).small().color(c.text_weak)).truncate());
             return;
         };
@@ -218,6 +220,32 @@ impl Cam {
             });
         }
         if let Some(pairs) = apply { self.apply_hw(&ctl.device, &pairs); }
+    }
+
+    /// The lens motor's position as a slider, to nudge focus after a tap or autofocus. Returns whether there is a
+    /// lens motor to show (a fixed-focus camera has none). Dragging stops the automatic focus from fighting it.
+    fn lens_fine_row(&mut self, ui: &mut egui::Ui) -> bool {
+        if self.ensure_lens().is_err() { return false; }
+        let c = self.colors.clone();
+        let Some((_, lens, act)) = &mut self.focus_lens else { return false };
+        let (min, max, step) = act.range;
+        let mut v = lens.current().unwrap_or((min + max) / 2).clamp(min, max);
+        let mut moved = None;
+        ui.horizontal(|ui| {
+            ui.colored_label(c.text_weak, format!("focus {v}"));
+            let r = ui.add(egui::Slider::new(&mut v, min..=max).show_value(false).step_by(step.max(1) as f64));
+            if r.changed() { moved = Some(v); }
+            for (label, d) in [("−", -(step.max(1) * 4)), ("+", step.max(1) * 4)] {
+                if ui.small_button(label).on_hover_text("a small nudge").clicked() { moved = Some((v + d).clamp(min, max)); }
+            }
+        });
+        if let Some(p) = moved {
+            if let Some((_, lens, _)) = &mut self.focus_lens { let _ = lens.move_to(p); }
+            self.autofocus.cancel();
+            self.focus.cancel();
+            self.note = format!("focus fine-tune: lens {p}");
+        }
+        true
     }
 
     /// Set camera controls, keep the panel's copy in step, say what happened.
