@@ -287,7 +287,10 @@ pub struct GestureConfig {
     /// recommended) re-ranks them against the surrounding text
     /// context to pick the contextually-correct one. Adds ~50-100ms
     /// to ambiguous swipes only (clear winners skip the LLM).
-    /// Requires `llm-swipe-ffi` build feature. Off by default.
+    /// Off by default — and NO BUILD OF THIS TREE HAS THE BACKEND:
+    /// the re-ranker is a mock that returns the recognizer's first
+    /// candidate (see gestures/llm_swipe.rs), so enabling this
+    /// changes nothing until one lands.
     #[serde(default)]
     pub llm_swipe_enabled: bool,
     /// Path to the GGUF model used for swipe re-ranking. Empty

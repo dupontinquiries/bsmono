@@ -32,14 +32,22 @@
 //!      phone.
 //!   3. Average added latency: 30-40 ms amortized across all swipes.
 //!
-//! ## Build matrix
+//! ## Build matrix — there is none, yet
 //!
-//! This module always compiles. The actual llama-cpp-2 calls live
-//! behind `#[cfg(feature = "llm-swipe-ffi")]`. Without that feature
-//! the reranker is a no-op that falls back to candidates[0] — useful
-//! for cross-compiling to environments where you don't have clang +
-//! a usable compute backend (e.g. the dev sandbox here, or the
-//! basic-config build).
+//! This module is the INTEGRATION POINT and a mock: the reranker
+//! loads, gates on ambiguity and context, builds the prompt, parses
+//! a reply — and the "inference" always answers "1" (the first
+//! candidate). The real llama-cpp-2 calls were written as
+//! `#[cfg(feature = "llm-swipe-ffi")]` arms calling a
+//! `crate::llm_backend` module, and neither the module, the feature
+//! nor the dependency ever existed in this tree (since June; the
+//! repo's cfg_feature_check flagged the nine arms as code that can
+//! never compile). The arms are gone: when the backend lands it
+//! arrives as one commit — module + feature + dep + these call
+//! sites — rather than as a permanent `not(...)` branch pretending
+//! to be a build option. `Config::gestures::llm_swipe_enabled`
+//! therefore selects a re-ranker that always returns the
+//! recognizer's own first choice.
 //!
 //! ## When the LLM is invoked
 //!
@@ -60,19 +68,6 @@ pub struct LlmSwipeReranker {
     inner: Arc<RerankerInner>,
 }
 
-#[cfg(feature = "llm-swipe-ffi")]
-struct RerankerInner {
-    /// The loaded GGUF model + backend handle. Reused across calls
-    /// (the heavy thing is the model weights, ~700 MB for Llama 3.2
-    /// 1B Q4 — we load once at startup and reuse forever).
-    model: crate::llm_backend::LoadedModel,
-    /// Cached generation params; tuned for the re-ranker case
-    /// (very short prompt, single-token reply, low temperature for
-    /// stability).
-    params: crate::llm_backend::GenParams,
-}
-
-#[cfg(not(feature = "llm-swipe-ffi"))]
 struct RerankerInner {
     /// In mock mode we carry no state. The path is retained for
     /// diagnostics so `RerankerStats` can still report what the
@@ -84,7 +79,7 @@ struct RerankerInner {
 /// the caller should fall back to candidates[0] on any error.
 #[derive(Debug, thiserror::Error)]
 pub enum RerankerError {
-    #[error("LLM swipe re-ranker not compiled in (build with --features llm-swipe-ffi)")]
+    #[error("LLM swipe re-ranker has no inference backend in this build (mock: first candidate wins)")]
     NotCompiledIn,
     #[error("model load failed: {0}")]
     ModelLoad(String),
@@ -101,43 +96,15 @@ impl LlmSwipeReranker {
     /// model on phone, ~10-30 seconds for a 7B model. Call ONCE at
     /// startup, never on the hot path.
     ///
-    /// On builds without `llm-swipe-ffi` this still succeeds (mock
-    /// mode), so config plumbing can be wired without the feature
-    /// flag. The reranker will always return `Ok(candidates[0])`
-    /// in mock mode — useful for ensuring the integration point
-    /// is correct before bringing in the FFI dep.
+    /// Always succeeds (mock mode — see the module note), so config
+    /// plumbing can be wired without a backend. The reranker returns
+    /// `Ok(candidates[0])` whenever it is consulted.
     pub fn load(model_path: &Path) -> Result<Self, RerankerError> {
-        #[cfg(feature = "llm-swipe-ffi")]
-        {
-            let params = crate::llm_backend::GenParams {
-                // Tiny context — re-ranker prompts are <100 tokens.
-                // Saves KV-cache RAM vs the default 4096.
-                n_ctx: 512,
-                n_batch: 512,
-                // Single token output. The whole point.
-                max_tokens: 4,
-                // Low for determinism. We want the same candidate
-                // chosen for the same context, every time.
-                temperature: 0.1,
-                ..Default::default()
-            };
-            let model = crate::llm_backend::load_model(
-                &model_path.to_string_lossy(),
-                &params,
-            )
-            .map_err(RerankerError::ModelLoad)?;
-            Ok(Self {
-                inner: Arc::new(RerankerInner { model, params }),
-            })
-        }
-        #[cfg(not(feature = "llm-swipe-ffi"))]
-        {
-            Ok(Self {
-                inner: Arc::new(RerankerInner {
-                    model_path: model_path.to_string_lossy().into_owned(),
-                }),
-            })
-        }
+        Ok(Self {
+            inner: Arc::new(RerankerInner {
+                model_path: model_path.to_string_lossy().into_owned(),
+            }),
+        })
     }
 
     /// Pick the best candidate given the surrounding text. Returns
@@ -185,21 +152,9 @@ impl LlmSwipeReranker {
     /// first candidate's 1-based index) so the rest of the pipeline
     /// is exercised by tests.
     fn run_inference(&self, prompt: &str) -> Result<String, RerankerError> {
-        #[cfg(feature = "llm-swipe-ffi")]
-        {
-            crate::llm_backend::generate(
-                &self.inner.model,
-                prompt,
-                &self.inner.params,
-            )
-            .map_err(RerankerError::Generation)
-        }
-        #[cfg(not(feature = "llm-swipe-ffi"))]
-        {
-            let _ = prompt;
-            let _ = &self.inner.model_path;
-            Ok("1".to_string())
-        }
+        let _ = prompt;
+        let _ = &self.inner.model_path;
+        Ok("1".to_string())
     }
 }
 
@@ -415,11 +370,9 @@ mod tests {
         assert_eq!(parse_response("Answer: 3", 5), Some(2));
     }
 
-    /// In mock mode (no ffi feature), the reranker should always
-    /// return the first candidate when invoked — exercising the
-    /// integration point without needing a real model.
+    /// The reranker always returns the first candidate when invoked —
+    /// exercising the integration point without a backend.
     #[test]
-    #[cfg(not(feature = "llm-swipe-ffi"))]
     fn mock_mode_returns_first_candidate() {
         let r = LlmSwipeReranker::load(Path::new("/dev/null")).unwrap();
         let cands = vec![
@@ -433,7 +386,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "llm-swipe-ffi"))]
     fn empty_candidates_errors() {
         let r = LlmSwipeReranker::load(Path::new("/dev/null")).unwrap();
         let chosen = r.rerank(&[], "context");
@@ -441,7 +393,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "llm-swipe-ffi"))]
     fn empty_surrounding_text_skips_llm() {
         // Even with ambiguous scores, no context → no LLM → first
         // candidate. In mock mode this is indistinguishable from
