@@ -121,6 +121,8 @@ pub enum Reason {
     NoActivateWithinGrace,
     /// Nothing has activated yet, but the grace window is still open.
     AwaitingFirstActivate,
+    /// A field lost focus a moment ago; held up in case it is a flap (see [`HIDE_HOLD_MS`]).
+    HoldingAfterFocus,
 }
 
 impl Reason {
@@ -139,6 +141,7 @@ impl Reason {
                 "compositor never signalled focus — showing anyway"
             }
             Reason::AwaitingFirstActivate => "waiting for first focus",
+            Reason::HoldingAfterFocus => "field just lost focus (holding)",
         }
     }
 
@@ -172,6 +175,13 @@ pub struct Decision {
 /// one unwanted appearance rather than a stuck state.
 pub const DEFAULT_GRACE_MS: u64 = 45_000;
 
+/// How long the keyboard stays up after a field loses focus. Hiding unmaps the layer surface and drops its
+/// exclusive zone, which resizes any maximised window beneath it, and a resize can make that window lose and
+/// regain its text focus: Activate/Deactivate every 25-40 ms with the keyboard mapping and unmapping each time
+/// (seen on the FP5 with hatch-egui in landscape, 390 maps in four minutes). An Activate inside this window cancels
+/// the hide, so a flap never unmaps; a real unfocus still hides, this much later.
+pub const HIDE_HOLD_MS: u64 = 300;
+
 /// Environment override, for diagnosing a device without editing config:
 /// `RUSTY_BOARD_FOCUS_GRACE_MS=0` shows the keyboard immediately when no
 /// Activate has arrived, `=disabled` never applies the timeout at all.
@@ -187,6 +197,10 @@ pub struct FocusPolicy {
     /// Whether a real Activate has ever arrived. Once it has, silence
     /// means "no field focused" and is to be believed.
     ever_activated: bool,
+    /// When a field was last seen focused, for the hide hold.
+    last_active_ms: Option<u64>,
+    /// While holding after a focus loss, when the hold ends (so an idle host knows when to wake).
+    hold_until_ms: Option<u64>,
 }
 
 impl Default for FocusPolicy {
@@ -196,13 +210,15 @@ impl Default for FocusPolicy {
             grace_ms: Some(DEFAULT_GRACE_MS),
             first_seen_ms: None,
             ever_activated: false,
+            last_active_ms: None,
+            hold_until_ms: None,
         }
     }
 }
 
 impl FocusPolicy {
     pub fn new(auto_hide: AutoHide, grace_ms: Option<u64>) -> FocusPolicy {
-        FocusPolicy { auto_hide, grace_ms, first_seen_ms: None, ever_activated: false }
+        FocusPolicy { auto_hide, grace_ms, first_seen_ms: None, ever_activated: false, last_active_ms: None, hold_until_ms: None }
     }
 
     /// Build from the shared config plus the environment override.
@@ -225,7 +241,13 @@ impl FocusPolicy {
     /// other transition is driven by a compositor event, which wakes the
     /// host on its own. Lets an idle host sleep instead of polling.
     pub fn next_timed_change_ms(&self, now_ms: u64) -> Option<u64> {
-        if self.auto_hide == AutoHide::Never || self.ever_activated {
+        if self.auto_hide == AutoHide::Never {
+            return None;
+        }
+        if let Some(t) = self.hold_until_ms.filter(|t| *t > now_ms) {
+            return Some(t - now_ms);
+        }
+        if self.ever_activated {
             return None;
         }
         let (grace, first) = (self.grace_ms?, self.first_seen_ms?);
@@ -266,10 +288,17 @@ impl FocusPolicy {
 
         if active {
             self.ever_activated = true;
+            self.last_active_ms = Some(now_ms);
+            self.hold_until_ms = None;
             return Decision { visible: true, reason: Reason::Focused };
         }
 
         if self.ever_activated {
+            if let Some(t) = self.last_active_ms.filter(|t| now_ms.saturating_sub(*t) < HIDE_HOLD_MS) {
+                self.hold_until_ms = Some(t + HIDE_HOLD_MS);
+                return Decision { visible: true, reason: Reason::HoldingAfterFocus };
+            }
+            self.hold_until_ms = None;
             // The signal has proved itself. Silence now means what it says.
             return Decision { visible: false, reason: Reason::Unfocused };
         }
@@ -445,7 +474,7 @@ mod tests {
         assert!(!p.decide(0, im(false)).visible);
         assert!(p.decide(DEFAULT_GRACE_MS, im(false)).visible);
         assert!(p.decide(DEFAULT_GRACE_MS + 1, im(true)).visible);
-        let d = p.decide(DEFAULT_GRACE_MS + 2, im(false));
+        let d = p.decide(DEFAULT_GRACE_MS + 2 + HIDE_HOLD_MS, im(false));
         assert!(!d.visible, "signal proved itself; auto-hide resumes");
         assert_eq!(d.reason, Reason::Unfocused);
     }
@@ -509,5 +538,37 @@ mod tests {
         let d = p.decide(12_345, im(false));
         assert!(d.visible);
         assert_eq!(d.reason, Reason::NoActivateWithinGrace);
+    }
+
+    #[test]
+    fn a_focus_flap_never_hides_the_keyboard_but_a_real_unfocus_does_after_the_hold() {
+        // hatch-egui in landscape: Activate/Deactivate every ~30 ms. Every Deactivate here lands inside the hold.
+        let mut p = FocusPolicy::default();
+        assert!(p.decide(0, im(false)).visible == false);
+        let mut t = 1_000;
+        assert!(p.decide(t, im(true)).visible);
+        for _ in 0..50 {
+            t += 15;
+            let d = p.decide(t, im(false));
+            assert!(d.visible && d.reason == Reason::HoldingAfterFocus, "a flap must not unmap: {d:?} at {t}");
+            t += 15;
+            assert!(p.decide(t, im(true)).visible);
+        }
+        // a real unfocus: still up inside the hold, gone once it has passed
+        t += 100;
+        assert!(p.decide(t, im(false)).visible, "inside the hold");
+        let d = p.decide(t + HIDE_HOLD_MS, im(false));
+        assert!(!d.visible && d.reason == Reason::Unfocused, "a lasting unfocus hides: {d:?}");
+    }
+
+    #[test]
+    fn the_hold_tells_an_idle_host_when_to_wake_and_stops_once_over() {
+        let mut p = FocusPolicy::default();
+        p.decide(0, im(false));
+        p.decide(1_000, im(true));
+        p.decide(1_100, im(false)); // holding until 1_300
+        assert_eq!(p.next_timed_change_ms(1_100), Some(HIDE_HOLD_MS - 100));
+        p.decide(1_300, im(false));
+        assert_eq!(p.next_timed_change_ms(1_300), None, "hold over: only events matter");
     }
 }
