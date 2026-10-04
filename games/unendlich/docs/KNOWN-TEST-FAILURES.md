@@ -29,7 +29,9 @@ Four failures on first run, all fixed:
   leaf templates (411 -> 160 quads per leaf block, no visual change) bring that chunk to
   181,430, and the grid's worst is now 213,550. Two sources remain: leaf stamps (512 x ~320)
   and, independently, weathered-top subdivision (chunk (0,2,0): 55,296 quads, ~110K triangles,
-  no leaves involved). The 90K budget is self-described as uncalibrated.
+  no leaves involved). The 90K budget is self-described as uncalibrated. **c21:** the grid's
+  worst is 150,012 at (-4,3,-1) before the stamp-budget fix and 155,304 at (-1,2,-1) after it
+  (seed 1); still over, still uncalibrated, left failing on purpose as before.
 - `render::mesher::tests::isolated_soft_block_sags_more_than_buried` -- a MASKED failure, now
   visible. It averaged every vertex over the block, grass tufts included, and the tufts on the
   buried block carried it past its 0.10 threshold. Measured on the block's own top surface
@@ -53,7 +55,16 @@ peaks near 2.98 GB). Of the four failures:
   foliage: ~800 triangles per stamped leaf block, 512 stamps allowed per chunk. Measured and
   explained in 79ab94223; the fix is a detail-versus-cost decision (the stamp cap, culling
   faces hidden inside templates, or skipping enclosed leaves).
-- `render::mesher_binary::tests::cross_tufts_are_eight_vertices_and_double_sided`: **open.**
+- `render::mesher_binary::tests::cross_tufts_are_eight_vertices_and_double_sided`: **fixed
+  (c21, d7af86ee4).** The hypothesis below was right: `decorate_chunk_styled` charged the
+  per-chunk stamp budget (150 by default) on every plant-tagged block it VISITED, before the
+  air-above and tuft-probability checks, so `plant_indices` (y-major) spent it on the slab's
+  buried layers and the surface was never reached — and on an ordinary field 55% of the budget
+  went to grass the probability skipped, so a chunk never held more than ~68 tufts however dense
+  its grass. The budget is now charged where a template, a procedural grid or a tuft is actually
+  emitted. The tripwire's worst chunk moved with it (150,012 at (-4,3,-1) → 155,304 at (-1,2,-1),
+  seed 1): more of a chunk's plants are drawn, up to the same 150-stamp ceiling the budget always
+  meant. The c20 entry, kept as written:
   With `TuftStyle::Cross` on a 5-block grass slab no tuft is emitted. The binary mesher is off
   by default (`UNENDLICH_MESHER=binary`), so the shipped game is not affected. Hypothesis, NOT
   confirmed: `decorate_chunk_styled` charges the per-chunk stamp budget (512) before its

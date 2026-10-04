@@ -3215,8 +3215,20 @@ pub(crate) fn decorate_chunk_styled(
         // Defensive: if the index got stale (shouldn't happen — set()
         // maintains it), skip. has_subvoxels is the gate.
         if !block.has_subvoxels() { continue; }
-        plant_stamps_used += 1;
-        MESH_DIAG_PLANT_STAMPS.with(|c| c.set(c.get() + 1));
+        // The budget is charged where something is STAMPED, not here. It used
+        // to be charged on every plant-tagged block visited, before the checks
+        // below decide whether the block draws anything: a grass block with
+        // no air above it, or one the tuft probability skips (55% of them),
+        // burned a stamp and drew nothing. plant_indices iterates y-major, so
+        // in a chunk with grass under grass the buried layers spent the whole
+        // budget first and the surface got no tufts at all — which is how
+        // mesher_binary's cross-tuft test (five layers of grass) found it with
+        // zero decoration vertices. On a plain field it meant at most
+        // ~150 × 0.45 tufts a chunk however dense the grass.
+        let charge = |used: &mut u32| {
+            *used += 1;
+            MESH_DIAG_PLANT_STAMPS.with(|c| c.set(c.get() + 1));
+        };
 
         // Per-block instance state drives color modulation. Different
         // block types interpret state differently:
@@ -3275,6 +3287,7 @@ pub(crate) fn decorate_chunk_styled(
             // procedural grid generation entirely.
             let (_, hash_int) = crate::world::subvoxel::plant_hash(wx, wy, wz);
             if let Some(tmpl) = crate::world::subvoxel_templates::template_for(block, hash_int) {
+                charge(&mut plant_stamps_used);
                 crate::world::subvoxel_templates::stamp_template(
                     &mut mesh.vertices, &mut mesh.indices,
                     tmpl,
@@ -3287,6 +3300,7 @@ pub(crate) fn decorate_chunk_styled(
             // but kept for robustness when new sub-voxel block types
             // are added before their templates exist).
             if let Some(grid) = crate::world::subvoxel::procedural_subgrid(block, wx, wy, wz) {
+                charge(&mut plant_stamps_used);
                 emit_subvoxel_grid(mesh, &grid, [wx as f32, wy as f32, wz as f32], sky, color_mul);
             }
             continue;
@@ -3336,6 +3350,9 @@ pub(crate) fn decorate_chunk_styled(
         // two paths.
         let (_, hash_int) = crate::world::subvoxel::plant_hash(wx, wy, wz);
         let tuft_origin = [wx as f32, (wy + 1) as f32 + corner_avg_offset, wz as f32];
+        if !matches!(tuft_style, TuftStyle::None) {
+            charge(&mut plant_stamps_used);
+        }
         match tuft_style {
             TuftStyle::None => {}
             TuftStyle::Cross => {
