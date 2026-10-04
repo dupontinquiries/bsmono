@@ -109,6 +109,19 @@ pub fn ink_on(on: Color32, c: &PaletteColors) -> Color32 {
     [c.bg_base, c.text, Color32::BLACK, Color32::WHITE].into_iter().max_by(|a, b| crate::uiverify::contrast(*a, on).total_cmp(&crate::uiverify::contrast(*b, on))).unwrap_or(c.text)
 }
 
+/// Body-text readability is the test the tint is not allowed to fail (4.5:1, AA). The palette's own
+/// text colour is used whenever it passes on the tinted surface, so a callout reads like the rest
+/// of the screen; where it does not, the most readable of the palette's extremes takes over, the way
+/// [`ink_on`] already does for the chip. `slate` is the case: its text is only 3.3:1 on its OWN card
+/// (#4b4b4b on #8aa2bf, a palette-level shortfall), and the danger tint takes that to 2.9:1 — no
+/// mix ratio recovers it, since the text is the problem, not the tint.
+pub const MIN_BODY_CONTRAST: f32 = 4.5;
+
+pub fn ink(sev: Severity, c: &PaletteColors) -> Color32 {
+    let surface = fill(sev, c);
+    if crate::uiverify::contrast(c.text, surface) >= MIN_BODY_CONTRAST { c.text } else { ink_on(surface, c) }
+}
+
 pub fn word(sev: Severity) -> &'static str {
     match sev {
         Severity::Error => "ERROR",
@@ -135,6 +148,7 @@ pub fn show_collapsible(ui: &mut egui::Ui, c: &PaletteColors, sev: Severity, cod
 
 fn draw(ui: &mut egui::Ui, c: &PaletteColors, sev: Severity, code: &str, title: &str, lines: &[Line], mut open: Option<&mut bool>) -> egui::Response {
     let tone = accent(sev, c);
+    let text_ink = ink(sev, c);
     let expanded = open.as_deref().copied().unwrap_or(true);
     let lines = if expanded { lines } else { &[] };
     let folds = open.is_some();
@@ -170,7 +184,7 @@ fn draw(ui: &mut egui::Ui, c: &PaletteColors, sev: Severity, code: &str, title: 
             }
         });
         ui.spacing_mut().interact_size.y = row_floor;
-        ui.add(egui::Label::new(RichText::new(title).size(FONT_LG as f32).strong().color(c.text)).wrap());
+        ui.add(egui::Label::new(RichText::new(title).size(FONT_LG as f32).strong().color(text_ink)).wrap());
         if let Some(open) = open.as_deref_mut() {
             // The whole header is the target, not the word: a thumb aims at the message.
             let header = egui::Rect::from_min_max(egui::pos2(ui.min_rect().left(), top), egui::pos2(ui.min_rect().right(), ui.cursor().top()));
@@ -193,7 +207,7 @@ fn draw(ui: &mut egui::Ui, c: &PaletteColors, sev: Severity, code: &str, title: 
             job.wrap.max_width = ui.available_width();
             let tag_color = if line.actionable { c.success } else { tone };
             job.append(&line.tag, 0.0, egui::TextFormat { font_id: egui::FontId::proportional(FONT_SM as f32), color: tag_color, ..Default::default() });
-            job.append(&line.text, 8.0, egui::TextFormat { font_id: egui::FontId::proportional(FONT_BASE as f32), color: c.text, line_height: Some(FONT_BASE as f32 * 1.35), ..Default::default() });
+            job.append(&line.text, 8.0, egui::TextFormat { font_id: egui::FontId::proportional(FONT_BASE as f32), color: text_ink, line_height: Some(FONT_BASE as f32 * 1.35), ..Default::default() });
             ui.add(egui::Label::new(job).wrap());
         }
     });
@@ -222,15 +236,25 @@ mod tests {
     fn body_text_stays_readable_on_every_tinted_surface_in_every_palette() {
         let palettes = all_palettes();
         assert!(palettes.len() >= 2, "the scan found palettes to check");
+        let (mut own, mut fallback) = (0, 0);
         for (name, c) in &palettes {
             for sev in SEVS {
                 let f = fill(sev, c);
-                let text = uiverify::contrast(c.text, f);
-                assert!(text >= 4.5, "{name}/{sev:?}: body text {text:.2}:1 on the tinted surface");
+                let text = uiverify::contrast(ink(sev, c), f);
+                assert!(text >= MIN_BODY_CONTRAST, "{name}/{sev:?}: body text {text:.2}:1 on the tinted surface");
+                if ink(sev, c) == c.text { own += 1 } else { fallback += 1 }
                 let chip = uiverify::contrast(ink_on(accent(sev, c), c), accent(sev, c));
                 assert!(chip >= 3.0, "{name}/{sev:?}: chip text {chip:.2}:1 on the severity colour");
             }
         }
+        // The fallback is for the palettes that need it, not a new default: most surfaces keep the
+        // palette's own text (so a callout reads like the screen it is on), and at least one does
+        // not (slate/Error at 2.9:1 is why `ink` exists; if every palette passes with its own text
+        // some day, the fallback has nothing to do and this floor is the thing to delete).
+        assert!(own > fallback, "{own} surfaces use the palette text, {fallback} the fallback");
+        assert!(fallback >= 1, "no palette needed the fallback — slate's text used to be 2.93:1 on its error tint");
+        let slate = palettes.iter().find(|(n, _)| n == "slate").expect("slate is a fleet palette");
+        assert_ne!(ink(Severity::Error, &slate.1), slate.1.text, "slate/Error is the case the fallback was written for");
     }
 
     /// "Not flat" as numbers: the surface is visibly not the card it sits among,
