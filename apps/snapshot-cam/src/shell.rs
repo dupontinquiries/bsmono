@@ -827,6 +827,8 @@ impl Cam {
     /// Per frame: a tap's search, else the automatic one, else decide whether to start it.
     fn drive_focus(&mut self, ctx: &egui::Context) {
         let now = now_ms();
+        // a focus stack (or any bracket) owns the lens while it runs
+        if self.flow.sequence.is_some() { return; }
         // TAP in progress: its frames, its verdict, then hold the lens until the scene changes
         if self.focus.is_searching() {
             ctx.request_repaint();

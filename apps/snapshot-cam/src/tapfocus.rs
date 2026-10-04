@@ -251,6 +251,16 @@ impl TapFocus {
     }
 }
 
+/// The lens motor described as the camera control a focus stack drives. On this phone the camera's own V4L2 node has
+/// no focus control (the voice coil is a separate sub-device), so focus stacking found "no focus control" and quietly
+/// took no photo. `device` is the motor's sub-device, `current` where the lens is now (it is put back afterwards).
+pub fn lens_controls(act: &Actuator, current: i64) -> crate::hwctl::Controls {
+    use crate::hwctl::{Controls, Ctrl, Kind};
+    let (min, max, step) = act.range;
+    let at = current.clamp(min, max);
+    Controls { device: act.device.clone(), ctrls: vec![Ctrl { name: "focus_absolute".into(), kind: Kind::Int, min, max, step: step.max(1), default: at, value: at, inactive: false }] }
+}
+
 /// Does a tap at `at` (screen points) count as "focus here"? Only on the picture (`shown` = [left, top, right,
 /// bottom]) AND above the controls (`controls_top`, where last frame's controls began): the shutter and the buttons
 /// beside it sit at the picture's edge, and a tap on "take photo" also ran a focus search.
@@ -589,5 +599,23 @@ mod tests {
             assert!(!matches!(v, Some(Verdict::Locked { .. })), "seed {seed}: noise was locked as focus ({v:?})");
             assert_eq!(lens.pos, 321, "seed {seed}: the lens did not go back");
         }
+    }
+
+    #[test]
+    fn the_lens_motor_can_stand_in_for_the_focus_control_a_focus_stack_needs() {
+        use crate::bracket::{Mode, Sequence};
+        let act = act();
+        // without a focus control the stack is refused, which is what silently took no photo
+        assert!(Sequence::plan(Mode::Focus, None).is_err());
+        let ctl = lens_controls(&act, 321);
+        let seq = Sequence::plan(Mode::Focus, Some(&ctl)).expect("the lens is a focus control");
+        let positions: Vec<i64> = seq.steps_for_test().iter().flat_map(|step| step.iter().filter(|(n, _)| n == "focus_absolute").map(|(_, v)| *v)).collect();
+        assert!(positions.len() >= 3, "a stack is several lens positions: {positions:?}");
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "swept in order: {positions:?}");
+        assert_eq!((positions[0], *positions.last().unwrap()), (act.range.0, act.range.1), "across the whole range");
+        assert_eq!(seq.restore(), &[("focus_absolute".to_string(), 321)], "the lens goes back where it was");
+        assert_eq!(ctl.device, act.device, "and it is the motor's own device that is driven");
+        // a current position outside the range is brought inside, never passed on
+        assert_eq!(lens_controls(&act, 5000).get(crate::hwctl::Role::Focus).unwrap().value, act.range.1);
     }
 }

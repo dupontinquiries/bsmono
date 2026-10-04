@@ -25,6 +25,9 @@ pub struct Flow {
     pub primed: Option<(Prime, Trigger)>,
     pub mode: Mode,
     pub sequence: Option<Sequence>,
+    /// The controls the running sequence drives: the camera's own, or (focus stack on a phone whose lens motor is a
+    /// separate device) the lens motor described as a focus control.
+    pub seq_ctl: Option<crate::hwctl::Controls>,
     /// The merge running on its thread: the result, and what it was.
     merging: Option<(Receiver<Result<RawFrame, String>>, String)>,
     /// The controls a sequence was started from, for the note.
@@ -75,11 +78,23 @@ impl Cam {
 
     pub fn start_sequence(&mut self) {
         if self.flow.busy() { return; }
-        match Sequence::plan(self.flow.mode, self.hw.controls.as_ref()) {
+        // A focus stack with no focus control on the camera's own node drives the lens motor (a separate device).
+        let mut controls = self.hw.controls.clone();
+        if self.flow.mode == Mode::Focus && !controls.as_ref().is_some_and(|c| c.get(crate::hwctl::Role::Focus).is_some()) && self.ensure_lens().is_ok() {
+            if let Some((_, lens, act)) = &mut self.focus_lens {
+                let current = lens.current().unwrap_or(act.range.0);
+                controls = Some(crate::tapfocus::lens_controls(act, current));
+            }
+        }
+        match Sequence::plan(self.flow.mode, controls.as_ref()) {
             Ok(mut s) => {
+                // automatic focus must not move the lens under a stack
+                self.focus.cancel();
+                self.autofocus.cancel();
                 let first = s.start();
-                if let Some(ctl) = &self.hw.controls { if !first.is_empty() { let d = ctl.device.clone(); self.apply_hw(&d, &first); } }
-                self.flow.last_merge = self.hw.controls.as_ref().filter(|_| s.mode == Mode::Hdr).map(bracket::hdr_labels);
+                if let Some(ctl) = &controls { if !first.is_empty() { let d = ctl.device.clone(); self.apply_hw(&d, &first); } }
+                self.flow.last_merge = controls.as_ref().filter(|_| s.mode == Mode::Hdr).map(bracket::hdr_labels);
+                self.flow.seq_ctl = controls;
                 self.note = bracket::status(&s);
                 self.flow.sequence = Some(s);
             }
@@ -115,13 +130,13 @@ impl Cam {
             if let Some(f) = self.camera.snapshot() {
                 match s.on_frame(&f) {
                     Next::Set(pairs) => {
-                        if let Some(ctl) = &self.hw.controls { let d = ctl.device.clone(); self.apply_hw(&d, &pairs); }
+                        if let Some(ctl) = &self.flow.seq_ctl { let d = ctl.device.clone(); self.apply_hw(&d, &pairs); }
                         self.note = bracket::status(&s);
                     }
                     Next::Wait => {}
                     Next::Done => {
                         keep = false;
-                        if let Some(ctl) = &self.hw.controls {
+                        if let Some(ctl) = self.flow.seq_ctl.take() {
                             if !s.restore().is_empty() { let d = ctl.device.clone(); let r = s.restore().to_vec(); self.apply_hw(&d, &r); }
                         }
                         self.finish_sequence(ctx, s.clone());

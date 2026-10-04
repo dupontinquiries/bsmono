@@ -115,6 +115,10 @@ impl Sequence {
         Ok(Sequence { mode, steps, restore, idx: 0, settle: 0, last_seq: None, frames: vec![] })
     }
 
+    /// The planned steps (each a list of control writes), for tests of what a mode would do.
+    #[cfg(test)]
+    pub fn steps_for_test(&self) -> &[Vec<(String, i64)>] { &self.steps }
+
     /// The first step's controls. Apply them, then feed frames.
     pub fn start(&mut self) -> Vec<(String, i64)> {
         let first = self.steps.first().cloned().unwrap_or_default();
