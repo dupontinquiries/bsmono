@@ -2087,6 +2087,16 @@ fn canonical_block(raw: &RawCall) -> String {
 /// write ordinary data, so only an object naming a real tool is taken as a call. Explicit
 /// wrappers (`<tool_call>`, ```tool, `<function=`, `[TOOL_CALLS]`) are taken as calls regardless,
 /// so an unknown tool there is reported as one.
+/// Would `extract_blocks` take this JSON text as a call with no wrapper telling it to — a ```json
+/// fence, or a bare `{…}` line? Exactly its rule, exposed so the taint gate refuses the same set
+/// and nothing more: a JSON example for the user that names no tool is prose to both.
+pub(crate) fn names_a_known_tool(body: &str) -> bool {
+    top_level_name(body).is_some_and(|n| known_tool_name(&n))
+}
+/// The end of a fenced JSON block (the index of its closing ``` in `after`, which starts right
+/// after the opener), balanced over the JSON so a fence INSIDE a string value does not end it.
+/// Shared with the taint gate so an authorised fence is copied whole, body un-rescanned.
+pub(crate) fn fence_body_end(after: &str) -> Option<usize> { balanced_fence_end(after) }
 fn known_tool_name(name: &str) -> bool {
     matches!(name, "write_file" | "read_file" | "edit" | "edit_file" | "patch" | "read_range" | "read_near"
         | "search" | "list_dir" | "git_log" | "log" | "propose" | "dry_run" | "doc" | "share_doc" | "write_doc"
