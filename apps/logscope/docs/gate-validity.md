@@ -31,9 +31,11 @@ days is a pattern, not an accident.
   that adapter. `gate-q6k`'s output already prints the adapter — it needs to be read.
 * **Container-green is a precondition, not a verdict.** It is worth having: it catches arithmetic cheaply
   and fast. It must not close a question.
-* The gates already run on hardware and disagree — `gate-matvec`'s subgroup rows fail on lavapipe *and*
+* The gates already run on hardware and disagree — `gate-matvec`'s subgroup rows failed on lavapipe *and*
   the subgroup kernel is disabled on Asahi and mobile. That disagreement was visible and treated as a
-  lavapipe quirk. It was a signal about the class.
+  lavapipe quirk. It was a signal about the class — and, it turned out (c21, `54b2bb8d1`), a kernel
+  bug: the partials array was sized for a subgroup of 32 and overflowed at tile 8 on lavapipe's 8,
+  which is any driver narrower than 16. The "quirk" was the kernel being wrong on that class.
 
 ## The specific Q6_K signature, for whoever picks it up
 
