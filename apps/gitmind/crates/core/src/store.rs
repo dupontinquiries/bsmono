@@ -175,6 +175,13 @@ fn decode_chunk(
         }
         let base_oid = &value[1..33];
         let len = u32::from_le_bytes(value[33..37].try_into().unwrap()) as usize;
+        // The length is the decompressor's preallocation. A chunk is at most CDC_MAX raw, so a
+        // larger figure is a corrupt value, and reading it as a size would ask for up to 4 GiB
+        // before zstd gets to say the payload is garbage — on a phone that is the process, not
+        // an error. Refuse it the way a short value is refused.
+        if len > CDC_MAX as usize {
+            return Err(format!("corrupt delta chunk: claims {len} raw bytes, chunks are at most {CDC_MAX}"));
+        }
         let payload = &value[37..];
         let base_comp = get(base_oid)?.ok_or("missing delta base chunk")?;
         let base_raw = decode_chunk(&base_comp, get, depth + 1)?;
@@ -643,6 +650,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = ChunkStore::open(dir.path().join("store.redb")).unwrap();
         (s, dir)
+    }
+
+    /// A delta value's length field is a preallocation size. Corrupt on disk, it must be an
+    /// error, not a 4 GiB Vec::with_capacity: the raw chunk it describes is at most CDC_MAX.
+    #[test]
+    fn a_delta_chunk_claiming_more_than_a_chunk_can_hold_is_refused_before_allocating() {
+        let base = vec![7u8; 1000];
+        let base_oid = [0x11u8; 32];
+        let base_val = encode_chunk_value(&base).unwrap();
+        let get = |oid: &[u8]| -> Result<Option<Vec<u8>>, String> { Ok((oid == base_oid).then(|| base_val.clone())) };
+        let mut val = vec![b'D'];
+        val.extend_from_slice(&base_oid);
+        val.extend_from_slice(&u32::MAX.to_le_bytes());
+        val.extend_from_slice(b"not a zstd frame");
+        let err = decode_chunk(&val, &get, 0).unwrap_err();
+        assert!(err.contains("claims 4294967295 raw bytes"), "{err}");
+        // Just over the bound is refused too; at the bound the length is believed and the
+        // garbage payload is what fails, from zstd rather than from the guard.
+        val[33..37].copy_from_slice(&(CDC_MAX + 1).to_le_bytes());
+        assert!(decode_chunk(&val, &get, 0).unwrap_err().contains("chunks are at most"));
+        val[33..37].copy_from_slice(&CDC_MAX.to_le_bytes());
+        let err = decode_chunk(&val, &get, 0).unwrap_err();
+        assert!(err.starts_with("undelta:"), "{err}");
     }
 
     #[test]
