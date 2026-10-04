@@ -1553,8 +1553,18 @@ pub fn container_plan(runtime: &str, repo_root: &std::path::Path, app: &TabletAp
         // Static for the tablet's own system; dynamic for the Alpine root
         // (links the same Alpine libraries the root has installed).
         let crt = if t.static_crt { "+crt-static" } else { "-crt-static" };
+        // A static build names its target explicitly. Without `--target`, RUSTFLAGS reach the build scripts and
+        // proc-macros too, and a musl host cannot build a proc-macro with +crt-static ("cannot produce proc-macro
+        // for `bytemuck_derive` ... does not support these crate types"). With it, cargo keeps host artifacts out
+        // of the flags, and the target is the container's own triple, so nothing is cross-compiled.
+        if t.static_crt {
+            cargo.push("--target".into());
+            cargo.push(t.triple.into());
+            output_rel = format!("{rel}/target/tablet-container/{}/release/{}", t.triple, app.bin);
+        } else {
+            output_rel = format!("{rel}/target/tablet-container/release/{}", app.bin);
+        }
         script += &format!("RUSTFLAGS='-C target-feature={crt}' {}", cargo.join(" "));
-        output_rel = format!("{rel}/target/tablet-container/release/{}", app.bin);
     } else {
         cargo.push("--target".into());
         cargo.push(t.triple.into());
@@ -2884,10 +2894,11 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
         let a = p.argv.join(" ");
         for want in ["podman run --rm --platform linux/arm64", "-v /home/user/mono:/src:Z", "-w /src/apps/tomescope",
                      "CARGO_TARGET_DIR=/src/apps/tomescope/target/tablet-container", CONTAINER_IMAGE,
-                     "+crt-static", "--bin tomescope-eink --no-default-features --features eink"] {
+                     "+crt-static", "--bin tomescope-eink --no-default-features --features eink", "--target aarch64-unknown-linux-musl"] {
             assert!(a.contains(want), "{want:?} not in {a}");
         }
-        assert_eq!(p.output, root.join("apps/tomescope/target/tablet-container/release/tomescope-eink"));
+        assert_eq!(p.output, root.join("apps/tomescope/target/tablet-container/aarch64-unknown-linux-musl/release/tomescope-eink"),
+                   "a static build names its target, so proc-macros are built for the host without +crt-static");
         assert_eq!(p.cwd, root);
         // the rM2 cross-compiles with rust-lld instead
         let rm2 = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::Rm2));
