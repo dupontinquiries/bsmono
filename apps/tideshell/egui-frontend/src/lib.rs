@@ -14,6 +14,7 @@
 
 pub mod effects;
 #[cfg(feature = "wayland")]
+pub mod stall;
 pub mod wash;
 pub mod wayland;
 #[cfg(feature = "ei")]

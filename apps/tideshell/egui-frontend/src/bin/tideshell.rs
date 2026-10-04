@@ -218,6 +218,12 @@ impl Shellbox {
         std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))).map(|d| d.join("tideshell/places.log"))
     }
 
+    /// What the shell was doing, for a stall line: the app in front and the shell's own state.
+    fn stall_ctx(&self) -> String {
+        let fg = if self.foreground_written.is_empty() { "-" } else { self.foreground_written.as_str() };
+        format!("fg={fg} locked={} palette={}", self.shell.lock.is_locked(), self.shell.palette.open)
+    }
+
     /// comfortgov reads this as the app in front (its scope is spared reclaim).
     fn write_foreground_hint(&mut self) {
         let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else { return };
@@ -765,7 +771,15 @@ fn main() {
     let mut last_display_on: Option<bool> = None;
     let trace_stderr = std::env::var("TIDESHELL_TRACE").is_ok_and(|v| v == "stderr");
     let mut printed: Vec<String> = Vec::new();
+    // The loop's own timing: slow work after a wake, and a sleep that overran (see `stall`). Always on, rate-limited.
+    let mut stalls = tideshell_egui::stall::StallLog::default();
+    let mut woke_at: Option<Instant> = None;
     loop {
+        if let Some(w) = woke_at.take() {
+            if let Some(line) = stalls.on_work(t0.elapsed().as_millis(), w.elapsed(), &sb.stall_ctx()) {
+                eprintln!("{line}");
+            }
+        }
         if trace_stderr {
             print_new_trace(&sb.shell, &mut printed);
         }
@@ -824,10 +838,15 @@ fn main() {
         if let Some(k) = sb.keys.as_ref().and_then(|k| k.wake_fd()) {
             wake_fds.push(k);
         }
+        let slept_from = Instant::now();
         let input = io.dispatch_with(timeout, &wake_fds).unwrap_or_else(|e| {
             eprintln!("tideshell: wayland: {e}");
             std::process::exit(1)
         });
+        woke_at = Some(Instant::now());
+        if let Some(line) = stalls.on_wake(t0.elapsed().as_millis(), slept_from.elapsed(), timeout, &format!("{} busy={busy} asleep={asleep} cam_live={}", sb.stall_ctx(), sb.cam_duty.is_live(t0.elapsed().as_millis() as u64))) {
+            eprintln!("{line}");
+        }
         let now_ms = t0.elapsed().as_millis() as u64;
         // Screen sleep on idle: the compositor measures idle (and honours
         // inhibitors such as a playing video); the Sleep model decides.
