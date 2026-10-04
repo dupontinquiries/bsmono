@@ -322,3 +322,25 @@ same driver. Focus stack and HDR found no V4L2 focus/exposure control on the cam
 * `date +%N` and `head -N` do not exist in the tablet's busybox either; `tools/penlog` (static aarch64) replaces
   `evtest` there.
 * eink-kit repainted the whole screen every frame (41-68 ms) until `TileCache`; see queue row 101.
+
+
+## Focusing on faces: what was tried and what is still open (2026-10-04)
+
+Field log, taps on a face: peak 0.76, contrast 1.24 over the lens sweep, so the search (bar 2.0) says "nothing to focus
+on". Cause: an 18% region of smooth skin in dim light gives almost no texture, and `focus::sharpness` (full-resolution
+4-neighbour Laplacian over mean luma squared) mostly measures sensor noise, which is the same at every lens position.
+
+**Experiment (synthetic, not shipped):** a smooth skin tone plus faint texture and one dark bar (an eye), defocused in
+proportion to distance from the peak, with white noise. Averaging 2x2 pixels before the same measure raised the
+best/mean contrast from 1.23 to 1.75 (noise sd 2), 1.06 to 1.25 (sd 4), 1.02 to 1.11 (sd 7), and found the true peak
+at sd 4 where the plain measure did not. Better at every level, but still under 2.0 even in the cleanest case, and 2x2
+averaging costs fine-detail sensitivity (distant text, macro). Not adopted: no real-device evidence.
+
+**Options that could work, none built:**
+1. A bigger region when the first sweep is flat (the whole face, hair and ears, not 18%), at the risk of focusing on the
+   background behind it.
+2. Score the frame centre with the 3x3 grid (the automatic mode already does) and weight regions by texture.
+3. Use the focus STACK mode for portraits (it now drives the lens motor): it needs no peak, it keeps the sharpest part
+   of each of 5 positions. Works today; untested on a face.
+4. A face detector (none in the repo) to centre the region on the eyes.
+5. Keep the 2.0 bar but report "too smooth to focus, try the stack" instead of silently doing nothing.
