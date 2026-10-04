@@ -5,6 +5,7 @@ use crypto_kit::{ed25519_keypair, ed25519_public_from_seed, x25519_keypair};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
+#[derive(Clone)]
 pub struct Identity {
     pub name: String,
     ed_seed: Zeroizing<[u8; 32]>,
@@ -49,6 +50,8 @@ impl Identity {
     pub fn id(&self) -> String { hex(&self.ed_pub[..8]) }
 
     pub(crate) fn sign(&self, msg: &[u8]) -> [u8; 64] { crypto_kit::sign(&self.ed_seed, msg) }
+    /// Sign for the sync handshake (the same key, a different message).
+    pub(crate) fn sign_public(&self, msg: &[u8]) -> [u8; 64] { self.sign(msg) }
     pub(crate) fn x_secret(&self) -> &[u8; 32] { &self.x_secret }
 
     pub fn to_text(&self) -> String {

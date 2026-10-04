@@ -17,6 +17,7 @@ pub mod identity;
 pub mod note;
 pub mod pairing;
 pub mod share;
+pub mod sync;
 pub mod trust;
 
 /// The app: notes list, a touch canvas, devices and QR screens (feature `app`).
