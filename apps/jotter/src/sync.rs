@@ -258,6 +258,10 @@ pub fn exchange<S: Read + Write>(sess: &mut Session<S>, store: &mut dyn Store) -
             _ => return Err(SyncError::Protocol("an unexpected message".into())),
         }
     }
+    // each side says "applied" only after merging everything, and waits for the other's: a finished sync means both
+    // devices hold the result, not just that the last frame left this one
+    sess.send(b"A")?;
+    if sess.recv()? != b"A" { return Err(SyncError::Protocol("no final acknowledgement".into())); }
     Ok(report)
 }
 
