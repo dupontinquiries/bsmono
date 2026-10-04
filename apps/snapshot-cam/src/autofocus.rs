@@ -20,7 +20,7 @@
 use capture_kit::focus;
 use capture_kit::RawFrame;
 
-use crate::tapfocus::{Lens, FRESH_FRAMES, SETTLE_MS, TIMEOUT_MS};
+use crate::tapfocus::{Lens, AVG_FRAMES, FRESH_FRAMES, NUDGE, SETTLE_MS, TIMEOUT_MS, VERIFY_RATIO};
 
 pub const GRID_W: usize = 3;
 pub const GRID_H: usize = 3;
@@ -306,45 +306,80 @@ pub struct AutoRun {
     probe: Option<Probe>,
     started_ms: u64,
     previous: Option<i64>,
+    /// Settled frames collected for the current probe (a probe is their per-region median, see `tapfocus::AVG_FRAMES`).
+    acc: Vec<Vec<f64>>,
+    /// Every probe's averaged region scores, to know what the search measured at the position it chose.
+    seen: Vec<(i64, Vec<f64>)>,
+    /// After the search: the landing is re-measured before the lens is called locked (see `tapfocus::VERIFY_RATIO`).
+    verify: Option<Verify>,
     /// The last result and when, for drawing.
     pub result: Option<(AutoVerdict, u64)>,
 }
 
+/// The re-measure of the position the search chose, in the region that decided it.
+#[derive(Debug, Clone)]
+struct Verify { region: usize, want: f64, probe: Option<Probe>, acc: Vec<f64>, best: (i64, f64), todo: Vec<i64> }
+
+fn median(v: &mut [f64]) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v[v.len() / 2]
+}
+
 impl Default for AutoRun {
-    fn default() -> Self { AutoRun { search: None, probe: None, started_ms: 0, previous: None, result: None } }
+    fn default() -> Self { AutoRun { search: None, probe: None, started_ms: 0, previous: None, acc: Vec::new(), seen: Vec::new(), verify: None, result: None } }
 }
 
 pub const RESULT_SHOW_MS: u64 = 1_200;
 
 impl AutoRun {
-    pub fn is_searching(&self) -> bool { self.search.is_some() }
+    pub fn is_searching(&self) -> bool { self.search.is_some() || self.verify.is_some() }
 
     pub fn begin(&mut self, w: Vec<f32>, range: (i64, i64, i64), lens: &mut dyn Lens, now_ms: u64) {
         self.search = Some(AutoSearch::new(range.0, range.1, range.2, w));
         self.probe = None;
+        self.acc.clear();
+        self.seen.clear();
+        self.verify = None;
         self.started_ms = now_ms;
         self.previous = lens.current();
         self.result = None;
     }
 
-    pub fn cancel(&mut self) { self.search = None; self.probe = None; }
+    pub fn cancel(&mut self) { self.search = None; self.probe = None; self.verify = None; self.acc.clear(); }
 
     pub fn on_frame(&mut self, f: &RawFrame, now_ms: u64, lens: &mut dyn Lens) -> Option<AutoVerdict> {
-        let Some(search) = self.search.as_mut() else { return None };
+        if self.search.is_none() && self.verify.is_none() { return None; }
         if now_ms.saturating_sub(self.started_ms) > TIMEOUT_MS + 3_000 {
             return self.finish(AutoVerdict::Failed("autofocus timed out".into()), now_ms);
         }
+        if self.verify.is_some() { return self.verify_frame(f, now_ms, lens); }
+        let search = self.search.as_mut()?;
         loop {
             match self.probe {
                 None => match search.step() {
                     AStep::Probe(p) => {
                         if let Err(e) = lens.move_to(p) { return self.finish(AutoVerdict::Failed(e), now_ms); }
+                        self.acc.clear();
                         self.probe = Some(Probe { pos: p, issued_ms: now_ms, issued_seq: f.seq });
                         return None;
                     }
                     AStep::Done(Some((p, r))) => {
-                        let v = match lens.move_to(p) { Ok(()) => AutoVerdict::Locked { pos: p, region: r }, Err(e) => AutoVerdict::Failed(e) };
-                        return self.finish(v, now_ms);
+                        // what the search measured at the chosen position, in the deciding region
+                        let want = self.seen.iter().filter(|(pos, _)| *pos == p).filter_map(|(_, sc)| sc.get(r).copied()).fold(0.0f64, f64::max);
+                        if want <= 0.0 {
+                            let v = match lens.move_to(p) { Ok(()) => AutoVerdict::Locked { pos: p, region: r }, Err(e) => AutoVerdict::Failed(e) };
+                            return self.finish(v, now_ms);
+                        }
+                        // re-measure where the lens is about to be left: the answer first, then nudges either side
+                        if let Err(e) = lens.move_to(p) { return self.finish(AutoVerdict::Failed(e), now_ms); }
+                        self.search = None;
+                        self.probe = None;
+                        self.verify = Some(Verify {
+                            region: r, want, acc: Vec::new(), best: (p, 0.0),
+                            probe: Some(Probe { pos: p, issued_ms: now_ms, issued_seq: f.seq }),
+                            todo: vec![p - 2 * NUDGE, p + 2 * NUDGE, p - NUDGE, p + NUDGE],
+                        });
+                        return None;
                     }
                     AStep::Done(None) => {
                         if let Some(prev) = self.previous { let _ = lens.move_to(prev); }
@@ -355,17 +390,49 @@ impl AutoRun {
                     let settled = now_ms.saturating_sub(pr.issued_ms) >= SETTLE_MS && f.seq >= pr.issued_seq + FRESH_FRAMES;
                     if !settled { return None; }
                     if !f.pixels_plausible() { return None; }
-                    search.feed(region_scores(f));
+                    self.acc.push(region_scores(f));
+                    if self.acc.len() < AVG_FRAMES { return None; } // a median of several frames, not one noisy one
+                    let n = self.acc[0].len();
+                    let m: Vec<f64> = (0..n).map(|k| { let mut col: Vec<f64> = self.acc.iter().map(|a| a[k]).collect(); median(&mut col) }).collect();
+                    self.acc.clear();
+                    self.seen.push((pr.pos, m.clone()));
+                    search.feed(m);
                     self.probe = None;
-                    let _ = pr.pos;
                 }
             }
         }
     }
 
+    fn verify_frame(&mut self, f: &RawFrame, now_ms: u64, lens: &mut dyn Lens) -> Option<AutoVerdict> {
+        let v = self.verify.as_mut()?;
+        let pr = v.probe?;
+        let settled = now_ms.saturating_sub(pr.issued_ms) >= SETTLE_MS && f.seq >= pr.issued_seq + FRESH_FRAMES;
+        if !settled || !f.pixels_plausible() { return None; }
+        v.acc.push(region_scores(f).get(v.region).copied().unwrap_or(0.0));
+        if v.acc.len() < AVG_FRAMES { return None; }
+        let m = median(&mut v.acc);
+        v.acc.clear();
+        if m > v.best.1 { v.best = (pr.pos, m); }
+        if m >= v.want * VERIFY_RATIO {
+            // reproduced: this is where the lens is, and it is sharp
+            let (pos, region) = (pr.pos, v.region);
+            return self.finish(AutoVerdict::Locked { pos, region }, now_ms);
+        }
+        if let Some(next) = v.todo.pop() {
+            if let Err(e) = lens.move_to(next) { return self.finish(AutoVerdict::Failed(e), now_ms); }
+            v.probe = Some(Probe { pos: next, issued_ms: now_ms, issued_seq: f.seq });
+            return None;
+        }
+        // Nothing near the answer reproduced the peak: noise, or the scene moved. Do not leave the lens somewhere blurry.
+        if let Some(prev) = self.previous { let _ = lens.move_to(prev); }
+        self.finish(AutoVerdict::Refused, now_ms)
+    }
+
     fn finish(&mut self, v: AutoVerdict, now_ms: u64) -> Option<AutoVerdict> {
         self.search = None;
         self.probe = None;
+        self.verify = None;
+        self.acc.clear();
         self.result = Some((v.clone(), now_ms));
         Some(v)
     }
@@ -389,14 +456,26 @@ mod tests {
     struct Scene { peaks: [Option<i64>; N_REGIONS] }
 
     fn frame(scene: &Scene, lens_pos: i64, seq: u64, shift: u32) -> RawFrame {
+        frame_ex(scene, lens_pos, seq, shift, 160.0, u64::MAX, 0, 0)
+    }
+
+    /// `width`: how quickly a region's sharpness falls off from its best lens position. After frame `drift_at` every
+    /// peak moves by `drift` (a subject that walked away). `noise` != 0: no peaks at all, a different amount of texture
+    /// in every region every frame, whatever the lens does.
+    fn frame_ex(scene: &Scene, lens_pos: i64, seq: u64, shift: u32, width: f32, drift_at: u64, drift: i64, noise: u32) -> RawFrame {
         let (w, h) = (180u32, 90u32);
         let mut v = Vec::with_capacity((w * h * 4) as usize);
         for y in 0..h {
             for x in 0..w {
                 let r = (y as usize * GRID_H / h as usize) * GRID_W + x as usize * GRID_W / w as usize;
-                let contrast = match scene.peaks[r] {
-                    Some(p) => { let d = (lens_pos - p) as f32 / 160.0; (-d * d).exp() }
-                    None => 0.0,
+                let contrast = if noise != 0 {
+                    let k = seq.wrapping_mul(2654435761).wrapping_add(noise as u64 * 40503).wrapping_add(r as u64 * 7919) >> 7;
+                    0.25 + 0.12 * ((k % 1000) as f32 / 1000.0)
+                } else {
+                    match scene.peaks[r] {
+                        Some(p) => { let d = (lens_pos - (p + if seq >= drift_at { drift } else { 0 })) as f32 / width; (-d * d).exp() }
+                        None => 0.0,
+                    }
                 };
                 let chk = if (x + y + shift) % 2 == 0 { 1.0 } else { -1.0 };
                 let l = (128.0 + 100.0 * contrast * chk) as u8;
@@ -551,5 +630,81 @@ mod tests {
         assert!(r.shown_region(1000 + RESULT_SHOW_MS + 1).is_none());
         r.result = Some((AutoVerdict::Refused, 1000));
         assert!(r.shown_region(1010).is_none(), "a refusal draws no region");
+    }
+
+    /// A lens that lands short or long depending on the direction of travel (a voice coil's hysteresis), with lag.
+    struct HystLens { cmd: i64, bias: i64, history: Vec<i64>, lag: usize, up: i64, down: i64 }
+    impl HystLens {
+        fn new(pos: i64, lag: usize, up: i64, down: i64) -> HystLens { HystLens { cmd: pos, bias: 0, history: vec![], lag, up, down } }
+        fn effective(&self) -> i64 { self.cmd + self.bias }
+        fn tick(&mut self) { let e = self.effective(); self.history.push(e); }
+        fn seen(&self) -> i64 { let n = self.history.len(); self.history[n.saturating_sub(1 + self.lag)] }
+    }
+    impl Lens for HystLens {
+        fn move_to(&mut self, pos: i64) -> Result<(), String> {
+            if pos > self.cmd { self.bias = self.up; } else if pos < self.cmd { self.bias = self.down; }
+            self.cmd = pos; Ok(())
+        }
+        fn current(&mut self) -> Option<i64> { Some(self.cmd) }
+    }
+
+    #[test]
+    fn a_lens_that_lands_short_or_long_still_ends_up_sharp_because_the_landing_is_re_measured() {
+        // width 40 and a motor that lands 12 steps off by direction: arriving from the other side than the probe did
+        // leaves the glass 24 steps from where it was measured (score x0.70, under the 0.85 bar; a nudge of 10-20 fixes it). Many starts and peaks so some arrive that way.
+        for peak in [300, 500, 800] {
+            for start in [0, 100, 250, 400, 650, 800, 950, 1023] {
+                let scene = only(4, peak);
+                let mut lens = HystLens::new(start, 2, -12, 12);
+                let mut run = AutoRun::default();
+                run.begin(center_weights(), (0, 1023, 1), &mut lens, 0);
+                let mut verdict = None;
+                for seq in 0..800u64 {
+                    lens.tick();
+                    if let Some(v) = run.on_frame(&frame_ex(&scene, lens.seen(), seq, 0, 40.0, u64::MAX, 0, 0), seq * 33, &mut lens) { verdict = Some(v); break; }
+                }
+                let Some(AutoVerdict::Locked { .. }) = verdict else { panic!("peak {peak} start {start}: {verdict:?}") };
+                let off = (lens.effective() - peak).abs();
+                assert!(off <= 14, "peak {peak} start {start}: the glass ends {off} steps from the peak (effective {}, commanded {})", lens.effective(), lens.cmd);
+            }
+        }
+    }
+
+    #[test]
+    fn a_subject_that_is_gone_when_the_lens_arrives_is_refused_not_locked() {
+        let scene = only(4, 400);
+        let go = |drift_at: u64| {
+            let mut lens = FakeLens::new(100, 2);
+            let mut run = AutoRun::default();
+            run.begin(center_weights(), (0, 1023, 1), &mut lens, 0);
+            let mut verdict = None;
+            let mut seq_end = 0;
+            for seq in 0..800u64 {
+                lens.tick();
+                if let Some(v) = run.on_frame(&frame_ex(&scene, lens.seen(), seq, 0, 60.0, drift_at, 500, 0), seq * 33, &mut lens) { verdict = Some(v); seq_end = seq; break; }
+            }
+            (verdict, lens, seq_end)
+        };
+        let (_, _, end) = go(u64::MAX);
+        let (v, lens, _) = go(end.saturating_sub(12));
+        assert_eq!(v, Some(AutoVerdict::Refused), "the subject moved away during the search");
+        assert_eq!(lens.pos, 100, "and the lens went back instead of staying on a spot that is now blurry");
+    }
+
+    #[test]
+    fn a_scene_that_is_only_noise_is_never_locked_even_when_noise_makes_a_peak_look_good() {
+        for seed in 1..=12u32 {
+            let scene = Scene { peaks: [None; N_REGIONS] };
+            let mut lens = FakeLens::new(321, 2);
+            let mut run = AutoRun::default();
+            run.begin(center_weights(), (0, 1023, 1), &mut lens, 0);
+            let mut verdict = None;
+            for seq in 0..800u64 {
+                lens.tick();
+                if let Some(v) = run.on_frame(&frame_ex(&scene, lens.seen(), seq, 0, 160.0, u64::MAX, 0, seed), seq * 33, &mut lens) { verdict = Some(v); break; }
+            }
+            assert!(!matches!(verdict, Some(AutoVerdict::Locked { .. })), "seed {seed}: noise was locked as focus ({verdict:?})");
+            assert_eq!(lens.pos, 321, "seed {seed}: the lens did not go back");
+        }
     }
 }
