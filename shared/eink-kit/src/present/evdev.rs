@@ -195,19 +195,19 @@ pub fn spawn_pen_reader(dev: &TouchDevice, width: u32, height: u32, t: Transform
 }
 
 /// Start the direct touch and pen readers for a `width` x `height` surface; both send through `input`.
-pub fn start_direct(touch: Transform, pen: Transform, width: u32, height: u32, with_pen: bool, input: InputSender) {
+pub fn start_direct(touch: Transform, pen: Transform, width: u32, height: u32, touch_in: InputSender, pen_in: Option<InputSender>) {
     match find_touchscreen() {
         Some(dev) => {
             eprintln!("eink: direct touch = event{} {:?} x{:?} y{:?} -> {width}x{height}", dev.number, dev.name, dev.x, dev.y);
-            if let Err(e) = spawn_reader(&dev, width, height, touch, input.clone()) { eprintln!("eink: direct touch failed: {e}"); }
+            if let Err(e) = spawn_reader(&dev, width, height, touch, touch_in) { eprintln!("eink: direct touch failed: {e}"); }
         }
         None => eprintln!("eink: no multitouch device found for direct input"),
     }
-    if !with_pen { return; }
+    let Some(pen_in) = pen_in else { return };
     match find_pen() {
         Some(dev) => {
             eprintln!("eink: direct pen = event{} {:?} x{:?} y{:?} -> {width}x{height}", dev.number, dev.name, dev.x, dev.y);
-            if let Err(e) = spawn_pen_reader(&dev, width, height, pen, input) { eprintln!("eink: direct pen failed: {e}"); }
+            if let Err(e) = spawn_pen_reader(&dev, width, height, pen, pen_in) { eprintln!("eink: direct pen failed: {e}"); }
         }
         None => eprintln!("eink: no pen digitizer found for direct input"),
     }

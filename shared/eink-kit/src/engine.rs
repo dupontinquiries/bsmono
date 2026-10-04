@@ -493,17 +493,12 @@ fn open_tablet_backend(cfg: &Config, hub: &InputHub, want: &str) -> std::io::Res
         // Paper Pro though the digitizer reports at ~60 Hz, so `evdev` reads the digitizers directly instead.
         // evdev: the finger is read directly, the pen still comes from AppLoad (its direct mapping is unchecked);
         // evdev-all: both are read directly; compare: AppLoad drives, the direct readers only log.
-        let (qtfb_route, direct, with_pen) = match cfg.input.as_str() {
-            "evdev" => (crate::present::Route::DropFinger, Some(crate::present::Route::Pass), false),
-            "evdev-all" => (crate::present::Route::DropTouch, Some(crate::present::Route::Pass), true),
-            "compare" => (crate::present::Route::Pass, Some(crate::present::Route::LogTouch), true),
-            _ => (crate::present::Route::Pass, None, false),
-        };
-        eprintln!("eink: input = {} (AppLoad's forwarded touch is {})", cfg.input, match qtfb_route { crate::present::Route::DropTouch => "ignored", crate::present::Route::DropFinger => "ignored for the finger, used for the pen", _ => "used" });
-        let present = qtfb::QtfbPresent::connect(key, model, mode, hub.sender_with(qtfb_route))?;
-        if let Some(route) = direct {
+        let plan = crate::present::InputPlan::parse(&cfg.input);
+        eprintln!("eink: input = {} (AppLoad's forwarded touch is {})", cfg.input, match plan.qtfb { crate::present::Route::DropTouch => "ignored", crate::present::Route::DropFinger => "ignored for the finger, used for the pen", _ => "used" });
+        let present = qtfb::QtfbPresent::connect(key, model, mode, hub.sender_with(plan.qtfb))?;
+        if let Some(touch_route) = plan.touch {
             let caps = present.caps();
-            crate::present::evdev::start_direct(cfg.touch, cfg.pen, caps.width, caps.height, with_pen, hub.sender_with(route));
+            crate::present::evdev::start_direct(cfg.touch, cfg.pen, caps.width, caps.height, hub.sender_with(touch_route), plan.pen.map(|r| hub.sender_with(r)));
         }
         return Ok(Box::new(present));
     }

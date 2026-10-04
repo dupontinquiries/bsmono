@@ -94,6 +94,35 @@ pub enum Route {
     LogTouch,
 }
 
+/// What `EINK_INPUT` means under qtfb: how AppLoad's forwarded input is treated, and which direct readers run and what
+/// they do with what they read. Pure, so the table can be tested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputPlan {
+    pub qtfb: Route,
+    /// The direct touch reader, if it runs.
+    pub touch: Option<Route>,
+    /// The direct pen reader, if it runs.
+    pub pen: Option<Route>,
+}
+
+impl InputPlan {
+    pub fn parse(mode: &str) -> InputPlan {
+        use Route::*;
+        match mode {
+            // the finger is read directly; the pen still comes from AppLoad
+            "evdev" => InputPlan { qtfb: DropFinger, touch: Some(Pass), pen: None },
+            // finger direct, the pen from AppLoad as usual, and the direct pen reader only LOGS (to check its mapping)
+            "evdev-pen-compare" => InputPlan { qtfb: DropFinger, touch: Some(Pass), pen: Some(LogTouch) },
+            // both read directly
+            "evdev-all" => InputPlan { qtfb: DropTouch, touch: Some(Pass), pen: Some(Pass) },
+            // AppLoad drives; both direct readers only log
+            "compare" => InputPlan { qtfb: Pass, touch: Some(LogTouch), pen: Some(LogTouch) },
+            // anything else (including the default "qtfb") is AppLoad's input alone
+            _ => InputPlan { qtfb: Pass, touch: None, pen: None },
+        }
+    }
+}
+
 /// Sending end, cloned into each input thread.
 #[derive(Clone)]
 pub struct InputSender {
@@ -229,5 +258,30 @@ mod route_tests {
         let got = hub.drain();
         let ids: Vec<u32> = got.iter().filter_map(|i| if let Input::Touch(t) = i { Some(t.id) } else { None }).collect();
         assert_eq!(ids, vec![crate::touch::PEN_ID], "the finger is dropped, the pen is not");
+    }
+
+    #[test]
+    fn each_input_mode_decides_who_may_drive_the_app() {
+        use Route::*;
+        // the default and any typo: AppLoad alone, no direct readers
+        for m in ["qtfb", "", "evdv", "EVDEV"] { assert_eq!(InputPlan::parse(m), InputPlan { qtfb: Pass, touch: None, pen: None }, "{m:?}"); }
+        let p = InputPlan::parse("evdev");
+        assert_eq!((p.qtfb, p.touch, p.pen), (DropFinger, Some(Pass), None), "finger direct, pen still AppLoad's, no direct pen");
+        let p = InputPlan::parse("evdev-pen-compare");
+        assert_eq!((p.qtfb, p.touch, p.pen), (DropFinger, Some(Pass), Some(LogTouch)), "the direct pen only logs");
+        let p = InputPlan::parse("evdev-all");
+        assert_eq!((p.qtfb, p.touch, p.pen), (DropTouch, Some(Pass), Some(Pass)));
+        let p = InputPlan::parse("compare");
+        assert_eq!((p.qtfb, p.touch, p.pen), (Pass, Some(LogTouch), Some(LogTouch)), "AppLoad drives, nothing direct is forwarded");
+        // no mode may let BOTH AppLoad and a direct reader drive the same device: every tap would arrive twice
+        for m in ["evdev", "evdev-pen-compare", "evdev-all", "compare"] {
+            let p = InputPlan::parse(m);
+            let appload_drives_finger = p.qtfb == Pass;
+            let direct_drives_finger = p.touch == Some(Pass);
+            assert!(!(appload_drives_finger && direct_drives_finger), "{m}: a finger would be delivered twice");
+            let appload_drives_pen = matches!(p.qtfb, Pass | DropFinger);
+            let direct_drives_pen = p.pen == Some(Pass);
+            assert!(!(appload_drives_pen && direct_drives_pen), "{m}: the pen would be delivered twice");
+        }
     }
 }
