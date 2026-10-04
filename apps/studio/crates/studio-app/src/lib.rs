@@ -9359,8 +9359,21 @@ mod tcp_carrier_tests {
             pump(&mut a, &ca);
             for p in a.voice_inbox.drain(..) { call_a.receive(&p); }
             for p in call_a.pump(&mut mic_a, &mut sink_a, a.session.doc.site) { ca.send(p); }
-            pump(&mut b, &cb);
-            for p in b.voice_inbox.drain(..) { inbox_b += 1; call_b.receive(&p); }
+            // The carrier is threaded (a reader thread and a channel), so this
+            // turn's frame crosses when the scheduler says, not when `send`
+            // returns: wait for it, bounded, before B plays a slot. What the
+            // loss bound below measures is then the pump ORDER, not the
+            // machine's load — the c21 fleet sweep (two cargo jobs on one
+            // core) concealed 2 of 400 slots and failed it. A frame that
+            // never comes still trips the bound; one that comes late to a
+            // 2 ms sleep no longer does.
+            let before = inbox_b;
+            for _ in 0..100 {
+                pump(&mut b, &cb);
+                for p in b.voice_inbox.drain(..) { inbox_b += 1; call_b.receive(&p); }
+                if inbox_b > before { break; }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
             // B's device plays one frame per turn; the pump refills one slot.
             sink_b.consume(FRAME);
             for p in call_b.pump(&mut mic_b, &mut sink_b, b.session.doc.site) { cb.send(p); }
