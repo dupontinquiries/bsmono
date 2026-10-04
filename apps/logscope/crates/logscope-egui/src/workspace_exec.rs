@@ -1714,6 +1714,9 @@ pub struct AgentConfig {
     /// to the workspace it builds; `run_agent_cfg` takes a caller-built workspace and leaves it alone.
     pub model_label: String,
     pub model_params: Option<u64>,
+    /// Which tool-call syntax the prompt teaches. None = decide from `model_label` (and the
+    /// LOGSCOPE_TOOL_SYNTAX env override) via `ToolSyntax::for_model`; see `AgentConfig::syntax`.
+    pub tool_syntax: Option<ToolSyntax>,
     /// The worker's STANCE, from `coordinator::plan()` — how this branch should approach its unit,
     /// as distinct from the tool protocol every branch shares. Empty for an ordinary run.
     ///
@@ -1744,6 +1747,41 @@ pub struct AgentConfig {
     pub owns: Vec<String>,
 }
 
+/// The syntax a model is asked to make tool calls in. The parser reads every shape regardless
+/// (`extract_blocks`); this decides which one the PROMPT teaches and demonstrates, because a model
+/// copies the last form it read — and a model trained on one grammar fights the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolSyntax {
+    /// ```tool nonce="…" fence, one JSON object — the harness's native contract, and what the
+    /// token-level acceptor (template_kit::constrain) can enforce.
+    JsonFence,
+    /// `<tool_call nonce="…"><function=NAME><parameter=KEY>value</parameter>…</function></tool_call>`:
+    /// the XML-parameter grammar of Qwen3-Coder / Qwen3.5 / Ornith-1.5's own chat template. The
+    /// run token rides on the wrapper's opening tag, which the gate already strips.
+    XmlParameters,
+}
+impl ToolSyntax {
+    /// From the model's name. The Qwen3-Coder / Qwen3.5 / Ornith family is post-trained on the XML
+    /// grammar; their template's tool instruction IS that grammar, and under the JSON fence they
+    /// emit `<tool_call><function=…>` anyway — which, without the token, the gate refuses. Anything
+    /// unrecognised keeps the fence. `LOGSCOPE_TOOL_SYNTAX=xml|json` overrides either way.
+    pub fn for_model(label: &str) -> ToolSyntax {
+        match std::env::var("LOGSCOPE_TOOL_SYNTAX").ok().as_deref().map(str::to_ascii_lowercase).as_deref() {
+            Some("xml") => return ToolSyntax::XmlParameters,
+            Some("json") => return ToolSyntax::JsonFence,
+            _ => {}
+        }
+        let l = label.to_ascii_lowercase();
+        let xml = ["ornith", "qwen3.5", "qwen3_5", "qwen35", "qwen3-coder", "qwen3coder", "qwen3.6", "qwen36"];
+        if xml.iter().any(|k| l.contains(k)) { ToolSyntax::XmlParameters } else { ToolSyntax::JsonFence }
+    }
+}
+
+impl AgentConfig {
+    /// The tool-call syntax this run teaches: the explicit choice, else derived from the model.
+    pub fn syntax(&self) -> ToolSyntax { self.tool_syntax.unwrap_or_else(|| ToolSyntax::for_model(&self.model_label)) }
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -1771,6 +1809,7 @@ impl Default for AgentConfig {
             keep_recent_turns: 3,
             model_label: String::new(),
             model_params: None,
+            tool_syntax: None,
             persona: String::new(),
             require_proof: false,
             extra_allow: Vec::new(),
@@ -2849,6 +2888,67 @@ fn system_prompt_all_tools(task: &str, cfg: &AgentConfig) -> String {
         crate::taint::ToolGate::Required(n) => format!(" nonce=\"{}\"", n.as_str()),
         crate::taint::ToolGate::Open => String::new(),
     };
+    // THE CALL FORM, in the syntax this model is trained on (`AgentConfig::syntax`). Three pieces
+    // of the prompt depend on it: the instruction + first example, the menu's framing line, and
+    // the closing example + "what is ignored" line. Everything else is shared.
+    let xml = cfg.syntax() == ToolSyntax::XmlParameters;
+    let call_intro = if xml {
+        format!("THEN act by emitting TOOL CALLS. Each tool call is a <tool_call> block, and the
+opening tag MUST carry this run's token exactly as shown or the call is ignored:
+
+<tool_call{nonce_attr}>
+<function=write_file>
+<parameter=path>
+src/lib.rs
+</parameter>
+<parameter=contents>
+fn add(a:i32,b:i32)->i32{{a+b}}
+</parameter>
+</function>
+</tool_call>
+
+The token is not a secret — it marks a call YOU are making, so tool syntax you
+quote out of a file you read cannot execute. Put it on the opening <tool_call> tag.
+Each argument is one <parameter=NAME> element with its RAW value on the lines
+between (no quotes, no escaping; a list such as argv is written as a JSON array).")
+    } else {
+        format!("THEN act by emitting TOOL CALLS. Each tool call is a fenced block, and the
+opener MUST carry this run's token exactly as shown or the call is ignored:
+
+```tool{nonce_attr}
+{{ \"tool\": \"write_file\", \"path\": \"src/lib.rs\", \"contents\": \"fn add(a:i32,b:i32)->i32{{a+b}}\\n\" }}
+```
+
+The token is not a secret — it marks a call YOU are making, so tool syntax you
+quote out of a file you read cannot execute. Put it on the opening fence line,
+and put the JSON on its own line after it.")
+    };
+    let menu_frame = if xml {
+        format!("Available tools. THESE LINES SHOW ARGUMENT NAMES ONLY — they are not complete calls.
+Every one still goes inside a <tool_call{nonce_attr}> block, one <parameter=NAME> per argument:")
+    } else {
+        format!("Available tools. THESE LINES SHOW ARGUMENTS ONLY — they are not complete calls.
+Every one still has to go inside a ```tool{nonce_attr} fence, JSON on the next line:")
+    };
+    let call_outro = if xml {
+        format!("<tool_call{nonce_attr}>
+<function=read_file>
+<parameter=path>
+src/lib.rs
+</parameter>
+</function>
+</tool_call>
+
+A <tool_call> whose opening tag has no token is ignored — you will get no result
+back and no error you can see.")
+    } else {
+        format!("```tool{nonce_attr}
+{{ \"tool\": \"read_file\", \"path\": \"src/lib.rs\" }}
+```
+
+A bare ```tool fence with no token, or JSON on the same line as the fence, is
+ignored — you will get no result back and no error you can see.")
+    };
     // ALL read/navigation tools are always on the menu; the policy only changes which one the
     // prompt recommends leading with. (Hiding search from the primary agent taught it to ask the
     // user about the code instead of grepping it.)
@@ -2925,19 +3025,9 @@ FIRST, emit a short PLAN — the steps you will take — as a fenced block:
 2. <step>
 ```
 
-THEN act by emitting TOOL CALLS. Each tool call is a fenced block, and the
-opener MUST carry this run's token exactly as shown or the call is ignored:
+{call_intro}
 
-```tool{nonce_attr}
-{{ \"tool\": \"write_file\", \"path\": \"src/lib.rs\", \"contents\": \"fn add(a:i32,b:i32)->i32{{a+b}}\\n\" }}
-```
-
-The token is not a secret — it marks a call YOU are making, so tool syntax you
-quote out of a file you read cannot execute. Put it on the opening fence line,
-and put the JSON on its own line after it.
-
-Available tools. THESE LINES SHOW ARGUMENTS ONLY — they are not complete calls.
-Every one still has to go inside a ```tool{nonce_attr} fence, JSON on the next line:
+{menu_frame}
 - write_file  {{ \"tool\":\"write_file\", \"path\":\"<rel path>\", \"contents\":\"<file text>\" }}
 - edit        {{ \"tool\":\"edit\", \"path\":\"<rel path>\", \"find\":\"<verbatim unique anchor>\", \"replace\":\"<replacement>\" }}
 {read_tools}
@@ -2953,12 +3043,7 @@ Once more, because the argument lines above outnumber it eleven to one and the
 LAST form you read is the one you will copy. A complete call looks like this and
 nothing else does:
 
-```tool{nonce_attr}
-{{ \"tool\": \"read_file\", \"path\": \"src/lib.rs\" }}
-```
-
-A bare ```tool fence with no token, or JSON on the same line as the fence, is
-ignored — you will get no result back and no error you can see.
+{call_outro}
 
 SIDE IDEAS GO IN scratch_code, NOT IN THE TASK. If while doing the work you notice something worth
 keeping — a refactor this suggests, a bug you are not being asked to fix, a sketch of the approach
@@ -5272,6 +5357,53 @@ That is this machine, not the allowlist.", tldr.output.trim());
         let (_, anomalies) = crate::taint::authorize_text(&opener, &cfg.gate);
         assert!(anomalies.is_empty(),
                 "the gate rejects the very syntax the prompt teaches: {anomalies:?}");
+    }
+
+    /// Same contract, the other grammar. For an Ornith / Qwen3.5 / Qwen3-Coder model the prompt
+    /// teaches the XML-parameter form their template trains — and the proof is the same as above:
+    /// the prompt's OWN example, with this run's token, must pass the gate and come out of the
+    /// parser as the call it shows. A model that copies the example exactly gets a working call.
+    #[test]
+    fn the_xml_prompt_s_own_example_is_a_call_the_gate_and_parser_accept() {
+        let cfg = AgentConfig { model_label: "Ornith-1.5-9B-Q4_K_M".into(), ..AgentConfig::default() };
+        assert_eq!(cfg.syntax(), ToolSyntax::XmlParameters);
+        let nonce = match &cfg.gate { crate::taint::ToolGate::Required(n) => n.as_str().to_string(), _ => panic!() };
+        let p = system_prompt("do the thing", &cfg);
+        assert!(p.contains(&format!("<tool_call nonce=\"{nonce}\">")), "the XML opener with this run's token:\n{p}");
+        assert!(p.contains("<parameter=path>") && p.contains("</function>"), "the parameter grammar is shown");
+        assert!(!p.contains("```tool"), "the JSON fence must not ALSO be taught — the last form read is the one copied:\n{p}");
+        // lift the first example straight out of the prompt text
+        let start = p.find("<tool_call nonce=").expect("example");
+        let end = p[start..].find("</tool_call>").expect("closed") + start + "</tool_call>".len();
+        let example = &p[start..end];
+        let (safe, anomalies) = crate::taint::authorize_text(example, &cfg.gate);
+        assert!(anomalies.is_empty(), "the gate refused the prompt's own example: {anomalies:?}");
+        let tools = parse_tools(&safe);
+        assert_eq!(tools.len(), 1, "from:\n{safe}");
+        match &tools[0] {
+            Tool::WriteFile { path, contents } => {
+                assert_eq!(path, "src/lib.rs");
+                assert!(contents.contains("fn add(a:i32,b:i32)->i32{a+b}"), "{contents}");
+            }
+            t => panic!("{t:?}"),
+        }
+        // the closing example too (read_file)
+        let start2 = p.rfind("<tool_call nonce=").expect("second example");
+        let end2 = p[start2..].find("</tool_call>").expect("closed") + start2 + "</tool_call>".len();
+        let (safe2, _) = crate::taint::authorize_text(&p[start2..end2], &cfg.gate);
+        assert!(matches!(parse_tools(&safe2).as_slice(), [Tool::ReadFile { path }] if path == "src/lib.rs"));
+    }
+
+    #[test]
+    fn the_tool_syntax_follows_the_model_family_and_the_env_override() {
+        for (label, want) in [("Ornith-1.5-9B-Q4_K_M", ToolSyntax::XmlParameters), ("Qwen3.5-35B-A3B", ToolSyntax::XmlParameters),
+                              ("qwen3-coder-30b", ToolSyntax::XmlParameters), ("Llama-3.2-3B-Instruct", ToolSyntax::JsonFence),
+                              ("", ToolSyntax::JsonFence), ("gemma-4-9b", ToolSyntax::JsonFence)] {
+            assert_eq!(ToolSyntax::for_model(label), want, "{label}");
+        }
+        let explicit = AgentConfig { model_label: "Ornith-1.5-9B".into(), tool_syntax: Some(ToolSyntax::JsonFence), ..AgentConfig::default() };
+        assert_eq!(explicit.syntax(), ToolSyntax::JsonFence, "an explicit choice wins over the label");
+        assert!(system_prompt("t", &explicit).contains("```tool nonce="));
     }
 
     #[test]
