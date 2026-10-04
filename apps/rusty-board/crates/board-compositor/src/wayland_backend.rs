@@ -559,6 +559,7 @@ impl WaylandBackend {
                 // below sends QWERTY evdev keycodes, which cosmic-comp maps with the SEAT's
                 // layout, not the keymap we upload: on a Dvorak seat `i` came out `c`.
                 // commit_string is the characters themselves, whatever the layout.
+                debug!("commit_text({} chars): {}", text.chars().count(), if inner.app_data.active { "through the input method (a text field is active)" } else { "as virtual-keyboard key events (no active text field: the focused surface gets keys)" });
                 if inner.app_data.active {
                     if let Some(im) = inner.im.as_ref() {
                         im.commit_string(text.to_string());
@@ -670,6 +671,7 @@ impl WaylandBackend {
                         }
                     }
                 }
+                debug!("press_keysym({name:?}): virtual-keyboard key (input method active={})", inner.app_data.active);
                 let vkbd = inner
                     .vkbd
                     .as_ref()

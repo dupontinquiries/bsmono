@@ -1042,6 +1042,7 @@ impl Dispatch<WlKeyboard, ()> for State {
         use xkbcommon::xkb;
         match e {
             wl_keyboard::Event::Keymap { format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1), fd, size } => {
+                eprintln!("wl_keyboard: keymap received ({size} bytes)");
                 // SAFETY: the compositor hands us a read-only keymap of `size` bytes.
                 let km = unsafe { xkb::Keymap::new_from_fd(&st.xkb_ctx, fd, size as usize, xkb::KEYMAP_FORMAT_TEXT_V1, xkb::KEYMAP_COMPILE_NO_FLAGS) };
                 st.xkb = km.ok().flatten().map(|k| xkb::State::new(&k));
@@ -1053,6 +1054,9 @@ impl Dispatch<WlKeyboard, ()> for State {
             }
             wl_keyboard::Event::RepeatInfo { rate, delay } => st.repeat = (rate, delay),
             wl_keyboard::Event::Key { key, state, .. } => {
+                // the first few keys after start, so "typed but nothing happened" shows where it stopped
+                static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 { eprintln!("wl_keyboard: key {key} {state:?} (keymap loaded: {})", st.xkb.is_some()); }
                 let Some(x) = &st.xkb else { return };
                 let code = xkb::Keycode::new(key + 8);
                 let keysym = x.key_get_one_sym(code).raw();
@@ -1143,7 +1147,9 @@ impl Dispatch<WlSeat, ()> for State {
                 st.shape_device = st.cursor_mgr.as_ref().map(|m| m.get_pointer(&p, qh, ()));
                 st.pointer = Some(p);
             }
+            eprintln!("wl_seat: capabilities {c:?} (keyboard already held: {})", st.keyboard.is_some());
             if c.contains(wl_seat::Capability::Keyboard) && st.keyboard.is_none() {
+                eprintln!("wl_seat: keyboard acquired");
                 st.keyboard = Some(seat.get_keyboard(qh, ()));
             }
             if c.contains(wl_seat::Capability::Touch) && st.touch.is_none() {
