@@ -29,3 +29,26 @@ styles with font/size/paper/scene-number options, the `scribe` CLI, and the `scr
 - **aperture-style AI completion** in the writing pane (the loop pane that shows every request, as aperture does).
 - A face/dictation path: `voice-kit` + whisper on device for dictating lines on the phone (ties to the hatch voice-message idea).
 - PDF export directly (the repo has no PDF writer crate; today the HTML prints to PDF from any browser).
+
+## Shared kits (what voiceterm already has, and what is missing)
+
+Read from voiceterm (2026-10-03): its HTML pipeline is HTML -> QML (Qt); its egui `browser.rs` only DETECTS actionable widgets (forms,
+chat endpoints), it does not render pages. What IS reusable, all pure and Qt-free:
+
+1. **`note_render.rs`: the WYSIWYG blend.** "The caret's line shows as raw source, every other line is rendered", per block, pure.
+   That is exactly the single-surface editor scribe wants (the focused block is editable source, the rest is the formatted page),
+   and its `[[wikilinks]]` (zbrackets) are how a scene can link a character sheet or a bucket.
+2. **`link_graph.rs` + `niftyplot_view.rs` (+ `connections_graph.rs`, `graph_view.rs`):** a link graph with backlinks, ring layout
+   around a focus, one-ring-at-a-time expansion, directional navigation, breadcrumbs, and the "layers rotate" orientation maths.
+   voiceterm's egui frontend mounts them with `#[path]`; aperture needs the same for a repository graph and scribe for scene
+   flow and branch history. Make them ONE shared crate (`shared/graph-kit`), keep voiceterm's Qt and egui mounts working, and
+   put the Prezi-style camera (pan/zoom between nodes) on top, with `ink-kit`'s camera as the starting point.
+3. **The missing piece, `shared/doc-kit`:** a small block/inline document model with two ways OUT: `to_html` (scribe's `html.rs` is
+   the seed: escape, emphasis, centred/left blocks, print CSS) and an egui painter (scribe's `editor.rs` preview is the seed), and
+   ways IN from Markdown and a Fountain/quick dialect (scribe's `script.rs`) and, later, an HTML subset. The browser question
+   (an angelfish-style wrapper vs growing voiceterm-egui's web support) needs the HTML -> block model -> egui direction, which
+   does not exist yet; scribe's exporter is the reverse of the same model, so building doc-kit once serves the writer, the
+   browser, hatch notices and voice-message summaries.
+
+Order: graph-kit first (it unblocks the git graph for scribe and aperture and is mostly moving files), then the WYSIWYG block
+editor on note_render's pattern, then doc-kit.
