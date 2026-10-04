@@ -43,7 +43,8 @@ pub struct Config {
     pub dump: Option<String>,
     /// `EINK_INPUT`: where touch and pen come from under qtfb. `qtfb` (default): the display server's forwarded input,
     /// which on the Paper Pro arrives at ~7 reports/s although the digitizer reports at ~60 Hz. `evdev`: read the
-    /// digitizers directly (non-exclusive) and drop the forwarded input. `compare`: forwarded input drives the app,
+    /// FINGER directly (non-exclusive) and drop the forwarded finger touch; the pen still comes from the display
+    /// server. `evdev-all`: finger and pen both direct. `compare`: forwarded input drives the app,
     /// the direct readers only LOG what they see, to check their coordinates first.
     pub input: String,
     /// `EINK_FULL_EVERY_PAGES`: full refresh every N page turns (0 = never).

@@ -491,16 +491,19 @@ fn open_tablet_backend(cfg: &Config, hub: &InputHub, want: &str) -> std::io::Res
         eprintln!("eink: qtfb window {key}");
         // Where touch and pen come from (EINK_INPUT, see Config::input): AppLoad forwards them at ~7 reports/s on the
         // Paper Pro though the digitizer reports at ~60 Hz, so `evdev` reads the digitizers directly instead.
-        let (qtfb_route, direct) = match cfg.input.as_str() {
-            "evdev" => (crate::present::Route::DropTouch, Some(crate::present::Route::Pass)),
-            "compare" => (crate::present::Route::Pass, Some(crate::present::Route::LogTouch)),
-            _ => (crate::present::Route::Pass, None),
+        // evdev: the finger is read directly, the pen still comes from AppLoad (its direct mapping is unchecked);
+        // evdev-all: both are read directly; compare: AppLoad drives, the direct readers only log.
+        let (qtfb_route, direct, with_pen) = match cfg.input.as_str() {
+            "evdev" => (crate::present::Route::DropFinger, Some(crate::present::Route::Pass), false),
+            "evdev-all" => (crate::present::Route::DropTouch, Some(crate::present::Route::Pass), true),
+            "compare" => (crate::present::Route::Pass, Some(crate::present::Route::LogTouch), true),
+            _ => (crate::present::Route::Pass, None, false),
         };
-        eprintln!("eink: input = {} (AppLoad's forwarded touch is {})", cfg.input, if qtfb_route == crate::present::Route::DropTouch { "ignored" } else { "used" });
+        eprintln!("eink: input = {} (AppLoad's forwarded touch is {})", cfg.input, match qtfb_route { crate::present::Route::DropTouch => "ignored", crate::present::Route::DropFinger => "ignored for the finger, used for the pen", _ => "used" });
         let present = qtfb::QtfbPresent::connect(key, model, mode, hub.sender_with(qtfb_route))?;
         if let Some(route) = direct {
             let caps = present.caps();
-            crate::present::evdev::start_direct(cfg.touch, cfg.pen, caps.width, caps.height, hub.sender_with(route));
+            crate::present::evdev::start_direct(cfg.touch, cfg.pen, caps.width, caps.height, with_pen, hub.sender_with(route));
         }
         return Ok(Box::new(present));
     }

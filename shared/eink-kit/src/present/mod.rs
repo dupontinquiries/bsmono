@@ -86,6 +86,9 @@ pub enum Route {
     /// Drop touch and pen (and their raw coordinates); `Closed` and `Wake` still go through. Used for the display
     /// server's own forwarded input when the digitizers are read directly (`EINK_INPUT=evdev`).
     DropTouch,
+    /// Drop finger touch but let the pen (id `PEN_ID`) through: the finger is read directly while the pen still comes
+    /// from the display server (`EINK_INPUT=evdev`, until the pen's direct mapping has been checked).
+    DropFinger,
     /// Print each touch to the log and forward nothing (`EINK_INPUT=compare`): lets the direct reader's coordinates be
     /// checked against the display server's before it is trusted.
     LogTouch,
@@ -103,6 +106,8 @@ impl InputSender {
     pub fn send(&self, ev: Input) {
         match (&ev, self.route) {
             (Input::Touch(_) | Input::Raw { .. }, Route::DropTouch) => return,
+            (Input::Touch(t), Route::DropFinger) if t.id != crate::touch::PEN_ID => return,
+            (Input::Raw { .. }, Route::DropFinger) => return,
             (Input::Touch(t), Route::LogTouch) => {
                 eprintln!("eink: direct {:?} id={} ({:.0},{:.0})", t.phase, t.id, t.x, t.y);
                 return;
@@ -201,7 +206,7 @@ mod route_tests {
     #[test]
     fn a_route_decides_whether_touch_is_forwarded_and_never_blocks_close_or_wake() {
         let hub = InputHub::new().unwrap();
-        for (route, forwards_touch) in [(Route::Pass, true), (Route::DropTouch, false), (Route::LogTouch, false)] {
+        for (route, forwards_touch) in [(Route::Pass, true), (Route::DropTouch, false), (Route::DropFinger, false), (Route::LogTouch, false)] {
             let s = hub.sender_with(route);
             s.send(touch());
             s.send(Input::Raw { x: 1, y: 2 });
@@ -213,5 +218,16 @@ mod route_tests {
             assert!(got.iter().any(|i| matches!(i, Input::Closed(_))), "{route:?}: a closed display must always reach the runner");
             assert!(got.iter().any(|i| matches!(i, Input::Wake)), "{route:?}: wake");
         }
+    }
+
+    #[test]
+    fn dropping_the_finger_keeps_the_pen() {
+        let hub = InputHub::new().unwrap();
+        let s = hub.sender_with(Route::DropFinger);
+        s.send(Input::Touch(TouchEvent { id: 3, phase: Phase::Start, x: 1.0, y: 1.0 }));
+        s.send(Input::Touch(TouchEvent { id: crate::touch::PEN_ID, phase: Phase::Start, x: 2.0, y: 2.0 }));
+        let got = hub.drain();
+        let ids: Vec<u32> = got.iter().filter_map(|i| if let Input::Touch(t) = i { Some(t.id) } else { None }).collect();
+        assert_eq!(ids, vec![crate::touch::PEN_ID], "the finger is dropped, the pen is not");
     }
 }

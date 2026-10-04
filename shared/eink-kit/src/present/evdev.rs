@@ -195,7 +195,7 @@ pub fn spawn_pen_reader(dev: &TouchDevice, width: u32, height: u32, t: Transform
 }
 
 /// Start the direct touch and pen readers for a `width` x `height` surface; both send through `input`.
-pub fn start_direct(touch: Transform, pen: Transform, width: u32, height: u32, input: InputSender) {
+pub fn start_direct(touch: Transform, pen: Transform, width: u32, height: u32, with_pen: bool, input: InputSender) {
     match find_touchscreen() {
         Some(dev) => {
             eprintln!("eink: direct touch = event{} {:?} x{:?} y{:?} -> {width}x{height}", dev.number, dev.name, dev.x, dev.y);
@@ -203,6 +203,7 @@ pub fn start_direct(touch: Transform, pen: Transform, width: u32, height: u32, i
         }
         None => eprintln!("eink: no multitouch device found for direct input"),
     }
+    if !with_pen { return; }
     match find_pen() {
         Some(dev) => {
             eprintln!("eink: direct pen = event{} {:?} x{:?} y{:?} -> {width}x{height}", dev.number, dev.name, dev.x, dev.y);
