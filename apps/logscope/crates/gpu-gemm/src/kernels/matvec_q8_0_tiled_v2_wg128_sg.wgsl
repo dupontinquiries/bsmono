@@ -5,7 +5,11 @@ struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
 @group(0)@binding(2) var<storage,read> qs: array<f32>;
 @group(0)@binding(3) var<storage,read_write> c: array<f32>;
 @group(0)@binding(4) var<uniform> d: D;
-var<workgroup> part: array<f32,64>; // nsg(≤8) x tile(≤8) partials — tiny vs red[tile*128]
+// nsg x tile partials, nsg = 128 / subgroup_size. Sized for a subgroup of 4 (32 x 8); it was 64,
+// which holds a subgroup of 32 (4 x 8) or 16 (8 x 8) and NOT 8 — lavapipe's size — where tile 8
+// wrote 16 x 8 = 128 partials into 64 slots and the kernel returned rel 2.5 garbage while tiles 1
+// and 4 were exact. Still tiny next to red[tile*128].
+var<workgroup> part: array<f32,256>;
 @compute @workgroup_size(128,1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
         @builtin(subgroup_invocation_id) sglid:u32, @builtin(subgroup_size) sgsz:u32){
