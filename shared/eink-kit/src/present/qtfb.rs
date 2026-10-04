@@ -491,7 +491,10 @@ mod tests {
 
     fn fake_server(drop_on_mode: bool) -> Fake {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let path = std::env::temp_dir().join(format!("qtfb-fake-{}-{}.sock", std::process::id(), drop_on_mode));
+        // unique per call: tests run in parallel inside one process, and two that both asked for `drop_on_mode = true`
+        // used to delete and rebind each other's socket (an intermittent "connect: No such file or directory")
+        static SERIAL: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!("qtfb-fake-{}-{}-{}.sock", std::process::id(), drop_on_mode, SERIAL.fetch_add(1, Ordering::SeqCst)));
         let _ = std::fs::remove_file(&path);
         let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
         let srv = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0) };
