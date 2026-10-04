@@ -49,6 +49,8 @@ pub const POCKET_SLEEP_MS: Millis = 1500;
 
 /// How long the drawn accent takes to close most of the way (63%) to a new colour.
 pub const ACCENT_EASE_MS: f32 = 1200.0;
+/// Gaze points this far apart (or more) mean the eyes have gone: the cursor goes back to the trackpad's rules.
+pub const GAZE_TIMEOUT_MS: Millis = 1500;
 
 #[derive(Debug)]
 pub struct Shell {
@@ -66,6 +68,8 @@ pub struct Shell {
     /// A real pointing device (a USB mouse or trackpad, not a touchscreen or a virtual one) is attached.
     /// Unknown at start means "yes", so the cursor is never hidden on a guess.
     hw_pointer: bool,
+    /// When the last gaze point arrived. While it is recent the eyes are driving the fat cursor (see `gaze_point`).
+    gaze_last: Option<Millis>,
     /// What the system cursor was last told, so it is only told on a change.
     cursor_hidden: bool,
     /// Ambient light + time of day brightness.
@@ -187,6 +191,7 @@ impl Shell {
             modes: Modes::default(),
             fat: None,
             hw_pointer: true,
+            gaze_last: None,
             cursor_hidden: false,
             ambient,
             palette: Palette::default(),
@@ -282,7 +287,8 @@ impl Shell {
     /// Start or stop the fat cursor to match (trackpad on && pref), and hide
     /// or restore the system cursor with it.
     fn sync_fat(&mut self) -> Vec<Action> {
-        let want = self.modes.trackpad && self.prefs.fat_cursor;
+        // the eyes need the disc whatever the preference says: a gaze point has no pointer to move, only the disc
+        let want = (self.modes.trackpad && self.prefs.fat_cursor) || self.gaze_on();
         match (want, self.fat.is_some()) {
             (true, false) => {
                 self.fat = Some(FatCursor::new(self.screen, self.now));
@@ -295,6 +301,26 @@ impl Shell {
             _ => {}
         }
         self.sync_system_cursor()
+    }
+
+    /// Are the eyes driving the cursor right now.
+    pub fn gaze_on(&self) -> bool {
+        self.gaze_last.is_some_and(|t| self.now.saturating_sub(t) < GAZE_TIMEOUT_MS)
+    }
+
+    /// A gaze point from the eye tracker, as fractions of the screen (0,0 top-left, 1,1 bottom-right). The first one
+    /// starts the fat cursor (the shell owns the pointer for the duration); it eases after each new point as after a
+    /// trackpad nudge, and when the points stop for `GAZE_TIMEOUT_MS` the cursor goes back to whatever the trackpad
+    /// wants. The tracker is expected to have filtered the point: this only places it.
+    pub fn gaze_point(&mut self, nx: f32, ny: f32) -> Vec<Action> {
+        let now = self.now;
+        let (nx, ny) = (if nx.is_finite() { nx } else { 0.5 }, if ny.is_finite() { ny } else { 0.5 });
+        self.gaze_last = Some(now);
+        let mut out = self.sync_fat();
+        if let Some(f) = &mut self.fat {
+            f.place(nx.clamp(0.0, 1.0) * self.screen.0, ny.clamp(0.0, 1.0) * self.screen.1, now);
+        }
+        out
     }
 
     /// The system cursor is hidden while the fat cursor stands in for it OR while no real pointing device
@@ -652,6 +678,11 @@ impl Shell {
             self.prefs.brightness_offset = self.ambient.user;
             self.log(format!("saved: brightness {:+.2} of the band, voicing {:+.2}", self.ambient.user, self.prefs.audio_tone));
             out.push(Action::SavePrefs);
+        }
+        // the eyes went away: give the cursor back to the trackpad's rules
+        if self.gaze_last.is_some() && !self.gaze_on() {
+            self.gaze_last = None;
+            out.extend(self.sync_fat());
         }
         // The fat cursor's eased position IS the pointer: send it as it moves.
         if let Some(p) = self.fat.as_mut().and_then(|f| f.tick(now, dt)) {
@@ -1987,6 +2018,47 @@ mod tests {
             sh.tick(10_000 + i);
         }
         assert_eq!(sh.trace().count(), TRACE_CAP);
+    }
+
+    #[test]
+    fn gaze_points_drive_the_disc_even_with_the_preference_off_and_give_it_back_when_they_stop() {
+        use crate::trackpad::PointerOut;
+        let mut p = ShellPrefs::default();
+        p.fat_cursor = false;
+        let mut sh = Shell::new(p, S);
+        sh.tick(0);
+        assert!(sh.fat.is_none() && !sh.gaze_on());
+        let out = sh.gaze_point(0.25, 0.75);
+        assert!(out.contains(&Action::HideSystemCursor(true)), "the disc stands in for the pointer: {out:?}");
+        assert!(sh.fat.is_some() && sh.gaze_on());
+        assert_eq!(sh.fat.as_ref().unwrap().target, (102.0, 675.0), "fractions of the 408 x 900 screen");
+        // the pointer follows the eased disc and arrives
+        let mut last = None;
+        for i in 1..=60 {
+            for a in sh.tick(i * 16) {
+                if let Action::Pointer(PointerOut::Absolute { x, y }) = a { last = Some((x, y)); }
+            }
+        }
+        let (x, y) = last.expect("the pointer was moved");
+        assert!((x - 102.0).abs() < 1.0 && (y - 675.0).abs() < 1.0, "({x},{y})");
+        // the eyes go away: after the timeout the disc goes (the trackpad is off), and the system cursor returns
+        let t = sh.tick(1000 + GAZE_TIMEOUT_MS + 100);
+        assert!(sh.fat.is_none() && !sh.gaze_on(), "{t:?}");
+        assert!(t.contains(&Action::HideSystemCursor(false)), "{t:?}");
+    }
+
+    #[test]
+    fn gaze_does_not_end_a_trackpad_session_and_bad_points_are_placed_safely() {
+        let mut p = ShellPrefs::default();
+        p.fat_cursor = true;
+        let mut sh = Shell::new(p, S);
+        sh.toggle_mode(HoldOption::Trackpad);
+        sh.tick(0);
+        sh.gaze_point(f32::NAN, 2.0);
+        assert_eq!(sh.fat.as_ref().unwrap().target, (204.0, 899.0), "NaN is the middle, 2.0 is the bottom edge");
+        sh.tick(GAZE_TIMEOUT_MS + 500);
+        assert!(!sh.gaze_on());
+        assert!(sh.fat.is_some(), "the trackpad is still on, so the disc stays");
     }
 
     #[test]

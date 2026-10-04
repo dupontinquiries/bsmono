@@ -65,6 +65,13 @@ impl FatCursor {
         self.last_motion = now;
     }
 
+    /// Absolute position, in px, from a source that knows where on the screen it means (the eye tracker): the
+    /// target goes there and the disc eases after it, exactly as it does after a trackpad nudge.
+    pub fn place(&mut self, x: f32, y: f32, now: Millis) {
+        self.target = self.clamp((x, y));
+        self.last_motion = now;
+    }
+
     pub fn press(&mut self, down: bool, now: Millis) {
         self.pressed = down;
         self.last_motion = now;

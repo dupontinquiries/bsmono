@@ -1312,6 +1312,11 @@ fn main() {
                         sb.execute(out);
                     }
                     Ok(Command::Screenshot) => sb.execute(vec![tideshell_core::Action::Screenshot]),
+                    // the eye tracker's point: the shell eases the disc after it (the first one starts the disc)
+                    Ok(Command::Gaze(x, y)) => {
+                        let out = sb.shell.gaze_point(x, y);
+                        sb.execute(out);
+                    }
                     // The settings app decided what the chain should do; we
                     // are the process with the PipeWire connection.
                     Ok(Command::ReloadPrefs) => {

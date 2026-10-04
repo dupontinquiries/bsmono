@@ -35,12 +35,22 @@ pub enum Command {
     /// payload, unlike the others, because the sender is deciding values
     /// rather than asking for an action.
     SpeakerProps(Vec<(String, f32)>),
+    /// `gaze 0.42 0.31`: where the eyes are, as fractions of the screen. Sent by the eye tracker, which filters the
+    /// point itself; the shell eases the fat cursor after it.
+    Gaze(f32, f32),
 }
 
 impl Command {
     pub fn parse(s: &str) -> Option<Command> {
         if let Some(pairs) = tideshell_core::chaingraph::decode_props(s) {
             return Some(Command::SpeakerProps(pairs));
+        }
+        if let Some(rest) = s.trim().strip_prefix("gaze ") {
+            let mut it = rest.split_whitespace().map(|v| v.parse::<f32>());
+            return match (it.next(), it.next(), it.next()) {
+                (Some(Ok(x)), Some(Ok(y)), None) if x.is_finite() && y.is_finite() => Some(Command::Gaze(x, y)),
+                _ => None,
+            };
         }
         match s.trim() {
             "power-key" => Some(Command::PowerKey),
@@ -56,7 +66,7 @@ impl Command {
         }
     }
 
-    pub const NAMES: [&'static str; 9] = ["power-key", "volume-up", "volume-down", "lock", "palette", "switcher", "carousel", "screenshot", "reload-prefs"];
+    pub const NAMES: [&'static str; 10] = ["power-key", "volume-up", "volume-down", "lock", "palette", "switcher", "carousel", "screenshot", "reload-prefs", "gaze X Y"];
 }
 
 /// The keys cosmic-comp should hand to tideshell, as (keysym name, command).
@@ -298,8 +308,17 @@ mod tests {
         for n in ["carousel", "screenshot"] {
             assert!(Command::NAMES.contains(&n), "{n} is advertised in the unknown-command error");
         }
-        assert_eq!(Command::NAMES.len(), 9);
+        assert_eq!(Command::NAMES.len(), 10);
         assert_eq!(Command::parse("screenshots"), None);
+    }
+
+    #[test]
+    fn gaze_is_a_socket_command_with_two_fractions_and_nothing_else() {
+        assert_eq!(Command::parse("gaze 0.42 0.31"), Some(Command::Gaze(0.42, 0.31)));
+        assert_eq!(Command::parse("gaze  1 0\n"), Some(Command::Gaze(1.0, 0.0)));
+        for bad in ["gaze", "gaze 0.5", "gaze a b", "gaze 0.5 0.5 0.5", "gaze nan 0.5", "gaze inf 0.5", "gazes 0.5 0.5"] {
+            assert_eq!(Command::parse(bad), None, "{bad:?}");
+        }
     }
 
     use super::*;
