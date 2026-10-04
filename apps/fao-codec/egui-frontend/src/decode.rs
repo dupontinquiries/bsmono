@@ -329,8 +329,14 @@ fn read_v8mx_trailer(data: &[u8], index: &[fao_v1::FaoFrameEntry]) -> Option<Vec
 }
 
 /// Where frame data ends: the furthest `offset + size` over the index.
+///
+/// Saturating, because the index is the first thing read from the file and a damaged entry can
+/// carry an offset next to u64::MAX: `offset + size` then overflows, which in a debug build is a
+/// panic on a bad FILE (the damaged-file harness found three such bytes in one key frame) and in
+/// release wraps to a small number that would make the trailer search start inside the frames.
+/// Callers clamp to `data.len()`, so saturating to the top is the right lie.
 fn frame_data_end(index: &[fao_v1::FaoFrameEntry]) -> usize {
-    index.iter().map(|e| (e.offset + e.size as u64) as usize).max().unwrap_or(0)
+    index.iter().map(|e| usize::try_from(e.offset.saturating_add(e.size as u64)).unwrap_or(usize::MAX)).max().unwrap_or(0)
 }
 
 /// The V8MX trailer, searched for from `search_start` in `data`.
