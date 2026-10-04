@@ -58,6 +58,7 @@ pub enum PaletteAction {
     /// decides), forced on, forced off.
     Cold(&'static str),
     LayoutPullDown,
+    LayoutThin,
     LayoutRightBar,
     ClockDigital,
     ClockAnalog,

@@ -283,9 +283,8 @@ impl ShellView {
 
     fn bar_width(shell: &Shell) -> f32 {
         match shell.prefs.layout {
-            Layout::RightBar if shell.bar_expanded => shell.prefs.bar_width * 2.6,
-            Layout::RightBar => shell.prefs.bar_width,
-            Layout::PullDown => 0.0,
+            l if l.has_bar() && shell.bar_expanded => l.bar_px(shell.prefs.bar_width) * 2.6,
+            l => l.bar_px(shell.prefs.bar_width),
         }
     }
 
@@ -293,8 +292,7 @@ impl ShellView {
     /// fake windows out beside it, as maximized windows would be.
     pub fn reserved_right(shell: &Shell) -> f32 {
         match shell.prefs.layout {
-            Layout::RightBar => shell.prefs.bar_width,
-            Layout::PullDown => 0.0,
+            l => l.bar_px(shell.prefs.bar_width),
         }
     }
 
@@ -310,7 +308,7 @@ impl ShellView {
             || shell.peek_dx.abs() > 1.0
             || shell.modes.trackpad
             || (shell.carousel.is_active() && !self.bar_surface)
-            || (shell.prefs.layout == Layout::RightBar && !self.bar_surface)
+            || (shell.prefs.layout.has_bar() && !self.bar_surface)
             || self.sheet.open
             || self.show_trace
             || shell.lock.is_locked()
@@ -336,7 +334,7 @@ impl ShellView {
         if shell.modes.trackpad {
             v.push(Self::pad_rect(size, Self::bar_width(shell)));
         }
-        if shell.prefs.layout == Layout::RightBar && !self.bar_surface {
+        if shell.prefs.layout.has_bar() && !self.bar_surface {
             let bw = Self::bar_width(shell);
             v.push(Rect::from_min_size(Pos2::new(size.x - bw, 0.0), Vec2::new(bw, size.y)));
         }
@@ -351,7 +349,7 @@ impl ShellView {
     /// Width the bar's surface should have right now (expanded or not), and
     /// the exclusive zone it reserves (always the collapsed width).
     pub fn bar_geometry(shell: &Shell) -> Option<(u32, i32)> {
-        (shell.prefs.layout == Layout::RightBar).then(|| (Self::bar_width(shell).round() as u32, shell.prefs.bar_width.round() as i32))
+        shell.prefs.layout.has_bar().then(|| (Self::bar_width(shell).round() as u32, shell.prefs.layout.bar_px(shell.prefs.bar_width).round() as i32))
     }
 
     /// The scale to draw a widget at, given whether it is pressed now: a
@@ -721,7 +719,7 @@ impl ShellView {
         let to = |x: f32, y: f32| origin + Vec2::new(x, y);
 
         // Bottom layer first: bar, then overlays above it.
-        if shell.prefs.layout == Layout::RightBar && !self.bar_surface {
+        if shell.prefs.layout.has_bar() && !self.bar_surface {
             out.extend(self.bar(ui, shell, pal, info, origin, size));
         }
         if shell.carousel.is_active() && !self.bar_surface {
@@ -1605,8 +1603,8 @@ impl ShellView {
             }
             self.bar_drag = 0.0;
         }
-        let unit = shell.prefs.bar_width.min(60.0);
-        let widgets = shell.prefs.bar_widgets.clone();
+        let unit = shell.prefs.layout.bar_px(shell.prefs.bar_width).min(60.0);
+        let widgets = shell.bar_widgets().to_vec(); // the thin bar has its own list
         let lay = bar::layout(&widgets, size.y - 28.0, unit);
         let cell = |y: f32, h: f32| Rect::from_min_size(rect.min + Vec2::new(4.0, 14.0 + y), Vec2::new(bw - 8.0, h));
         let icon_c = |r: Rect| if expanded { Pos2::new(r.left() + unit / 2.0, r.center().y) } else { r.center() };
@@ -1848,8 +1846,9 @@ impl ShellView {
             .show(ctx, |ui| {
               egui::ScrollArea::vertical().id_salt("ts-settings-scroll").max_height((shell.screen.1 - 90.0).max(200.0)).show(ui, |ui| {
                 ui.label("Layout");
-                ui.radio_value(&mut draft.layout, Layout::PullDown, "Pull-down control center");
-                ui.radio_value(&mut draft.layout, Layout::RightBar, "Right-hand bar");
+                ui.radio_value(&mut draft.layout, Layout::PullDown, "Top only (swipe down for the control center)");
+                ui.radio_value(&mut draft.layout, Layout::Thin, "Thin bar (the switcher on the right, narrow carousel)");
+                ui.radio_value(&mut draft.layout, Layout::RightBar, "Thick bar (full widgets)");
                 ui.separator();
                 ui.label("Clock");
                 ui.horizontal(|ui| {
@@ -2113,6 +2112,17 @@ mod tests {
     }
 
     #[test]
+    fn the_thin_bar_has_a_surface_of_half_the_width_and_top_only_has_none() {
+        let mut p = ShellPrefs::default();
+        p.layout = Layout::Thin;
+        let sh = Shell::new(p.clone(), (408.0, 900.0));
+        assert_eq!(ShellView::bar_geometry(&sh), Some((32, 32)), "half of the configured 64");
+        assert!(!sh.bar_widgets().is_empty(), "the thin bar draws its own widget list");
+        p.layout = Layout::PullDown;
+        assert_eq!(ShellView::bar_geometry(&Shell::new(p, (408.0, 900.0))), None);
+    }
+
+    #[test]
     fn bar_on_its_own_surface_frees_the_overlay() {
         use tideshell_core::prefs::{Layout, ShellPrefs};
         let mut view = ShellView::default();
@@ -2122,10 +2132,11 @@ mod tests {
         let mut sh = Shell::new(p, (408.0, 900.0));
         assert!(!view.needs_overlay(&sh), "idle right-bar shell: bar surface only, no overlay");
         assert_eq!(view.input_rects(&sh), Some(vec![]));
-        assert_eq!(ShellView::bar_geometry(&sh), Some((64, 64)));
+        // the thick bar is 5% under the configured 64 (prefs::THICK_SCALE)
+        assert_eq!(ShellView::bar_geometry(&sh), Some((61, 61)));
         sh.set_bar_expanded(true);
         let (w, reserve) = ShellView::bar_geometry(&sh).unwrap();
-        assert!(w > 64 && reserve == 64, "expanding widens the surface, not the reservation: {w} {reserve}");
+        assert!(w > 61 && reserve == 61, "expanding widens the surface, not the reservation: {w} {reserve}");
     }
 
     #[test]

@@ -12,17 +12,45 @@ use crate::switcher::Style;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
-    /// Swipe down from the top for the control-center drawer.
+    /// ONLY the top: swipe down for the control-center drawer, no bar.
     PullDown,
-    /// A persistent right-hand bar of mixable widgets; the top edge is inert.
+    /// A thin right-hand bar (half the thick bar's width) that is the switcher: the running windows, the
+    /// switcher and hatch, with narrower carousel peeks. The top drawer stays.
+    Thin,
+    /// A persistent right-hand bar of mixable widgets (the thick bar); the top edge is inert.
     RightBar,
+}
+
+/// The thick bar is 5% narrower than it was; the thin bar is half the thick bar's old width.
+pub const THICK_SCALE: f32 = 0.95;
+pub const THIN_SCALE: f32 = 0.5;
+/// What the thin bar holds: the running windows as the switcher, the switcher button, hatch, settings.
+pub const THIN_WIDGETS: &str = "running,spacer,switcher,hatch,settings";
+
+/// The thin bar's widgets, parsed once.
+pub fn thin_widgets() -> &'static [BarWidget] {
+    static W: std::sync::OnceLock<Vec<BarWidget>> = std::sync::OnceLock::new();
+    W.get_or_init(|| bar::parse_widgets(THIN_WIDGETS).0)
 }
 
 impl Layout {
     pub fn token(self) -> &'static str {
         match self {
             Layout::PullDown => "pull-down",
+            Layout::Thin => "thin",
             Layout::RightBar => "right-bar",
+        }
+    }
+
+    /// Does this layout draw the right-hand bar at all.
+    pub fn has_bar(self) -> bool { self != Layout::PullDown }
+
+    /// The bar's collapsed width in logical px for a configured base `bar_width` (0 with no bar).
+    pub fn bar_px(self, bar_width: f32) -> f32 {
+        match self {
+            Layout::PullDown => 0.0,
+            Layout::Thin => (bar_width * THIN_SCALE).round().max(28.0),
+            Layout::RightBar => (bar_width * THICK_SCALE).round(),
         }
     }
 }
@@ -276,8 +304,9 @@ impl ShellPrefs {
             "shell.layout" => {
                 self.layout = match v {
                     "pull-down" => Layout::PullDown,
+                    "thin" => Layout::Thin,
                     "right-bar" => Layout::RightBar,
-                    _ => return Err(format!("shell.layout: '{v}' is not pull-down|right-bar")),
+                    _ => return Err(format!("shell.layout: '{v}' is not pull-down|thin|right-bar")),
                 }
             }
             "shell.bar.widgets" => {
@@ -445,6 +474,36 @@ fn parse_range(key: &str, v: &str, lo: f32, hi: f32) -> Result<f32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_three_layouts_round_trip_and_widths_follow_the_ask() {
+        for l in [Layout::PullDown, Layout::Thin, Layout::RightBar] {
+            let mut p = ShellPrefs::default();
+            p.layout = l;
+            let kv = p.to_kv();
+            let mut q = ShellPrefs::default();
+            assert!(q.apply_kv(kv.iter().map(|(a, b)| (a.as_str(), b.as_str()))).is_empty(), "{kv:?}");
+            assert_eq!(q.layout, l, "{}", l.token());
+        }
+        let base = 80.0;
+        let (none, thin, thick) = (Layout::PullDown.bar_px(base), Layout::Thin.bar_px(base), Layout::RightBar.bar_px(base));
+        assert_eq!(none, 0.0);
+        assert_eq!(thick, 76.0, "5% under the old 80");
+        assert_eq!(thin, 40.0, "half of the old 80");
+        assert!(thin < thick && !Layout::PullDown.has_bar() && Layout::Thin.has_bar() && Layout::RightBar.has_bar());
+        assert!(Layout::Thin.bar_px(20.0) >= 28.0, "never thinner than a thumb can use");
+        let mut p = ShellPrefs::default();
+        assert!(p.apply_kv([("shell.layout", "wide")]).len() == 1, "an unknown layout is rejected");
+    }
+
+    #[test]
+    fn the_thin_bar_is_the_switcher() {
+        let (ws, errs) = bar::parse_widgets(THIN_WIDGETS);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(ws.contains(&BarWidget::Running) && ws.contains(&BarWidget::Switcher));
+        assert!(!ws.contains(&BarWidget::Clock) && !ws.iter().any(|w| matches!(w, BarWidget::Slider(_))), "reduced: no clock or sliders");
+        assert_eq!(thin_widgets(), &ws[..]);
+    }
 
     #[test]
     fn round_trip_through_kv() {

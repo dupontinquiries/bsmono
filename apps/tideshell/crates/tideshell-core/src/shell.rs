@@ -845,8 +845,10 @@ impl Shell {
         };
         items.push(PaletteItem::new("set:cold", cold_label, if self.cold.on { "active" } else { "setting" }, PaletteAction::Cold(cold_next)));
         match self.prefs.layout {
-            Layout::PullDown => items.push(PaletteItem::new("set:layout", "Layout: right-hand bar", "setting", PaletteAction::LayoutRightBar)),
-            Layout::RightBar => items.push(PaletteItem::new("set:layout", "Layout: pull-down", "setting", PaletteAction::LayoutPullDown)),
+            // each entry is the NEXT layout in the cycle: top only -> thin bar -> thick bar -> top only
+            Layout::PullDown => items.push(PaletteItem::new("set:layout", "Layout: thin bar", "setting", PaletteAction::LayoutThin)),
+            Layout::Thin => items.push(PaletteItem::new("set:layout", "Layout: thick bar", "setting", PaletteAction::LayoutRightBar)),
+            Layout::RightBar => items.push(PaletteItem::new("set:layout", "Layout: top only", "setting", PaletteAction::LayoutPullDown)),
         }
         match self.prefs.clock_style {
             crate::clock::ClockStyle::Digital => items.push(PaletteItem::new("set:clock", "Clock: analog", "setting", PaletteAction::ClockAnalog)),
@@ -954,6 +956,10 @@ impl Shell {
             }
             PaletteAction::LayoutPullDown => {
                 prefs.layout = Layout::PullDown;
+                self.set_prefs(prefs)
+            }
+            PaletteAction::LayoutThin => {
+                prefs.layout = Layout::Thin;
                 self.set_prefs(prefs)
             }
             PaletteAction::LayoutRightBar => {
@@ -1522,7 +1528,7 @@ impl Shell {
     /// Width in px the carousel peeks reserve on EACH side while active.
     pub fn peek_reserve(&self) -> f32 {
         if self.carousel.is_active() {
-            (self.screen.0 * crate::carousel::peek_frac()).round()
+            (self.screen.0 * crate::carousel::peek_frac_for(self.prefs.layout)).round()
         } else {
             0.0
         }
@@ -1591,6 +1597,7 @@ impl Shell {
     pub fn bar_widgets(&self) -> &[BarWidget] {
         match self.prefs.layout {
             Layout::RightBar => &self.prefs.bar_widgets,
+            Layout::Thin => crate::prefs::thin_widgets(),
             Layout::PullDown => &[],
         }
     }

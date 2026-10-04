@@ -25,6 +25,17 @@ pub fn peek_frac() -> f32 {
     (1.0 - CENTER_FRAC) / 2.0
 }
 
+/// The peek strip's width fraction under a layout: the thick bar's carousel is 5% narrower, the thin bar's half
+/// as wide (reduced carousel), and with no bar it is what it always was.
+pub fn peek_frac_for(layout: crate::prefs::Layout) -> f32 {
+    use crate::prefs::Layout;
+    match layout {
+        Layout::PullDown => peek_frac(),
+        Layout::Thin => peek_frac() * 0.5,
+        Layout::RightBar => peek_frac() * crate::prefs::THICK_SCALE,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Left,
@@ -180,6 +191,15 @@ impl Carousel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_carousel_peeks_narrow_with_the_bar() {
+        use crate::prefs::Layout;
+        let (top, thick, thin) = (peek_frac_for(Layout::PullDown), peek_frac_for(Layout::RightBar), peek_frac_for(Layout::Thin));
+        assert!((top - 0.075).abs() < 1e-6, "no bar: unchanged");
+        assert!((thick / top - 0.95).abs() < 1e-5, "thick: 5% narrower");
+        assert!((thin / top - 0.5).abs() < 1e-5, "thin: half");
+    }
 
     #[test]
     fn a_window_that_opens_in_the_mode_becomes_current_and_maximized() {
