@@ -19,6 +19,34 @@ impl Gray {
     #[inline]
     pub fn at(&self, x: usize, y: usize) -> u8 { self.d[y * self.w + x] }
 
+    /// Resize by averaging: each output pixel is the area-weighted mean of the source pixels it covers (what OpenCV's
+    /// `INTER_AREA` does), the right way to SHRINK. Bilinear sampling of a 0.35x shrink skips most pixels and aliases.
+    pub fn resize_area(&self, out_w: usize, out_h: usize) -> Gray {
+        let (sx, sy) = (self.w as f64 / out_w as f64, self.h as f64 / out_h as f64);
+        // weights of each source column/row for each output column/row
+        let spans = |n_out: usize, scale: f64, n_src: usize| -> Vec<Vec<(usize, f64)>> {
+            (0..n_out).map(|o| {
+                let (a, b) = (o as f64 * scale, ((o + 1) as f64 * scale).min(n_src as f64));
+                let (i0, i1) = (a.floor() as usize, (b.ceil() as usize).min(n_src));
+                (i0..i1).map(|i| (i, ((i + 1) as f64).min(b) - (i as f64).max(a))).filter(|(_, w)| *w > 0.0).collect()
+            }).collect()
+        };
+        let (cx, cy) = (spans(out_w, sx, self.w), spans(out_h, sy, self.h));
+        // horizontal pass into floats, then vertical
+        let mut tmp = vec![0f64; out_w * self.h];
+        for y in 0..self.h {
+            for (ox, span) in cx.iter().enumerate() {
+                let tot: f64 = span.iter().map(|(_, w)| w).sum();
+                tmp[y * out_w + ox] = span.iter().map(|&(i, w)| self.at(i, y) as f64 * w).sum::<f64>() / tot;
+            }
+        }
+        Gray::from_fn(out_w, out_h, |x, y| {
+            let span = &cy[y];
+            let tot: f64 = span.iter().map(|(_, w)| w).sum();
+            (span.iter().map(|&(i, w)| tmp[i * out_w + x] * w).sum::<f64>() / tot + 0.5) as u8
+        })
+    }
+
     /// Turned a quarter turn clockwise (what a phone's sideways front sensor needs to stand a face upright).
     pub fn rotate_cw(&self) -> Gray {
         Gray::from_fn(self.h, self.w, |x, y| self.at(y, self.h - 1 - x))
@@ -350,5 +378,17 @@ mod tests {
         assert!(edge.d.iter().all(|&p| p == 50), "off the corner it holds the edge value");
         let wide = g.window(15.0, 15.0, 40.0, 40.0, 4, 4);
         assert!(wide.d.iter().any(|&p| p == 50) && wide.d.iter().any(|&p| p > 50));
+    }
+
+    #[test]
+    fn area_resize_averages_what_it_covers_and_keeps_a_flat_field_flat() {
+        let flat = Gray::new(100, 60, 117).resize_area(35, 21);
+        assert!(flat.d.iter().all(|&p| p == 117));
+        // alternating columns 0/200 shrunk 2x: every output pixel averages one of each -> 100 (bilinear sampling would give 0 or 200)
+        let stripes = Gray::from_fn(40, 8, |x, _| if x % 2 == 0 { 0 } else { 200 }).resize_area(20, 4);
+        assert!(stripes.d.iter().all(|&p| p == 100), "{:?}", &stripes.d[..6]);
+        // a fractional ratio: 3 -> 2 columns [10, 20, 30]: first = (10 + 0.5*20)/1.5, second = (0.5*20 + 30)/1.5
+        let g = Gray::from_fn(3, 1, |x, _| [10u8, 20, 30][x]).resize_area(2, 1);
+        assert_eq!((g.at(0, 0), g.at(1, 0)), (13, 27));
     }
 }
