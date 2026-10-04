@@ -118,13 +118,21 @@ fn score(name: &str, ps: &[P], extra_pines: usize, falls: usize) {
 }
 
 fn hand() -> (Vec<P>, usize, usize) {
-    let (mut ps, mut hp, mut fa) = (Vec::new(), 0, 0);
+    let (mut ps, mut hp, mut fa, mut scenery) = (Vec::new(), 0, 0, 0usize);
     for it in passworld::placements() {
         match it {
             Item::Prop { kind, x, z, .. } => ps.push(P { kind, x, z }),
             Item::HighPine { .. } => hp += 1,
             Item::Fall { .. } => fa += 1,
+            // Rooted in the rock, by passworld's own account: none of them is
+            // a floor prop a lane or a clearing can be scored against, so
+            // they are counted and said, not folded into the prop list.
+            Item::Crag { .. } | Item::Gem { .. } | Item::Arch { .. }
+            | Item::Statue { .. } | Item::Burrow { .. } | Item::Diorama { .. } => scenery += 1,
         }
+    }
+    if scenery > 0 {
+        println!("  (hand placements also carry {scenery} rock-rooted scenery items -- crags, gems, arches, statues, burrows, dioramas -- outside this score)");
     }
     (ps, hp, fa)
 }
