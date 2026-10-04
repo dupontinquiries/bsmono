@@ -207,6 +207,8 @@ pub struct Cam {
     /// Height of everything under the viewfinder last frame, so the
     /// full-screen viewfinder can take the rest.
     bottom_h: f32,
+    /// Where last frame's controls began (screen y): taps at or below it are the buttons', not the picture's.
+    controls_top: f32,
 }
 
 impl Cam {
@@ -285,6 +287,7 @@ impl Cam {
             layout: ViewMode::Auto,
             roll_open: false,
             bottom_h: 0.0,
+            controls_top: f32::INFINITY,
         }
     }
 
@@ -531,7 +534,7 @@ impl Cam {
         for g in gestures {
             if let uikit_egui::touch::Gesture::Tap(p) = g {
                 let at = egui::pos2(p.x, p.y);
-                if shown.contains(at) && has_live && self.viewer.is_none() { self.tap_focus(at, shown); }
+                if crate::tapfocus::tap_counts([at.x, at.y], [shown.left(), shown.top(), shown.right(), shown.bottom()], self.controls_top) && has_live && self.viewer.is_none() { self.tap_focus(at, shown); }
             }
         }
         self.drive_focus(ctx);
@@ -555,6 +558,7 @@ impl Cam {
             ui.painter().galley(at, g, egui::Color32::WHITE);
         }
         let bottom_top = ui.cursor().top();
+        self.controls_top = bottom_top;
         if let Some(t) = &self.flashed {
             let age = t.elapsed().as_secs_f32();
             if age < 0.25 {

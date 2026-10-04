@@ -28,6 +28,14 @@ pub const ROI_SIZE: f32 = 0.18;
 /// How long the result is shown over the picture.
 pub const RESULT_SHOW_MS: u64 = 1_400;
 
+/// `SNAPSHOT_CAM_AF_TRACE=1` logs, to stderr, every frame's score while a probe settles (position, ms and frames since
+/// the move) and each probe's accepted score and the verdict. It changes nothing else. One tap's trace shows how long
+/// the lens really takes to ring down after a step and where the peak truly is, which is what overshoot tuning needs.
+fn trace() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("SNAPSHOT_CAM_AF_TRACE").is_ok_and(|v| v == "1"))
+}
+
 /// Something that moves the lens.
 pub trait Lens {
     fn move_to(&mut self, pos: i64) -> Result<(), String>;
@@ -115,6 +123,7 @@ impl TapFocus {
                         return None; // the frames in flight are the old position's
                     }
                     Step::Done(o) => {
+                        if trace() { eprintln!("af: DONE position={:?} peak={:.1} contrast={:.2} probes={}", o.position, o.peak, o.contrast, o.probes); }
                         let verdict = match o.position {
                             Some(p) => match lens.move_to(p) {
                                 Ok(()) => Verdict::Locked { pos: p, contrast: o.contrast },
@@ -131,8 +140,14 @@ impl TapFocus {
                 },
                 Some(pr) => {
                     let settled = now_ms.saturating_sub(pr.issued_ms) >= SETTLE_MS && f.seq >= pr.issued_seq + FRESH_FRAMES;
+                    if trace() {
+                        if let Some(s) = focus::sharpness(f, *roi) {
+                            eprintln!("af: pos={} +{}ms seq+{} score={:.1} settled={settled}", pr.pos, now_ms.saturating_sub(pr.issued_ms), f.seq.saturating_sub(pr.issued_seq), s);
+                        }
+                    }
                     if !settled { return None; }
                     let Some(score) = focus::sharpness(f, *roi) else { return None }; // a torn frame: wait for the next
+                    if trace() { eprintln!("af: PROBE pos={} score={:.1}", pr.pos, score); }
                     search.feed(score);
                     *probe = None; // ask for the next one in this same call
                 }
@@ -164,6 +179,13 @@ impl TapFocus {
             Verdict::Failed(e) => Some(format!("focus failed: {e}")),
         }
     }
+}
+
+/// Does a tap at `at` (screen points) count as "focus here"? Only on the picture (`shown` = [left, top, right,
+/// bottom]) AND above the controls (`controls_top`, where last frame's controls began): the shutter and the buttons
+/// beside it sit at the picture's edge, and a tap on "take photo" also ran a focus search.
+pub fn tap_counts(at: [f32; 2], shown: [f32; 4], controls_top: f32) -> bool {
+    at[0] >= shown[0] && at[0] <= shown[2] && at[1] >= shown[1] && at[1] <= shown[3] && at[1] < controls_top
 }
 
 /// The frame fractions a tap at `picture` (fractions of what is drawn, already mirrored) means, given
@@ -407,4 +429,14 @@ mod tests {
         assert_eq!(actuator_for("/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a", &subdevs), None, "so is the other rear sensor");
     }
 
+
+    #[test]
+    fn a_tap_on_the_controls_never_focuses_even_when_the_picture_runs_under_them() {
+        let shown = [0.0, 0.0, 900.0, 300.0];
+        assert!(tap_counts([450.0, 150.0], shown, 280.0), "on the picture");
+        assert!(!tap_counts([800.0, 290.0], shown, 280.0), "the picture's last rows are under the controls: the shutter");
+        assert!(!tap_counts([450.0, 350.0], shown, 280.0), "below the picture");
+        assert!(!tap_counts([950.0, 100.0], shown, 280.0), "beside it");
+        assert!(tap_counts([800.0, 290.0], shown, f32::INFINITY), "with no controls known yet the picture alone decides");
+    }
 }
