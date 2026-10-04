@@ -200,6 +200,12 @@ impl Launcher {
         self.results = scored.into_iter().map(|(_, i)| i).collect();
     }
 
+    /// Every entry the launcher knows, apps AND the virtual ones (an app's actions, Lock), whatever the query. For a
+    /// caller with its own search box (Tideshell's palette) that wants to match them itself.
+    pub fn all_entries(&self) -> impl Iterator<Item = &AppEntry> {
+        self.entries.iter()
+    }
+
     /// Entries in display order for the current query.
     pub fn results(&self) -> impl Iterator<Item = &AppEntry> {
         self.results.iter().map(|&i| &self.entries[i])
@@ -531,5 +537,16 @@ mod tests {
         l.toggle_favorite("firefox");
         assert!(l.is_favorite("firefox"), "an app still can be");
         assert!(l.activate("nope#nothing").is_err());
+    }
+
+    #[test]
+    fn all_entries_includes_the_virtual_ones_that_browsing_hides() {
+        let _g = crate::testenv::scoped_config_home("all-entries");
+        let l = Launcher::with_entries(Config::default(), vec![firefox()]);
+        assert_eq!(l.results().count(), 1, "browsing: the app only");
+        let kinds: Vec<_> = l.all_entries().map(|e| e.kind.clone()).collect();
+        assert!(kinds.iter().any(|k| matches!(k, entry::EntryKind::Action { .. })), "its actions are there: {kinds:?}");
+        assert!(kinds.iter().any(|k| matches!(k, entry::EntryKind::System(_))), "and Lock");
+        assert_eq!(kinds.iter().filter(|k| **k == entry::EntryKind::App).count(), 1);
     }
 }
