@@ -6333,11 +6333,26 @@ reproducible in software and not a fault.", raw_diff - diff);
         eprintln!("gate-moe-raw: adapter = {}", gpu.adapter_name);
         let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
         let (d, ff, ne, n_used, ring) = (256usize, 256usize, 4usize, 2usize, 3usize);
-        // synthetic Q4_K tensors, laid out as a GGUF does: expert index slowest, so each expert is contiguous
+        // synthetic Q4_K tensors, laid out as a GGUF does: expert index slowest, so each expert is contiguous.
+        // The super-block scales (f16 d, dmin at bytes 0..4) are kept in a REAL weight's range — random
+        // f16 bits reach 1e4, the dequantized weights 1e24, and the decode compared below was two numbers
+        // of magnitude 2.6e24 whose 1.3e20 difference read as garbage when it was rel 5e-5 of rounding.
+        // The seed is MIXED in, not added: `i*K + seed` for seeds 1, 2, 3 gave three tensors that
+        // differed in one byte per 512 (the +1 only reaches bit 9 on a carry), so gate ≈ up ≈ down
+        // and a fill that swapped gate and up changed the decode in the fourth digit — a break the
+        // gate could not see.
         let mk = |seed: u32, nb: usize| -> Vec<u8> {
             (0..nb * 144).map(|i| {
-                let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed);
-                (x >> 9) as u8
+                let mut x = (i as u32).wrapping_mul(2654435761) ^ seed.wrapping_mul(0x9E37_79B9);
+                x ^= x >> 15; x = x.wrapping_mul(0x2C1B_3C6D); x ^= x >> 12;
+                let r = (x >> 9) as u8;
+                match i % 144 {
+                    0 => (0x2800u16 | (x as u16 & 0x3ff)) as u8,        // d    in [0.03125, 0.0625)
+                    1 => ((0x2800u16 | (x as u16 & 0x3ff)) >> 8) as u8,
+                    2 => (0x2400u16 | (x as u16 & 0x3ff)) as u8,        // dmin in [0.015625, 0.03125)
+                    3 => ((0x2400u16 | (x as u16 & 0x3ff)) >> 8) as u8,
+                    _ => r,
+                }
             }).collect()
         };
         let gu_nb = ff * d / 256; let dn_nb = d * ff / 256;
@@ -6360,7 +6375,7 @@ reproducible in software and not a fault.", raw_diff - diff);
         let rw: Vec<f32> = (0..ne * d).map(|i| (((i as u32).wrapping_mul(2654435761) >> 9) as f32 / 8_388_608.0) - 1.0).collect();
         let xin: Vec<f32> = (0..d).map(|i| ((i as f32) * 0.023).cos()).collect();
 
-        let run = |stream: gpu_kernels::MoeStream| -> Vec<f32> {
+        let run = |stream: gpu_kernels::MoeStream| -> (Vec<f32>, gpu_kernels::MoeLayer) {
             let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
                 router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
                 gate_up: Vec::new(), down: Vec::new(),
@@ -6374,14 +6389,100 @@ reproducible in software and not a fault.", raw_diff - diff);
                 let n2 = gpu.upload(&xin, 1, d);
                 last = gpu.download(&gpu.moe_ffn_t(&layer, &n2, 1, d, &x));
             }
-            last
+            (last, layer)
         };
 
-        let want = run(gpu.build_moe_stream_ring(&gus, &dns, ff, d, n_used, 0, Some(ring)));
-        let got = run(gpu.build_moe_stream_raw(gate, up, down, ne, ff, d, n_used, ring));
-        ck(&format!("view path produces {} outputs", want.len()), got.len() == want.len() && !want.is_empty());
+        // THE KERNEL ALONE, before the plumbing: expert 0's gate matrix converted on the GPU from its
+        // Q4_K bytes (q4k_to_q4_words, the kernel the view path's fills run) against the host path's
+        // requantization of the same bytes. If this line fails the decode line below cannot pass and
+        // the fault is the conversion kernel; if it passes, the fault is the staging / view / slot
+        // plumbing. The decode line alone could not tell the two apart.
+        {
+            let gw = gpu.q4k_to_q4_words(&gate[..gu_nb * 144], ff, d);
+            let (hb, hoff) = gpu.quantize_q4_host_bytes(&gpu_kernels::gguf::dequantize(12, &gate[..gu_nb * 144], ff * d).unwrap(), ff, d);
+            let hw: &[u32] = bytemuck::cast_slice(&hb);
+            // A ROUNDING TIE is one nibble off by one: the requantizer's quotient landed on .5 and
+            // the GPU's reciprocal went the other way (--gate-q4k documents the same straddles on
+            // lavapipe). Anything else — a scale, a nibble off by more, a word elsewhere — is a bug.
+            let tie = |a: u32, b: u32| -> bool {
+                a != b && (0..8).all(|n| { let (ca, cb) = ((a >> (n * 4)) & 0xf, (b >> (n * 4)) & 0xf); ca.abs_diff(cb) <= 1 })
+            };
+            let hoff_w = hoff / 4;
+            let mut ties = 0usize; let mut bad: Option<String> = None;
+            for (i, (a, b)) in gw.iter().zip(hw).enumerate() {
+                if a == b { continue; }
+                if i < hoff_w && tie(*a, *b) { ties += 1; continue; }
+                if bad.is_none() {
+                    bad = Some(if i < hoff_w { format!("codes word {i}: {a:08x} vs {b:08x}") } else { format!("scale {} = {:.3e} vs {:.3e}", i - hoff_w, f32::from_bits(*a), f32::from_bits(*b)) });
+                }
+            }
+            ck(&format!("Q4_K→q4 GPU conversion == host requantization up to rounding ties, one expert ({} words, {ties} tie{}{})", gw.len(), if ties == 1 { "" } else { "s" }, bad.as_ref().map(|b| format!("; first real difference {b}")).unwrap_or_default()),
+                gw.len() == hw.len() && bad.is_none() && ties * 200 <= gw.len());
+        }
+        // THE PLUMBING ALONE: the same kernel through the fill's staging buffer and a bound VIEW, at
+        // offset 0 and at a ring-slot offset, against the plain-buffer conversion. The slot layout puts
+        // the scales at a 256-aligned word offset, so the comparison is region by region.
+        {
+            let plain = gpu.q4k_to_q4_words(&gate[..gu_nb * 144], ff, d);
+            let (qw_words, qs_words) = (ff * d / 8, ff * d / 32);
+            let qs_off_words = (ff * d / 2).div_ceil(256) * 256 / 4;
+            for off in [0usize, 110592] {
+                let staged = gpu.probe_staged_convert(&gate[..gu_nb * 144], ff, d, off, qs_off_words);
+                let codes_ok = staged[..qw_words] == plain[..qw_words];
+                let scales_ok = staged[qs_off_words..qs_off_words + qs_words] == plain[qw_words..qw_words + qs_words];
+                ck(&format!("conversion through the staging VIEW at byte {off} == plain-buffer conversion (codes {}, scales {})", if codes_ok { "same" } else { "DIFFER" }, if scales_ok { "same" } else { "DIFFER" }), codes_ok && scales_ok);
+            }
+        }
+        let (want, _host_layer) = run(gpu.build_moe_stream_ring(&gus, &dns, ff, d, n_used, 0, Some(ring)));
+        let (got, raw_layer) = run(gpu.build_moe_stream_raw(gate, up, down, ne, ff, d, n_used, ring));
         let md = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-        ck(&format!("decode from FILE VIEWS == decode from host copies: max|diff|={md:.3e}"), md == 0.0);
+        let mag = want.iter().fold(0f32, |m, x| m.max(x.abs())).max(f32::MIN_POSITIVE);
+        // WHAT IS IN THE SLOTS after the view-path run, printed only when the decode disagrees: each
+        // gate‖up and down slot against every expert's plain conversion, codes and scales separately,
+        // so a wrong fill names its region (this is how the 1e20 was traced to the fixture's scales).
+        if md / mag > 5e-2 {
+            let s = raw_layer.stream.as_ref().unwrap().lock().unwrap();
+            let (qw_words, qs_words) = (2 * ff * d / 8, 2 * ff * d / 32);
+            let qs_off_words = (2 * ff * d / 2).div_ceil(256) * 256 / 4;
+            let plain: Vec<Vec<u32>> = (0..ne).map(|e| {
+                let mut g = gpu.q4k_to_q4_words(&gate[e * gu_nb * 144..(e + 1) * gu_nb * 144], ff, d);
+                let u = gpu.q4k_to_q4_words(&up[e * gu_nb * 144..(e + 1) * gu_nb * 144], ff, d);
+                // [2ff, d]: gate codes, up codes, then gate scales, up scales
+                let (gq, gs) = g.split_at_mut(ff * d / 8);
+                let mut v = Vec::with_capacity(qw_words + qs_words);
+                v.extend_from_slice(gq); v.extend_from_slice(&u[..ff * d / 8]);
+                v.extend_from_slice(gs); v.extend_from_slice(&u[ff * d / 8..]);
+                v
+            }).collect();
+            for slot in 0..s.gu_slots.n_slots() {
+                let w = gpu.download_words(&s.gu_slots.tensor_full(slot));
+                let codes = &w[..qw_words];
+                let scales = &w[qs_off_words..qs_off_words + qs_words];
+                let who = (0..ne).find(|&e| codes == &plain[e][..qw_words]);
+                let sc_who = (0..ne).find(|&e| scales == &plain[e][qw_words..]);
+                let finite = scales.iter().all(|b| f32::from_bits(*b).is_finite());
+                eprintln!("gate-moe-raw: slot {slot}: codes = expert {who:?}, scales = expert {sc_who:?} (finite {finite}; scale[0] {:.3e})", f32::from_bits(scales[0]));
+            }
+            let (dqw, dqs) = (d * ff / 8, d * ff / 32);
+            let dqs_off = (d * ff / 2).div_ceil(256) * 256 / 4;
+            let dplain: Vec<Vec<u32>> = (0..ne).map(|e| gpu.q4k_to_q4_words(&down[e * dn_nb * 144..(e + 1) * dn_nb * 144], d, ff)).collect();
+            for slot in 0..s.dn_slots.n_slots() {
+                let w = gpu.download_words(&s.dn_slots.tensor_full(slot));
+                let who = (0..ne).find(|&e| &w[..dqw] == &dplain[e][..dqw]);
+                let sc_who = (0..ne).find(|&e| &w[dqs_off..dqs_off + dqs] == &dplain[e][dqw..]);
+                eprintln!("gate-moe-raw: down slot {slot}: codes = expert {who:?}, scales = expert {sc_who:?} (scale[0] {:.3e})", f32::from_bits(w[dqs_off]));
+            }
+            let mag = |v: &[f32]| v.iter().fold(0f32, |m, x| m.max(x.abs()));
+            eprintln!("gate-moe-raw: |want| max {:.3e} (host copies), |got| max {:.3e} (views)", mag(&want), mag(&got));
+        }
+        ck(&format!("view path produces {} outputs", want.len()), got.len() == want.len() && !want.is_empty());
+        // Equal up to the conversion's rounding ties. A one-code difference compounds through the
+        // SwiGLU product and the down projection: 3 ties in one gate matrix moved this output by rel
+        // 8e-3 on lavapipe, so the bar is 5e-2. A slot holding the wrong expert, or gate and up
+        // swapped in the fill (the break test), is rel ~0.9; scales read from the codes region was
+        // 1e20 absolute before the fixture's scales were tamed. Orders of magnitude either way.
+        ck(&format!("decode from FILE VIEWS == decode from host copies up to rounding ties: max|diff|={md:.3e}, rel={:.2e} (bound 5e-2)", md / mag),
+            got.iter().all(|v| v.is_finite()) && md / mag <= 5e-2);
         // and the view-backed store genuinely holds no expert bytes
         let s = gpu.build_moe_stream_raw(gate, up, down, ne, ff, d, n_used, ring);
         ck("view-backed store holds zero host expert bytes", s.host_gu.is_empty() && s.host_dn.is_empty());

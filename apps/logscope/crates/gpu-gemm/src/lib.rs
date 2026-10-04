@@ -2310,6 +2310,22 @@ line: {head:?}. Compiler: {e}");
         self.dispatch(Q4K_TO_Q4, &[src], out, bytemuck::cast_slice(&dims), (gx, gy, 1));
     }
 
+    /// GATE HELPER: the expert fill's conversion path in isolation — `raw` written into the shared
+    /// staging buffer at byte `stage_off`, bound as a VIEW, converted by `q4k_convert_from` into a
+    /// fresh [n, k] q4 blob laid out like a stream slot (codes, then scales at `qs_off_words`), and
+    /// read back. `q4k_to_q4_words` is the same kernel over a buffer of its own, so a difference
+    /// between the two is the staging / view plumbing and nothing else.
+    pub fn probe_staged_convert(&self, raw: &[u8], n: usize, k: usize, stage_off: usize, qs_off_words: usize) -> Vec<u32> {
+        let al = |x: usize| x.div_ceil(256) * 256;
+        let stage = self.moe_stage(stage_off + al(raw.len()));
+        self.write_chunked(&stage.buf, stage_off as u64, raw);
+        let src = Tensor { buf: stage.buf.clone(), rows: 1, cols: raw.len() / 4, pool: None, site: (0, 0),
+                           view: Some((stage_off as u64, al(raw.len()) as u64)), bid: 0 };
+        let out = self.alloc_words(qs_off_words + n * (k / 32));
+        self.q4k_convert_from(&src, &out, n, k, 0, qs_off_words);
+        self.download_words(&out)
+    }
+
     /// How many fills the staging ring holds before it must wrap.
     ///
     /// This is the renderer's answer to the problem _181 solved with a submit per fill. A single staging
