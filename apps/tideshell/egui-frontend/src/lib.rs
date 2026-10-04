@@ -274,6 +274,11 @@ fn initial(name: &str) -> String {
     name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().collect()).unwrap_or_else(|| "?".into())
 }
 
+/// The settings sheet's width: 520 where there is room, else the screen less a margin (a phone is ~400 points wide).
+pub fn settings_sheet_width(screen_w: f32) -> f32 {
+    (screen_w - 16.0).clamp(240.0, 520.0)
+}
+
 impl ShellView {
     /// Geometry of the trackpad pad in screen-local coordinates.
     pub fn pad_rect(screen: Vec2, bar_w: f32) -> Rect {
@@ -1839,19 +1844,27 @@ impl ShellView {
         let catalog = bar::catalog();
         let sheet = &mut self.sheet;
         let draft = sheet.draft.get_or_insert_with(ShellPrefs::default);
+        // never wider than the screen: the sheet sizes itself to its widest row, and a phone is ~400 points wide
+        let sheet_w = settings_sheet_width(shell.screen.0);
         egui::Window::new("Shell settings")
             .collapsible(false)
             .resizable(false)
+            .default_width(sheet_w)
+            .max_width(sheet_w)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-              egui::ScrollArea::vertical().id_salt("ts-settings-scroll").max_height((shell.screen.1 - 90.0).max(200.0)).show(ui, |ui| {
+              ui.set_max_width(sheet_w - 16.0);
+              egui::ScrollArea::vertical().id_salt("ts-settings-scroll").max_height((shell.screen.1 - 90.0).max(200.0)).auto_shrink([false, true]).show(ui, |ui| {
                 ui.label("Layout");
-                ui.radio_value(&mut draft.layout, Layout::PullDown, "Top only (swipe down for the control center)");
-                ui.radio_value(&mut draft.layout, Layout::Thin, "Thin bar (the switcher on the right, narrow carousel)");
-                ui.radio_value(&mut draft.layout, Layout::RightBar, "Thick bar (full widgets)");
+                ui.horizontal_wrapped(|ui| {
+                    ui.radio_value(&mut draft.layout, Layout::PullDown, "Top only");
+                    ui.radio_value(&mut draft.layout, Layout::Thin, "Thin bar");
+                    ui.radio_value(&mut draft.layout, Layout::RightBar, "Thick bar");
+                });
+                ui.label(egui::RichText::new("Top only: swipe down for the control center. Thin: a narrow right-hand switcher and narrow carousel. Thick: the full widget bar.").small().weak());
                 ui.separator();
                 ui.label("Clock");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.radio_value(&mut draft.clock_style, tideshell_core::clock::ClockStyle::Digital, "Digital");
                     ui.radio_value(&mut draft.clock_style, tideshell_core::clock::ClockStyle::Analog, "Analog");
                 });
@@ -1882,13 +1895,13 @@ impl ShellView {
                 });
                 ui.separator();
                 ui.label("Trackpad cursor");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.radio_value(&mut draft.fat_cursor, false, "Normal");
                     ui.radio_value(&mut draft.fat_cursor, true, "Fat (iPad-style, eased)");
                 });
                 ui.separator();
                 ui.label("Switcher");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.radio_value(&mut draft.switcher_style, Style::Grid, "Grid");
                     ui.radio_value(&mut draft.switcher_style, Style::Deck, "Deck");
                 });
@@ -1945,7 +1958,7 @@ impl ShellView {
                 });
                 ui.separator();
                 ui.label("Cold mode (gloves: volume keys steer, flicks act)");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     for (v, label) in [("auto", "Auto"), ("on", "On"), ("off", "Off")] {
                         ui.radio_value(&mut draft.cold, v.to_string(), label);
                     }
@@ -1956,14 +1969,14 @@ impl ShellView {
                 ui.checkbox(&mut draft.rotate_flip, "Landscape is mirrored on this panel (flip 90/270)");
                 ui.separator();
                 ui.label("Home widget (tap the clock on the cover to cycle)");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     use tideshell_core::prefs::HomeWidget as H;
                     for (w, label) in [(H::Clock, "Clock"), (H::Snapclone, "Snapclone id"), (H::Temperature, "Temperature")] {
                         ui.radio_value(&mut draft.home_widget, w, label);
                     }
                 });
                 ui.checkbox(&mut draft.living, "Living lock screen (rear camera glass; uses the GPU)");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Lock-screen night black (OLED):");
                     for (v, label) in [("on", "auto"), ("off", "old"), ("ab", "A/B"), ("force", "force night")] {
                         ui.radio_value(&mut draft.lock_night, v.to_string(), label);
@@ -1987,7 +2000,7 @@ impl ShellView {
                     .weak(),
                 );
                 ui.separator();
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Apply").clicked() {
                         applied = Some(draft.clone());
                     }
@@ -2109,6 +2122,17 @@ mod tests {
         assert!(r[0].contains(Pos2::new(200.0, 800.0)) && !r[0].contains(Pos2::new(200.0, 100.0)));
         sh.open_switcher();
         assert_eq!(view.input_rects(&sh), None, "switcher is modal: whole screen");
+    }
+
+    #[test]
+    fn the_settings_sheet_never_outgrows_the_screen() {
+        for w in [320.0f32, 360.0, 408.0, 480.0, 720.0, 1280.0, 1920.0] {
+            let sheet = settings_sheet_width(w);
+            assert!((240.0..=520.0).contains(&sheet), "{w}: {sheet}");
+            if w >= 256.0 { assert!(sheet <= w - 16.0 + 1e-3, "{w}: sheet {sheet} leaves no margin"); }
+        }
+        assert_eq!(settings_sheet_width(1920.0), 520.0);
+        assert!(settings_sheet_width(408.0) < 408.0, "the phone portrait case");
     }
 
     #[test]
