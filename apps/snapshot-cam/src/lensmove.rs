@@ -10,7 +10,8 @@
 //! **What this does.** The motor is open-loop (nothing reports where the glass really is), so the PD law from the
 //! owner's embedded-controls coursework runs on a VIRTUAL position instead: each 4 ms tick
 //! `step = KP * error + KD * (error - previous_error)`, capped at `MAX_STEP`, and the motor is commanded to follow.
-//! The derivative term shrinks the step as the error shrinks (the damping that keeps a spring-mass from ringing), the
+//! Gains are chosen so kp + kd < 1 (the loop cannot overshoot; see `math_kit::pd`, which carries the same law and
+//! measured that the derivative term is extra gain, not damping), the
 //! cap keeps every step under the audible size, and a full-range move takes under 200 ms. Pure; the thread that
 //! applies it to the real device is `tapfocus::V4l2Lens`.
 

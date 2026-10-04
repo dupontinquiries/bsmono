@@ -36,6 +36,7 @@ pub mod daylight;
 pub mod geom;
 pub mod hash;
 pub mod mat;
+pub mod pd;
 pub mod scalar;
 pub mod stats;
 pub mod vec;
