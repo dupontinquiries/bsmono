@@ -64,6 +64,8 @@ struct AppState {
     walk_to: Option<Vec3>,
     /// Open only while the LAN screen is: it holds a socket.
     lan: Option<crate::lanlobby::LanLobby>,
+    /// The lockstep match running over the den's socket, while one is (`lanmatch`).
+    lanmatch: Option<crate::lanmatch::LanMatch>,
     /// The stalk toggle. App state, not sim state: the sim decides whether
     /// a cat that WANTS to stalk currently can.
     stalk_on: bool,
@@ -420,6 +422,7 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         capturing: None,
         walk_to: None,
         lan: None,
+        lanmatch: None,
         stalk_on: false,
         locked: false,
         scoreboard: false,
@@ -712,6 +715,7 @@ fn gather_controls(s: &mut AppState, dt: f32) {
             // Esc leaves the match being watched
             s.spectator = None;
             s.game = None;
+            s.lanmatch = None;
             s.intro = None;
             s.screen = Screen::Menu;
             return;
@@ -871,37 +875,59 @@ fn fit_scene_to_quality(s: &mut AppState) {
 }
 
 fn start_game(s: &mut AppState) {
-    // The map the select screen chose -- except with a LAN lobby open,
-    // where both peers must be on the same map and the picker is not synced
-    // between them: that match stays on the launch map.
-    let want = if s.lan.is_some() { s.launch.map } else { s.ui.map_choice };
+    start_game_with(s, None);
+}
+
+/// The host's START, or the plan a member received: the match every machine in the den
+/// builds identically (the plan's seed draws the rosters and the playbook, its map is the
+/// host's) and then runs in lockstep (`lanmatch`).
+fn begin_lan_match(s: &mut AppState, plan: crate::lanmatch::MatchPlan, sock: std::net::UdpSocket) {
+    s.lanmatch = None;
+    start_game_with(s, Some((plan, sock)));
+}
+
+fn start_game_with(s: &mut AppState, lan: Option<(crate::lanmatch::MatchPlan, std::net::UdpSocket)>) {
+    // The map the select screen chose -- or the host's, in a LAN match: every machine must
+    // build the same match, so the plan carries the map and the seed.
+    let want = match &lan {
+        Some((plan, _)) => crate::map::MapId::ALL.get(plan.map as usize).copied().unwrap_or(s.launch.map),
+        None if s.lan.is_some() => s.launch.map,
+        None => s.ui.map_choice,
+    };
     switch_map(s, want);
     fit_scene_to_quality(s);
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(42);
+    let seed = match &lan {
+        Some((plan, _)) => plan.seed,
+        None => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(42),
+    };
     let mut rng = crate::sim::Rng::new(0xBEEF ^ seed);
     // The match rules (`rules`, the god limit among them) -- a normal
-    // match's in a LAN match, for the same reason as the map: nothing
-    // carries the setup between peers yet.
-    let rules = if s.lan.is_some() { crate::rules::MatchRules::default() } else { s.ui.rules };
-    let (blue, red) = crate::map::team_picks_under(rules.gods, rules.fill(), s.ui.selected as u32, &mut rng);
-    if crate::map::active() != crate::map::MapId::Jungle {
-        let mut game = Game::new_teams(&blue, &red);
-        game.apply_rules(rules);
-        open_playbook(s, &mut game, &mut rng);
-        s.game = Some(game);
-        finish_start(s);
-        return;
-    }
-    // (the jungle's constructor takes fixed arrays; the deal is the same
-    // draw the jungle made here by hand before the god limit)
-    let allies: [u32; 4] = blue[1..5].try_into().expect("the jungle is 5 a side");
-    let enemies: [u32; 5] = red[..5].try_into().expect("the jungle is 5 a side");
-    let mut game = Game::new(s.ui.selected as u32, allies, enemies);
+    // match's in a LAN match: the plan does not carry a custom setup.
+    let rules = if lan.is_some() || s.lan.is_some() { crate::rules::MatchRules::default() } else { s.ui.rules };
+    // In a LAN match everyone's ancestor is drawn from the seed (there is no shared select
+    // screen); solo, the one the player picked.
+    let selected = match &lan {
+        Some((plan, _)) => (plan.seed % crate::gods::ROSTER_LEN as u64) as u32,
+        None => s.ui.selected as u32,
+    };
+    let (blue, red) = crate::map::team_picks_under(rules.gods, rules.fill(), selected, &mut rng);
+    let mut game = if crate::map::active() != crate::map::MapId::Jungle {
+        Game::new_teams(&blue, &red)
+    } else {
+        // (the jungle's constructor takes fixed arrays; the deal is the same
+        // draw the jungle made here by hand before the god limit)
+        let allies: [u32; 4] = blue[1..5].try_into().expect("the jungle is 5 a side");
+        let enemies: [u32; 5] = red[..5].try_into().expect("the jungle is 5 a side");
+        Game::new(selected, allies, enemies)
+    };
     game.apply_rules(rules);
     open_playbook(s, &mut game, &mut rng);
+    if let Some((plan, sock)) = lan {
+        let lm = crate::lanmatch::LanMatch::new(plan, sock, crate::map::active().team_size());
+        lm.prepare(&mut game);
+        s.ui.selected = game.gods[game.me()].def_id as usize;
+        s.lanmatch = Some(lm);
+    }
     s.game = Some(game);
     finish_start(s);
 }
@@ -1170,7 +1196,46 @@ fn render(s: &mut AppState) {
                     // the click that fired a prepared ability is not an attack
                     gi.attack_held = c.attack && !attack_eaten;
                 }
-                g.tick(1.0 / 60.0);
+                match s.lanmatch.as_mut() {
+                    None => g.tick(1.0 / 60.0),
+                    Some(lm) => {
+                        // The LAN match: this frame's presses become one lockstep input, the
+                        // session applies every player's for the tick when all are in, and the
+                        // queues the local code above filled for `me` are drained into it (the
+                        // other machines receive them as the input, not as queue entries).
+                        let gi = &g.gods[me];
+                        let leap = g.leap_queue.iter().position(|(who, _)| *who == me).map(|i| g.leap_queue.remove(i)).is_some();
+                        let cast = g.cast_queue.iter().position(|(who, _, _)| *who == me).map(|i| g.cast_queue.remove(i)).map(|(_, slot, at)| {
+                            (slot as u8, [(at.x * 8.0).round().clamp(-32000.0, 32000.0) as i16, (at.z * 8.0).round().clamp(-32000.0, 32000.0) as i16])
+                        });
+                        let input = crate::lockstep::Input {
+                            mv: [(gi.move_dir.x.clamp(-1.0, 1.0) * 127.0).round() as i8, (gi.move_dir.z.clamp(-1.0, 1.0) * 127.0).round() as i8],
+                            attack: gi.attack_held,
+                            sneak: gi.sneak,
+                            leap,
+                            cast,
+                        };
+                        let pressed = leap || cast.is_some() || (gi.attack_held && !s.attack_was);
+                        if !lm.pump(g, input, pressed, 1.0 / 60.0) {
+                            // waiting on a peer (or forked): say so about once a second of
+                            // stalling, and skip this step's event handling -- nothing happened
+                            if lm.stall_run % 60 == 12 {
+                                if let Some(line) = lm.status() {
+                                    s.ui.push_events(&[ui::Event2::Announce { text: line, dur: 1.1 }]);
+                                }
+                            }
+                            // the frame's input was not consumed: the queues were drained into
+                            // it, so a leap or cast pressed during a stall rides the next stamp
+                            if leap {
+                                g.leap_queue.push((me, Vec3::new(input.mv[0] as f32 / 127.0, 0.0, input.mv[1] as f32 / 127.0)));
+                            }
+                            if let Some((slot, at)) = cast {
+                                g.cast_queue.push((me, slot as u32, Vec3::new(at[0] as f32 / 8.0, 0.0, at[1] as f32 / 8.0)));
+                            }
+                            continue;
+                        }
+                    }
+                }
                 let events: Vec<crate::sim::Event> = g.events.drain(..).collect();
                 s.audio_events.extend(events.iter().cloned());
                 for e in &events {
@@ -1521,7 +1586,9 @@ fn render(s: &mut AppState) {
         s.targeting.slot = None;
         s.intro = None;
         s.game = None;
-        s.screen = Screen::Menu;
+        // a LAN match ends for this machine; the den stays open behind it
+        s.lanmatch = None;
+        s.screen = if s.lan.is_some() { Screen::Lan } else { Screen::Menu };
         set_locked(s, false);
     }
     if panel.close {
@@ -1590,15 +1657,26 @@ fn render(s: &mut AppState) {
             s.screen = Screen::Menu;
         }
         crate::lanlobby::Action::Join(addr) => {
-            // Discovery ends here. There is no synchronised match to enter
-            // yet, and the screen's footer says so; do not fake one.
-            // Joins the den's roster for real. It still does not start a
-            // synchronised match -- there is none -- and the footer says so.
+            // Joins the den's roster; the host's START then brings the plan (`take_start`,
+            // checked every frame the screen is up) and the match begins on both machines.
             if let Some(l) = s.lan.as_mut() {
                 l.join(addr);
             }
         }
+        crate::lanlobby::Action::Start => {
+            let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(42);
+            let map = crate::map::MapId::ALL.iter().position(|m| *m == s.launch.map).unwrap_or(0) as u8;
+            if let Some(l) = s.lan.as_mut() {
+                l.start(seed, map);
+            }
+        }
         crate::lanlobby::Action::None => {}
+    }
+    // A plan in hand -- the host's own, or one that just arrived -- starts the match here.
+    if s.screen == Screen::Lan {
+        if let Some((plan, sock)) = s.lan.as_mut().and_then(|l| l.take_start()) {
+            begin_lan_match(s, plan, sock);
+        }
     }
     if spectate {
         start_spectate(s);
@@ -1639,8 +1717,9 @@ fn render(s: &mut AppState) {
         start_game(s);
     }
     if menu {
-        s.screen = Screen::Menu;
+        s.screen = if s.lanmatch.is_some() && s.lan.is_some() { Screen::Lan } else { Screen::Menu };
         s.game = None;
+        s.lanmatch = None;
     }
 }
 

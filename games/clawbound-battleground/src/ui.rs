@@ -233,12 +233,26 @@ pub fn draw_lan(ctx: &egui::Context, lobby: &mut crate::lanlobby::LanLobby) -> c
                     action = Action::Back;
                 }
             });
+            // START: the host's, once somebody is in the den (`lanmatch`). A member waits
+            // for the host's plan; the footer says so.
+            if lobby.hosting {
+                ui.add_space(8.0);
+                let n = lobby.players();
+                let label = if lobby.can_start() { format!("▶  START THE MATCH  ({n} players)") } else { "START — waiting for someone to join".to_string() };
+                let b = ui.add_enabled(lobby.can_start(), egui::Button::new(egui::RichText::new(label).size(19.0).color(Color32::BLACK).strong()).fill(GOLD).min_size(egui::vec2(388.0, 48.0)));
+                if b.clicked() {
+                    action = Action::Start;
+                }
+            } else if lobby.joined.is_some() {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("The host starts the match; stay on this screen.").size(15.0).color(GOLD));
+            }
             ui.add_space(10.0);
             if let Some(note) = &lobby.handoff_note {
                 ui.label(egui::RichText::new(note).size(16.0).color(GOLD));
             }
             ui.label(egui::RichText::new(&lobby.status).size(15.0).color(Color32::from_rgb(190, 188, 178)));
-            ui.label(egui::RichText::new("Hosting, finding and joining a den work, and the den counts who is in it. Playing a match across machines does not yet.").size(13.0).color(Color32::from_rgb(230, 170, 110)));
+            ui.label(egui::RichText::new("Everyone gets a random ancestor; the host's map; two players face each other, more fill the teams in turn.").size(13.0).color(Color32::from_rgb(190, 188, 178)));
         });
     });
     action

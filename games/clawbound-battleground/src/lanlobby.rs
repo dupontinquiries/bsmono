@@ -4,12 +4,13 @@
 //! shows and what its buttons mean, and `ui::draw_lan` only paints it. So the
 //! screen's behaviour is testable without a window.
 //!
-//! WHAT THIS IS NOT: a networked match. Discovery, hosting a lobby and
-//! picking one to join are real and work over a real network. Pressing JOIN
-//! hands back the host's address and stops there, because the simulation is
-//! not yet synchronised between machines -- it is deterministic at a fixed
-//! tick with a seeded RNG, which is what lockstep needs, but no input
-//! exchange exists. The screen says so rather than pretending.
+//! Discovery, hosting a den and joining one are real and work over a real
+//! network; the den counts who is in it. Since c21 the host can START: it
+//! sends every member a `lanmatch::MatchPlan` (seed, map, who is which
+//! player, everyone's address) over the den's socket, and each machine
+//! hands the plan and that socket to `lanmatch::LanMatch`, which runs the
+//! match in lockstep. The screen used to say JOIN stopped at the address
+//! "because the simulation is not yet synchronised between machines".
 
 use netcode::lan::{Announcer, Beacon, Browser, Found};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -41,6 +42,8 @@ pub enum Action {
     Back,
     /// The player picked a lobby. The caller owns what happens next.
     Join(SocketAddr),
+    /// The host pressed START (`LanLobby::start`): the caller picks the seed and the map.
+    Start,
 }
 
 pub struct LanLobby {
@@ -68,6 +71,9 @@ pub struct LanLobby {
     pub rows: Vec<Row>,
     /// One line for the screen's footer: what is going on, or what is wrong.
     pub status: String,
+    /// The match this den is starting -- set on the host by `start`, on a
+    /// member when the host's plan arrives; taken by the app with `take_start`.
+    start: Option<crate::lanmatch::MatchPlan>,
 }
 
 impl LanLobby {
@@ -87,7 +93,7 @@ impl LanLobby {
             }
         });
         let status = browser.as_ref().err().cloned().unwrap_or_else(|| "Searching the local network...".into());
-        LanLobby { my_name: my_name.into(), my_id, browser, announcer: None, hosting: false, game_sock: None, roster: Vec::new(), joined: None, join_sock: None, last_hello: None, mp: None, handoff_note: None, rows: Vec::new(), status }
+        LanLobby { my_name: my_name.into(), my_id, browser, announcer: None, hosting: false, game_sock: None, roster: Vec::new(), joined: None, join_sock: None, last_hello: None, mp: None, handoff_note: None, rows: Vec::new(), status, start: None }
     }
 
     pub fn port(&self) -> Option<u16> {
@@ -219,12 +225,18 @@ impl LanLobby {
                 let _ = sock.send_to(format!("CBHELLO\t{}", self.my_name).as_bytes(), *host);
                 self.last_hello = Some(now);
             }
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; 512]; // a start plan with ten addresses is longer than the 64 the den's replies needed
             while let Ok((n, from)) = sock.recv_from(&mut buf) {
                 if from != *host {
                     continue;
                 }
-                match std::str::from_utf8(&buf[..n]).unwrap_or("").split('\t').collect::<Vec<_>>().as_slice() {
+                let text = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                if let Some(plan) = crate::lanmatch::MatchPlan::decode(text, *host) {
+                    *said = format!("the match is starting -- you are player {}", plan.me + 1);
+                    self.start = Some(plan);
+                    continue;
+                }
+                match text.split('\t').collect::<Vec<_>>().as_slice() {
                     ["CBWELCOME", p, s] => *said = format!("in the den ({p}/{s})"),
                     ["CBFULL"] => *said = "the den is full".into(),
                     _ => {}
@@ -262,6 +274,45 @@ impl LanLobby {
             (false, 0) => "Searching the local network... no games yet.".into(),
             (false, n) => format!("{n} game{} on this network.", if n == 1 { "" } else { "s" }),
         };
+    }
+
+    /// Can the host press START: hosting, with at least one member in the den.
+    pub fn can_start(&self) -> bool {
+        self.hosting && self.game_sock.is_some() && !self.roster.is_empty()
+    }
+
+    /// The host starts the match: builds the plan from the roster (the host is player 0, the
+    /// members in the order they arrived) and sends each member its own copy, twice (UDP; the
+    /// member keeps saying HELLO until it has one, so a lost plan shows as a member still "in
+    /// the den"). Returns the host's own plan, also left for `take_start`.
+    pub fn start(&mut self, seed: u64, map: u8) -> Option<crate::lanmatch::MatchPlan> {
+        if !self.can_start() {
+            return None;
+        }
+        let sock = self.game_sock.as_ref()?;
+        let me_addr = sock.local_addr().ok()?;
+        let mut peers = vec![me_addr];
+        peers.extend(self.roster.iter().take(crate::lanmatch::MAX_PLAYERS - 1).map(|m| m.0));
+        let plan = crate::lanmatch::MatchPlan { seed, map, me: 0, peers };
+        for (i, addr) in plan.peers.iter().enumerate().skip(1) {
+            let line = plan.encode_for(i);
+            for _ in 0..2 {
+                let _ = sock.send_to(line.as_bytes(), addr);
+            }
+        }
+        self.status = format!("Starting with {} player(s)...", plan.players());
+        self.start = Some(plan.clone());
+        Some(plan)
+    }
+
+    /// The plan this den is starting, with the socket the match runs on (the host's game
+    /// socket, a member's join socket -- the address the others know), once. The lobby keeps
+    /// its own handle but must not be ticked while the match reads the socket.
+    pub fn take_start(&mut self) -> Option<(crate::lanmatch::MatchPlan, UdpSocket)> {
+        let plan = self.start.take()?;
+        let sock = if plan.me == 0 { self.game_sock.as_ref() } else { self.join_sock.as_ref() }?;
+        let sock = sock.try_clone().ok()?;
+        Some((plan, sock))
     }
 
     /// A click on row `i`. Unjoinable rows do nothing: the button is drawn
@@ -351,6 +402,60 @@ mod tests {
     /// handoff announces over the (file-backed) DHT, a joiner launched by
     /// handoff resolves the friend BY ID -- no LAN discovery involved -- and
     /// lands on the same roster a LAN joiner would.
+    /// The host's START reaches the member as a plan naming it player 2 at the host's address,
+    /// and both come away with the plan and a socket the match can run on. Nobody can start an
+    /// empty den.
+    #[test]
+    fn the_hosts_start_hands_both_machines_the_same_plan() {
+        let mut seeker = LanLobby::open_on("Ash", 0);
+        let mut host = LanLobby::open_on("Bramble", 0);
+        assert!(!host.can_start() && host.start(1, 0).is_none(), "nothing to start before hosting");
+        let to = vec![(Ipv4Addr::LOCALHOST, seeker.port().expect("seeker is listening")).into()];
+        host.host_to(to);
+        assert!(!host.can_start(), "an empty den has nobody to start with");
+        let t0 = Instant::now();
+        for _ in 0..50 {
+            host.tick(t0);
+            seeker.tick(t0);
+            if !seeker.rows.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        let Action::Join(addr) = seeker.click_join(0) else { panic!("not joinable: {}", seeker.status) };
+        seeker.join(addr);
+        let t1 = t0 + netcode::lan::ANNOUNCE_EVERY;
+        for _ in 0..60 {
+            seeker.tick(t1);
+            host.tick(t1);
+            if host.players() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        assert!(host.can_start());
+        let plan = host.start(0xC0FFEE, 2).expect("the host starts");
+        assert_eq!((plan.me, plan.players(), plan.seed, plan.map), (0, 2, 0xC0FFEE, 2));
+        let mut got = None;
+        for _ in 0..60 {
+            seeker.tick(t1);
+            if let Some((p, _)) = seeker.take_start() {
+                got = Some(p);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        let got = got.expect("the plan reached the member");
+        assert_eq!((got.me, got.players(), got.seed, got.map), (1, 2, 0xC0FFEE, 2));
+        assert_eq!(got.peers[0], addr, "the member fills the host in as the address it joined");
+        assert_eq!(got.peers[1], plan.peers[1], "and sees itself as the host saw it");
+        assert!(seeker.status.contains("starting"), "{}", seeker.status);
+        let (mine, sock) = host.take_start().expect("the host keeps its own plan");
+        assert_eq!(mine, plan);
+        assert_eq!(sock.local_addr().unwrap().port(), addr.port(), "the match runs on the den's socket");
+        assert!(host.take_start().is_none(), "taken once");
+    }
+
     #[test]
     fn a_friend_joining_by_id_through_the_dht_lands_in_the_den() {
         use netcode::multiplayer::Multiplayer;
