@@ -42,7 +42,8 @@ cargo run --release --features app -- --play
 Opens the menu: pick **Game** (Rendezvous / Survive / Prowl / Pop Island), a
 **Hunter**, and a **Class**, then Start. Settings has an **Easy / Normal / Hard**
 difficulty that scales the hunter's speed, how fast it grows suspicious, and how far
-it roots hiders out of cover.
+it roots hiders out of cover, and a **Camera** row that pulls the follow-cam in or
+out of every mode's own distance.
 
 Controls (mouse buttons are bindable alongside the keys):
 - **WASD / arrows** — move · **mouse** — look

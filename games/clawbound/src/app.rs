@@ -833,7 +833,7 @@ impl State {
         // a shield-soak spares you, so it shows no damage tint
         let fx0 = if shield_flash > 0.0 { 0.0 } else { grim };
         self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[fx0, 0.2f32, self.frame * 0.016, 0.0f32, 1.0 / self.scene_w, 1.0 / self.scene_h, self.config.width as f32, self.config.height as f32]));
-        self.write_camera(20.0);
+        self.write_camera(20.0 + clawbound_rs::castguide::camera_offset(self.menu.settings.camera_zoom));
 
         let items = self.menu.items();
         let (cursor, open, screen) = (self.menu.cursor, self.menu.open, self.menu.screen);
@@ -1085,7 +1085,7 @@ impl State {
         let stunned = { self.capture.as_ref().unwrap().mobs[0].stunned() };
         let grim = if stunned { 0.4 } else { 0.0 };
         self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[grim, 0.2f32, self.frame * 0.016, 0.0f32, 1.0 / self.scene_w, 1.0 / self.scene_h, self.config.width as f32, self.config.height as f32]));
-        self.write_camera(34.0);
+        self.write_camera(34.0 + clawbound_rs::castguide::camera_offset(self.menu.settings.camera_zoom));
 
         let items = self.menu.items();
         let (cursor, open, screen) = (self.menu.cursor, self.menu.open, self.menu.screen);
@@ -1432,7 +1432,8 @@ impl State {
 
         // third-person orbit positioned from mouse-driven yaw/pitch
         let (sy, cy) = (self.yaw.sin(), self.yaw.cos());
-        let dist = 20.0;
+        // the Settings camera row: an offset on the hunt's 20 m
+        let dist = 20.0 + clawbound_rs::castguide::camera_offset(self.menu.settings.camera_zoom);
         let horiz = self.pitch.cos() * dist;
         let height = self.pitch.sin() * dist;
         let eye = self.focus.add(v3(-sy * horiz, height, -cy * horiz));

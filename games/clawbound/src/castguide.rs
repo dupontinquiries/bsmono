@@ -274,6 +274,14 @@ pub fn camera_dist(zoom: u8) -> f32 {
     CAM_NEAR + (CAM_FAR - CAM_NEAR) * t
 }
 
+/// The same zoom as an OFFSET on a mode's own tuned distance: zoom 1 (the
+/// menu's default) is that distance exactly, 0 pulls in 3.5 m, 4 pushes out
+/// 10.5 m. The hunt and Prowl sit at 20 m and Pop Island at 34 m by design,
+/// so one absolute distance would move all three off their defaults.
+pub fn camera_offset(zoom: u8) -> f32 {
+    camera_dist(zoom) - camera_dist(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +385,10 @@ mod tests {
         assert_eq!(camera_dist(4), CAM_FAR);
         assert!(camera_dist(2) > CAM_NEAR && camera_dist(2) < CAM_FAR);
         assert_eq!(camera_dist(9), CAM_FAR, "a bad setting clamps rather than flies");
+        // the offset form: the default zoom leaves a mode's own distance alone
+        assert_eq!(camera_offset(1), 0.0);
+        assert!(camera_offset(0) < 0.0 && camera_offset(4) > camera_offset(2) && camera_offset(2) > 0.0);
+        assert_eq!(camera_offset(9), camera_offset(4));
         // the default sits nearer than the old capture-mode distance
         assert!(CAM_DEFAULT < 34.0);
     }
