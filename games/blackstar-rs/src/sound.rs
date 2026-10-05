@@ -25,6 +25,23 @@ pub enum Sfx {
     XformFold(bool),
     /// the metal clank on the frame the fold actually lands
     XformSnap,
+    // ── combat. The game had a gun, a sabre, section damage and a death and not one sound for
+    // any of it until c21: every cue above is the air-dribble heritage. All synthesized like
+    // the rest; the voices are a first pass nobody has heard in this sandbox.
+    /// the weapon leaves: the verb's delivery decides the voice (`weapons::Verb::delivery`)
+    Shot(crate::ballistics::Delivery),
+    /// the sabre arc, whether or not it connected
+    Swing,
+    /// your shot lands on a bot, arg = damage
+    Strike(f32),
+    /// a hit on YOUR body, arg = damage
+    Hurt(f32),
+    /// structural failure: the body goes down
+    Down,
+    /// the field rebuild stands the body back up
+    Rebuilt,
+    /// a console / menu row moved or pressed
+    Click,
 }
 
 /// A sound event plus where it landed in the mix.
@@ -442,6 +459,56 @@ mod imp {
                     // short low thump, fired the frame the fold finishes
                     self.spawn(Voice { t: 0.0, dur: 0.16, f0: 1500.0, f1: 220.0, amp: 0.45, noise: 0.55, phase: 0.0, second: 0.0, ..Voice::unplaced() });
                     self.spawn(Voice { t: 0.0, dur: 0.28, f0: 95.0, f1: 55.0, amp: 0.35, noise: 0.2, phase: 0.0, second: 0.0, ..Voice::unplaced() });
+                }
+                Sfx::Shot(deliv) => {
+                    use crate::ballistics::Delivery as D;
+                    match deliv {
+                        // mass thrown: a crack that drops fast, over a short low thump
+                        D::Kinetic => {
+                            self.spawn(Voice { t: 0.0, dur: 0.09, f0: 1900.0, f1: 240.0, amp: 0.42, noise: 0.7, phase: 0.0, second: 0.0, ..Voice::unplaced() });
+                            self.spawn(Voice { t: 0.0, dur: 0.18, f0: 110.0, f1: 60.0, amp: 0.3, noise: 0.3, phase: 0.0, second: 0.0, ..Voice::unplaced() });
+                        }
+                        // a pressure event: a boom with a long tail
+                        D::Blast => {
+                            self.spawn(Voice { t: 0.0, dur: 0.45, f0: 140.0, f1: 40.0, amp: 0.5, noise: 0.6, phase: 0.0, second: 0.2, ..Voice::unplaced() });
+                        }
+                        // light: a steady high tone with a hiss, held a little
+                        D::Beam => {
+                            self.spawn(Voice { t: 0.0, dur: 0.3, f0: 1200.0, f1: 1500.0, amp: 0.22, noise: 0.4, phase: 0.0, second: 0.45, ..Voice::unplaced() });
+                        }
+                        // contact: the swing voice carries it
+                        D::Melee => {
+                            self.spawn(Voice { t: 0.0, dur: 0.16, f0: 300.0, f1: 900.0, amp: 0.2, noise: 0.85, phase: 0.0, second: 0.0, ..Voice::unplaced() });
+                        }
+                    }
+                }
+                Sfx::Swing => {
+                    // a whoosh: filtered noise that rises and dies
+                    self.spawn(Voice { t: 0.0, dur: 0.2, f0: 250.0, f1: 1100.0, amp: 0.24, noise: 0.9, phase: 0.0, second: 0.0, ..Voice::unplaced() });
+                }
+                Sfx::Strike(dmg) => {
+                    let a = (dmg / 40.0).clamp(0.15, 1.0);
+                    self.spawn(Voice { t: 0.0, dur: 0.12, f0: 700.0, f1: 180.0, amp: 0.35 * a, noise: 0.5, phase: 0.0, second: 0.2, ..Voice::unplaced() });
+                }
+                Sfx::Hurt(dmg) => {
+                    // a dull thud at the listener, heavier with the hit
+                    let a = (dmg / 45.0).clamp(0.2, 1.0);
+                    self.spawn(Voice { t: 0.0, dur: 0.2 + 0.1 * a, f0: 90.0, f1: 40.0, amp: 0.5 * a, noise: 0.45, phase: 0.0, second: 0.0, ..Voice::unplaced() });
+                    self.spawn(Voice { t: 0.0, dur: 0.08, f0: 2400.0, f1: 600.0, amp: 0.18 * a, noise: 0.6, phase: 0.0, second: 0.0, ..Voice::unplaced() });
+                }
+                Sfx::Down => {
+                    // the frame gives: a long falling groan under a rattle
+                    self.spawn(Voice { t: 0.0, dur: 1.1, f0: 180.0, f1: 35.0, amp: 0.4, noise: 0.3, phase: 0.0, second: 0.5, ..Voice::unplaced() });
+                    self.spawn(Voice { t: 0.0, dur: 0.5, f0: 900.0, f1: 120.0, amp: 0.25, noise: 0.8, phase: 0.0, second: 0.0, ..Voice::unplaced() });
+                }
+                Sfx::Rebuilt => {
+                    // the fold-snap's clank under a rising glide (a voice's `t` starts at 0:
+                    // a negative start is louder, not later, so no staggered notes here)
+                    self.spawn(Voice { t: 0.0, dur: 0.14, f0: 1400.0, f1: 300.0, amp: 0.35, noise: 0.5, phase: 0.0, second: 0.0, ..Voice::unplaced() });
+                    self.spawn(Voice { t: 0.0, dur: 0.5, f0: 392.0, f1: 659.25, amp: 0.22, noise: 0.0, phase: 0.0, second: 0.4, ..Voice::unplaced() });
+                }
+                Sfx::Click => {
+                    self.spawn(Voice { t: 0.0, dur: 0.04, f0: 1800.0, f1: 1200.0, amp: 0.14, noise: 0.2, phase: 0.0, second: 0.0, ..Voice::unplaced() });
                 }
             }
         }

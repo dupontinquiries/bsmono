@@ -3937,10 +3937,13 @@ impl Game {
             }
         }
         let any = !struck.is_empty();
+        self.snd.fire(Sfx::Swing);
         for (i, dir) in struck {
             let b = &mut self.bots[i];
             let _ = b.body.hit(sections::Kind::Melee, Vec3::new(0.0, 1.0, 0.0), dir, dmg, 0.0);
             b.car.vel += dir * (p.impulse * 0.5);
+            let at = b.car.pos;
+            self.fire_at(Sfx::Strike(dmg), at, 1.0);
         }
         if any {
             self.fx.ring_burst(self.car.pos + fwd * (reach * 0.6), [1.0, 0.85, 0.3, 1.0], false);
@@ -3979,6 +3982,7 @@ impl Game {
         let local = (self.car.rot.inverse() * (at - self.car.pos)).clamp_length_max(1.0);
         let _ = self.body.hit(kind, local, Vec3::Y, dmg, 0.6);
         self.fx.ring_burst(at, [1.0, 0.35, 0.2, 1.0], false);
+        self.snd.fire(Sfx::Hurt(dmg));
         // MOTION WEIGHT: a hit you take shakes the lens in proportion, and
         // a heavy one holds the frame
         self.cam.add_shake((dmg / 45.0).clamp(0.12, 0.9));
@@ -3986,6 +3990,7 @@ impl Game {
             self.hitstop = self.hitstop.max(0.05);
         }
         if was && !self.body.alive() {
+            self.snd.fire(Sfx::Down);
             if let Some(s) = self.sortie.as_mut() {
                 s.player_down();
             } else {
@@ -4282,6 +4287,9 @@ impl Game {
         // the same gate as the robot's trigger — cost, cooldown, fx — with
         // no instant targets: everything from the saddle flies
         let out = self.wep.fire(origin, fwd, &[], self.car.boost);
+        if out.fired {
+            self.fire_at(Sfx::Shot(verb.delivery()), origin, 1.0);
+        }
         if !out.fired {
             return;
         }
@@ -4376,6 +4384,7 @@ impl Game {
         if !out.fired {
             return;
         }
+        self.fire_at(Sfx::Shot(deliv), origin, 1.0);
         match deliv {
             ballistics::Delivery::Kinetic | ballistics::Delivery::Blast => {
                 // a live LOCK at trigger time flies a charge as a missile:
@@ -4482,6 +4491,8 @@ impl Game {
             if let Some(s) = res.struck {
                 bot.grime.add_scorch(s, (amount * 0.15).min(0.4));
             }
+            let struck_at = bot.car.pos;
+            self.fire_at(Sfx::Strike(amount), struck_at, 1.0);
             for s in &res.severed {
                 self.toastf(&format!("{} torn off", s.name()));
             }
@@ -6959,7 +6970,9 @@ impl Game {
                                 dmg,
                                 0.4,
                             );
+                            self.snd.fire(Sfx::Hurt(dmg));
                             if was && !self.body.alive() {
+                                self.snd.fire(Sfx::Down);
                                 self.toastf("STRUCTURAL FAILURE — grounded");
                             }
                         }
@@ -7149,6 +7162,7 @@ impl Game {
             // this nothing ever repaired it: one death and the bot could not be hurt, healed
             // or downed again for the rest of the session.
             if self.rebuild.tick(&mut self.body, dt) {
+                self.snd.fire(Sfx::Rebuilt);
                 self.toastf("REBUILT — back on your wheels");
             }
             self.grime.tick(dt);
