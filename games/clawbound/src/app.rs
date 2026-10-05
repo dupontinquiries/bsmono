@@ -459,7 +459,7 @@ impl State {
         let mut mp_status = String::new();
         if let Some(h) = &handoff {
             eprintln!("[handoff] {h:?}");
-            let mut m = netcode::multiplayer::for_startup("clawbound", "cat", Some(h));
+            let mut m = netcode::multiplayer::for_startup("clawbound", &netcode::handoff::local_name("cat"), Some(h));
             match m.apply_handoff(h) {
                 Ok(status) => {
                     menu.open = false; // straight past the title into the live scene
@@ -1573,7 +1573,7 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                                 // flips InGame so friends' bsgames can "▶ join" and hand
                                                 // a second clawbound straight to us
                                                 let mp = state.mp.get_or_insert_with(|| {
-                                                    netcode::multiplayer::for_startup("clawbound", "cat", None)
+                                                    netcode::multiplayer::for_startup("clawbound", &netcode::handoff::local_name("cat"), None)
                                                 });
                                                 state.mp_status = if mp.token.is_some() {
                                                     mp.stop_hosting();

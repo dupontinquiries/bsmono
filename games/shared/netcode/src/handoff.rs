@@ -38,9 +38,39 @@ fn parse(role: Option<String>, me: Option<String>, peer: Option<String>) -> Opti
     }
 }
 
+/// The name a game presents as when launched standalone (no handoff): the login name, from
+/// `USER`, `USERNAME` or `LOGNAME`, else `fallback`. Before c21 clawbound used the literal
+/// "cat" for both id and name, so every standalone clawbound on the fleet store was the same
+/// player: two of them on one box overwrote each other's profile, and the hub could not tell
+/// them apart. bsgames and battleground already read `USER`; this is the one spelling.
+pub fn local_name(fallback: &str) -> String {
+    local_name_from(["USER", "USERNAME", "LOGNAME"].into_iter().map(|k| (k, std::env::var(k).ok())), fallback)
+}
+
+/// [`local_name`] over an explicit environment, for tests: the first non-empty value in order.
+pub fn local_name_from<'a>(vars: impl IntoIterator<Item = (&'a str, Option<String>)>, fallback: &str) -> String {
+    vars.into_iter()
+        .filter_map(|(_, v)| v)
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_standalone_name_is_the_login_name_in_order_else_the_fallback() {
+        let env = |user: Option<&str>, username: Option<&str>, logname: Option<&str>| {
+            vec![("USER", user.map(String::from)), ("USERNAME", username.map(String::from)), ("LOGNAME", logname.map(String::from))]
+        };
+        assert_eq!(local_name_from(env(Some("kessler"), Some("x"), None), "cat"), "kessler");
+        assert_eq!(local_name_from(env(None, Some("win"), Some("log")), "cat"), "win");
+        assert_eq!(local_name_from(env(Some("  "), None, Some("log")), "cat"), "log", "blank is absent");
+        assert_eq!(local_name_from(env(None, None, None), "cat"), "cat");
+        assert_ne!(local_name("cat"), "", "never empty");
+    }
 
     #[test]
     fn parses_join_with_all_three_vars() {
