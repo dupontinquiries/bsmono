@@ -1041,6 +1041,8 @@ struct Game {
     /// theirs on `Bot`; the player's lives here for the same reason —
     /// so a body and its wounds cannot drift apart.
     body: sections::Body,
+    /// The field rebuild after the body goes down (`sections::Rebuild`).
+    rebuild: sections::Rebuild,
     grime: grime::Grime,
     /// the action bar, live during play — loaded once at boot rather
     /// than through a Deck console, since quick-select has to work
@@ -2503,6 +2505,7 @@ fn main() {
         swing: 0.0,
         hotbar,
         body: sections::Body::default(),
+        rebuild: sections::Rebuild::default(),
         grime: grime::Grime::default(),
         held: HashSet::new(),
         held_mouse: HashSet::new(),
@@ -7132,6 +7135,12 @@ impl Game {
             for s in self.body.tick(dt) {
                 self.toastf(&format!("{} regrown", s.name()));
             }
+            // A body that went down is scrap for a few seconds, then stands up whole. Before
+            // this nothing ever repaired it: one death and the bot could not be hurt, healed
+            // or downed again for the rest of the session.
+            if self.rebuild.tick(&mut self.body, dt) {
+                self.toastf("REBUILT — back on your wheels");
+            }
             self.grime.tick(dt);
             for b in self.bots.iter_mut() {
                 b.body.tick(dt);
@@ -8379,6 +8388,7 @@ impl Game {
         // the same way (fresh map, fresh medium).
         self.patrol.bridge_to(dest);
         let style = mapsim::style_for(d);
+        self.body.repair(); // a jump is a change of world: you arrive whole
         self.load_map(style, dest_seed(d.id));
         self.set_medium_for(d);
         // the console belongs to the ship you just left
@@ -8425,6 +8435,7 @@ impl Game {
         match sortie::Sortie::begin(mission_id, week) {
             Ok(s) => {
                 let d = s.dest;
+                self.body.repair(); // a launch is a repaired bot
                 self.load_map(mapsim::style_for(d), dest_seed(d.id));
                 self.set_medium_for(d);
                 self.close_deck();
@@ -8472,6 +8483,7 @@ impl Game {
         match raidflow::RaidFlow::begin(boss_id) {
             Ok(r) => {
                 let a = r.arena();
+                self.body.repair(); // a raid drop is a repaired bot
                 self.arena_map(a);
                 self.close_deck();
                 // arena.note is real, authored lore (10 arenas, one line

@@ -293,6 +293,15 @@ impl Body {
     /// the "grown back" animation/fx on exactly the frame it happens
     /// rather than polling `is_gone` every frame to notice.
     ///
+    /// Back to factory: every section whole, nothing severed, nothing recently hit. What a
+    /// launch, a raid, a jump to another world, and the field rebuild after a loss all start
+    /// from. Without it a body that died once stayed dead for the rest of the session --
+    /// `hit` refuses a dead body and `tick` does not heal one -- so the second sortie could
+    /// not be lost and `player_down` never fired again.
+    pub fn repair(&mut self) {
+        *self = Body::default();
+    }
+
     /// A dead body does not heal — `alive()` gates the whole tick, same
     /// as `hit` already refuses to apply further damage to one.
     pub fn tick(&mut self, dt: f32) -> Vec<Section> {
@@ -323,10 +332,94 @@ impl Body {
     }
 }
 
+/// The field rebuild: a body that goes down is scrap for [`Rebuild::SECS`], then stands up
+/// whole. Ticked beside `Body::tick` in play; a sortie's loss has already been recorded by
+/// then (`Sortie::player_down` fires on the frame of death), so the rebuild never undoes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Rebuild {
+    /// Seconds of scrap left; 0 while alive.
+    t: f32,
+}
+
+impl Rebuild {
+    pub const SECS: f32 = 3.0;
+
+    /// Seconds until the body stands again, 0 when it is standing.
+    pub fn remaining(&self) -> f32 {
+        self.t
+    }
+
+    /// Advance; `true` on the frame the body is rebuilt.
+    pub fn tick(&mut self, body: &mut Body, dt: f32) -> bool {
+        if body.alive() {
+            self.t = 0.0;
+            return false;
+        }
+        if self.t <= 0.0 {
+            self.t = Self::SECS;
+        }
+        self.t -= dt.max(0.0);
+        if self.t <= 0.0 {
+            body.repair();
+            self.t = 0.0;
+            return true;
+        }
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::weapons::Verb;
+
+    fn killed() -> Body {
+        let mut b = Body::default();
+        for _ in 0..100 {
+            b.hit(Kind::Kinetic, Section::Torso.centre(), Vec3::Z, 100.0, 0.0);
+        }
+        assert!(!b.alive(), "the torso must be destroyed");
+        b
+    }
+
+    #[test]
+    fn a_repaired_body_is_whole_and_can_be_hurt_and_killed_again() {
+        let mut b = killed();
+        assert!(!b.tick(100.0).is_empty() || !b.alive(), "dead: no healing");
+        b.repair();
+        assert!(b.alive());
+        for s in Section::ALL {
+            assert_eq!(b.hp_of(s), s.max_hp(), "{}", s.name());
+            assert!(!b.is_gone(s));
+        }
+        let r = b.hit(Kind::Kinetic, Section::ArmL.centre(), Vec3::Z, 5.0, 0.0);
+        assert!(!r.killed && b.hp_of(Section::ArmL) < Section::ArmL.max_hp(), "a hit lands again");
+        let b2 = killed();
+        assert!(!b2.alive(), "and it can die again");
+    }
+
+    #[test]
+    fn the_rebuild_waits_its_seconds_then_stands_the_body_up_once() {
+        let mut b = killed();
+        let mut r = Rebuild::default();
+        assert!(!r.tick(&mut b, 1.0 / 60.0));
+        assert!(r.remaining() > Rebuild::SECS - 0.1 && r.remaining() < Rebuild::SECS);
+        let mut t = 1.0 / 60.0;
+        let mut rebuilt_at = None;
+        for _ in 0..600 {
+            if r.tick(&mut b, 1.0 / 60.0) {
+                rebuilt_at = Some(t);
+                break;
+            }
+            t += 1.0 / 60.0;
+        }
+        let at = rebuilt_at.expect("rebuilt within ten seconds");
+        assert!((at - Rebuild::SECS).abs() < 0.05, "rebuilt at {at}s, not {}", Rebuild::SECS);
+        assert!(b.alive() && r.remaining() == 0.0);
+        // alive: nothing happens, and the countdown does not run
+        assert!(!r.tick(&mut b, 10.0));
+        assert_eq!(r.remaining(), 0.0);
+    }
 
     #[test]
     fn healing_waits_for_regen_delay_then_caps_at_max_hp() {
