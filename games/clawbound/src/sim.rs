@@ -226,6 +226,17 @@ impl Game {
     /// before a step the hunter is the AI again, so a dropped link hands it back to the FSM.
     pub fn set_hunter_input(&mut self, mx: f32, mz: f32, pounce: bool) { self.hunter_input = Some((mx, mz, pounce)); }
 
+    /// The ambient wildlife alone: it flees the hunter and the living cats. `step` runs it;
+    /// a MIRROR of a match (`hunt_net`), whose cats and hunter come off the wire but whose
+    /// critters are its own, runs it by itself so the forest is not a still life.
+    pub fn step_wildlife(&mut self, dt: f32) {
+        if self.critters.is_empty() { return; }
+        let mut threats: Vec<(f32, f32)> = Vec::with_capacity(1 + self.cats.len());
+        threats.push((self.hunter.x, self.hunter.z));
+        for c in &self.cats { if c.alive { threats.push((c.x, c.z)); } }
+        for cr in &mut self.critters { cr.step(dt, &threats); }
+    }
+
     /// Turn the clan passive/ultimate kit on or off (a settings toggle — off by default,
     /// so the hunter stays the dominant force; the abilities are a "softer" option).
     pub fn set_abilities_on(&mut self, on: bool) { self.abilities_on = on; }
@@ -777,12 +788,7 @@ impl Game {
         if grabbed_any { self.hunter.carrying = true; }
         }
         // ambient wildlife: flee the hunter and any living cats
-        if !self.critters.is_empty() {
-            let mut threats: Vec<(f32, f32)> = Vec::with_capacity(1 + self.cats.len());
-            threats.push((self.hunter.x, self.hunter.z));
-            for c in &self.cats { if c.alive { threats.push((c.x, c.z)); } }
-            for cr in &mut self.critters { cr.step(dt, &threats); }
-        }
+        self.step_wildlife(dt);
         // pounce: a cat mid-burst (a leap or a roll) snatches any ambient critter it
         // lands on — a small meal that tops up stamina, tying the wildlife into the
         // hunt (from the JS build: caught when airborne or moving fast).

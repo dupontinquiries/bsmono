@@ -1327,7 +1327,9 @@ impl State {
         let mirror = self.hunt_recv(now_s, dt);
 
         if !self.menu.open && mirror {
-            // the joiner: what the mirrored state did, to hear
+            // the joiner: its own wildlife moves (the state carries none), and what the
+            // mirrored state did, to hear
+            self.game.step_wildlife(dt);
             let l = self.hunt_listener.get_or_insert_with(|| clawbound_rs::cues::HuntListener::new(&self.game));
             let cues = l.step(&self.game);
             for c in cues { self.sound(clawbound_rs::audio::Msg::Cue(c)); }
