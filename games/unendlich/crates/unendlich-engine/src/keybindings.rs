@@ -264,7 +264,8 @@ impl KeyBindings {
         b.insert(GameAction::Hotbar9, Key::Num9);
         b.insert(GameAction::ToggleDebug, Key::F3);
         b.insert(GameAction::ToggleDebugOverlay, Key::F4);
-        b.insert(GameAction::ReloadChunks, Key::F5);
+        // `ReloadChunks` has no handler and shared F5 with the third-person toggle; it is
+        // unbound until something reloads chunks (`keys_for_action` returns nothing).
         // `[` / `]`: F6 and F7 were these, and F6 is also the survival/creative toggle and F7
         // (held) the rest ritual, read raw by the fullgame -- so every mode toggle also slowed
         // the world by sqrt(10) and every rest sped it up, and nobody could say why.
@@ -569,6 +570,38 @@ mod tests {
                     assert!(!toggle_keys.contains(k),
                         "ToggleFlight collides with {:?} on key {:?} — would toggle on movement!",
                         action, k);
+                }
+            }
+        }
+    }
+
+    /// One key, one action, in every preset -- except the pairs that are the same key on
+    /// purpose because the two actions never apply at once (Jump/FlyUp, Sneak/FlyDown). The
+    /// F5 of `ReloadChunks` and `ToggleThirdPerson` was the kind of thing this catches: a
+    /// press that would have done two things had both been handled.
+    #[test]
+    fn no_key_serves_two_actions_by_accident() {
+        let intended = |a: GameAction, b: GameAction| {
+            matches!((a, b), (GameAction::Jump, GameAction::FlyUp) | (GameAction::FlyUp, GameAction::Jump)
+                | (GameAction::Sneak, GameAction::FlyDown) | (GameAction::FlyDown, GameAction::Sneak))
+        };
+        for (name, preset) in [
+            ("dvorak", KeyBindings::dvorak_preset()),
+            ("qwerty", KeyBindings::qwerty_preset()),
+            ("qwerty_wasd", KeyBindings::qwerty_wasd_preset()),
+        ] {
+            let mut by_key: HashMap<Key, Vec<GameAction>> = HashMap::new();
+            for (action, keys) in &preset.bindings {
+                for k in keys {
+                    by_key.entry(*k).or_default().push(*action);
+                }
+            }
+            assert!(by_key.len() >= 20, "{name}: the scan sees the table ({} keys)", by_key.len());
+            for (k, actions) in &by_key {
+                for i in 0..actions.len() {
+                    for j in i + 1..actions.len() {
+                        assert!(intended(actions[i], actions[j]), "{name}: {:?} is bound to both {:?} and {:?}", k, actions[i], actions[j]);
+                    }
                 }
             }
         }
