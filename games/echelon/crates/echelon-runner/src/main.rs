@@ -385,6 +385,130 @@ fn run_lockstep(race1: &str, race2: &str, seed: u64, max_ticks: u32, map_name: &
     }
 }
 
+/// Two PROCESSES, one match: this process plays `side` (0 hosts on `bind`, 1 joins `peer`)
+/// with its own bot, the other side's commands come over `echelon_net::udp::UdpLink`, and
+/// both run the same lockstep as `run_lockstep` does in memory -- turns, delay, hash
+/// checkpoints, desync detection. The host waits for the joiner's first datagram to learn
+/// its address. Across two machines this is the first networked Echelon match; on one it is
+/// `--lan-host 7777` in one terminal and `--lan-join 127.0.0.1:7777` in another.
+fn run_lan(race1: &str, race2: &str, seed: u64, max_ticks: u32, map_name: &str, side: u8, bind: Option<u16>, peer: Option<std::net::SocketAddr>) {
+    use echelon_net::udp::UdpLink;
+    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+    use std::time::{Duration, Instant};
+    let cfg = NetCfg { players: 2, turn_len: 4, delay: 2 };
+    let pack = load_pack();
+    let r1 = pack.race_index(race1).expect("race1");
+    let r2 = pack.race_index(race2).expect("race2");
+    let mut link = match (side, bind, peer) {
+        (0, Some(port), _) => {
+            let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).expect("bind the host port");
+            sock.set_nonblocking(true).unwrap();
+            println!("== lan host: {} vs {} on {}, seed {}, listening on {} -- waiting for the joiner ==", race1, race2, map_name, seed, sock.local_addr().unwrap());
+            // the joiner's first datagram (its bootstrap-turn commands) names it
+            let mut buf = [0u8; 64];
+            let from: SocketAddr = loop {
+                if let Ok((_, from)) = sock.peek_from(&mut buf) {
+                    break from;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            println!("   joiner at {from}");
+            UdpLink::over(sock, from)
+        }
+        (1, _, Some(peer)) => {
+            println!("== lan joiner: {} vs {} on {}, seed {}, host {} ==", race1, race2, map_name, seed, peer);
+            UdpLink::open("0.0.0.0:0", peer).expect("bind a socket")
+        }
+        _ => {
+            eprintln!("--lan-host PORT (plays player 0) or --lan-join HOST:PORT (plays player 1)");
+            std::process::exit(2);
+        }
+    };
+    let plans = [plan(race1), plan(race2)];
+    let mut world = World::new(pack, load_map(map_name).0, [r1, r2], seed);
+    let mut sess = Lockstep::new(cfg, side);
+    let mut bot = Bot::default();
+    let mut turn = 0u32;
+    let mut checkpoints = 0u32;
+    let max_turns = max_ticks / cfg.turn_len;
+    let started = Instant::now();
+    let mut last_progress = Instant::now();
+    while turn < max_turns {
+        let cmds = if turn % 6 == 0 {
+            let mut v = Vec::new();
+            bot_step(&world, side, &plans[side as usize], &mut bot, &mut v);
+            v
+        } else {
+            Vec::new()
+        };
+        sess.submit_local(cmds);
+        // wait for the peer's commands for this turn, pumping the link
+        loop {
+            link.pump(&mut sess, Instant::now());
+            let mut advanced = false;
+            while let Some((_t, merged)) = sess.next_turn() {
+                advanced = true;
+                world.step(&merged);
+                for _ in 1..cfg.turn_len {
+                    world.step(&[]);
+                }
+                let tk = world.tick;
+                if tk % 448 == 0 {
+                    sess.report_hash(tk, world.state_hash());
+                    checkpoints += 1;
+                }
+            }
+            if advanced {
+                last_progress = Instant::now();
+                break;
+            }
+            if last_progress.elapsed() > Duration::from_secs(20) {
+                println!("   the peer has gone quiet for 20 s ({} unacked, {} resent); giving up", link.unacked(), link.resent);
+                std::process::exit(1);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        link.pump(&mut sess, Instant::now());
+        if let Some(t) = sess.desync {
+            println!("   DESYNC at checkpoint tick {}", t);
+            std::process::exit(1);
+        }
+        if world.defeated.iter().any(|d| *d) {
+            break;
+        }
+        turn += 1;
+    }
+    // let the last acks and hashes cross before the sockets close
+    let t_end = Instant::now();
+    while t_end.elapsed() < Duration::from_millis(600) {
+        link.pump(&mut sess, Instant::now());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let w = &world;
+    let winner = match (w.defeated[0], w.defeated[1]) {
+        (true, false) => Some((1usize, race2)),
+        (false, true) => Some((0usize, race1)),
+        _ => None,
+    };
+    match winner {
+        Some((pw, name)) => println!("   winner: player {} ({}) at t{} ({}m{:02}s)", pw, name, w.tick, w.tick / 22 / 60, w.tick / 22 % 60),
+        None => println!("   no winner by t{}", w.tick),
+    }
+    println!(
+        "   {} command turns, {} hash checkpoints, desync: {}, {} datagram(s) resent, {} duplicate(s), {:.1}s wall, final state hash {:016x}",
+        turn,
+        checkpoints,
+        match sess.desync { Some(t) => format!("at t{t}"), None => "none".into() },
+        link.resent,
+        link.duplicates,
+        started.elapsed().as_secs_f32(),
+        w.state_hash()
+    );
+    if sess.desync.is_some() {
+        std::process::exit(1);
+    }
+}
+
 fn assets_dir(sub: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/data").join(sub)
 }
@@ -775,6 +899,8 @@ fn main() {
     let mut verify = false;
     let mut verbose = false;
     let mut lockstep = false;
+    let mut lan_host: Option<u16> = None;
+    let mut lan_join: Option<std::net::SocketAddr> = None;
     let mut svg_base: Option<String> = None;
     let mut svg_every = 0u32;
     let mut png_base: Option<String> = None;
@@ -789,6 +915,14 @@ fn main() {
             "--verify" => verify = true,
             "--events" => verbose = true,
             "--lockstep" => lockstep = true,
+            "--lan-host" => {
+                i += 1;
+                lan_host = Some(args[i].parse().expect("--lan-host PORT"));
+            }
+            "--lan-join" => {
+                i += 1;
+                lan_join = Some(args[i].parse().expect("--lan-join HOST:PORT"));
+            }
             "--svg" => {
                 i += 1;
                 svg_base = Some(args[i].clone());
@@ -872,7 +1006,10 @@ fn main() {
     }
     let r1 = pos.get(0).cloned().unwrap_or_else(|| "Genetron".into());
     let r2 = pos.get(1).cloned().unwrap_or_else(|| "Xayid".into());
-    if lockstep {
+    if lan_host.is_some() || lan_join.is_some() {
+        let side = if lan_host.is_some() { 0 } else { 1 };
+        run_lan(&r1, &r2, seed, max_ticks, &map_name, side, lan_host, lan_join);
+    } else if lockstep {
         run_lockstep(&r1, &r2, seed, max_ticks, &map_name);
     } else {
         one(&r1, &r2, seed, max_ticks, verify, verbose, &map_name, svg_out, png_out);

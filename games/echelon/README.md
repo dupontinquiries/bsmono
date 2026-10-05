@@ -21,13 +21,18 @@ cargo run --release -p echelon-runner -- Keiron Genetron --events
 cargo run --release -p echelon-runner -- Genetron Xayid --lockstep
 cargo run --release -p echelon-runner -- Keiron Genetron \
     --svg out.svg --svg-every 2200          # battlefield snapshots
+# two processes (or two machines), one match over UDP: the host plays player 0
+cargo run --release -p echelon-runner -- Keiron Genetron --lan-host 7777
+cargo run --release -p echelon-runner -- Keiron Genetron --lan-join 192.168.1.10:7777
 ```
 
 Runner arguments: `[race1 race2 | all]`, `--map NAME` (standard,
 confluence, cauldron), `--seed N`, `--ticks N`, `--events`, `--verify`
 (re-simulate the recorded command log and compare periodic + final state
 hashes), `--lockstep` (two clients, in-memory transport, hash
-checkpoints), `--svg PATH [--svg-every N]`, `--png PATH [--png-every N]`
+checkpoints), `--lan-host PORT` / `--lan-join HOST:PORT` (two processes,
+each its own bot, the same lockstep over `echelon_net::udp`; both must give
+the same races, seed, map and ticks), `--svg PATH [--svg-every N]`, `--png PATH [--png-every N]`
 (lit look-dev frames), and `preview MAP OUT.png` (render a map with its
 tileset's palette + light rig).
 
