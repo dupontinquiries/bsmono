@@ -1128,18 +1128,28 @@ impl FpsApp {
                             }
                         } else if menu_button(ui, "Host a Match").clicked() {
                             self.mp_status = match self.mp.host("0.0.0.0:0") {
-                                Ok(token) => format!("hosting: {token}"),
+                                // the address is what a friend on another machine types: the
+                                // store resolves a name only on this one
+                                Ok(token) => match self.mp.host_addr() {
+                                    Some(a) => format!("hosting: {token} at {a}"),
+                                    None => format!("hosting: {token}"),
+                                },
                                 Err(e) => format!("couldn't host: {e}"),
                             };
                         }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Friend's name:").monospace().size(12.0).color(dim()));
+                            ui.label(egui::RichText::new("Friend's name or ip:port:").monospace().size(12.0).color(dim()));
                             ui.add(egui::TextEdit::singleline(&mut self.mp_friend_input).id_salt("app-self_mp_friend_input"));
                         });
                         if menu_button(ui, "Join").clicked() {
                             let friend = self.mp_friend_input.trim().to_string();
-                            self.mp_status = match self.mp.join(&friend) {
+                            let dialled = if netcode::multiplayer::Multiplayer::looks_like_addr(&friend) {
+                                self.mp.join_addr(&friend)
+                            } else {
+                                self.mp.join(&friend)
+                            };
+                            self.mp_status = match dialled {
                                 Ok(addr) => format!("connected to {friend} at {addr}"),
                                 Err(e) => e,
                             };
