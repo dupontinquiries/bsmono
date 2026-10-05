@@ -1,6 +1,15 @@
 # Known test failures (non-GPU lib suite)
 
-## Current state (2026-09-24, c20unified): 8828 passed, 0 failed, 12 ignored
+## Current state (2026-10-05, c21): 9130 passed, 0 failed, 14 ignored (headless)
+
+The headless command below did not COMPILE between c20's canopy-depth commit (`e92b8b962`,
+2026-09-25) and c21's `c5ef751f1`: `world/foliage_depth.rs` imported the mesher's `Vertex`
+with no feature gate. Every count in between came from the default-features run, which
+also carries the render tests and the two failures described under "Update" below (the
+soft-block sag question and the uncalibrated triangle tripwire) — those two are render-side
+and do not run headless.
+
+## Earlier state (2026-09-24, c20unified): 8828 passed, 0 failed, 12 ignored
 
 `cargo test -p unendlich-engine --no-default-features --lib` builds and runs in a 3 GB
 sandbox **with one build job** (`CARGO_BUILD_JOBS=1`): the test crate's rustc peaks near

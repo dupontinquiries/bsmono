@@ -30,8 +30,9 @@ The engine's tests build without a GPU or a window:
 CARGO_BUILD_JOBS=1 cargo test -p unendlich-engine --no-default-features --lib
 ```
 
-(About 9.5k tests; the two that fail, and why, are in `docs/KNOWN-TEST-FAILURES.md` and
-C21_TODO §3b. One build job: the test crate's rustc peaks near 2.6 GB.)
+(9130 pass headless as of c21; the default-features run adds the render tests and carries
+two documented failures — `docs/KNOWN-TEST-FAILURES.md`, C21_TODO §3b. One build job: the
+test crate's rustc peaks near 2.6 GB.)
 
 ## Where things are
 
