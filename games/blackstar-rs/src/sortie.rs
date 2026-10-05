@@ -106,6 +106,9 @@ pub struct Sortie {
     pub sites: Vec<Site>,
     pub plans: Vec<Plan>,
     pub site_sel: usize,
+    /// The cutscene cursor: which of the stage's slides (`Mission::intro` on the brief,
+    /// `Mission::outro` on a won debrief) is showing; `slides().len()` once they are done.
+    pub slide: usize,
     /// unit bearing from the origin to the LZ, hashed off the mission id;
     /// the chosen site's distance scales it (`lz_now`)
     lz_dir: Vec3,
@@ -253,6 +256,7 @@ impl Sortie {
             sites,
             plans,
             site_sel,
+            slide: 0,
             lz_dir,
             site_exposure: false,
             hull: None,
@@ -273,6 +277,43 @@ impl Sortie {
     /// field is rebuilt with it at touchdown.
     pub fn set_ride_h(&mut self, h: f32) {
         self.ride_h = h.max(0.01);
+    }
+
+    /// The cutscene slides for this stage. `content::Mission` has carried three intro slides
+    /// and an outro for every mission since the campaign was authored -- "shown over a dim
+    /// backdrop before and after the mission, advanced or skipped", per its own doc -- and
+    /// the only thing that ever printed them was the headless `campsim`. The brief shows the
+    /// intro, a won debrief shows the outro; a lost one has nothing to say but the loss.
+    pub fn slides(&self) -> &'static [&'static str] {
+        match self.stage {
+            Stage::Brief => self.mission.intro,
+            Stage::Debrief { won: true } => self.mission.outro,
+            _ => &[],
+        }
+    }
+
+    /// The slide on screen, or `None` when the stage's own panel is.
+    pub fn slide_now(&self) -> Option<&'static str> {
+        self.slides().get(self.slide).copied()
+    }
+
+    /// Enter during the slides: the next one. `true` when a slide was consumed, so the caller
+    /// does nothing else with the key; `false` once the stage's panel is up.
+    pub fn next_slide(&mut self) -> bool {
+        if self.slide < self.slides().len() {
+            self.slide += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Esc during the slides: straight to the stage's panel. `true` if there was anything to
+    /// skip -- otherwise Esc keeps its stage meaning (stand down / log it).
+    pub fn skip_slides(&mut self) -> bool {
+        let had = self.slide < self.slides().len();
+        self.slide = self.slides().len();
+        had
     }
 
     pub fn falling(&self) -> bool {
@@ -456,6 +497,7 @@ impl Sortie {
         self.field.sync(run.foes());
         if let Some(won) = run.outcome() {
             self.stage = Stage::Debrief { won };
+            self.slide = 0;
         }
         if self.feed.len() > 64 {
             let cut = self.feed.len() - 64;
@@ -497,6 +539,7 @@ impl Sortie {
         }
         self.field.clear();
         self.stage = Stage::Debrief { won: false };
+        self.slide = 0;
     }
 
     /// The player's shot, into the fight, AIM-AGNOSTIC: lands on the
@@ -601,6 +644,24 @@ impl Sortie {
     /// where text goes.
     pub fn hud_rows(&self) -> Vec<String> {
         let mut rows = Vec::new();
+        if let Some(text) = self.slide_now() {
+            // a slide owns the panel: the mission's name, the prose, and how to move on
+            let n = self.slides().len();
+            rows.push(format!(
+                "{} — {}/{}",
+                match self.stage {
+                    Stage::Brief => "SORTIE",
+                    _ => "DEBRIEF",
+                },
+                self.slide + 1,
+                n
+            ));
+            rows.push(String::new());
+            rows.extend(wrap(text, SLIDE_COLS));
+            rows.push(String::new());
+            rows.push(if self.slide + 1 < n { "ENTER next · ESC skip".into() } else { "ENTER continue".into() });
+            return rows;
+        }
         match self.stage {
             Stage::Brief => {
                 rows.push(format!("SORTIE — {}", self.mission.id));
@@ -689,6 +750,32 @@ impl Sortie {
         }
         rows
     }
+}
+
+/// Characters per slide line. The sortie panel is 0.48 of the screen wide at the row glyph
+/// size, which fits about this many; a slide is up to ~100 characters, so most wrap to two.
+pub const SLIDE_COLS: usize = 52;
+
+/// Word-wrap `text` to lines of at most `cols` characters (a single word longer than `cols`
+/// stands alone on its line rather than being cut).
+pub fn wrap(text: &str, cols: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let wl = word.chars().count();
+        let cl = cur.chars().count();
+        if cl > 0 && cl + 1 + wl > cols {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
 }
 
 /// Abandoning a sortie on the field takes TWO presses of Esc within [`Abandon::WINDOW`]
@@ -1035,5 +1122,91 @@ mod tests {
         b.site_sel = 0;
         assert_eq!(a.lz_now(), b.lz_now());
         assert!(a.lz_now().length() > 100.0, "an LZ at the origin is not a navigation task");
+    }
+
+    /// The brief opens on the mission's first intro slide, Enter walks them, and the brief
+    /// proper (sites, launch line) is only drawn once they are done. Every authored mission
+    /// has intro slides, so a brief that opened on the sites would mean the prose is lost.
+    #[test]
+    fn the_brief_opens_on_the_intro_slides_and_enter_walks_them() {
+        let mut s = Sortie::begin(first_mission(), None).unwrap();
+        let intro = s.mission.intro;
+        assert!(intro.len() >= 2, "the fixture mission has slides to walk");
+        assert_eq!(s.slide_now(), Some(intro[0]));
+        let rows = s.hud_rows();
+        assert!(rows[0].starts_with("SORTIE") && rows[0].ends_with(&format!("1/{}", intro.len())), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains(intro[0].split_whitespace().next().unwrap())), "the slide text is in the panel: {rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("ENTER launch")), "the launch line waits behind the slides: {rows:?}");
+        assert!(rows.iter().any(|r| r == "ENTER next · ESC skip"));
+        for i in 1..intro.len() {
+            assert!(s.next_slide());
+            assert_eq!(s.slide_now(), Some(intro[i]));
+        }
+        assert!(s.hud_rows().iter().any(|r| r == "ENTER continue"), "the last slide says so");
+        assert!(s.next_slide(), "the last slide is consumed by Enter too");
+        assert_eq!(s.slide_now(), None);
+        assert!(!s.next_slide(), "and then Enter is the launch key");
+        let rows = s.hud_rows();
+        assert_eq!(rows[0], format!("SORTIE — {}", s.mission.id));
+        assert!(rows.iter().any(|r| r.contains("ENTER launch")), "{rows:?}");
+        assert!(!s.skip_slides(), "nothing left to skip: Esc stands down");
+    }
+
+    /// Esc on a slide skips the rest rather than standing the sortie down.
+    #[test]
+    fn esc_skips_the_slides_once_and_then_means_stand_down() {
+        let mut s = Sortie::begin(first_mission(), None).unwrap();
+        assert!(s.skip_slides());
+        assert_eq!(s.slide_now(), None);
+        assert!(!s.skip_slides());
+    }
+
+    /// The outro belongs to a WON debrief; a lost sortie has only the loss to show, and the
+    /// cursor starts over when the stage changes.
+    #[test]
+    fn the_outro_shows_on_a_win_and_not_on_a_loss() {
+        let mut s = Sortie::begin(first_mission(), None).unwrap();
+        s.skip_slides();
+        s.stage = Stage::Debrief { won: false };
+        s.slide = 0;
+        assert_eq!(s.slides(), &[] as &[&str]);
+        assert_eq!(s.slide_now(), None);
+        assert!(s.hud_rows().iter().any(|r| r == "MISSION LOST"));
+        s.stage = Stage::Debrief { won: true };
+        assert_eq!(s.slides(), s.mission.outro);
+        assert_eq!(s.slide_now(), Some(s.mission.outro[0]));
+        let rows = s.hud_rows();
+        assert!(rows[0].starts_with("DEBRIEF"), "{rows:?}");
+        assert!(!rows.iter().any(|r| r == "OBJECTIVE COMPLETE"), "the summary waits behind the slides");
+        s.skip_slides();
+        assert!(s.hud_rows().iter().any(|r| r == "OBJECTIVE COMPLETE"));
+        // a stage change starts the cursor over: the player going down mid-fight, with a
+        // stale cursor from the brief, lands on a debrief whose cursor is at zero
+        s.stage = Stage::Engage;
+        s.run = Some(MissionRun::new(s.mission, &DEFAULT_SQUAD, DEFAULT_DOCTRINE, s.have));
+        s.slide = 7;
+        s.player_down();
+        assert_eq!(s.stage, Stage::Debrief { won: false });
+        assert_eq!(s.slide, 0);
+    }
+
+    /// Slides wrap at word boundaries to the panel's width; every authored slide fits.
+    #[test]
+    fn slides_wrap_at_words_and_every_authored_slide_fits_the_panel() {
+        let lines = wrap("the system's edge. an old soldier in an older suit walks the wall he helped build.", 52);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().all(|l| l.chars().count() <= 52), "{lines:?}");
+        assert_eq!(lines.join(" "), "the system's edge. an old soldier in an older suit walks the wall he helped build.");
+        assert_eq!(wrap("", 10), Vec::<String>::new());
+        assert_eq!(wrap("supercalifragilistic", 5), vec!["supercalifragilistic".to_string()], "a long word stands alone, uncut");
+        let mut slides = 0;
+        for m in crate::content::MISSIONS {
+            for t in m.intro.iter().chain(m.outro.iter()) {
+                slides += 1;
+                let w = wrap(t, SLIDE_COLS);
+                assert!((1..=3).contains(&w.len()), "{}: a slide is one to three panel lines, not {}: {w:?}", m.id, w.len());
+            }
+        }
+        assert!(slides >= 60, "the scan read the campaign: {slides} slides");
     }
 }

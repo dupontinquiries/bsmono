@@ -5667,6 +5667,11 @@ impl Game {
                             s.site_cycle(1);
                             return;
                         }
+                        // the intro slides come first: Enter turns the page,
+                        // Esc skips to the brief, and only then do the keys
+                        // mean launch and stand down
+                        Key::Named(NamedKey::Enter) if s.next_slide() => return,
+                        Key::Named(NamedKey::Escape) if s.skip_slides() => return,
                         Key::Named(NamedKey::Enter) => {
                             let lz = s.lz_now();
                             let gy = self.world.ground_h(lz.x, lz.z);
@@ -5700,6 +5705,10 @@ impl Game {
                         }
                     }
                     sortie::Stage::Debrief { .. } => match &key {
+                        // a won sortie's outro slides, the same way: Enter
+                        // turns, Esc skips, and the log comes after
+                        Key::Named(NamedKey::Enter) if s.next_slide() => return,
+                        Key::Named(NamedKey::Escape) if s.skip_slides() => return,
                         Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
                             let line = s.commit();
                             self.sortie = None;
