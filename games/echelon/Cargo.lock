@@ -104,6 +104,7 @@ version = "0.1.0"
 dependencies = [
  "echelon-bots",
  "echelon-data",
+ "echelon-net",
  "echelon-sim",
  "minifb",
  "ron",

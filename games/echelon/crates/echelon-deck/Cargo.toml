@@ -8,6 +8,7 @@ rust-version = "1.75"
 echelon-data = { path = "../echelon-data" }
 echelon-sim = { path = "../echelon-sim" }
 echelon-bots = { path = "../echelon-bots" }
+echelon-net = { path = "../echelon-net" }
 ron = { workspace = true }
 minifb = { version = "0.25", optional = true }
 

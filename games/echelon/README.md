@@ -24,6 +24,9 @@ cargo run --release -p echelon-runner -- Keiron Genetron \
 # two processes (or two machines), one match over UDP: the host plays player 0
 cargo run --release -p echelon-runner -- Keiron Genetron --lan-host 7777
 cargo run --release -p echelon-runner -- Keiron Genetron --lan-join 192.168.1.10:7777
+# the same match between two PEOPLE: the Command Deck on each machine
+cargo run --release -p echelon-deck --features window -- play --race Keiron --enemy Genetron --lan-host 7777
+cargo run --release -p echelon-deck --features window -- play --race Keiron --enemy Genetron --lan-join 192.168.1.10:7777
 ```
 
 Runner arguments: `[race1 race2 | all]`, `--map NAME` (standard,
@@ -60,6 +63,7 @@ Sample session:
 | `echelon-net`    | lockstep sessions: command turns, input delay, deterministic merge, hash exchange, desync detection (no sockets — feed any transport) |
 | `echelon-bots`   | the scripted macro AIs, shared by runner and client            |
 | `echelon-runner` | headless matches, replay verification, lockstep harness, SVG snapshots |
+| `echelon-deck`   | the Command Deck, the native client: tape mode (headless, CI-tested) and `--features window`; `--lan-host`/`--lan-join` seat two decks in one lockstep match over UDP |
 | `client/`        | **M1 Bevy front-end** (detached workspace — needs current stable Rust; see `client/README.md`). Play any race vs the bot: drag-select, move/attack/harvest, train hotkeys, build-placement ghost, HUD |
 
 `assets/data/races/*.ron` holds every unit and structure — including
