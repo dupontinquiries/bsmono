@@ -1715,6 +1715,11 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                     if let PhysicalKey::Code(code) = key_event.physical_key {
                         let down = key_event.state == ElementState::Pressed;
                         // F11 anywhere: the fullscreen setting flips (and is saved like any other)
+                        // the Menu bind (default Esc, rebindable on the Keybinds page) is read HERE:
+                        // Esc stays a menu key whatever it is bound to, so no rebind can strand a
+                        // player with no way back, and the bound key works where Esc works
+                        let menu_key = code == KeyCode::Escape
+                            || Keys::keycode_name(code) == state.menu.settings.keybinds.key_for(clawbound_rs::menu::Action::Menu);
                         if code == KeyCode::F11 && down && !key_event.repeat {
                             state.menu.settings.fullscreen = !state.menu.settings.fullscreen;
                             state.menu.mark_dirty();
@@ -1799,12 +1804,12 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                             }
                                             MenuCmd::None => {}
                                         },
-                                        KeyCode::Escape => { if state.menu.back() == MenuCmd::Close { state.menu.open = false; } }
+                                        _ if menu_key => { if state.menu.back() == MenuCmd::Close { state.menu.open = false; } }
                                         _ => {}
                                     }
                                 }
                             }
-                        } else if code == KeyCode::Escape && down {
+                        } else if menu_key && down {
                             state.menu.open = true; state.menu.screen = clawbound_rs::menu::Screen::Title; state.menu.cursor = 0;
                         } else if down && (code == KeyCode::Enter || code == KeyCode::NumpadEnter)
                             && state.tutorial.as_ref().map(|t| t.step == TUTORIAL_STEPS.len() - 1).unwrap_or(false) {
