@@ -16,10 +16,12 @@
 //!   * F4: toggle in-world debug overlay (player AABB, wind arrow,
 //!         velocity arrow, plant lifecycle markers, tick-cull boundary).
 //!         Watch stderr for the verbose toggle confirmation message.
-//!   * F6 / F7: tick speed slower / faster (geometric, sqrt(10) per press).
+//!   * [ / ]: tick speed slower / faster (geometric, sqrt(10) per press).
 //!         Lets you fast-forward slow simulation features (plant lifecycle,
 //!         leaf decay, weathering) for showcase or debugging. Range
 //!         [0.01x, 1000x]. Default 1.0x. Watch stderr for current value.
+//!         The settings page's "game speed" slider is the same knob (0x-10x),
+//!         and also drives the sky and the day clock.
 
 use glfw::{Action, CursorMode, Key, MouseButton, MouseButtonLeft, WindowEvent, WindowHint, ClientApiHint};
 // r328: native input vocabulary for InputCache queries; glfw types above
@@ -2423,6 +2425,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     use unendlich_engine::sim::ui_state::MenuState;
     let mut menu_state = MenuState::NoMenu;
     let mut world_clock_elapsed: f32 = 0.0; // r121: 1 real sec = 1 game minute
+    // The game speed the settings slider last applied, and the world's speed this frame
+    // (the chunk multiplier capped at 10x, for the sky and the day clock).
+    let mut game_speed_slider_applied: f32 = 1.0;
+    let mut world_speed: f32 = 1.0;
     let fg_item_registry = unendlich_engine::items::UniformRegistry(64);
 
     // -----------------------------------------------------------------------
@@ -6992,7 +6998,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             .freeze_time
             .load(std::sync::atomic::Ordering::Relaxed);
         if !game_paused && !freeze_time {
-            world_clock_elapsed += dt; // r121 world clock (r161: frozen while paused)
+            world_clock_elapsed += dt * world_speed; // r121 world clock (r161: frozen while paused; c21: at the game speed)
         }
         // r139: popdyn step — humidity-scaled grass regen vs herd grazing.
         // r461: named-location discovery — when the player crosses into a new biome-scale region,
@@ -12939,7 +12945,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             );
         }
 
-        // ---- Tick speed slider (F6 = slower, F7 = faster) ----
+        // ---- Tick speed ([ = slower, ] = faster; the settings page's game-speed slider) ----
         //
         // Geometric step: each press multiplies/divides by sqrt(10), so
         // 6 presses = 1000x. Clamped to [0.01, 1000.0]. Mutates the
@@ -12947,17 +12953,39 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // before it reaches the scheduler. Slow simulation features
         // (plant lifecycle stages, weathering) become visible in
         // seconds at 100x+ — useful for showcasing or debugging.
+        //
+        // The settings page's "game speed" slider (`ui_game_speed_pos`, r235) drove nothing
+        // until c21: it is the same knob, 0x (frozen) to 10x, and the slider and the keys
+        // keep each other current. The multiplier also reaches the sky and the day clock
+        // (capped at 10x: a 1000x sky is a strobe); creatures, weather and the player's own
+        // body keep real time. Single-player: r235's "closest to 1x across peers" reconcile
+        // is not sent over the LAN.
         if bindings.is_action_just_pressed(unendlich_engine::keybindings::GameAction::TickSpeedSlower, &input) {
             chunk_manager.tick_speed_multiplier =
                 (chunk_manager.tick_speed_multiplier / 10.0_f32.sqrt()).max(0.01);
-            eprintln!("[F6] Tick speed: {:.3}x — simulation runs slower (use F7 to speed up)",
+            eprintln!("[tick] speed: {:.3}x — simulation runs slower (] to speed up)",
                 chunk_manager.tick_speed_multiplier);
         }
         if bindings.is_action_just_pressed(unendlich_engine::keybindings::GameAction::TickSpeedFaster, &input) {
             chunk_manager.tick_speed_multiplier =
                 (chunk_manager.tick_speed_multiplier * 10.0_f32.sqrt()).min(10000.0);
-            eprintln!("[F7] Tick speed: {:.3}x — simulation runs faster (use F6 to slow down)",
+            eprintln!("[tick] speed: {:.3}x — simulation runs faster ([ to slow down)",
                 chunk_manager.tick_speed_multiplier);
+        }
+        {
+            use unendlich_engine::sim::game_speed::{multiplier_to_pos, pos_to_multiplier};
+            let from_slider = pos_to_multiplier(renderer.ui_game_speed_pos);
+            if (from_slider - game_speed_slider_applied).abs() > 1e-4 {
+                // the slider moved: it sets the world's speed
+                chunk_manager.tick_speed_multiplier = from_slider;
+                game_speed_slider_applied = from_slider;
+            } else if (chunk_manager.tick_speed_multiplier - game_speed_slider_applied).abs() > 1e-4 {
+                // the keys moved it: the slider follows (clamped to its 0x-10x track)
+                renderer.ui_game_speed_pos = multiplier_to_pos(chunk_manager.tick_speed_multiplier);
+                game_speed_slider_applied = pos_to_multiplier(renderer.ui_game_speed_pos);
+            }
+            world_speed = chunk_manager.tick_speed_multiplier.clamp(0.0, 10.0);
+            sky_state.time_scale = world_speed;
         }
         if bindings.is_action_just_pressed(unendlich_engine::keybindings::GameAction::LightFire, &input) {
             if !local_player.permissions.can_light_fire {

@@ -265,8 +265,11 @@ impl KeyBindings {
         b.insert(GameAction::ToggleDebug, Key::F3);
         b.insert(GameAction::ToggleDebugOverlay, Key::F4);
         b.insert(GameAction::ReloadChunks, Key::F5);
-        b.insert(GameAction::TickSpeedSlower, Key::F6);
-        b.insert(GameAction::TickSpeedFaster, Key::F7);
+        // `[` / `]`: F6 and F7 were these, and F6 is also the survival/creative toggle and F7
+        // (held) the rest ritual, read raw by the fullgame -- so every mode toggle also slowed
+        // the world by sqrt(10) and every rest sped it up, and nobody could say why.
+        b.insert(GameAction::TickSpeedSlower, Key::LeftBracket);
+        b.insert(GameAction::TickSpeedFaster, Key::RightBracket);
         b.insert(GameAction::ToggleChunkBorders, Key::F8);
         b.insert(GameAction::LightFire, Key::F9);
         b.insert(GameAction::Screenshot, Key::F2);

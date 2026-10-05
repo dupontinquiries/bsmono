@@ -4526,8 +4526,8 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                         unendlich_ui::menu::slider(ui, &mut ui_game_speed_pos, 0.0, 1.0, 0, accent);
                                     });
                                     ui.weak(
-                                        "server-authoritative · logarithmic 0x–1x–10x · in multiplayer \
-                                         the world runs at whichever setting is closest to 1x",
+                                        "logarithmic 0x–1x–10x · the day, the sky and the chunk simulation \
+                                         (plants, weathering); creatures, weather and you keep real time · [ ] step it",
                                     );
                                     ui.label("F6 toggles survival/creative · F7 hold = rest ritual");
                                 }
