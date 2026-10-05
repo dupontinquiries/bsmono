@@ -26,6 +26,8 @@ pub mod intro;
 pub mod spectator;
 /// The intro's fanfare, synthesized brass.
 pub mod brass;
+/// The match's music, synthesized per map when no music file is in the bank.
+pub mod score;
 /// Loaded clips played in the audio callback: realtime-safe, three buses, ducking.
 pub mod mixer;
 /// The space sounds happen in: stereo reverb and echo, set by place.

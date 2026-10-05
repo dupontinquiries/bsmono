@@ -1404,7 +1404,16 @@ fn render(s: &mut AppState) {
             Some(g) if s.screen == Screen::Playing => {
                 // the map's music waits for the intro (and its score) to end
                 if !s.music_on && s.intro.is_none() {
-                    if let Some(id) = bank.pick(&format!("music/{}", crate::map::active().key())) {
+                    let key = format!("music/{}", crate::map::active().key());
+                    // no file under the key: the map's synthesized bed (`score`), made once
+                    // per match at the device rate -- the match played in silence over the
+                    // wind before (the game ships no music)
+                    if !bank.has(&key) {
+                        let clip = crate::score::clip(crate::map::active(), amb.sample_rate as f32);
+                        bank.insert(&key, clip, &mut amb.mixer);
+                        eprintln!("music: no {key} file; a synthesized bed ({:.0} s loop)", crate::score::loop_secs(&crate::score::theme(crate::map::active())));
+                    }
+                    if let Some(id) = bank.pick(&key) {
                         amb.mixer.play(Play { handle: 0, clip: id, bus: Bus::Music, gain: 0.8, pan: 0.0, priority: 9, looped: true, speaker: None });
                     }
                     s.music_on = true;
