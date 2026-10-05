@@ -1,12 +1,11 @@
 #[cfg(feature = "app")]
 fn main() -> eframe::Result<()> {
     use netcode::profile::Profile;
-    use netcode::store::{ProfileService, SnapcoreStore};
 
-    // identity + snapcore-DHT service (OpenDHT primary swaps into the first slot behind its feature)
+    // identity + the shared-store service the games publish to (OpenDHT primary swaps into the
+    // first slot behind its feature)
     let me = Profile::new("me@local", whoami_name());
-    let svc = ProfileService::new(SnapcoreStore::new(), SnapcoreStore::new());
-    let mut centre = bsgames::ui::GameCentre::new(me, svc);
+    let mut centre = bsgames::ui::GameCentre::new(me, bsgames::centre::hub_service());
 
     eframe::run_native(
         "BigSilicon Games",
@@ -23,11 +22,7 @@ fn whoami_name() -> String {
 #[cfg(feature = "app")]
 fn dummy() -> bsgames::ui::GameCentre {
     use netcode::profile::Profile;
-    use netcode::store::{ProfileService, SnapcoreStore};
-    bsgames::ui::GameCentre::new(
-        Profile::new("x", "x"),
-        ProfileService::new(SnapcoreStore::new(), SnapcoreStore::new()),
-    )
+    bsgames::ui::GameCentre::new(Profile::new("x", "x"), bsgames::centre::hub_service())
 }
 
 #[cfg(feature = "app")]

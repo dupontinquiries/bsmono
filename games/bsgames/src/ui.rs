@@ -5,11 +5,11 @@ use crate::centre::{self, GameEntry};
 use crate::identity::LocalIdentity;
 use crate::wizard::{self, WizardEvent, WizardPhase};
 use netcode::profile::Profile;
-use netcode::store::{ProfileService, SnapcoreStore};
 
-/// LAN-only service for now; the OpenDHT primary drops into the first slot once its FFI backend is
-/// built (feature `opendht`), no UI change.
-pub type Service = ProfileService<SnapcoreStore, SnapcoreStore>;
+/// The shared-store service every game also writes to -- see `centre::HubService` for why it is
+/// not an in-process `SnapcoreStore`. The OpenDHT primary drops into the first slot once its FFI
+/// backend is built (feature `opendht`), no UI change.
+pub type Service = crate::centre::HubService;
 
 pub struct GameCentre {
     pub prefs: settings_kit::Prefs,

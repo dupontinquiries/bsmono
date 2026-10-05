@@ -1,6 +1,27 @@
 //! centre — the pure game-centre backend.
 use netcode::profile::{Presence, Profile};
-use netcode::store::ProfileBackend;
+use netcode::store::{FileStore, ProfileBackend, ProfileService};
+
+/// The hub's profile service: the SAME shared store every game publishes to.
+///
+/// `netcode::multiplayer::Multiplayer::new` (soldier, skydribble, blackstar-rs via shellkit) puts
+/// a game's profile, presence and session record in `FileStore::dev_default_path()`. Until c21 the
+/// hub built its service over two `SnapcoreStore`s -- a private in-process map -- so a friend
+/// hosting a match in a game process was invisible to the centre that was supposed to show the
+/// "Join" row, and the hub's own presence never reached any game. The OpenDHT primary still drops
+/// into the first slot behind its feature; this is the floor both sides agree on.
+pub type HubService = ProfileService<FileStore, FileStore>;
+
+/// The hub's service over the machine-wide shared store (what the games use).
+pub fn hub_service() -> HubService {
+    hub_service_at(FileStore::dev_default_path())
+}
+
+/// Same, pointed at an explicit store file -- tests give each run its own path so they neither
+/// pollute the real dev store nor see a game that happens to be running on the box.
+pub fn hub_service_at(path: std::path::PathBuf) -> HubService {
+    ProfileService::new(FileStore::at(&path), FileStore::at(&path))
+}
 
 /// How a game is started.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +257,55 @@ mod tests {
 
     fn svc() -> ProfileService<SnapcoreStore, SnapcoreStore> {
         ProfileService::new(SnapcoreStore::new(), SnapcoreStore::new())
+    }
+
+    /// Env var naming the store file for the child half of the two-process test below.
+    const CHILD_STORE: &str = "BSGAMES_TEST_CHILD_STORE";
+
+    /// The GAME half: runs in a separate process (spawned by the test below), exactly as soldier
+    /// or skydribble would -- `Multiplayer::new` resolves to the same `at_store` constructor, with
+    /// the path coming from the environment instead of `dev_default_path()`.
+    #[test]
+    #[ignore = "the child half of hub_sees_a_match_hosted_by_a_separate_game_process; its parent runs it"]
+    fn child_game_process_hosts_a_match() {
+        let path = std::path::PathBuf::from(std::env::var(CHILD_STORE).expect("parent sets the store path"));
+        let mut game = netcode::multiplayer::Multiplayer::at_store("soldier", "bob@1", "Bob", path);
+        game.host("127.0.0.1:0").expect("bind a loopback socket and announce");
+        // the socket dies with this process; the announcement stays in the file, which is what the hub reads
+    }
+
+    /// The hub's `Service` and a game's `Multiplayer` must read one store. The game side runs in
+    /// another PROCESS (this test binary re-exec'd on the ignored child above), because the bug
+    /// this pins -- an in-process `SnapcoreStore` in the hub -- is invisible to any single-process
+    /// test: within one process a shared map works perfectly.
+    #[test]
+    fn hub_sees_a_match_hosted_by_a_separate_game_process() {
+        let path = std::env::temp_dir().join(format!("bsgames-two-process-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(&exe)
+            .args(["--exact", "centre::tests::child_game_process_hosts_a_match", "--ignored", "--nocapture"])
+            .env(CHILD_STORE, &path)
+            .output()
+            .expect("re-exec the test binary");
+        assert!(out.status.success(), "child failed:\n{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(path.exists(), "the child must have written the shared store at {}", path.display());
+
+        let hub = hub_service_at(path.clone());
+        let mut me = Profile::new("me@0", "Me");
+        me.friends.push("bob@1".into());
+        let rows = friend_rows(&me, &hub);
+        assert_eq!(rows.len(), 1, "Bob was published by the game process; the hub must resolve him: {rows:?}");
+        assert_eq!(rows[0].name, "Bob");
+        assert!(rows[0].joinable, "Bob is hosting; the row must offer Join: {:?}", rows[0]);
+        assert_eq!(rows[0].raw_game.as_deref(), Some("soldier"));
+        // and the other direction: the hub's own publish is what a game's friends list resolves
+        let mut hub = hub;
+        assert!(hub.publish(&me));
+        let game = netcode::multiplayer::Multiplayer::at_store("soldier", "bob@1", "Bob", path.clone());
+        let (found, _) = game.svc().lookup("me@0");
+        assert_eq!(found.map(|p| p.name), Some("Me".to_string()), "a game must see the hub's profile in the same store");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
