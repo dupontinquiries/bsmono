@@ -143,6 +143,9 @@ pub struct Game {
     shift_t: f32,
     teleport_cd: f32,
     input: Option<(u8, f32, f32, bool, bool, bool)>,
+    /// A person at the hunter's controls this step (`set_hunter_input`): a move vector and
+    /// whether the pounce is held. Consumed by `step` like `input`.
+    hunter_input: Option<(f32, f32, bool)>,
     pub abilities_on: bool,   // settings toggle: give each clan a small passive + ultimate (off = hardcore)
     pub ult_cd: f32,          // player's clan ultimate cooldown remaining
     pub ult_t: f32,           // player's clan ultimate active time remaining
@@ -197,11 +200,19 @@ impl Game {
         let name_seed = (objective.0.abs() as u32).wrapping_mul(2_654_435_761)
             ^ (objective.1.abs() as u32).wrapping_mul(40_503) ^ (kind as u32).wrapping_mul(2_246_822_519);
         let roster = crate::lore::roster(name_seed, crate::lore::Rank::Warrior, N_CATS);
-        Game { cats, hunter, bushes, trees, objective, tick: 0, caught: 0, escaped: 0, time: 0.0, outcome: None, scent: Vec::new(), wind, weather, snake_home, mode, shifted: false, critters, prey_caught: 0, difficulty: 1.0, clan: 0, roster, danger: 0.0, player_move: None, combo_last: None, combo_flash: 0.0, combo_name: "", hunter_stagger: 0.0, twigs, logs, noise_flash: 0.0, shift_t: 0.0, teleport_cd: 5.0, input: None,
+        Game { cats, hunter, bushes, trees, objective, tick: 0, caught: 0, escaped: 0, time: 0.0, outcome: None, scent: Vec::new(), wind, weather, snake_home, mode, shifted: false, critters, prey_caught: 0, difficulty: 1.0, clan: 0, roster, danger: 0.0, player_move: None, combo_last: None, combo_flash: 0.0, combo_name: "", hunter_stagger: 0.0, twigs, logs, noise_flash: 0.0, shift_t: 0.0, teleport_cd: 5.0, input: None, hunter_input: None,
             abilities_on: false, ult_cd: 0.0, ult_t: 0.0, ult_want: false }
     }
 
     pub fn set_input(&mut self, id: u8, mx: f32, mz: f32, crouch: bool, dodge: bool, leap: bool) { self.input = Some((id, mx, mz, crouch, dodge, leap)); }
+
+    /// Put a person at the hunter's controls for the next `step`: it walks where `(mx, mz)`
+    /// points at its kind's pace (the difficulty still scales it) and takes a cat in reach
+    /// only while `pounce` is held -- the senses and the FSM keep running (they drive the
+    /// gaze, the HUD's danger and what the cats' AI reacts to), but the person decides where
+    /// to go and when to strike. Hidden cats are still rooted out by the nose. Without a call
+    /// before a step the hunter is the AI again, so a dropped link hands it back to the FSM.
+    pub fn set_hunter_input(&mut self, mx: f32, mz: f32, pounce: bool) { self.hunter_input = Some((mx, mz, pounce)); }
 
     /// Turn the clan passive/ultimate kit on or off (a settings toggle — off by default,
     /// so the hunter stays the dominant force; the abilities are a "softer" option).
@@ -278,6 +289,7 @@ impl Game {
         let mode = self.mode;
         let (mut hx, mut hz) = (self.hunter.x, self.hunter.z);
         let input = self.input.take();
+        let driven = self.hunter_input.take();
 
         // ── hawk carry: a grabbed cat is hoisted aloft, struggles, then breaks free
         //    (small chance, limps away crippled) or is taken. While carrying, the hawk
@@ -694,7 +706,8 @@ impl Game {
         }
         // Shadow: blink across the map to where the prey just was (Freddy-style —
         // you never outrun it). Cooldown-gated, only when its quarry has slipped far.
-        if self.hunter.kind.is_shadow() {
+        // (Not for a person at the controls: a blink nobody asked for is a teleport.)
+        if self.hunter.kind.is_shadow() && driven.is_none() {
             self.teleport_cd -= dt;
             if self.teleport_cd <= 0.0 {
                 if let Some((lx, lz)) = self.hunter.last_seen {
@@ -707,6 +720,12 @@ impl Game {
             }
         }
         if self.hunter.kind.is_shadow() && self.shifted { speed *= 1.35; } // empowered by the otherworld
+        // a person at the controls: the FSM's goal, stalk creep and snake lunge give way to
+        // the stick; the kind's pace, the shift and the difficulty still apply
+        if let Some((mx, mz, _)) = driven {
+            goal = (hx + mx, hz + mz);
+            speed = p.speed * if self.hunter.kind.is_shadow() && self.shifted { 1.35 } else { 1.0 };
+        }
         speed *= self.difficulty;   // Settings difficulty scales the hunter's pace
         let d = norm(goal.0 - hx, goal.1 - hz);
         if d.0.abs() + d.1.abs() > 1e-4 {
@@ -718,7 +737,10 @@ impl Game {
         // catch: open cats need the hunter aggressive + in reach; a hidden cat is
         // rooted out by proximity scaled by the nose. During the Shadow's shift,
         // cover is stripped so hiders are as catchable as cats in the open.
-        let aggressive = self.hunter.state == HState::Chase || self.hunter.suspicion > 0.55;
+        let aggressive = match driven {
+            Some((_, _, pounce)) => pounce,
+            None => self.hunter.state == HState::Chase || self.hunter.suspicion > 0.55,
+        };
         let flush_r = (1.2 + p.smell * 0.035) * self.difficulty / ct.stealth;   // harder settings root hiders out from further; lurking clans hide tighter
         let is_hawk = matches!(self.hunter.kind, Kind::Hawk);
         let mut grabbed_any = false;
@@ -967,6 +989,51 @@ mod tests {
         assert!(matches!(g.hunter.state, HState::Chase | HState::Alert));
         let d1 = dist(g.hunter.x, g.hunter.z, g.cats[0].x, g.cats[0].z);
         assert!(d1 < d0, "hunter should have closed distance ({d0} -> {d1})");
+    }
+
+    #[test]
+    fn a_driven_hunter_walks_where_it_is_pointed_and_not_where_the_fsm_would() {
+        let mut g = Game::new_6v1(Kind::Fox);
+        g.bushes.clear();
+        // a cat in plain sight to the +z side; the FSM would chase it
+        g.cats[0].x = 0.0; g.cats[0].z = 10.0; g.cats[0].moving = true; g.cats[0].hidden = false;
+        g.hunter.x = 0.0; g.hunter.z = 0.0; g.hunter.heading = 0.0;
+        for _ in 0..30 {
+            g.set_hunter_input(1.0, 0.0, false); // the person walks +x
+            g.step(1.0 / 30.0);
+        }
+        assert!(g.hunter.x > 3.0, "walked +x ({})", g.hunter.x);
+        assert!(g.hunter.z.abs() < 0.5, "and not toward the cat ({})", g.hunter.z);
+        assert!((g.hunter.heading - (1.0f32).atan2(0.0)).abs() < 1e-3, "faces the way it walks");
+        // no input before a step: the FSM has it again -- with nothing to hunt it patrols the
+        // objective, put far to -x, so the AI must turn back the way the person came
+        for c in g.cats.iter_mut() { c.x = 200.0; c.z = 200.0; c.hidden = true; c.moving = false; }
+        g.objective = (-80.0, 0.0);
+        g.hunter.suspicion = 0.0; g.hunter.state = HState::Patrol; g.hunter.last_seen = None;
+        g.scent.clear(); // nor a trail to track
+        let x = g.hunter.x;
+        for _ in 0..30 { g.step(1.0 / 30.0); }
+        assert!(g.hunter.x < x - 1.0, "the AI walks its own way again ({} -> {})", x, g.hunter.x);
+    }
+
+    #[test]
+    fn a_driven_hunter_takes_a_cat_in_reach_only_while_pouncing() {
+        let mut g = Game::new_6v1(Kind::Fox);
+        g.bushes.clear();
+        g.cats[0].x = 1.0; g.cats[0].z = 0.0; g.cats[0].hidden = false; g.cats[0].player = false;
+        g.cats[0].goal = (1.0, 0.0); // an AI cat would flee: pin its goal where it stands
+        g.hunter.x = 0.0; g.hunter.z = 0.0; g.hunter.suspicion = 1.5; g.hunter.state = HState::Chase;
+        // the FSM is as aggressive as it gets, but the person is not pouncing
+        for _ in 0..3 {
+            g.cats[0].x = 1.0; g.cats[0].z = 0.0;
+            g.set_hunter_input(0.0, 0.0, false);
+            g.step(1.0 / 30.0);
+        }
+        assert!(g.cats[0].alive, "no pounce, no catch");
+        g.cats[0].x = 1.0; g.cats[0].z = 0.0;
+        g.set_hunter_input(0.0, 0.0, true);
+        g.step(1.0 / 30.0);
+        assert!(!g.cats[0].alive, "the pounce takes the cat in reach");
     }
 
     #[test]
