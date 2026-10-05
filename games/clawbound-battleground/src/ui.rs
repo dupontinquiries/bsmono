@@ -1089,6 +1089,8 @@ pub fn roster_len() -> usize {
 pub struct ControlsPanel {
     /// In: the panel is open over a match (so it offers to leave it).
     pub in_match: bool,
+    /// In: the match is standing still behind the panel (`app::sim_paused`); a LAN match is not.
+    pub paused: bool,
     /// Out: leave the match for the main menu (confirmed).
     pub leave: bool,
     pub close: bool,
@@ -1211,6 +1213,13 @@ pub fn draw_controls(ctx: &egui::Context, cfg: &mut crate::input::Config, captur
             });
             ui.add_space(6.0);
             if out.in_match {
+                let (text, color) = if out.paused {
+                    ("PAUSED -- the match waits for you", GOLD)
+                } else {
+                    ("LAN match: play goes on behind this panel", Color32::from_rgb(220, 120, 90))
+                };
+                ui.label(egui::RichText::new(text).size(14.0).color(color).strong());
+                ui.add_space(4.0);
                 leave_row(ui, out);
                 ui.add_space(8.0);
             }

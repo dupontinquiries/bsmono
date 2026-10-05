@@ -2040,7 +2040,7 @@ pub fn run_settings_shot() -> Result<(), String> {
             time: Some(k as f64 * 0.016),
             ..Default::default()
         };
-        let mut panel = ui::ControlsPanel { in_match: true, leave: false, close: false, capture: None, clear: None, scheme: None, reset: false };
+        let mut panel = ui::ControlsPanel { in_match: true, paused: true, leave: false, close: false, capture: None, clear: None, scheme: None, reset: false };
         let o = ctx.run(raw, |c| {
             ui::draw_fps(c, 60.0, 16.7);
             ui::draw_controls(c, &mut cfg, None, false, &mut panel);

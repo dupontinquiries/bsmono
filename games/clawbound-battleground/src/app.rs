@@ -1022,6 +1022,8 @@ fn render(s: &mut AppState) {
     // fixed-step simulation + player input
     if s.screen == Screen::Playing {
         let c = s.controls;
+        // Esc's panel is the pause menu: the match waits while it is open.
+        let paused = sim_paused(s.controls_open, s.capturing.is_some(), s.lan.is_some());
         let aim = if s.game.is_some() { compute_aim(s) } else { Vec3::ZERO };
         let yaw = s.cam_yaw;
         let walk_to = s.walk_to;
@@ -1082,7 +1084,7 @@ fn render(s: &mut AppState) {
             // The intro runs instead of the sim: cats appear on its beats,
             // the fanfare starts on the first spawn, and play begins when
             // it ends or is skipped.
-            if let Some(it) = s.intro.as_mut() {
+            if let Some(it) = s.intro.as_mut().filter(|_| !paused) {
                 let before = it.t;
                 let arrived = if s.skip_intro { it.skip() } else { it.advance(dt_wall) };
                 let bursts = !s.skip_intro;
@@ -1139,9 +1141,9 @@ fn render(s: &mut AppState) {
                     s.accumulator = 0.0;
                 }
             }
-            s.accumulator = (s.accumulator + dt_frame).min(0.25);
-            while s.intro.is_none() && s.accumulator >= 1.0 / 60.0 {
-                s.accumulator -= 1.0 / 60.0;
+            s.accumulator = bank_frame(s.accumulator, dt_frame, paused);
+            while s.intro.is_none() && tick_due(s.accumulator, paused) {
+                s.accumulator -= SIM_STEP;
                 // camera_basis (input.rs) is verified against the real view
                 // matrix; hand-rolling this vector here is exactly how it
                 // was backwards before (D/right and A/left were swapped).
@@ -1451,7 +1453,8 @@ fn render(s: &mut AppState) {
     let mut again = false;
     let mut menu = false;
     let mut open_controls = false;
-    let mut panel = ui::ControlsPanel { in_match: s.screen == Screen::Playing && s.game.is_some() && s.spectator.is_none(), leave: false, close: false, capture: None, clear: None, scheme: None, reset: false };
+    let in_match = s.screen == Screen::Playing && s.game.is_some() && s.spectator.is_none();
+    let mut panel = ui::ControlsPanel { in_match, paused: in_match && sim_paused(true, false, s.lan.is_some()), leave: false, close: false, capture: None, clear: None, scheme: None, reset: false };
     let (show_fps, frame_s) = (s.cfg.settings.show_fps, s.frame_s);
     // where the camera is: bars fade with distance and behind terrain
     let cam_eye = s.renderer.camera.eye;
@@ -1655,12 +1658,75 @@ fn render_portraits(s: &mut AppState) {
 /// The present mode for the vsync setting: on, Fifo (always offered); off,
 /// uncapped -- Immediate if the surface offers it (Metal does), else
 /// Mailbox, else Fifo after all.
+/// The fixed simulation step, 60 Hz.
+pub const SIM_STEP: f32 = 1.0 / 60.0;
+
+/// The frame-time accumulator after this frame. A paused frame banks nothing, so the first
+/// frame back yields one frame's worth of ticks rather than a catch-up burst of however long
+/// the panel was open; a running frame banks at most 0.25 s (a stall is not replayed either).
+pub fn bank_frame(acc: f32, dt_frame: f32, paused: bool) -> f32 {
+    if paused { 0.0 } else { (acc + dt_frame).min(0.25) }
+}
+
+/// Whether another fixed step is owed from `acc` -- never while paused.
+pub fn tick_due(acc: f32, paused: bool) -> bool {
+    !paused && acc >= SIM_STEP
+}
+
+/// Whether the match stands still this frame. The controls panel (what Esc opens -- the
+/// "Pause" of the menu button) and a binding capture freeze a local match: until c21 the sim
+/// kept ticking under the panel, so opening settings mid-fight meant dying to the bots behind
+/// it. A LAN match cannot be paused by one peer, so there the panel floats over a live game.
+pub fn sim_paused(controls_open: bool, capturing: bool, lan: bool) -> bool {
+    (controls_open || capturing) && !lan
+}
+
 pub fn present_mode_for(vsync: bool, offered: &[wgpu::PresentMode]) -> wgpu::PresentMode {
     use wgpu::PresentMode::*;
     if vsync {
         return Fifo;
     }
     [Immediate, Mailbox].into_iter().find(|m| offered.contains(m)).unwrap_or(Fifo)
+}
+
+#[cfg(test)]
+mod pause_tests {
+    use super::{bank_frame, sim_paused, tick_due, SIM_STEP};
+
+    #[test]
+    fn the_panel_pauses_a_local_match_but_not_a_lan_one() {
+        assert!(!sim_paused(false, false, false), "nothing open: the match runs");
+        assert!(sim_paused(true, false, false), "Esc panel open: it waits");
+        assert!(sim_paused(false, true, false), "a key capture waits too");
+        assert!(!sim_paused(true, false, true), "a LAN peer cannot stop the others");
+        assert!(!sim_paused(false, false, true));
+    }
+
+    /// The gate as the frame loop applies it: a 60 Hz accumulator fed 0.25 s produces fifteen
+    /// ticks running and none paused, and resuming after a pause does not replay them.
+    #[test]
+    fn a_paused_accumulator_produces_no_ticks_and_no_catch_up() {
+        // the frame loop's own two calls, in its order
+        let step = |paused: bool, acc: &mut f32, dt: f32| -> u32 {
+            *acc = bank_frame(*acc, dt, paused);
+            let mut ticks = 0;
+            while tick_due(*acc, paused) {
+                *acc -= SIM_STEP;
+                ticks += 1;
+            }
+            ticks
+        };
+        // each half on its own: the pause owes no tick however much is banked, and banks nothing
+        assert!(!tick_due(0.5, true));
+        assert!(tick_due(0.5, false));
+        assert_eq!(bank_frame(0.2, 0.1, true), 0.0);
+        let mut acc = 0.0;
+        assert_eq!(step(false, &mut acc, 0.25), 15);
+        assert_eq!(step(true, &mut acc, 0.25), 0);
+        assert_eq!(step(true, &mut acc, 0.25), 0);
+        // the first frame back is one frame's worth, not the quarter second the panel was open
+        assert_eq!(step(false, &mut acc, 1.0 / 60.0), 1);
+    }
 }
 
 #[cfg(test)]
