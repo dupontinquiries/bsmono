@@ -48,5 +48,7 @@ pub mod wire;
 pub mod soundscape;
 /// What just happened in the hunt or the prowl, named, for the sound.
 pub mod cues;
+/// The sound, synthesized: beds for the air, a voice per cue.
+pub mod audio;
 pub mod world;
 pub mod worldscript;

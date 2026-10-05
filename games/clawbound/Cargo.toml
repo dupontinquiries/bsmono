@@ -26,9 +26,16 @@ console_error_panic_hook = { version = "0.1", optional = true }
 console_log = { version = "1", optional = true }
 web-sys = { version = "0.3", optional = true, features = ["Document", "Window", "Element", "HtmlCanvasElement"] }
 
+# Synthesized sound through cpal (needs ALSA headers on Linux: libasound2-dev). Native only:
+# the web build gets the silent `audio::Audio` whatever features it carries.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cpal = { version = "0.15", optional = true }
+
 [features]
 # Native playable window (winit + wgpu surface). Run: cargo run --features app -- --play
-app = ["dep:winit", "dep:env_logger", "dep:egui", "dep:egui-winit", "dep:web-time"]
+app = ["dep:winit", "dep:env_logger", "dep:egui", "dep:egui-winit", "dep:web-time", "sound"]
+# The cpal stream behind `audio::Audio`; off, the handle is the silent one. Part of `app`.
+sound = ["dep:cpal"]
 # Web build (wasm32 + WebGPU/WebGL canvas). Build on a machine with the wasm target.
 web = ["app", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:console_error_panic_hook", "dep:console_log", "dep:web-sys"]
 

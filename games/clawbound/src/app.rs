@@ -304,6 +304,14 @@ struct State {
     egui_state: egui_winit::State,
     egui_render: crate::egui_render::EguiRender,
     menu: clawbound_rs::menu::Menu,
+    /// The sound (`audio`): `None` on a machine with no output, and the game runs silent.
+    audio: Option<clawbound_rs::audio::Audio>,
+    /// The listeners that name the round's moments (`cues`); `None` until a round steps, and
+    /// set back to `None` wherever a new round is built so a fresh game is not heard as events.
+    hunt_listener: Option<clawbound_rs::cues::HuntListener>,
+    prowl_listener: Option<clawbound_rs::cues::ProwlListener>,
+    /// The master volume last sent to the synth, so a settings change reaches it once.
+    sent_volume: f32,
     /// Fleet online play (netcode::multiplayer, game id "clawbound"): presence + host/join over
     /// the shared control plane. The bsgames handoff (BSGAMES_HANDOFF_*) hosts/joins at startup;
     /// the Title menu's Multiplayer entry toggles hosting. Gameplay-byte sync over mp.socket is
@@ -471,7 +479,11 @@ impl State {
             mp = Some(m);
         }
 
-        State { _window: window, surface, device, queue, config, scene_pipe, post_pipe, ubuf, ubg, world_vbuf, world_vcount, ent_vbuf, ent_vcount: 0, ent_cap, game, prowl: None, capture: None, tutorial: None, kind, mode, over_timer: 0.0, debug_cone: false, egui_ctx, egui_state, egui_render, menu, mp, mp_status, keys: Keys::default(), pbgl, samp, fxbuf, scene_view, depth_view, ss_on: false, scene_w: w as f32, scene_h: h as f32, flick: (0.0, 0.0), mleft_prev: false, pbg, focus, frame: 0.0, last: web_time::Instant::now(), anim_t: 0.0, yaw: 0.55, pitch: 0.62, captured: false, death_t: 0.0, prev_player_alive: true }
+        let audio = clawbound_rs::audio::Audio::start();
+        if audio.is_none() {
+            eprintln!("[clawbound] no audio output; running silent");
+        }
+        State { _window: window, surface, device, queue, config, scene_pipe, post_pipe, ubuf, ubg, world_vbuf, world_vcount, ent_vbuf, ent_vcount: 0, ent_cap, game, prowl: None, capture: None, tutorial: None, kind, mode, over_timer: 0.0, debug_cone: false, egui_ctx, egui_state, egui_render, menu, audio, hunt_listener: None, prowl_listener: None, sent_volume: -1.0, mp, mp_status, keys: Keys::default(), pbgl, samp, fxbuf, scene_view, depth_view, ss_on: false, scene_w: w as f32, scene_h: h as f32, flick: (0.0, 0.0), mleft_prev: false, pbg, focus, frame: 0.0, last: web_time::Instant::now(), anim_t: 0.0, yaw: 0.55, pitch: 0.62, captured: false, death_t: 0.0, prev_player_alive: true }
     }
 
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -728,6 +740,20 @@ impl State {
     }
 
     /// The full per-frame path for the Prowl mode (parallel to the sim `render`).
+    fn sound(&self, m: clawbound_rs::audio::Msg) {
+        if let Some(a) = &self.audio { a.send(m); }
+    }
+
+    /// The prowl's moments and air, after a step.
+    fn prowl_sound(&mut self) {
+        let Some(p) = self.prowl.as_ref() else { return };
+        let l = self.prowl_listener.get_or_insert_with(|| clawbound_rs::cues::ProwlListener::new(p));
+        let cues = l.step(p);
+        let air = clawbound_rs::cues::ProwlListener::ambience(p);
+        for c in cues { self.sound(clawbound_rs::audio::Msg::Cue(c)); }
+        self.sound(clawbound_rs::audio::Msg::Air(air));
+    }
+
     fn render_prowl(&mut self, dt: f32) {
         self.set_capture(!self.menu.open);   // prowl is endless — capture while playing
 
@@ -740,6 +766,7 @@ impl State {
                 // expected it when they gained control.)
                 self.prowl.as_mut().unwrap().set_input(0.0, 0.0, false, false, false);
                 self.prowl.as_mut().unwrap().step(dt);
+                self.prowl_sound();
                 if let Some(t) = self.tutorial.as_mut() { t.intro_t -= dt; }
             } else {
             let (ix, iz) = self.keys.move_vec();
@@ -762,6 +789,7 @@ impl State {
             }
             self.mleft_prev = self.keys.mleft;
             self.prowl.as_mut().unwrap().step(dt);
+            self.prowl_sound();
             // tutorial: advance to the next step once the current one's condition is met
             if let Some(t) = self.tutorial.as_mut() {
                 t.advance_flash = (t.advance_flash - dt * 1.5).max(0.0);
@@ -1153,6 +1181,12 @@ impl State {
         self.anim_t += dt;
         self.debug_cone = self.menu.settings.show_cone;
         if self.ss_on != self.menu.settings.hires { self.apply_targets(); }   // Graphics toggle → (de)supersample
+        // the master volume reaches the synth when it changes; a menu over a round quiets the air
+        if (self.menu.settings.master_volume - self.sent_volume).abs() > 1e-4 {
+            self.sent_volume = self.menu.settings.master_volume;
+            self.sound(clawbound_rs::audio::Msg::Master(self.sent_volume));
+        }
+        if self.menu.open { self.sound(clawbound_rs::audio::Msg::Air(Default::default())); }
         // a changed setting or bind reaches the file the same frame; nothing was persisted
         // before c21 and every launch began at the defaults
         if self.menu.take_dirty() { self.menu.settings.save(); }
@@ -1193,6 +1227,11 @@ impl State {
             let step_dt = if self.death_t > 0.0 { dt * 0.35 } else { dt };
             self.death_t = (self.death_t - dt).max(0.0);
             self.game.step(step_dt);
+            // what the step did, to hear (`cues`)
+            let l = self.hunt_listener.get_or_insert_with(|| clawbound_rs::cues::HuntListener::new(&self.game));
+            let cues = l.step(&self.game);
+            for c in cues { self.sound(clawbound_rs::audio::Msg::Cue(c)); }
+            self.sound(clawbound_rs::audio::Msg::Air(clawbound_rs::cues::HuntListener::ambience(&self.game)));
 
             // round flow: hold the result a beat, then restart (or on 'R')
             if self.game.outcome.is_some() { self.over_timer += dt; } else { self.over_timer = 0.0; }
@@ -1204,6 +1243,7 @@ impl State {
                 self.game.difficulty = diff;
                 self.game.clan = clan;
                 self.game.set_abilities_on(self.menu.settings.clan_abilities);
+                self.hunt_listener = None;
                 self.over_timer = 0.0; self.keys.restart = false;
                 self.death_t = 0.0; self.prev_player_alive = true;
             }
@@ -1523,13 +1563,13 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                         KeyCode::ArrowLeft | KeyCode::KeyA => state.menu.adjust(-1),
                                         KeyCode::ArrowRight | KeyCode::KeyD => state.menu.adjust(1),
                                         KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => match state.menu.activate() {
-                                            MenuCmd::StartSingle(k, m) => { state.prowl = None; state.capture = None; state.tutorial = None; state.kind = k; state.mode = m; let seed = (state.frame as u32).wrapping_mul(2_654_435_761) | 1; state.game = Game::new_match_seeded(k, m, seed); state.game.difficulty = clawbound_rs::menu::difficulty_mult(state.menu.settings.difficulty); state.game.clan = state.menu.sel_clan; state.game.set_abilities_on(state.menu.settings.clan_abilities); state.over_timer = 0.0; }
+                                            MenuCmd::StartSingle(k, m) => { state.prowl = None; state.capture = None; state.tutorial = None; state.kind = k; state.mode = m; let seed = (state.frame as u32).wrapping_mul(2_654_435_761) | 1; state.game = Game::new_match_seeded(k, m, seed); state.hunt_listener = None; state.game.difficulty = clawbound_rs::menu::difficulty_mult(state.menu.settings.difficulty); state.game.clan = state.menu.sel_clan; state.game.set_abilities_on(state.menu.settings.clan_abilities); state.over_timer = 0.0; }
                                             MenuCmd::StartMode(g, k, c) => {
                                                 use clawbound_rs::menu::GameMode;
                                                 state.prowl = None; state.capture = None; state.tutorial = None;
                                                 let diff = clawbound_rs::menu::difficulty_mult(state.menu.settings.difficulty);
                                                 match g {
-                                                    GameMode::Prowl => { let mut p = clawbound_rs::prowl::Prowl::new(c, k); p.difficulty = diff; p.set_fixed_wind(state.menu.settings.prowl_fixed_wind); state.prowl = Some(p); }
+                                                    GameMode::Prowl => { let mut p = clawbound_rs::prowl::Prowl::new(c, k); p.difficulty = diff; p.set_fixed_wind(state.menu.settings.prowl_fixed_wind); state.prowl = Some(p); state.prowl_listener = None; }
                                                     GameMode::Capture => { state.capture = Some(clawbound_rs::capture::Capture::new(c)); }
                                                     _ => { state.menu.open = true; }
                                                 }
@@ -1539,6 +1579,7 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                                 let mut p = clawbound_rs::prowl::Prowl::new(clawbound_rs::class::Class::Cat, clawbound_rs::hunter::Kind::Fox);
                                                 p.set_tutorial_mode(true);
                                                 state.prowl = Some(p);
+                                                state.prowl_listener = None;
                                                 state.tutorial = Some(TutorialRun { step: 0, intro_t: 4.0, advance_flash: 0.0 });
                                             }
                                             // The Battleground is the separate game `games/clawbound-
@@ -1610,12 +1651,12 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                     KeyCode::Digit3 => Some(HK::Badger), KeyCode::Digit4 => Some(HK::Hawk),
                                     KeyCode::Digit5 => Some(HK::Snake), KeyCode::Digit6 => Some(HK::Shadow), _ => None,
                                 };
-                                if let Some(k) = pick { state.kind = k; state.game = Game::new_match(k, state.mode); state.over_timer = 0.0; }
+                                if let Some(k) = pick { state.kind = k; state.game = Game::new_match(k, state.mode); state.hunt_listener = None; state.over_timer = 0.0; }
                                 if code == KeyCode::KeyV { state.menu.settings.show_cone = !state.menu.settings.show_cone; }
                                 if code == KeyCode::KeyM {
                                     use clawbound_rs::sim::Mode;
                                     state.mode = if state.mode == Mode::Rendezvous { Mode::Survive } else { Mode::Rendezvous };
-                                    state.game = Game::new_match(state.kind, state.mode); state.over_timer = 0.0;
+                                    state.game = Game::new_match(state.kind, state.mode); state.hunt_listener = None; state.over_timer = 0.0;
                                 }
                             }
                             state.keys.set(code, down, &state.menu.settings.keybinds);
