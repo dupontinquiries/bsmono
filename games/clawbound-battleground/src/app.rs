@@ -98,6 +98,10 @@ struct AppState {
     emitters: crate::emitters::Emitters,
     /// Whether this match's music has been started.
     music_on: bool,
+    /// The synthesized bed being rendered off the frame thread (`score`): a receiver until it
+    /// lands, then inserted in the bank and played. Rendering a fifty-second loop at the
+    /// device rate is a few hundred milliseconds of DSP -- a hitch on the frame thread.
+    score_pending: Option<std::sync::mpsc::Receiver<crate::soundbank::Clip>>,
     /// The game-state announcer (`announcer`).
     announcer: crate::announcer::Announcer,
     /// Frames since the listener's space was last sent to the mixer.
@@ -450,6 +454,7 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         voice_gate: Default::default(),
         emitters: Default::default(),
         music_on: false,
+        score_pending: None,
         announcer: Default::default(),
         space_tick: 0,
         vol_sent: [-1.0; 4],
@@ -1405,18 +1410,31 @@ fn render(s: &mut AppState) {
                 // the map's music waits for the intro (and its score) to end
                 if !s.music_on && s.intro.is_none() {
                     let key = format!("music/{}", crate::map::active().key());
-                    // no file under the key: the map's synthesized bed (`score`), made once
-                    // per match at the device rate -- the match played in silence over the
-                    // wind before (the game ships no music)
-                    if !bank.has(&key) {
-                        let clip = crate::score::clip(crate::map::active(), amb.sample_rate as f32);
-                        bank.insert(&key, clip, &mut amb.mixer);
-                        eprintln!("music: no {key} file; a synthesized bed ({:.0} s loop)", crate::score::loop_secs(&crate::score::theme(crate::map::active())));
+                    // no file under the key: the map's synthesized bed (`score`), rendered
+                    // off the frame thread and played when it lands -- the match played in
+                    // silence over the wind before (the game ships no music)
+                    if bank.has(&key) {
+                        if let Some(id) = bank.pick(&key) {
+                            amb.mixer.play(Play { handle: 0, clip: id, bus: Bus::Music, gain: 0.8, pan: 0.0, priority: 9, looped: true, speaker: None });
+                        }
+                        s.music_on = true;
+                        s.score_pending = None;
+                    } else if let Some(rx) = s.score_pending.as_ref() {
+                        if let Ok(clip) = rx.try_recv() {
+                            let id = bank.insert(&key, clip, &mut amb.mixer);
+                            amb.mixer.play(Play { handle: 0, clip: id, bus: Bus::Music, gain: 0.8, pan: 0.0, priority: 9, looped: true, speaker: None });
+                            s.music_on = true;
+                            s.score_pending = None;
+                        }
+                    } else {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let (map, rate) = (crate::map::active(), amb.sample_rate as f32);
+                        std::thread::spawn(move || {
+                            let _ = tx.send(crate::score::clip(map, rate));
+                        });
+                        eprintln!("music: no {key} file; rendering the map's synthesized bed ({:.0} s loop)", crate::score::loop_secs(&crate::score::theme(map)));
+                        s.score_pending = Some(rx);
                     }
-                    if let Some(id) = bank.pick(&key) {
-                        amb.mixer.play(Play { handle: 0, clip: id, bus: Bus::Music, gain: 0.8, pan: 0.0, priority: 9, looped: true, speaker: None });
-                    }
-                    s.music_on = true;
                 }
                 let f = cam.target - cam.eye;
                 let right = Vec3::new(f.x, 0.0, f.z).normalize_or_zero().cross(Vec3::Y).normalize_or_zero();
