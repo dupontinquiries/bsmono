@@ -2,6 +2,9 @@
 name = "early-fps"
 version = "0.1.0"
 edition = "2021"
+# Four bins (the game, `gpu`, `mapstudy`, `soldier-netview`): without this, the documented
+# `cargo run --release --features app` is refused with "could not determine which binary to run".
+default-run = "early-fps"
 description = "An early-2000s-style first-person shooter in Rust + egui, software-rendered (painter's algorithm) the way Doom/Quake-era engines were. Built on the logscope Mesh3 renderer technique and the shooter_map architecture."
 license = "MIT OR Apache-2.0"
 
