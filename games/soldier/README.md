@@ -50,6 +50,7 @@ QWERTY preset.
 | Mouse wheel        | Cycle weapons                   |
 | `Space`            | Jump                            |
 | `Esc`              | Open menu / pause (releases the mouse) |
+| `F11`              | Fullscreen (also in Settings; saved)   |
 
 From the pause menu, **Settings** exposes mouse sensitivity, invert-look, field
 of view, a minimap toggle, and fully rebindable movement keys (click a key, then

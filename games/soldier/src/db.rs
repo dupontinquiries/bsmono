@@ -29,6 +29,8 @@ pub struct Options {
     pub graphics_preset: GraphicsPreset,
     pub hostile_color: [u8; 3],
     pub friendly_color: [u8; 3],
+    /// Borderless fullscreen (F11 flips it too).
+    pub fullscreen: bool,
     /// `(action id, key name)` for every rebindable action, in the app's action order. Empty means "the
     /// layout's defaults"; an action missing from the list keeps its default key, so a save written by an
     /// older build (or hand-edited) never strips a binding.
@@ -48,6 +50,7 @@ impl Default for Options {
             graphics_preset: GraphicsPreset::default(),
             hostile_color: [230, 120, 40], // orange
             friendly_color: [70, 190, 90], // green
+            fullscreen: false,
             binds: Vec::new(),
         }
     }
@@ -68,6 +71,7 @@ impl Options {
             "opt.graphics_preset" => self.graphics_preset = GraphicsPreset::from_name(v).unwrap_or(self.graphics_preset),
             "opt.hostile_color" => self.hostile_color = parse_hex_rgb(v).unwrap_or(self.hostile_color),
             "opt.friendly_color" => self.friendly_color = parse_hex_rgb(v).unwrap_or(self.friendly_color),
+            "opt.fullscreen" => self.fullscreen = flag(v),
             _ => {
                 let Some(action) = k.strip_prefix("bind.") else { return false };
                 if action.is_empty() || v.is_empty() {
@@ -85,7 +89,7 @@ impl Options {
     fn to_text(&self) -> String {
         let mut out = format!(
             "opt.sensitivity={}\nopt.invert_y={}\nopt.fov_deg={}\nopt.third_person={}\nopt.show_minimap={}\n\
-             opt.render_detail={}\nopt.texture_detail={}\nopt.graphics_preset={}\nopt.hostile_color={}\nopt.friendly_color={}\n",
+             opt.render_detail={}\nopt.texture_detail={}\nopt.graphics_preset={}\nopt.hostile_color={}\nopt.friendly_color={}\nopt.fullscreen={}\n",
             self.sensitivity,
             self.invert_y as u8,
             self.fov_deg,
@@ -96,6 +100,7 @@ impl Options {
             self.graphics_preset.name(),
             hex_rgb(self.hostile_color),
             hex_rgb(self.friendly_color),
+            self.fullscreen as u8,
         );
         for (action, key) in &self.binds {
             out.push_str(&format!("bind.{action}={key}\n"));
@@ -290,6 +295,7 @@ mod tests {
             graphics_preset: GraphicsPreset::Low,
             hostile_color: [255, 0, 128],
             friendly_color: [1, 2, 3],
+            fullscreen: true,
             binds: vec![("forward".into(), "W".into()), ("jump".into(), "Space".into()), ("forge_menu".into(), "Escape".into())],
         }
     }

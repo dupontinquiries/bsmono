@@ -366,6 +366,8 @@ struct Settings {
     /// Preferred renderer: false = software painter, true = GPU (wgpu). Mirrors `Db::gpu_renderer`; applied on
     /// the next launch (the two backends use different windowing, so it can't hot-swap live).
     gpu_renderer: bool,
+    /// Borderless fullscreen; F11 flips it. Sent to the viewport when it changes (`fullscreen_applied`).
+    fullscreen: bool,
 }
 
 impl Default for Settings {
@@ -400,6 +402,7 @@ impl Settings {
             hostile_color: rgb(o.hostile_color),
             friendly_color: rgb(o.friendly_color),
             gpu_renderer: false,
+            fullscreen: o.fullscreen,
         }
     }
 
@@ -419,6 +422,7 @@ impl Settings {
             graphics_preset: self.graphics_preset,
             hostile_color: rgb(self.hostile_color),
             friendly_color: rgb(self.friendly_color),
+            fullscreen: self.fullscreen,
             binds: BindAction::ALL.iter().map(|&a| (a.id().to_string(), self.bindings.get(a).name().to_string())).collect(),
         }
     }
@@ -453,6 +457,8 @@ pub struct FpsApp {
     /// Map selector state: chosen biome (None = random / quick play) and whether we arrived via "online".
     sel_preset: Option<usize>,
     mp_online: bool,
+    /// What the viewport was last told about fullscreen (`None` before the first frame).
+    fullscreen_applied: Option<bool>,
     /// Real online-play control-plane state (see multiplayer.rs): session announce/discover over
     /// the fleet DHT. `mp_status` is the last host/join result shown in the Multiplayer menu;
     /// `mp_friend_input` is the "Join" text field.
@@ -558,6 +564,7 @@ impl FpsApp {
             db,
             sel_preset: None,
             mp_online: false,
+            fullscreen_applied: None,
             mp,
             mp_status,
             mp_friend_input: String::new(),
@@ -1783,6 +1790,15 @@ impl eframe::App for FpsApp {
         }
 
         let esc = ctx.input(|i| i.key_pressed(Key::Escape));
+        // F11 anywhere flips the fullscreen setting (saved with the rest); the viewport is told
+        // once at the start and whenever the setting changes
+        if ctx.input(|i| i.key_pressed(Key::F11)) {
+            self.settings.fullscreen = !self.settings.fullscreen;
+        }
+        if self.fullscreen_applied != Some(self.settings.fullscreen) {
+            self.fullscreen_applied = Some(self.settings.fullscreen);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.settings.fullscreen));
+        }
 
         // ── Rebinding capture takes priority over everything else ────────────────
         if let Some(action) = self.rebinding {
@@ -2282,6 +2298,7 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Settings, rebinding: &mut Option<Bin
     section(ui, "VIEW");
     ui.add(egui::Slider::new(&mut s.fov_deg, 60.0..=100.0).suffix("°").text("Field of view"));
     ui.checkbox(&mut s.show_minimap, "Show minimap");
+    ui.checkbox(&mut s.fullscreen, "Fullscreen (F11)");
 
     ui.add_space(10.0);
     section(ui, "GRAPHICS");
@@ -2643,7 +2660,7 @@ mod preview_tests {
         assert_eq!(s.hostile_color, Color32::from_rgb(230, 120, 40));
         assert_eq!(s.friendly_color, Color32::from_rgb(70, 190, 90));
         assert_eq!(s.bindings.get(BindAction::Forward), Key::Period, "the default layout is Dvorak");
-        assert!(!s.gpu_renderer);
+        assert!(!s.gpu_renderer && !s.fullscreen);
     }
 
     #[test]
@@ -2662,6 +2679,7 @@ mod preview_tests {
         s.bindings.set(BindAction::Jump, Key::F);
         s.bindings.set(BindAction::ForgeUndo, Key::Backtick);
         s.bindings.set(BindAction::NavBack, Key::Minus);
+        s.fullscreen = true;
         let o = s.options();
         assert_eq!(o.binds.len(), BindAction::ALL.len(), "every rebindable action is written");
         assert!(o.binds.contains(&("jump".to_string(), "F".to_string())));
@@ -2673,6 +2691,7 @@ mod preview_tests {
         assert_eq!(back.graphics_preset, crate::graphics::GraphicsPreset::Low);
         assert_eq!(back.hostile_color, Color32::from_rgb(1, 2, 3));
         assert_eq!(back.friendly_color, Color32::from_rgb(9, 8, 7));
+        assert!(back.fullscreen);
         for a in BindAction::ALL {
             assert_eq!(back.bindings.get(a), s.bindings.get(a), "binding for {}", a.id());
         }
