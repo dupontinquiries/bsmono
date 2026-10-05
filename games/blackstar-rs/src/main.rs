@@ -1043,6 +1043,8 @@ struct Game {
     body: sections::Body,
     /// The field rebuild after the body goes down (`sections::Rebuild`).
     rebuild: sections::Rebuild,
+    /// Esc twice to abandon a sortie on the field (`sortie::Abandon`).
+    abandon: sortie::Abandon,
     grime: grime::Grime,
     /// the action bar, live during play — loaded once at boot rather
     /// than through a Deck console, since quick-select has to work
@@ -2506,6 +2508,7 @@ fn main() {
         hotbar,
         body: sections::Body::default(),
         rebuild: sections::Rebuild::default(),
+        abandon: sortie::Abandon::default(),
         grime: grime::Grime::default(),
         held: HashSet::new(),
         held_mouse: HashSet::new(),
@@ -5673,8 +5676,15 @@ impl Game {
                     },
                     sortie::Stage::Engage => {
                         if key == Key::Named(NamedKey::Escape) {
-                            self.sortie = None;
-                            self.toastf("sortie abandoned — nothing recorded");
+                            if self.abandon.press(self.time) {
+                                self.sortie = None;
+                                self.toastf("sortie abandoned — nothing recorded");
+                            } else {
+                                self.toastf(&format!(
+                                    "press Esc again within {:.0}s to abandon the sortie — nothing would be recorded",
+                                    sortie::Abandon::WINDOW
+                                ));
+                            }
                             return;
                         }
                     }
@@ -8438,6 +8448,7 @@ impl Game {
             Ok(s) => {
                 let d = s.dest;
                 self.body.repair(); // a launch is a repaired bot
+                self.abandon.disarm();
                 self.load_map(mapsim::style_for(d), dest_seed(d.id));
                 self.set_medium_for(d);
                 self.close_deck();

@@ -689,9 +689,61 @@ impl Sortie {
     }
 }
 
+/// Abandoning a sortie on the field takes TWO presses of Esc within [`Abandon::WINDOW`]
+/// seconds. One press used to drop the whole run with "nothing recorded" -- the same key that
+/// backs out of every menu, pressed once by reflex, mid-fight.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Abandon {
+    armed_at: Option<f32>,
+}
+
+impl Abandon {
+    pub const WINDOW: f32 = 3.0;
+
+    /// A press at `now`: `true` when it confirms (an arming press within the window came
+    /// before it); `false` arms (or re-arms, if the last one has expired).
+    pub fn press(&mut self, now: f32) -> bool {
+        match self.armed_at {
+            Some(t) if now - t <= Self::WINDOW && now >= t => {
+                self.armed_at = None;
+                true
+            }
+            _ => {
+                self.armed_at = Some(now);
+                false
+            }
+        }
+    }
+
+    /// Still waiting for the confirming press at `now`?
+    pub fn armed(&self, now: f32) -> bool {
+        matches!(self.armed_at, Some(t) if now - t <= Self::WINDOW && now >= t)
+    }
+
+    pub fn disarm(&mut self) {
+        self.armed_at = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abandoning_takes_a_second_press_inside_the_window() {
+        let mut a = Abandon::default();
+        assert!(!a.press(10.0), "the first press arms");
+        assert!(a.armed(11.0));
+        assert!(a.press(12.5), "the second, inside the window, confirms");
+        assert!(!a.armed(12.6), "and nothing is armed afterwards");
+        assert!(!a.press(20.0));
+        assert!(!a.press(20.0 + Abandon::WINDOW + 0.1), "too late: this press re-arms instead");
+        assert!(a.armed(23.2));
+        a.disarm();
+        assert!(!a.armed(23.3));
+        assert!(!a.press(30.0));
+        assert!(!a.press(29.0), "a clock that went backwards does not confirm");
+    }
 
     /// Autopilot a begun sortie to touchdown, competently — fold high,
     /// steer at the mark — so tests can reach Engage without a screen.
