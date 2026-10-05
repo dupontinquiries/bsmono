@@ -213,6 +213,24 @@ test and a §5b break test; nothing below was seen on a screen or heard.
     shielded titan that kills whoever arrives. The match test asserts progress at 3.75 and
     the end at 1.42. Also seen and left: a bot healed at the fountain beelines to its old far
     waypoint through the middle; bots stand at a shielded titan.
+  - **road-warrior** `502b42211` `cues` (the car's moments named: launch, landing clean or
+    rough, hit, ram, nitro, dry tank; the engine note); `39eada491` sound -- an engine drone, a
+    voice per cue, two stings, `M` mutes; cpal behind a default-on `sound` feature.
+  - **clawbound** `3e991f0fb` settings and keybinds persist (`~/.config/clawbound/settings.cfg`;
+    every launch began at the defaults); `b410bd5ad` `cues` for the hunt and the prowl;
+    `c0d6868b8` sound -- wind/rain/thunder/snow beds, a tension drone with a heartbeat, a voice
+    per cue, the Settings master volume finally read. (`soundscape.rs` is a mix for the in-crate
+    battleground the window never plays.)
+  - **netcode/shellkit/soldier** `5b1dacddf` `af466d3fc` join by the host's address: the fleet
+    store resolves a name only between machines sharing its temp-dir path, so across two
+    machines a name resolved nowhere. HOST lines show `ip:port`, FRIEND takes one (the field
+    cap of 16 cut every address short), skydribble/blackstar-rs/soldier.
+  - **unendlich** `fa78357b8` `9b21c5216` WORLD HISTORY restores: a point was `save_all` plus
+    a marker (the live files overwritten in place; nothing read the RESTORE marker) -- now a
+    copy of the region tree in the world root, staged restore applied on open by the game and
+    the server, the replaced state kept as a point. `876619520` `a5035513e` world edits over
+    a reliable-ordered link (seq/ack/resend per peer; they went out in one raw datagram, and
+    a dropped one was a silent divergence) in the inline loop and `HostPump`.
 - **Decided, not wired:** blackstar-rs `dispatch.rs` models voyages (`voyage`/`damage`/
   `survival`/`loot`, orbits and delta-v) that nothing in the shipboard game reaches -- wiring
   it is a game-layer design, not a bug; `suitability.rs` would tell the player "wheels have
@@ -221,12 +239,14 @@ test and a §5b break test; nothing below was seen on a screen or heard.
   handling". The other five battleground "done" mechanics (markers/daylight/freshkill/
   shadowrealm/camps) are the Warriors design (`docs/WARRIORS_MECHANICS.md`), a different
   fantasy from the 5v5 the sim plays; wiring them is a rules change, not a fix.
-- **Still open from the surveys** (ranked): unendlich settings_model unwired / `gpu_mesher_mode`
-  hard-coded / World History Restore stub / edit reliability (#5) / the inline host loop vs
-  `HostPump` duplication; clawbound-battleground: the AI radii vs MAP_SCALE (above), missing
-  music/narrator/announcer assets, LAN ancestor pick + custom rules in the plan; clawbound
-  settings persistence, no audio backend; skydribble join by address; road-warrior has no
-  audio at all; echelon has no transport.
+- **Still open from the surveys** (ranked): unendlich `settings_model` unwired (the renderer's
+  `ui_*` fields ARE the settings; the model's draft/apply/revert is a Cancel button nobody has
+  asked for) / `gpu_mesher_mode` hard-coded (documented decision) / the inline host loop vs
+  `HostPump` duplication (both now carry admission and the reliable link; the dedupe is a
+  refactor of a 20k-line bin); clawbound-battleground: the AI radii vs MAP_SCALE (above),
+  missing music/narrator/announcer assets, LAN ancestor pick + custom rules in the plan;
+  echelon has no transport. Everything synthesized this batch (road-warrior, clawbound) is
+  unheard: the voices are first passes by their numbers.
 - **Not touched:** blackstar-rs's visual/playtest backlog (`TODO.md` §"Found, NOT fixed" needs
   eyes on a screen), unendlich's BACKLOG §B pure cores (octree re-merge, rebuild coalescer,
   `MoistureField::recenter`) — sandbox-verifiable but each is a feature, not a fix, and the
