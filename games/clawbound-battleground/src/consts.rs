@@ -45,11 +45,20 @@ pub fn ground_half() -> f32 {
     }
 }
 
+/// The arena the outer ring was authored round, in world units: 95 u of lanes at the original
+/// MAP_SCALE of 1.42. A number, not `95.0 * MAP_SCALE`: that expression equalled 135 only at
+/// 1.42, and at any other scale it cancelled MAP_SCALE out of OUTER_SCALE -- at 3.75 the rim
+/// began at 187 u inside a 388 u floor, the rivers ran up the mountainside (dry: the bed never
+/// got below the water line), and the ground ended 140 u short of the camera's reach, which is
+/// what 111256693's TODO ("does not scale the jungle mountains slope as much as the travel
+/// dist") was seeing.
+pub const AUTHORED_ARENA: f32 = 135.0;
+
 /// Everything past the playable floor -- the hill ring, the landmarks, the
 /// mountain rim, the rendered ground -- was authored in world units for a
 /// 135 u arena. It is carried out by this ratio so the ring keeps its shape
 /// round a bigger floor instead of the floor growing into it.
-pub const OUTER_SCALE: f32 = ARENA_RADIUS / (95.0 * MAP_SCALE);
+pub const OUTER_SCALE: f32 = ARENA_RADIUS / AUTHORED_ARENA;
 
 /// Where the mountain rim starts rising.
 pub const RIM_RADIUS: f32 = 172.0 * OUTER_SCALE;
