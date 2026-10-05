@@ -4720,6 +4720,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let mut lan_joinsync_backlog: Vec<unendlich_engine::sim::net::join_sync::ChunkEditRecord> = Vec::new();
     let mut lan_joinsync_retry_ms: u64 = 0;
     let mut lan_keepalive_ms: u64 = 0;
+    // When our upstream host last sent us anything; a quiet host means it pruned us (or the
+    // network dropped), and a re-Join is what gets us re-admitted (`HostPump` drops a pruned
+    // peer's data until then).
+    let mut lan_last_from_host_ms: u64 = 0;
+    // Data-channel datagrams dropped for coming from a non-admitted address.
+    let mut lan_dropped_unadmitted: u64 = 0;
     let lan_local_ip: Option<[u8; 4]> = if lan_beacon.is_some() {
         let ip = unendlich_engine::sim::lan_discovery::local_lan_ipv4();
         match ip {
@@ -19134,8 +19140,29 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     std::net::SocketAddr::V4(a) => Some(a),
                                     _ => None, // LAN sessions are v4-only today
                                 };
-                                if let Some(a) = src4 {
-                                    lan_host.note_seen(a, now_ms);
+                                // Who may send us data (entity states, edits, avatars): as the
+                                // host, an ADMITTED peer -- `note_seen` says whether this address
+                                // is one; as a joiner, our upstream host and nobody else. Until
+                                // c21 the answer was dropped and every arm below applied and
+                                // relayed whatever arrived, so the whitelist gated the Accept and
+                                // nothing after it (see `HostPump::pump`, the same fix).
+                                let from_admitted = src4.map(|a| lan_host.note_seen(a, now_ms)).unwrap_or(false);
+                                let trusted = match lan_peer_addr {
+                                    Some(up) => src4 == Some(up),
+                                    None => from_admitted,
+                                };
+                                if src4.is_some() && src4 == lan_peer_addr {
+                                    lan_last_from_host_ms = now_ms;
+                                }
+                                if buf[0] != CH_HANDSHAKE && !trusted {
+                                    lan_dropped_unadmitted += 1;
+                                    if lan_dropped_unadmitted == 1 || lan_dropped_unadmitted % 500 == 0 {
+                                        log::warn!(
+                                            "[lan-mp] dropped {} data datagram(s) from non-admitted address(es), latest {src} ch{}",
+                                            lan_dropped_unadmitted, buf[0]
+                                        );
+                                    }
+                                    continue;
                                 }
                                 let relay_as_host = |from: std::net::SocketAddrV4,
                                                      lan_host: &unendlich_engine::sim::net::lan_host::LanHost| {
@@ -19514,8 +19541,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // not yet InGame, re-send JOIN every 2 s; the host treats
                     // it as a rejoin (cheap re-Accept), and our duplicate-
                     // Accept guard makes the reply a no-op.
+                    // c21: also while InGame whenever the host has gone quiet on us for
+                    // HOST_QUIET_MS -- a host that pruned us drops our data until we re-Join
+                    // (its admission is now the only way in), and before this nothing ever
+                    // re-sent one, so a 5 s hiccup was a silent, permanent disconnect.
+                    const HOST_QUIET_MS: u64 = 3000;
                     if let Some(up) = lan_peer_addr {
-                        if fg_app.state() != AppState::InGame
+                        let host_quiet = lan_last_from_host_ms > 0
+                            && now_ms.saturating_sub(lan_last_from_host_ms) >= HOST_QUIET_MS;
+                        if (fg_app.state() != AppState::InGame || host_quiet)
                             && now_ms.saturating_sub(lan_keepalive_ms) >= 2000
                         {
                             lan_keepalive_ms = now_ms;

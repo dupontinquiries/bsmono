@@ -77,6 +77,10 @@ pub struct HostPump {
     sock: UdpSocket,
     pub host: LanHost,
     gate: SnapshotGate,
+    /// Data-channel datagrams dropped because their source was not an admitted peer (never
+    /// joined, denied, or pruned and not yet re-joined). A counter rather than an event: a
+    /// stranger can send as fast as it likes, and the status line is where an operator sees it.
+    pub dropped_unadmitted: u64,
 }
 
 impl HostPump {
@@ -87,7 +91,7 @@ impl HostPump {
         let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, preferred_port))
             .or_else(|_| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)))?;
         sock.set_nonblocking(true)?;
-        Ok(HostPump { sock, host: LanHost::new(host_name, host_entity_id), gate: SnapshotGate::new() })
+        Ok(HostPump { sock, host: LanHost::new(host_name, host_entity_id), gate: SnapshotGate::new(), dropped_unadmitted: 0 })
     }
 
     /// The actually-bound session port (what adverts should carry).
@@ -100,7 +104,13 @@ impl HostPump {
     /// relay everything non-handshake to the other peers, and prune silent
     /// peers. Non-blocking; call once per tick/frame.
     ///
-    /// `admit` is the access policy (e.g. `|name| whitelist.admits(name)`).
+    /// `admit` is the access policy (e.g. `|name| whitelist.admits(name)`), and it is the ONLY
+    /// way in: a data-channel datagram (entity, world command, avatar) from an address that is
+    /// not an admitted peer is dropped -- not applied, not relayed. Until c21 the admission
+    /// decided who got an Accept and nothing else; `note_seen`'s answer was thrown away, so a
+    /// denied name, or anyone who never sent a Join, could edit the world and be relayed to
+    /// every player, and the whitelist was a formality. A pruned peer is a stranger again until
+    /// its next Join (the fullgame re-sends one when the host goes quiet on it).
     pub fn pump(
         &mut self,
         now_ms: u64,
@@ -125,7 +135,10 @@ impl HostPump {
                             }
                         }
                         CH_ENTITY => {
-                            self.host.note_seen(src, now_ms);
+                            if !self.host.note_seen(src, now_ms) {
+                                self.dropped_unadmitted += 1;
+                                continue;
+                            }
                             if let Some(states) = receive(&mut self.gate, payload) {
                                 if !states.is_empty() {
                                     events.push(PumpEvent::Entities(states));
@@ -134,7 +147,10 @@ impl HostPump {
                             self.relay(&buf[..n], src);
                         }
                         CH_WORLDCMD => {
-                            self.host.note_seen(src, now_ms);
+                            if !self.host.note_seen(src, now_ms) {
+                                self.dropped_unadmitted += 1;
+                                continue;
+                            }
                             if let Some(raw) =
                                 super::packet_compress::unpack(payload, WORLDCMD_MAX_BYTES)
                             {
@@ -147,7 +163,10 @@ impl HostPump {
                             self.relay(&buf[..n], src);
                         }
                         CH_AVATAR => {
-                            self.host.note_seen(src, now_ms);
+                            if !self.host.note_seen(src, now_ms) {
+                                self.dropped_unadmitted += 1;
+                                continue;
+                            }
                             if payload.len() >= 20 {
                                 let mut idb = [0u8; 8];
                                 idb.copy_from_slice(&payload[0..8]);
@@ -380,6 +399,74 @@ mod tests {
 
         // A must NOT have been echoed its own datagram.
         assert!(a.recv().is_none(), "relay echoed back to the source");
+    }
+
+    /// The admission is the only way in: a stranger's edit, entity state and avatar are
+    /// neither surfaced nor relayed, a denied joiner is a stranger, and so is a peer the host
+    /// pruned -- until the next Join.
+    #[test]
+    fn data_from_an_unadmitted_address_is_dropped_not_applied_or_relayed() {
+        use crate::sim::net::world_cmd_wire::encode_batch;
+        let mut pump = pump_on_loopback();
+        let member = Client::connect(pump.port());
+        member.send(CH_HANDSHAKE, &LanJoin::Join { name: "alice".into() }.encode());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        pump.pump(0, "W", 1, 0, &|_| true);
+        member.recv().expect("alice's Accept");
+
+        let batch = vec![(7u64, WorldCmd::Remove { pos: (10, 64, -4) })];
+        let edit = super::super::packet_compress::pack(&encode_batch(&batch), 48);
+        let avatar = [0u8; 20];
+
+        // never joined
+        let stranger = Client::connect(pump.port());
+        stranger.send(CH_WORLDCMD, &edit);
+        stranger.send(CH_AVATAR, &avatar);
+        stranger.send(CH_ENTITY, &[0u8; 8]);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let events = pump.pump(100, "W", 1, 0, &|_| true);
+        assert!(events.is_empty(), "a stranger's data surfaced: {events:?}");
+        assert_eq!(pump.dropped_unadmitted, 3);
+        assert!(member.recv().is_none(), "a stranger's data was relayed to alice");
+
+        // denied by the policy
+        let denied = Client::connect(pump.port());
+        denied.send(CH_HANDSHAKE, &LanJoin::Join { name: "mallory".into() }.encode());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        pump.pump(200, "W", 1, 0, &|name| name != "mallory");
+        denied.recv().expect("mallory's Deny");
+        denied.send(CH_WORLDCMD, &edit);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let events = pump.pump(300, "W", 1, 0, &|name| name != "mallory");
+        assert!(events.is_empty(), "a denied joiner's edit surfaced: {events:?}");
+        assert_eq!(pump.dropped_unadmitted, 4);
+        assert!(member.recv().is_none());
+
+        // the member's own edit still lands, so the gate is the address and not the channel
+        member.send(CH_WORLDCMD, &edit);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let events = pump.pump(400, "W", 1, 0, &|_| true);
+        assert!(events.iter().any(|e| matches!(e, PumpEvent::WorldCmds(c) if c == &batch)), "{events:?}");
+        assert_eq!(pump.dropped_unadmitted, 4);
+
+        // pruned: a stranger again until it re-joins
+        let events = pump.pump(400 + PEER_TIMEOUT_MS + 1, "W", 1, 0, &|_| true);
+        assert!(events.iter().any(|e| matches!(e, PumpEvent::PeerLeft { .. })), "{events:?}");
+        member.send(CH_WORLDCMD, &edit);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let t = 400 + PEER_TIMEOUT_MS + 2;
+        let events = pump.pump(t, "W", 1, 0, &|_| true);
+        assert!(events.is_empty(), "a pruned peer's edit surfaced: {events:?}");
+        assert_eq!(pump.dropped_unadmitted, 5);
+        member.send(CH_HANDSHAKE, &LanJoin::Join { name: "alice".into() }.encode());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let events = pump.pump(t + 1, "W", 1, 0, &|_| true);
+        assert!(events.iter().any(|e| matches!(e, PumpEvent::PeerJoined { rejoined: true, .. })), "{events:?}");
+        member.recv().expect("the re-Accept");
+        member.send(CH_WORLDCMD, &edit);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let events = pump.pump(t + 2, "W", 1, 0, &|_| true);
+        assert!(events.iter().any(|e| matches!(e, PumpEvent::WorldCmds(_))), "back in after the re-join: {events:?}");
     }
 
     #[test]
