@@ -258,6 +258,16 @@ mod tests {
 
         let mut p = LockstepPeer::new(0, Battleground::new_with(a, b, 3, LanePolicy::Kit));
         let mut q = LockstepPeer::new(1, Battleground::new_with(a, b, 3, LanePolicy::Kit));
+        // both sims read the one global height grid: hold the terrain lock across the
+        // stepping so a parallel test's bake cannot swap the country between p's tick
+        // and q's (it did, one run in eight: "ticks: 30 and 30", a desync at the first
+        // checkpoint that was the suite's, not the wire's)
+        let _hold = crate::world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // two builds of one draft are one battleground; if they are not, the desync below
+        // is the suite's (a knob flipped under a build), not the wire's -- say which
+        let d0 = (p.bg.digest(), q.bg.digest());
+        assert_eq!(d0.0, d0.1, "the two peers were built on different ground: camps {:?} vs {:?}", p.bg.camps, q.bg.camps);
+        let mut stalls = 0u32;
 
         for t in 0..240u32 {
             p.submit(Frame { mx: 1.0, mz: 0.0, claw: t % 30 == 0, ability: None });
@@ -279,10 +289,10 @@ mod tests {
                 }
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
-            p.step();
-            q.step();
+            let (sp, sq) = (p.step(), q.step());
+            if !sp || !sq { stalls += 1; }
         }
-        assert!(p.tick > 200 && q.tick > 200, "ticks: {} and {}", p.tick, q.tick);
+        assert!(p.tick > 200 && q.tick > 200, "ticks: {} and {}; stalls {}; halted {:?} {:?}", p.tick, q.tick, stalls, p.halted, q.halted);
         assert_eq!(p.tick, q.tick);
         assert_eq!(p.halted, None, "no desync over the wire");
         assert_eq!(q.halted, None);
@@ -293,3 +303,4 @@ mod tests {
         );
     }
 }
+

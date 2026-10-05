@@ -192,6 +192,9 @@ mod tests {
 
     #[test]
     fn flyer_speed_is_terrain_independent() {
+        // the bake and the reads after it, under the terrain lock: the grid is global and
+        // another test baking in parallel would swap it out from under this one
+        let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         world::init_world();
         // scan a range of terrains; the hawk's speed never changes, a ground class's does
         let mut hawk_speeds = std::collections::HashSet::new();
@@ -208,6 +211,9 @@ mod tests {
 
     #[test]
     fn terrain_classifier_matches_heightfield() {
+        // the bake and the reads after it, under the terrain lock: the grid is global and
+        // another test baking in parallel would swap it out from under this one
+        let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         world::init_world();
         // a point below the water line classifies as water
         let mut saw_water = false;

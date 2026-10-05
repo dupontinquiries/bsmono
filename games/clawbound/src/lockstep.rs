@@ -243,6 +243,10 @@ mod tests {
     #[test]
     fn two_peers_play_the_same_match() {
         let (mut p, mut q) = pair();
+        // hold the terrain lock across the stepping: both sims read the one global
+        // height grid, and a parallel test's bake between p's tick and q's would be a
+        // desync that is the suite's, not the protocol's
+        let _hold = crate::world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for t in 0..600u32 {
             p.submit(Frame { mx: 1.0, mz: 0.0, claw: t % 30 == 0, ability: None });
             q.submit(Frame { mx: -1.0, mz: 0.5, claw: false, ability: None });
@@ -325,6 +329,7 @@ mod tests {
     #[test]
     fn each_side_moves_its_own_leader_and_neither_moves_the_others() {
         let (mut p, mut q) = pair();
+        let _hold = crate::world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner()); // as above
         let a0 = p.bg.warriors.iter().position(|w| w.team == 0 && w.is_player).unwrap();
         let b0 = p.bg.warriors.iter().position(|w| w.team == 1 && w.is_player).unwrap();
         let start_a = (p.bg.warriors[a0].x, p.bg.warriors[a0].z);

@@ -1920,6 +1920,9 @@ mod tests {
         // it's meant to recur, pushing you back to hunt or rest every so often across
         // the whole round, not be a one-time event or bite immediately.
         let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        // the walk below reads the one global height grid for seven simulated minutes;
+        // hold the terrain lock so a parallel test's bake cannot swap the country under it
+        let _hold = crate::world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         g.hx = 900.0; g.hz = 900.0;
         for t in 0..(60 * 30) {
             g.set_input((t as f32 * 0.05).sin(), (t as f32 * 0.04).cos(), false, false, false);

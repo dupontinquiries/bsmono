@@ -280,6 +280,9 @@ mod tests {
 
     #[test]
     fn land_critter_stays_out_of_deep_water() {
+        // the bake and the reads after it, under the terrain lock: the grid is global and
+        // another test baking in parallel would swap it out from under this one
+        let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         world::init_world();
         // find a shoreline: a land cell whose +x neighbour is deep water
         let mut spot = None;
@@ -304,6 +307,9 @@ mod tests {
 
     #[test]
     fn population_is_deterministic_and_placed() {
+        // the bake and the reads after it, under the terrain lock: the grid is global and
+        // another test baking in parallel would swap it out from under this one
+        let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         world::init_world();
         let a = populate(400, false);
         let b = populate(400, false);

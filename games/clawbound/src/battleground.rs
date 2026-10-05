@@ -611,7 +611,11 @@ impl Battleground {
         // every Heal Tree and medic den is placed relative to a camp.
         let a_camp = land_near(CAMP_ANCHOR[0].0, CAMP_ANCHOR[0].1);
         let camps = [a_camp, junglemap::reflect(a_camp.0, a_camp.1)];
-        drop(_terrain_guard);
+        // The guard is held to the end of the build. It used to be dropped here and taken
+        // again for the fishing runs below, and in that gap a bake elsewhere (a parallel
+        // test's) swapped the grid: two battlegrounds built back to back found their fish at
+        // different water, and a lockstep pair desynced at its first checkpoint ("ticks: 30
+        // and 30", one suite run in eight). Everything between reads the country.
 
         let medic_a = (camps[0].0 + 4.0, camps[0].1);
         let medics = [medic_a, junglemap::reflect(medic_a.0, medic_a.1)];
@@ -642,8 +646,7 @@ impl Battleground {
             .collect();
         {
             // two fishing runs, sought from mirrored anchors so neither clan's side
-            // of the river eats better by construction
-            let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // of the river eats better by construction (under the build's guard)
             for anchor in [(60.0, -110.0), junglemap::reflect(60.0, -110.0)] {   // the U's two arms, mirrored
                 if let Some((fx, fz)) = world::nearest_water(anchor, 100.0) {
                     prey.push(Prey { x: fx, z: fz, home: (fx, fz), kind: PreyKind::Fish, hp: PreyKind::Fish.hp(), respawn_t: 0.0 });

@@ -922,6 +922,10 @@ mod biome_blend_tests {
 
     #[test]
     fn a_higher_mountain_bias_yields_more_mountain_terrain() {
+        // under the terrain lock: the knobs and the grid are global, and a bake or a knob
+        // flip here landed in the middle of another test's build (a battleground's two
+        // peers found different camps -- the wire test's one-in-eight desync)
+        let _terrain_guard = TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fn mountain_fraction() -> f32 {
             let (mut mtn, mut total) = (0, 0);
             for i in -60..60 { for j in -60..60 {
@@ -941,6 +945,10 @@ mod biome_blend_tests {
 
     #[test]
     fn season_tint_shifts_leaf_color_by_season() {
+        // under the terrain lock: the knobs and the grid are global, and a bake or a knob
+        // flip here landed in the middle of another test's build (a battleground's two
+        // peers found different camps -- the wire test's one-in-eight desync)
+        let _terrain_guard = TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base = [0.4f32, 0.55, 0.2];
         set_terrain_pool(1.0, 1);   // Greenleaf
         let green = season_tint(base);
@@ -966,6 +974,10 @@ mod biome_blend_tests {
 
     #[test]
     fn all_three_tree_kinds_produce_geometry() {
+        // under the terrain lock: the knobs and the grid are global, and a bake or a knob
+        // flip here landed in the middle of another test's build (a battleground's two
+        // peers found different camps -- the wire test's one-in-eight desync)
+        let _terrain_guard = TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         init_world();
         for kind in [0u8, 1, 2] {
             let mut m = Mesh::new();
@@ -976,6 +988,10 @@ mod biome_blend_tests {
 
     #[test]
     fn willow_has_a_trailing_drooping_silhouette() {
+        // under the terrain lock: the knobs and the grid are global, and a bake or a knob
+        // flip here landed in the middle of another test's build (a battleground's two
+        // peers found different camps -- the wire test's one-in-eight desync)
+        let _terrain_guard = TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // the willow's branch tips should hang well below its crown, unlike the
         // upright conifer/broadleaf canopies
         init_world();
@@ -988,6 +1004,10 @@ mod biome_blend_tests {
 
     #[test]
     fn bushes_vary_between_round_and_spiky_shapes() {
+        // under the terrain lock: the knobs and the grid are global, and a bake or a knob
+        // flip here landed in the middle of another test's build (a battleground's two
+        // peers found different camps -- the wire test's one-in-eight desync)
+        let _terrain_guard = TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         init_world();
         let m = build_bushes(60);
         assert!(!m.verts.is_empty());
@@ -998,6 +1018,10 @@ mod biome_blend_tests {
 
     #[test]
     fn cover_is_thick_in_the_woods_thin_in_the_open() {
+        // under the terrain lock: the knobs and the grid are global, and a bake or a knob
+        // flip here landed in the middle of another test's build (a battleground's two
+        // peers found different camps -- the wire test's one-in-eight desync)
+        let _terrain_guard = TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         init_world();
         // sample many points; forest/reed biomes should average far more cover than the
         // bare moor/mountains, and open water should be near-zero.

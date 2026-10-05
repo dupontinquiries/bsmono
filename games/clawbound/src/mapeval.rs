@@ -119,6 +119,9 @@ mod lane_water_tests {
 
     #[test]
     fn a_dry_map_has_zero_water_fraction_and_zero_asymmetry() {
+        // the bake and the reads after it, under the terrain lock: the grid is global and
+        // another test baking in parallel would swap it out from under this one
+        let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         world::init_world();
         world::set_terrain_seed(1);
         // A bend positioned ON one of the camps degenerates that lane's half
@@ -141,6 +144,9 @@ mod lane_water_tests {
         // camp_a == camp_b makes every lane's two halves the literal same
         // segment — the asymmetry floor, and a cheap way to check the
         // arithmetic without depending on exactly where the river lands.
+        // the bake and the reads after it, under the terrain lock: the grid is global and
+        // another test baking in parallel would swap it out from under this one
+        let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         world::init_world();
         let camp = (-50.0, -50.0);
         let bends = [(0.0, 0.0), (20.0, 30.0)];
@@ -153,6 +159,9 @@ mod lane_water_tests {
 
     #[test]
     fn lane_index_matches_input_order() {
+        // the bake and the reads after it, under the terrain lock: the grid is global and
+        // another test baking in parallel would swap it out from under this one
+        let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         world::init_world();
         let bends = [(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)];
         let report = lane_water_report((0.0, 0.0), (0.0, 0.0), &bends, 4);
