@@ -609,6 +609,8 @@ pub struct Settings {
     /// Wait for the display's refresh (on) or run uncapped (off: for
     /// measuring what the machine can do).
     pub vsync: bool,
+    /// Borderless fullscreen on the current monitor (F11 toggles it too).
+    pub fullscreen: bool,
 }
 
 impl Default for Settings {
@@ -616,7 +618,7 @@ impl Default for Settings {
         Settings { mouse_sens: 1.0, pad_sens: 1.0, invert_y: false, touch_enabled: false, touch_scale: 1.0, cast_on_press: true,
                    touch_glide: crate::glide::Glide::Light,
                    quality: crate::quality::Quality::High, fur: crate::render::FurStyle::Tape,
-                   vol_master: 0.8, vol_music: 0.7, vol_sfx: 1.0, vol_voice: 1.0, show_fps: false, vsync: true }
+                   vol_master: 0.8, vol_music: 0.7, vol_sfx: 1.0, vol_voice: 1.0, show_fps: false, vsync: true, fullscreen: false }
     }
 }
 
@@ -649,6 +651,7 @@ impl Settings {
         let _ = writeln!(out, "vol_voice {:.3}", self.vol_voice);
         let _ = writeln!(out, "show_fps {}", self.show_fps as u8);
         let _ = writeln!(out, "vsync {}", self.vsync as u8);
+        let _ = writeln!(out, "fullscreen {}", self.fullscreen as u8);
     }
     pub fn load_line(&mut self, key: &str, rest: &str) -> bool {
         let f = || rest.trim().parse::<f32>().ok();
@@ -675,6 +678,7 @@ impl Settings {
             "vol_voice" => self.vol_voice = f().unwrap_or(1.0).clamp(0.0, 1.0),
             "show_fps" => self.show_fps = b(),
             "vsync" => self.vsync = b(),
+            "fullscreen" => self.fullscreen = b(),
             _ => return false,
         }
         true
@@ -1080,6 +1084,7 @@ mod settings_tests {
         a.vol_voice = 0.6;
         a.show_fps = true;
         a.vsync = false;
+        a.fullscreen = true;
         let mut text = String::new();
         a.save_lines(&mut text);
         let mut b = Settings::default();
@@ -1087,7 +1092,7 @@ mod settings_tests {
             let (k, rest) = line.split_once(' ').unwrap();
             assert!(b.load_line(k, rest), "unknown key {k}");
         }
-        assert_eq!((b.quality, b.fur, b.show_fps, b.vsync), (a.quality, a.fur, a.show_fps, a.vsync));
+        assert_eq!((b.quality, b.fur, b.show_fps, b.vsync, b.fullscreen), (a.quality, a.fur, a.show_fps, a.vsync, a.fullscreen));
         assert!((b.vol_master - 0.4).abs() < 1e-3 && (b.vol_music - 0.2).abs() < 1e-3 && (b.vol_voice - 0.6).abs() < 1e-3);
         let mut c = Settings::default();
         c.load_line("quality", "hyper");

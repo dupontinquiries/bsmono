@@ -1351,6 +1351,7 @@ pub fn draw_controls(ctx: &egui::Context, cfg: &mut crate::input::Config, captur
             changed |= ui.add(egui::Slider::new(&mut st.vol_voice, 0.0..=1.0).text("voices")).changed();
             changed |= ui.checkbox(&mut st.show_fps, "show frame rate").changed();
             changed |= ui.checkbox(&mut st.vsync, "vsync (off: uncapped, to measure the machine)").changed();
+            changed |= ui.checkbox(&mut st.fullscreen, "fullscreen (F11)").changed();
             if changed {
                 cfg.save();
             }

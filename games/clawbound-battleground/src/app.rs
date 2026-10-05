@@ -612,6 +612,13 @@ fn handle_window_event(s: &mut AppState, event: WindowEvent) {
             }
         }
         WindowEvent::KeyboardInput { event: KeyEvent { state, logical_key, repeat, .. }, .. } => {
+            // F11 anywhere: the fullscreen setting flips and is saved like a panel change;
+            // the window follows it next frame
+            if state == ElementState::Pressed && !repeat && logical_key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11) {
+                s.cfg.settings.fullscreen = !s.cfg.settings.fullscreen;
+                s.cfg.save();
+                return;
+            }
             if state == ElementState::Pressed && !repeat && s.intro.is_some() {
                 s.skip_intro = true;
                 return;
@@ -1339,6 +1346,11 @@ fn render(s: &mut AppState) {
         crate::quality::Quality::set_chosen(st.quality);
         crate::render::FurStyle::set_chosen(st.fur);
         s.renderer.quality = crate::quality::Quality::effective();
+        // fullscreen follows the setting (the window's own state is the truth: a compositor
+        // can leave fullscreen by itself, and the next toggle re-applies it)
+        if s.window.fullscreen().is_some() != s.cfg.settings.fullscreen {
+            s.window.set_fullscreen(if s.cfg.settings.fullscreen { Some(winit::window::Fullscreen::Borderless(None)) } else { None });
+        }
         // vsync follows the setting: the surface is reconfigured on change
         let want = present_mode_for(s.cfg.settings.vsync, &s.present_modes);
         if want != s.present {

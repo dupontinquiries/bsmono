@@ -387,6 +387,7 @@ input model the monorepo's other games (skydribble, unendlich) use.
 | Mouse wheel / `PgUp` `PgDn` | Zoom |
 | `X` | Camera behind me |
 | `Esc` | Pause: release cursor and open the controls panel (one press) |
+| `F11` | Fullscreen (also a checkbox in the panel; remembered) |
 
 **Controller** (`--features gamepad`, gilrs; needs `libudev-dev` on Linux):
 left stick move, right stick look, `RT` attack, `X Y B RB` abilities 1–4,
