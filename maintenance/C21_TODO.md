@@ -280,7 +280,22 @@ test and a §5b break test; nothing below was seen on a screen or heard.
     the TERRAIN POOL (`world::TerrainPool`, `Game::new_match_with_terrain`) because the bake
     reads the global knobs as it finds them; the Multiplayer entry and the bsgames handoff both
     land on it; a stale stick (2 s) hands the hunter back to the AI. Loopback-tested; never two
-    machines. Left: the joiner's wildlife stands still; Single Player while joined is confused.
+    machines. `7740910ac` the joiner's wildlife moves (`Game::step_wildlife`). Left: Single
+    Player while joined is confused.
+  - **Fullscreen, four games:** clawbound `a8e52bcc9` (Settings row + F11, saved),
+    clawbound-battleground `c83c8b55c` (panel checkbox + F11, controls.cfg), road-warrior
+    `f8161f463` (F11, in the save), soldier `ba54cdf8a` (Settings checkbox + F11, save.txt);
+    unendlich `4bfcd99aa` `ToggleFullscreen` (F11) had been bound and on the keybind page with
+    NO handler since the table was written -- handled now (glfw monitor at its video mode,
+    back to the window where it was). None seen on a screen.
+  - **unendlich** `c5ef751f1` the headless test build (`--no-default-features --lib`, the
+    documented way) had not COMPILED since c20's canopy-depth commit (an ungated
+    `crate::render` import in `world/foliage_depth.rs`); 9130 pass headless now, 0 failed.
+    `cd65791fa` `DropItem` (Q) was the other bound-and-listed action with no handler: one of the
+    held stack is tossed ahead (`DropField::toss`, a 45-tick grace before pickup so it does not
+    come straight back). `b7b65445c` "Screenshot" (F2) off the keybind page -- no readback
+    exists -- and a scan test that fails for any page row the fullgame does not handle.
+    `e5e15e788` KNOWN-TEST-FAILURES / README counts.
 - **Decided, not wired:** blackstar-rs `dispatch.rs` models voyages (`voyage`/`damage`/
   `survival`/`loot`, orbits and delta-v) that nothing in the shipboard game reaches -- wiring
   it is a game-layer design, not a bug; `suitability.rs` would tell the player "wheels have
@@ -296,7 +311,11 @@ test and a §5b break test; nothing below was seen on a screen or heard.
   refactor of a 20k-line bin); clawbound-battleground: the AI radii vs MAP_SCALE (above), the
   narrator/announcer VOICE (the calls are text now; speech cannot be synthesized here);
   echelon's Bevy client on the session (the deck is; the Bevy `client/` is a detached
-  workspace and still human vs bot).
+  workspace and still human vs bot); soldier's "play with a friend" (host/join over the
+  fleet DHT, then each end plays its own bots match -- the sim has one player; a co-op
+  second player needs a second actor the enemies target, enemy genomes on the wire for the
+  joiner to draw them, and client-authoritative positions: a day, not a fix); unendlich's
+  F2 screenshot (a swapchain readback the sandbox cannot run).
   Everything synthesized this batch (road-warrior, clawbound, the battleground's beds) is
   unheard: the voices are first passes by their numbers.
 - **Not touched:** blackstar-rs's visual/playtest backlog (`TODO.md` §"Found, NOT fixed" needs
