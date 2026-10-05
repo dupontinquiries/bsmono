@@ -313,6 +313,13 @@ test and a §5b break test; nothing below was seen on a screen or heard.
     upscale)" slider is disabled and says "not wired" (docs/UPSCALING.md: zero callers; the
     knob waits on the post-FX offscreen path, which needs a GPU to land). Everything else
     on the settings page has a reader and a save/load line.
+  - **Settings audit, the other games** (every settings field vs who reads it): clawbound
+    `6b04ebe6d` "Ability guides" and "Casting" were the in-crate battleground's rows (a mode
+    the app launches as its own game) -- gone; "Camera" read by nothing -- now an offset on
+    each mode's own follow-cam distance (`castguide::camera_offset`). The battleground's
+    `cast_on_press` is saved/loaded with no row and no reader (dormant, left); blackstar-rs's
+    unread save fields (`wep_mods`, `circuit_*`, `berth`) are documented plumbing-only;
+    soldier, skydribble clean.
 - **Decided, not wired:** blackstar-rs `dispatch.rs` models voyages (`voyage`/`damage`/
   `survival`/`loot`, orbits and delta-v) that nothing in the shipboard game reaches -- wiring
   it is a game-layer design, not a bug; `suitability.rs` would tell the player "wheels have
