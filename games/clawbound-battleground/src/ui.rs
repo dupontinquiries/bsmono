@@ -93,6 +93,10 @@ pub struct UiState {
     /// The level the HUD last saw, and when it last went up (the toast).
     pub level_seen: u32,
     pub level_toast_t: f64,
+    /// The announcer's current line as text, and when it was called (`ctx` time): the call
+    /// is READ as well as heard -- and with no recording under its key (the game ships none)
+    /// it is the only way the call reaches the player at all.
+    pub callout: Option<(String, f64)>,
 }
 
 impl UiState {
@@ -489,6 +493,9 @@ pub fn draw_select(ctx: &egui::Context, ui_state: &mut UiState, locked: &mut boo
 
 // --- HUD ----------------------------------------------------------------------
 
+/// How long the announcer's call stays on screen.
+pub const CALLOUT_SECS: f32 = 2.6;
+
 pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f32, h: f32, ui_state: &mut UiState, eye: Vec3) {
     // Project into egui's OWN screen, in logical points. The caller passes
     // the render surface's size, in physical pixels; on a display scaled
@@ -587,6 +594,21 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
                 });
             });
         });
+    }
+    // the announcer's call, read: a banner over the field for a couple of seconds
+    if let Some((text, at)) = ui_state.callout.clone() {
+        let age = (now - at) as f32;
+        if age > CALLOUT_SECS {
+            ui_state.callout = None;
+        } else {
+            let a = (1.0 - (age - (CALLOUT_SECS - 0.6)).max(0.0) / 0.6).clamp(0.0, 1.0) * (age * 8.0).min(1.0);
+            egui::Area::new(egui::Id::new("callout")).anchor(egui::Align2::CENTER_TOP, [0.0, 92.0]).interactable(false).show(ctx, |ui| {
+                ui.set_width(620.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new(text).size(30.0).color(GOLD.gamma_multiply(a)).strong());
+                });
+            });
+        }
     }
     egui::Area::new(egui::Id::new("abilities")).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -14.0]).show(ctx, |ui| {
         let slot_w = 62.0;

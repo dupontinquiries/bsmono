@@ -1454,6 +1454,10 @@ fn render(s: &mut AppState) {
                 }
                 if let Some(call) = s.announcer.next(g.t) {
                     let key = format!("announcer/{}", call.key);
+                    // the line's words on the screen whether or not it is recorded
+                    if let Some(line) = crate::voicescript::part("announcer").and_then(|p| p.lines.iter().find(|l| l.key == call.key)) {
+                        s.ui.callout = Some((line.text.to_string(), s.egui_ctx.input(|i| i.time)));
+                    }
                     let secs = match bank.pick(&key) {
                         Some(id) => {
                             amb.mixer.play(Play { handle: 0, clip: id, bus: Bus::Voice, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: Some(u16::MAX) });
