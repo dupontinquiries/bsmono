@@ -490,13 +490,16 @@ mod tests {
     #[test]
     fn an_author_is_refused_in_words_and_cannot_make_an_unfair_map() {
         let mut d = MapDraft::default();
+        // the red mid outer tower's feet, wherever MAP_SCALE puts the tower: 12 u off the lane
+        let tower = consts::tower_pos(consts::Lane::Mid, consts::Team::Red, false);
+        let at_feet: &'static str = Box::leak(format!("place Bush {} {}", tower.x + 12.0, tower.z).into_boxed_str());
         let t = run(&mut d, &mut Script(vec![
             "survey -40 30 12",
             "place Rock -40 30",
             "place BoulderCluster -44 35 1",
             "place Rock -44 35.5",          // on top of the boulders
             "place Rock 0 40",              // on mid lane
-            "place Bush 12 54",             // off the lane, but at a tower's feet
+            at_feet,                        // off the lane, but at a tower's feet
             "place Dragon 10 10",           // not a thing
             "place Rock 900 0",             // off the map
             "place Rock banana 3",

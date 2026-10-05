@@ -183,7 +183,10 @@ fn half() -> Vec<Placement> {
             }
             v.push(p(kind, side * SCREEN_X, centre, (k % 4) as u8, 1.0));
             k += 1;
-            z = centre + r + 0.25;
+            // past 0.3, the margin `mapgen`'s overlap rule holds an author to (radius + radius + 0.3);
+            // at 0.25 the pair at z = 33.0 / 36.6 broke it -- unseen at MAP_SCALE 1.42, where
+            // the mid tower's cleared ground swallowed that pair, found at 3.75.
+            z = centre + r + 0.4;
         }
         // The run's own floor: cover to move through, never a solid.
         let mut z = RUN_Z.0 + 2.0;

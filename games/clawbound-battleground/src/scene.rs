@@ -2152,7 +2152,8 @@ mod plan_tests {
         let hull: usize = pieces.iter().map(|p| p.0.inst.len()).sum();
         println!("static world: {hull} instances in {} pieces", pieces.len());
         assert!(hull > 120_000, "{hull}: did the cull eat the surface?");
-        assert!(hull < 520_000, "{hull}: the world is still being uploaded solid (it was ~877k)");
+        // measured: 502k at MAP_SCALE 1.42, 527k at 3.75 (the outer ring grows with the floor)
+        assert!(hull < 560_000, "{hull}: the world is still being uploaded solid (it was ~877k)");
         // And per shape, against the solid: a boulder is mostly inside.
         let mut g = crate::voxel::Grid::new(24, 24, 24);
         g.ellipsoid(12.0, 12.0, 12.0, 10.0, 10.0, 10.0, [0.5, 0.5, 0.5, 1.0]);
@@ -2244,7 +2245,11 @@ mod plan_tests {
         }
         let frac = rough as f32 / n as f32;
         println!("rough fraction of the jungle floor: {frac:.3} ({} patches)", b.going().len());
-        assert!(frac > 0.10 && frac < 0.55, "{frac}: the jungle should cost something, and not everywhere");
+        // build_world's grove and scatter counts are fixed numbers authored for the 135 u arena
+        // (`groves(&mut rng, 26)`, the `for _ in 0..N` loops); the floor's area is not. At
+        // MAP_SCALE 3.75 the same 26 groves cover a floor 5.4x the size and this reads 0.03.
+        let area = (ARENA_RADIUS / (95.0 * 1.42 + consts::JUNGLE_MARGIN)).powi(2);
+        assert!(frac > 0.10 && frac < 0.55, "{frac}: the jungle should cost something, and not everywhere (MAP_SCALE {}: the floor is {area:.1}x the authored area and the scatter counts did not grow with it)", consts::MAP_SCALE);
     }
 
     /// Groves are rooms, not pillars: every one has a gap wide enough for a
