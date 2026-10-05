@@ -124,6 +124,75 @@ change what runs on the GPU say so and name the ledger row that decides them.
   (-1,2,-1) seed 1, terrain-dominated per the c20 breakdown). **Open:** those two, and the
   tripwire wants calibrating against the weathered-top subdivision it keeps finding.
 - Games sweep results (same commands as fleet_build.sh): see §5.
+
+### 3b. The "you wouldn't release a game without ___" pass (c21, second half)
+
+Three read-only surveys (multiplayer, campaign, menus, audio, performance, wired-but-unused
+modules) across every game, then the cheapest verified fixes first. Every commit carries its
+test and a §5b break test; nothing below was seen on a screen or heard.
+
+- **bsgames hub** `a63e0c94b` `f77bd9091` `9fd396081` `4927e74e9` `d5c3a950b`: the hub built
+  its presence service over an in-process `SnapcoreStore` while every game publishes to
+  `FileStore::dev_default_path()` — no friend could ever appear (two-process test). Its launch
+  argv was refused by cargo for soldier (four bins), unendlich (a virtual workspace) and EVERY
+  quick match (`--quick-match` before `--`); clawbound launched the headless render. `CargoRun
+  { bin, features, args }` per entry, a `cargo metadata --no-deps` test against the real
+  manifests, skydribble and blackstar-rs registered, launches from the monorepo root wherever
+  the hub was started. shellkit's `Net` takes the game id: blackstar-rs announced as skydribble.
+- **clawbound** `c9b1b7834`: the Battleground rows launch `games/clawbound-battleground`
+  (they printed to stderr); `mp_status` is drawn (it never was).
+- **clawbound-battleground** `0fd1d1da1` the Esc panel pauses a local match (the sim ran under
+  it). Then its 16 failing lib tests, never seen because the `mapgen_eval` example broke the
+  sweep's build first: `44125e839` a Time trophy at zero stacks underflowed — in RELEASE it
+  wrapped to four billion stacks, Beacon of Ages granted +1000 INT at purchase (the manifest
+  said "there is a bug where it applies right away all 1k"); `558752b3e` `is_sentinel` was
+  "has a field", so Twofang's new Face Death dressed him in a permanent slow aura; `daa61fba1`
+  the flick glide never coasted (pad units vs the glide's px/s floor; the plumbing commit said
+  its tests were never run); `470e45b3d` `OUTER_SCALE` cancelled MAP_SCALE out (e4c7a60aa's
+  message says `/ 135`, the code said `/ (95*MAP_SCALE)`) — at the user's 3.75 the rim began
+  inside the floor, the rivers were dry, the ground ended short of the intro camera;
+  `964d6b240` `lane_clearance` now counts the fountain approach minions walk; `8b55c240c`
+  three tests pinned 1.42 coordinates. **Open:** `the_lanes_are_open_going_and_the_jungle_is_not`
+  still fails at 3.75 and should — build_world's grove/scatter counts are fixed numbers for the
+  135 u arena, so 3% of the 5.4x floor is rough. Scaling ~20 counts by area is a perf decision
+  (~5x instances) that belongs to the MAP_SCALE experiment; the assertion says so.
+- **blackstar-rs** `37077878f` a dead body was never repaired (one death and no later sortie
+  could be lost); `0213e3764` HUD hull bar + rebuild countdown; `770288240` Esc twice to abandon
+  a sortie; `4a5e2879d` the flown sortie/raid now banks the warden's arm, the nightfall's chi
+  and kit — only the CLI sims ever rewarded anyone; `f90bfce0c` combat sounds (seven synthesized
+  cues; unheard here). 1798 tests.
+- **unendlich** `54552a7b3` the dedicated server persists (`--world-dir`, the fullgame's
+  `worlds/<name>-<seed hex>` rule lifted to `server_config::world_dir_for`), loads the world's
+  whitelist, saves on Ctrl-C/SIGTERM (`libc::signal` into a static atomic) and autosaves;
+  `3cb8980a3` admission is the only way in -- data from a non-admitted address is dropped by
+  the pump and the fullgame's inline loop (anyone could edit the world before), and a joiner
+  re-Joins when its host goes quiet; `c77c34d27` per-world `player.json` (position, view,
+  inventory slot for slot incl. forged weapons, hotbar, clocks) written at Save & Quit, the
+  autosave and the world switch, loaded over the seed's spawn; `4ef8b0a0c` music under play
+  (the title's pad stem alone at a quarter: `cue_for(InGame)` was None); `9053d76e6` a death is
+  a moment (the veil with YOU DIED, 2.5 s, then the respawn -- at THIS world's spawn: `spawn_pos`
+  was the startup world's). The fullgame bin compiles here with `--features ui-overlay` (its
+  first compile in this sandbox; the sweep's `--all-targets` skips it).
+- **soldier** `72220a86f` footsteps (the DSP existed, nothing emitted one); `6a70a77da` the
+  `--features app` test build had not compiled since d854f8ebc.
+- **road-warrior** `e7410f3ca` a title screen with the car select (unlocks were undriveable), a
+  pause, a campaign-complete screen (was a toast).
+- **netcode/clawbound** `052b03bf9` a standalone player is the login name, not every player
+  "cat" (one shared profile on the fleet store).
+- **clawbound-battleground LAN** `4b0bbc507` `2f5cc5091` `6ab5659d7`: the local player is
+  `Game::viewer` (22 `gods[0]` sites); `lanmatch` puts the tested lockstep + netplay on the
+  den's UDP socket (loopback test: two sockets, two copies, 600 frames, bit-identical); the host
+  STARTs the match from the den (plan over the wire, members build the same match). Not seen
+  across two windows. Limits in the commit: a leap's wire direction is the move direction,
+  ancestors are drawn by the seed, Esc does not pause a LAN match.
+- **Still open from the surveys** (ranked): unendlich settings_model unwired / `gpu_mesher_mode`
+  hard-coded / World History Restore stub / edit reliability (#5) / the inline host loop vs
+  `HostPump` duplication; clawbound-battleground's six "done" mechanics unwired
+  (markers/daylight/freshkill/shadowrealm/teamplay/camps), missing music/narrator/announcer
+  assets, LAN ancestor pick + custom rules in the plan; clawbound settings persistence, no audio
+  backend; skydribble sims not in `cargo test`, join by address; road-warrior has no audio at
+  all; echelon has no transport; blackstar-rs items 6 and 8 (mission intro/outro text,
+  `dispatch.rs`/`suitability.rs` unreferenced, `Hotbar::cycle`), the `Sfx::Click` consoles.
 - **Not touched:** blackstar-rs's visual/playtest backlog (`TODO.md` §"Found, NOT fixed" needs
   eyes on a screen), unendlich's BACKLOG §B pure cores (octree re-merge, rebuild coalescer,
   `MoistureField::recenter`) — sandbox-verifiable but each is a feature, not a fix, and the
@@ -131,6 +200,16 @@ change what runs on the GPU say so and name the ledger row that decides them.
   with the check included; `cargo test -p unendlich-engine --lib` alone, one job, is the way).
 
 ## 4. Repo tooling
+
+- **A split script that opens a file for writing before it finishes computing the text
+  truncates the file when it fails.** `open(p,'w').write(f(x))` with an assertion inside `f`
+  left `blackstar-rs/src/main.rs` EMPTY, and `cargo test` then reported "0 tests, ok" against
+  a 1 MB binary — twice, read as a stale-build problem. Compute every output first, assert on
+  its length, then write; and a `cargo test` that finishes in 0.1 s with 0 tests is a missing
+  source, not a cache.
+- **A background job launched in a Bash call that then sleeps past the tool timeout dies with
+  the shell** (the process group is killed): a cargo link interrupted that way leaves a fresh-
+  looking, truncated binary. Launch, return at once, poll in separate short calls.
 
 - `maintenance/tools/f32_fallback_fix.py` (above). Resolves relative diagnostic paths against the
   WORKSPACE root — the first run on a member crate opened `crates/uikit-egui/crates/uikit-egui/…`.
