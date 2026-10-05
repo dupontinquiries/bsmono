@@ -162,7 +162,11 @@ pub enum AiState {
 }
 
 pub struct AiBrain {
+    /// The lane it is walking now: `home` unless a team call (`teamplay`) has it pushing
+    /// another, and back to `home` when the call ends.
     pub lane: Lane,
+    /// The lane it was given (the playbook's), the one it farms.
+    pub home: Lane,
     pub aggression: f32,
     pub state: AiState,
     pub target: Option<TargetRef>,
@@ -194,6 +198,7 @@ impl AiBrain {
         let lane = if lanes.contains(&lane) { lane } else { lanes[0] };
         AiBrain {
             lane,
+            home: lane,
             aggression,
             state: AiState::Push,
             target: None,
@@ -584,6 +589,10 @@ pub struct Game {
     /// A bot's dive on an enemy god, for its teammates to answer:
     /// (target god, when). Indexed by the diving team.
     pub calls: [Option<(usize, f32)>; 2],
+    /// Where each team's bots are going as a TEAM (`teamplay::Call`): decided once per team
+    /// per tick in `tick` from counted facts, held for `CALL_MIN_HOLD`, read by `ai::think`.
+    /// Derived from the match state, so it needs no place in the checksum.
+    pub team_call: [crate::teamplay::Call; 2],
     /// The Engineer's Quarry's waking order (`maze`); unused on other maps.
     pub wake: crate::maze::Wake,
 }
@@ -796,6 +805,7 @@ impl Game {
             plans_this_tick: 0,
             styles: [crate::playbook::even_keel(), crate::playbook::even_keel()],
             calls: [None, None],
+            team_call: [crate::teamplay::Call::default(); 2],
             // its own seed from the match's (not drawn from `rng`, so every
             // other random thing in a match stays as it was)
             wake: crate::maze::Wake::new(&mut Rng::new((player_god as u64 + 1).wrapping_mul(0xD6E8_FEB8_6659_FD93) ^ 0x7A0E)),
@@ -847,6 +857,7 @@ impl Game {
                     b.lane = want[k];
                     b.wp = 0;
                 }
+                b.home = want[k];
             }
         }
         self.styles = pages;

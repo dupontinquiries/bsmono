@@ -124,8 +124,9 @@ pub struct TeamView {
     pub titan_exposed: Option<f32>,
     /// A lane the enemy is pushing hard enough to threaten a tower.
     pub lane_under_threat: Option<Lane>,
-    /// The lane with the most enemy structures still standing, as the natural
-    /// place to push.
+    /// The lane with the FEWEST enemy structures still standing -- the one closest to
+    /// opening the titan, and so the natural place to push. (The doc said "most" while
+    /// nothing filled the struct; `ai::team_view` fills it with the fewest.)
     pub weakest_lane: Option<Lane>,
 }
 

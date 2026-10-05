@@ -11,6 +11,7 @@ use crate::consts::*;
 use crate::gods::Archetype;
 use crate::sim::*;
 use crate::tactics::{Genes, Read, Stance};
+use crate::teamplay::{Call, Objective, TeamView};
 use glam::Vec3;
 
 /// How long a teammate's dive call stands.
@@ -43,6 +44,107 @@ impl Game {
             }
         }
     }
+}
+
+/// An enemy god this close to a structure of ours is pushing it.
+pub const THREAT_R: f32 = 14.0;
+
+/// The facts `teamplay::Call::decide` counts, read off the match for one team. Kept here
+/// rather than in `teamplay`, which is deliberately a struct of numbers with no borrow of
+/// `Game` -- this is the one place that knows where the numbers come from.
+pub fn team_view(game: &Game, team: Team) -> TeamView {
+    let et = team.other();
+    let alive = |g: &GodUnit| g.respawn_t <= 0.0;
+    let roster = game.gods.iter().filter(|g| g.team == team).count();
+    // a body that can commit: alive, not hurt to the retreat line, not already running home
+    let available = game
+        .gods
+        .iter()
+        .filter(|g| g.team == team && alive(g) && g.hp / g.max_hp.max(1.0) >= 0.3)
+        .filter(|g| g.ai.as_ref().map_or(true, |b| b.state != AiState::Retreat))
+        .count();
+    let enemies_up = (0..game.gods.len())
+        .filter(|&j| game.gods[j].team == et && alive(&game.gods[j]) && game.sees(team, j))
+        .count();
+    let boss_up = game.bosses.list.iter().any(|b| b.alive && b.grounded());
+    let tp = &game.titans[et as usize];
+    let titan_exposed = (tp.hp > 0.0 && !game.titan_shielded(et)).then(|| (tp.hp / TITAN_HP).clamp(0.0, 1.0));
+    let enemies_near = |p: Vec3, r: f32| game.gods.iter().filter(|g| g.team == et && alive(g) && g.pos.distance(p) < r).count();
+    // the lane of our standing tower with the most enemy gods on it (ties: the first)
+    let lane_under_threat = game
+        .towers
+        .iter()
+        .filter(|tw| tw.team == team && tw.hp > 0.0)
+        .map(|tw| (enemies_near(tw.pos, THREAT_R), tw.lane))
+        .filter(|&(n, _)| n > 0)
+        .max_by_key(|&(n, _)| n)
+        .map(|(_, l)| l);
+    // the lane to push: STRICTLY the fewest enemy towers standing, among the lanes that
+    // still have one and that the enemy is not holding in numbers. A tie is no lane: on a
+    // fresh map every lane is equally far from the titan, and "push Top" there would pull
+    // the whole team off two lanes for no reason -- Farm is the answer until a tower falls.
+    // A DEFENDED lane is no lane either: ten bots sat at one tower for forty minutes, five
+    // a side, nobody diving and nobody leaving; the way through a standoff is the lane
+    // the defenders left.
+    let standing = |l: Lane| game.towers.iter().filter(|tw| tw.team == et && tw.lane == l && tw.hp > 0.0).count();
+    let defended = |l: Lane| {
+        game.towers
+            .iter()
+            .filter(|tw| tw.team == et && tw.lane == l && tw.hp > 0.0)
+            .any(|tw| enemies_near(tw.pos, TOWER_RANGE) >= 2)
+    };
+    let lanes = crate::map::lanes();
+    let open: Vec<Lane> = lanes.iter().copied().filter(|&l| standing(l) > 0 && !defended(l)).collect();
+    let weakest_lane = open
+        .iter()
+        .copied()
+        .min_by_key(|&l| standing(l))
+        .filter(|&l| open.iter().all(|&o| o == l || standing(o) > standing(l)));
+    TeamView { available, roster, enemies_up, boss_up, titan_exposed, lane_under_threat, weakest_lane }
+}
+
+/// Where the team's call sends one god: a place to walk to, or a lane to push instead of
+/// its own. `None` for Farm, and for a call whose object is gone (the boss died while the
+/// team walked; `decide` drops such a call next tick).
+pub fn call_target(game: &Game, team: Team, call: &Call) -> Option<CallTarget> {
+    let et = team.other();
+    match call.objective {
+        Objective::Farm => None,
+        Objective::Push(l) => crate::map::lanes().contains(&l).then_some(CallTarget::Lane(l)),
+        Objective::Boss => game
+            .bosses
+            .list
+            .iter()
+            .filter(|b| b.alive && b.grounded())
+            .min_by(|a, b| a.pos.distance(team.fountain()).total_cmp(&b.pos.distance(team.fountain())))
+            .map(|b| CallTarget::Place(b.pos)),
+        Objective::Titan => {
+            let tp = &game.titans[et as usize];
+            (tp.hp > 0.0 && !game.titan_shielded(et)).then_some(CallTarget::Place(tp.pos))
+        }
+        Objective::Defend(l) => {
+            // the tower on that lane the enemy is on, else the lane's standing tower
+            // nearest them; a lane with no tower left has nothing to defend
+            let ours: Vec<&Tower> = game.towers.iter().filter(|tw| tw.team == team && tw.lane == l && tw.hp > 0.0).collect();
+            let enemies: Vec<Vec3> = game.gods.iter().filter(|g| g.team == et && g.respawn_t <= 0.0).map(|g| g.pos).collect();
+            ours.iter()
+                .min_by(|a, b| {
+                    let da = enemies.iter().map(|e| e.distance(a.pos)).fold(f32::MAX, f32::min);
+                    let db = enemies.iter().map(|e| e.distance(b.pos)).fold(f32::MAX, f32::min);
+                    da.total_cmp(&db)
+                })
+                .map(|tw| CallTarget::Place(tw.pos))
+        }
+    }
+}
+
+/// What a call asks of one god (`call_target`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CallTarget {
+    /// Walk here (a boss pit, the titan, a tower to hold).
+    Place(Vec3),
+    /// Push this lane instead of your own.
+    Lane(Lane),
 }
 
 pub fn think(game: &mut Game, gi: usize) {
@@ -381,6 +483,69 @@ pub fn think(game: &mut Game, gi: usize) {
         }
     }
 
+    // THE TEAM'S CALL (`teamplay`). Five bots farming five lanes well still
+    // lose to five humans who arrive together; the call is the layer that
+    // moves them as one. It binds a healthy bot that is pushing with nothing
+    // local already pulling it -- a boss in reach, the well, an escape all
+    // came first above -- and never a hurt or retreating one (`Call::binds`).
+    // A Push call changes the LANE: the bot walks its own lane no further and
+    // joins the called one at the nearest waypoint. The others set a goal.
+    let (cur_lane, home_lane) = {
+        let b = game.gods[gi].ai.as_ref().unwrap();
+        (b.lane, b.home)
+    };
+    // the lane a bound Push call names; its home lane otherwise -- so a bot pulled onto
+    // Mid by a call goes back to its own lane when the call ends, instead of five cats
+    // farming one lane for the rest of the match (the first headless run did exactly that)
+    let mut new_lane = home_lane;
+    let mut grouped_siege = false;
+    if state == AiState::Push && goal.is_none() && !escaping {
+        let call = game.team_call[team as usize];
+        if call.binds(hp_frac, new_state == AiState::Retreat) {
+            let enemy_near = (0..game.gods.len()).any(|j| game.gods[j].team != team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(g.pos) < THREAT_R);
+            match call_target(game, team, &call) {
+                Some(CallTarget::Lane(l)) => {
+                    new_lane = l;
+                    grouped_siege = true;
+                }
+                Some(CallTarget::Place(p)) if !enemy_near => {
+                    let d = Vec3::new(p.x - g.pos.x, 0.0, p.z - g.pos.z);
+                    // a Defend call is answered by the lane's own cats and whoever is
+                    // close; the whole team comes only against a real group (three
+                    // or more) -- one enemy at a tower is not worth five lanes empty
+                    let mine = match call.objective {
+                        Objective::Defend(l) => {
+                            let at_tower = (0..game.gods.len()).filter(|&j| game.gods[j].team != team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(p) < THREAT_R).count();
+                            home_lane == l || d.length() < 40.0 || at_tower >= 3
+                        }
+                        _ => true,
+                    };
+                    if mine {
+                        // arrive and hold: the siege override and the boss block
+                        // take over once the object is in reach
+                        move_dir = if d.length() > 6.0 { d.normalize_or_zero() } else { Vec3::ZERO };
+                        goal = Some(p);
+                        grouped_siege = matches!(call.objective, Objective::Titan);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if new_lane != cur_lane && state == AiState::Push && goal.is_none() {
+        // changing lanes: join the other where it is nearest, not at its start
+        let path = crate::consts::lane_path(new_lane, team);
+        let nearest = (0..path.len()).min_by(|&a, &b| path[a].distance(g.pos).total_cmp(&path[b].distance(g.pos))).unwrap_or(0);
+        new_wp = nearest;
+        let enemy_near = (0..game.gods.len()).any(|j| game.gods[j].team != team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(g.pos) < THREAT_R);
+        if !enemy_near && !escaping {
+            let tp = path[nearest];
+            move_dir = Vec3::new(tp.x - g.pos.x, 0.0, tp.z - g.pos.z).normalize_or_zero();
+        }
+    } else if new_lane != cur_lane {
+        new_lane = cur_lane; // mid-fight or on an errand: the lane change waits
+    }
+
     // the hunt: hurt, with no enemy ancestor in sight and prey close by,
     // an ancestor breaks off to chase it (a mouthful of health + gold). If a
     // dash is off cooldown and the animal is in range, pounce with it.
@@ -436,7 +601,23 @@ pub fn think(game: &mut Game, gi: usize) {
             let kill_dive = stance == Stance::Dive && matches!(target, Some(TargetRef::God(j)) if game.gods[j].hp / game.gods[j].max_hp < 0.22);
             let committed = stance == Stance::Dive && matches!(target, Some(TargetRef::God(_))) && hp_frac > 0.4;
             let shot_at = tw.aim == Some(TargetRef::God(gi));
-            if uncovered && !finishing && !kill_dive && !(committed && !shot_at) {
+            // THE GROUPED SIEGE. Minions never reach an inner tower -- both sides'
+            // waves die where they meet -- so a tower that only cover unlocks is a
+            // tower that never falls, and ten bots sat at 2 towers a side for forty
+            // minutes without touching a titan. Under a Push or Titan call, with the
+            // call's quorum of teammates at the tower and no enemy god to punish it,
+            // the team takes the shots in turn: the one the tower is aiming at backs
+            // out (below), the others hit it.
+            let grouped = grouped_siege && hp_frac > 0.5 && !shot_at && {
+                let call = game.team_call[team as usize];
+                let here = (0..game.gods.len())
+                    .filter(|&j| j != gi && game.gods[j].team == team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(tw.pos) < TOWER_RANGE + 6.0)
+                    .count();
+                let enemies_at_tower = (0..game.gods.len()).filter(|&j| game.gods[j].team != team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(tw.pos) < TOWER_RANGE).count();
+                // numbers, not bravery: two more of us than of them at the tower
+                here + 1 >= call.objective.quorum().max(2) && here + 1 >= enemies_at_tower + 2
+            };
+            if uncovered && !finishing && !kill_dive && !grouped && !(committed && !shot_at) {
                 let away = Vec3::new(pos.x - tw.pos.x, 0.0, pos.z - tw.pos.z).normalize_or_zero();
                 let d = Vec3::new(pos.x - tw.pos.x, 0.0, pos.z - tw.pos.z).length();
                 if d < TOWER_RANGE + 1.0 {
@@ -563,6 +744,7 @@ pub fn think(game: &mut Game, gi: usize) {
             b.goal = goal;
             b.state = new_state;
             b.target = target;
+            b.lane = new_lane;
             b.wp = new_wp;
             b.strafe_dir = strafe_dir;
             b.strafe_t = strafe_t;
@@ -865,4 +1047,192 @@ fn regroup_point(game: &Game, gi: usize, anchor: Vec3) -> Vec3 {
     }
     let f = me.team.fountain();
     me.pos + Vec3::new(f.x - me.pos.x, 0.0, f.z - me.pos.z).normalize_or_zero() * 8.0
+}
+
+#[cfg(test)]
+mod team_tests {
+    use super::*;
+
+    fn game() -> Game {
+        Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9])
+    }
+
+    /// The view counts what `Call::decide` needs, and changes when the match does.
+    #[test]
+    fn the_team_view_counts_bodies_threats_and_the_open_titan() {
+        let mut g = game();
+        let v = team_view(&g, Team::Blue);
+        assert_eq!(v.roster, 5);
+        assert_eq!(v.available, 5, "everyone is up at the start");
+        assert_eq!(v.titan_exposed, None, "a titan behind towers is not an objective");
+        assert_eq!(v.lane_under_threat, None);
+        assert_eq!(v.weakest_lane, None, "every lane equal is no lane to push: the team farms");
+        // an enemy god at one of our Top towers threatens Top
+        let top = g.towers.iter().find(|t| t.team == Team::Blue && t.lane == Lane::Top).unwrap().pos;
+        let e = g.gods.iter().position(|x| x.team == Team::Red).unwrap();
+        g.gods[e].pos = top + Vec3::new(3.0, 0.0, 0.0);
+        assert_eq!(team_view(&g, Team::Blue).lane_under_threat, Some(Lane::Top));
+        g.gods[e].pos = Team::Red.fountain();
+        // one of Bot's enemy towers down -> Bot is the weakest lane; with a Red cat holding
+        // it in numbers it is no lane; with every Bot tower down there is nothing to push
+        // there and the other two tie -> no lane; every tower down -> the titan is exposed
+        let bot_outer = g.towers.iter().position(|t| t.team == Team::Red && t.lane == Lane::Bot && !t.inner).unwrap();
+        g.towers[bot_outer].hp = 0.0;
+        assert_eq!(team_view(&g, Team::Blue).weakest_lane, Some(Lane::Bot));
+        let inner = g.towers.iter().find(|t| t.team == Team::Red && t.lane == Lane::Bot && t.inner).unwrap().pos;
+        let reds: Vec<usize> = g.gods.iter().enumerate().filter(|(_, x)| x.team == Team::Red).map(|(j, _)| j).take(2).collect();
+        for &j in &reds {
+            g.gods[j].pos = inner + Vec3::new(2.0, 0.0, 0.0);
+        }
+        assert_eq!(team_view(&g, Team::Blue).weakest_lane, None, "two cats under the tower: a defended lane is a standoff, not a push");
+        for &j in &reds {
+            g.gods[j].pos = Team::Red.fountain();
+        }
+        for t in g.towers.iter_mut().filter(|t| t.team == Team::Red && t.lane == Lane::Bot) {
+            t.hp = 0.0;
+        }
+        assert_eq!(team_view(&g, Team::Blue).weakest_lane, None, "nothing left on Bot and the other two tie");
+        g.tower_alive[Team::Red as usize] = 0;
+        g.titans[Team::Red as usize].hp = TITAN_HP * 0.5;
+        let v = team_view(&g, Team::Blue);
+        assert!((v.titan_exposed.unwrap() - 0.5).abs() < 1e-3, "{v:?}");
+        // hurt and dead bodies are not available
+        g.gods[1].hp = g.gods[1].max_hp * 0.1;
+        g.gods[2].respawn_t = 10.0;
+        assert_eq!(team_view(&g, Team::Blue).available, 3);
+    }
+
+    /// A Titan call walks a healthy bot to the enemy titan and moves none that are hurt.
+    #[test]
+    fn a_titan_call_sends_a_healthy_bot_to_the_titan_and_not_a_hurt_one() {
+        let mut g = game();
+        g.tower_alive[Team::Red as usize] = 0; // exposed
+        let bot = 1;
+        assert!(g.gods[bot].ai.is_some());
+        g.team_call[Team::Blue as usize] = Call { objective: Objective::Titan, made_t: g.t, committed: 5 };
+        think(&mut g, bot);
+        let titan = g.titans[Team::Red as usize].pos;
+        assert_eq!(g.gods[bot].ai.as_ref().unwrap().goal, Some(titan));
+        let hurt = 2;
+        g.gods[hurt].hp = g.gods[hurt].max_hp * 0.2;
+        think(&mut g, hurt);
+        assert_ne!(g.gods[hurt].ai.as_ref().unwrap().goal, Some(titan), "a hurt bot does not follow the call");
+    }
+
+    /// A Push call moves a bot onto the called lane, joining it at the nearest waypoint
+    /// rather than walking back to its start.
+    #[test]
+    fn a_push_call_moves_a_bot_onto_the_called_lane() {
+        let mut g = game();
+        let bot = (1..5).find(|&i| g.gods[i].ai.as_ref().unwrap().lane != Lane::Bot).unwrap();
+        g.team_call[Team::Blue as usize] = Call { objective: Objective::Push(Lane::Bot), made_t: g.t, committed: 5 };
+        think(&mut g, bot);
+        let b = g.gods[bot].ai.as_ref().unwrap();
+        assert_eq!(b.lane, Lane::Bot);
+        let path = crate::consts::lane_path(Lane::Bot, Team::Blue);
+        let nearest = (0..path.len()).min_by(|&a, &c| path[a].distance(g.gods[bot].pos).total_cmp(&path[c].distance(g.gods[bot].pos))).unwrap();
+        assert_eq!(b.wp, nearest);
+    }
+
+    /// Farm is the default and binds nobody: the team starts the match on its own lanes.
+    #[test]
+    fn a_farm_call_leaves_every_bot_on_its_own_lane_with_no_goal() {
+        let mut g = game();
+        let lanes: Vec<Lane> = (1..5).map(|i| g.gods[i].ai.as_ref().unwrap().lane).collect();
+        assert_eq!(g.team_call[0].objective, Objective::Farm);
+        for i in 1..5 {
+            think(&mut g, i);
+        }
+        for (k, i) in (1..5).enumerate() {
+            let b = g.gods[i].ai.as_ref().unwrap();
+            assert_eq!(b.lane, lanes[k]);
+            assert_eq!(b.goal, None);
+        }
+    }
+
+    /// The call is decided in the tick from the view: a match with the enemy towers down
+    /// and the enemy dead calls the titan, and a fresh one farms.
+    #[test]
+    fn the_tick_decides_the_call_from_the_match() {
+        let mut g = game();
+        g.tick(1.0 / 60.0);
+        assert_eq!(g.team_call[0].objective, Objective::Farm, "nothing to do yet");
+        g.tower_alive[1] = 0;
+        for j in 5..10 {
+            g.gods[j].respawn_t = 30.0;
+        }
+        g.tick(1.0 / 60.0);
+        assert_eq!(g.team_call[0].objective, Objective::Titan);
+    }
+}
+
+#[cfg(test)]
+mod match_tests {
+    use super::*;
+
+    /// Ten bots, no human: the match is played out headless at 60 Hz. This is the check on
+    /// the team layer as a whole -- a call that pulled the team into a corner of the map, or
+    /// made it dither between objectives, shows up here as a match that makes no progress.
+    ///
+    /// What is asserted depends on the map scale. At the AUTHORED scale (`MAP_SCALE` 1.42)
+    /// the match must END inside the budget: measured 9:18 with the layer (Red), 17:01
+    /// without it. At the 3.75 experiment the AI's structure radii (siege at 16 u, tower
+    /// range 24 u, "near" at 12-16 u) are not scaled with the valley, the inner towers sit
+    /// off the lane paths by more than a bot ever looks, and no match ends with or without
+    /// the layer (40 minutes measured, both ways) -- so there the test asserts progress,
+    /// half the towers down, and the end of the match waits on the scale question. Prints
+    /// the result; `BG_TRACE=1` prints the call changes and a per-minute state, and
+    /// `BG_MATCH_BUDGET_S` overrides the budget (`cargo test -- --nocapture ten_bots`).
+    #[test]
+    fn ten_bots_finish_a_match() {
+        let mut g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        g.gods[0].ai = Some(AiBrain::new(Lane::Mid, 0.5));
+        g.gods[0].is_player = false;
+        let dt = 1.0 / 60.0;
+        let towers_total = g.towers.len(); // a fallen tower leaves the list
+        let budget_s = std::env::var("BG_MATCH_BUDGET_S").ok().and_then(|v| v.parse().ok()).unwrap_or(20.0 * 60.0);
+        let mut calls_made = std::collections::BTreeSet::new();
+        let mut last = [Objective::Farm; 2];
+        let mut minute = 0;
+        while g.over.is_none() && g.t < budget_s {
+            g.tick(dt);
+            for (ti, c) in g.team_call.iter().enumerate() {
+                calls_made.insert(format!("{:?}", c.objective));
+                if c.objective != last[ti] && std::env::var("BG_TRACE").is_ok() {
+                    println!("  t={:6.1} team {ti}: {:?} (available {})", g.t, c.objective, c.committed);
+                    last[ti] = c.objective;
+                }
+            }
+            if std::env::var("BG_TRACE").is_ok() && (g.t / 60.0) as u32 > minute {
+                minute = (g.t / 60.0) as u32;
+                let lanes: Vec<String> = g.gods.iter().map(|x| format!("{}{:?}{}", if x.team == Team::Blue { "B" } else { "R" }, x.ai.as_ref().map(|b| b.lane).unwrap_or(Lane::Mid), if x.respawn_t > 0.0 { "x" } else { "" })).collect();
+                println!("  min {minute}: towers {}/{} titans {:.0}/{:.0} minions {} lanes {:?}", g.tower_alive[0], g.tower_alive[1], g.titans[0].hp, g.titans[1].hp, g.minions.len(), lanes);
+                if minute >= 10 {
+                    for (i, x) in g.gods.iter().enumerate().take(5) {
+                        let b = x.ai.as_ref().unwrap();
+                        let et = x.team.other();
+                        let near = g.towers.iter().filter(|t| t.team == et && t.hp > 0.0).map(|t| (t.pos.distance(x.pos), t.lane, t.hp / t.max_hp, t.aim)).min_by(|a, c| a.0.total_cmp(&c.0));
+                        let path = crate::consts::lane_path(b.lane, x.team);
+                        let wpp = path[b.wp.min(path.len() - 1)];
+                        println!("     god {i}: at ({:.0},{:.0}) hp {:.2} state {:?} target {:?} goal {:?} lane {:?} wp {}/{} at ({:.0},{:.0}) call {:?} nearest enemy tower {:?}", x.pos.x, x.pos.z, x.hp / x.max_hp, b.state, b.target, b.goal, b.lane, b.wp, path.len(), wpp.x, wpp.z, g.team_call[x.team as usize].objective, near);
+                    }
+                    for t in g.towers.iter() {
+                        println!("     tower {:?} {:?} inner {} at ({:.0},{:.0}) hp {:.2}", t.team, t.lane, t.inner, t.pos.x, t.pos.z, t.hp / t.max_hp);
+                    }
+                }
+            }
+        }
+        println!(
+            "bots finished: over={:?} at t={:.0}s; towers standing blue/red {}/{}; titan hp blue/red {:.0}/{:.0}; calls seen: {calls_made:?}",
+            g.over, g.t, g.tower_alive[0], g.tower_alive[1], g.titans[0].hp, g.titans[1].hp
+        );
+        let down = towers_total - g.tower_alive[0] - g.tower_alive[1];
+        assert!(down * 2 >= towers_total, "ten bots took only {down} of {towers_total} towers in {budget_s} s: no progress; calls seen: {calls_made:?}");
+        assert!(calls_made.len() >= 2, "the team layer made more than one kind of call: {calls_made:?}");
+        if crate::consts::MAP_SCALE <= 2.0 {
+            assert!(g.over.is_some(), "ten bots did not finish a match in {budget_s} s of sim time; calls seen: {calls_made:?}");
+        } else {
+            println!("(MAP_SCALE {} is the experiment: the end of the match is not asserted here, see the doc comment)", crate::consts::MAP_SCALE);
+        }
+    }
 }

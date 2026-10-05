@@ -23,6 +23,15 @@ impl Game {
             self.waves += 1;
         }
 
+        // 1b. the team's call (`teamplay`): what the bot team is doing, decided once per
+        // team per tick from what can be counted, before any bot thinks. Humans get a
+        // call too and ignore it; it costs two struct fills a tick.
+        for team in [Team::Blue, Team::Red] {
+            let v = crate::ai::team_view(self, team);
+            let ti = team as usize;
+            self.team_call[ti] = self.team_call[ti].decide(&v, self.t);
+        }
+
         // 2. AI decisions
         self.plans_this_tick = 0;
         let n = self.gods.len();
