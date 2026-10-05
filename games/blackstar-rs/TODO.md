@@ -849,6 +849,19 @@ session.
 
 Repro: `cargo run --bin skydribble --no-default-features -- --sim planets`.
 
+**Resolved (c21, `c391100b6`), and neither reading above was right.** The planet the sim
+watches — KUIPER seed 9's first drifter — spawned 2.5 m INSIDE a structure (`sdf(pos) - r =
+-2.5`), and a body inside a solid is pushed out along the normal every tick: it never fell,
+so the 65 "bounces" were a sphere jittering in a wall at y = 64 for the whole run, which is
+also why there was never a 1.4 s gap. The other four drifters had 39–94 m of clearance. The
+fix is in worldgen (`World::unbury_drifters`, lifts a buried drifter until it has a radius of
+clearance), the sim now prints each drifter's spawn clearance and fails on a buried one by
+name, and the physics was never the problem: with the planet in the open it bounces 18
+times in 40 s, squashes to 42%, returns to round and is still doing 6.7 m/s at the end. The
+sims run under `cargo test` since `62d53b751` (`tests/sims.rs`), so this class of failure no
+longer waits for a manual sweep. (This note lives in blackstar-rs's TODO by accident of the
+session that wrote it; it is about skydribble.)
+
 ---
 
 ## Process notes for whoever continues this
