@@ -114,8 +114,13 @@ impl GameCentre {
     }
 
     fn spawn(&mut self, argv: Vec<String>, g: &GameEntry) {
-        // I/O seam: spawn the game process, fire-and-forget.
-        let spawned = std::process::Command::new(&argv[0]).args(&argv[1..]).spawn();
+        // I/O seam: spawn the game process, fire-and-forget -- from the monorepo root, which
+        // every launch path is relative to.
+        let Some(root) = centre::fleet_root() else {
+            self.status = "couldn't find the monorepo root (games/bsgames/Cargo.toml) above the cwd or this binary".into();
+            return;
+        };
+        let spawned = std::process::Command::new(&argv[0]).args(&argv[1..]).current_dir(root).spawn();
         match spawned {
             Ok(_) => {
                 self.status = format!("launched {}", g.name);
@@ -147,7 +152,11 @@ impl GameCentre {
         };
         let argv = centre::launch_argv(&g);
         let env = centre::handoff_env(centre::HandoffRole::Join, &self.me, Some(&r.id));
-        let spawned = std::process::Command::new(&argv[0]).args(&argv[1..]).envs(env).spawn();
+        let Some(root) = centre::fleet_root() else {
+            self.status = "couldn't find the monorepo root (games/bsgames/Cargo.toml) above the cwd or this binary".into();
+            return;
+        };
+        let spawned = std::process::Command::new(&argv[0]).args(&argv[1..]).envs(env).current_dir(root).spawn();
         match spawned {
             Ok(_) => self.status = format!("joining {} in {}…", r.name, g.name),
             Err(e) => self.status = format!("couldn't launch {}: {e}", g.name),

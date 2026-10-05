@@ -107,8 +107,25 @@ pub fn registry() -> Vec<GameEntry> {
     ]
 }
 
-/// The command line to launch a game (program first; paths relative to the monorepo root).
-/// Spawning is the caller's job.
+/// The directory a launch must run in: the monorepo root, found by walking up from `start`
+/// (the hub's cwd, then its executable) to the first ancestor holding `games/bsgames/Cargo.toml`.
+/// Every path in [`launch_argv`] is relative to it, so a hub started from `games/bsgames/`
+/// (`cargo run` there) or from a desktop launcher with `$HOME` as cwd could not launch anything.
+pub fn fleet_root_from(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    start.ancestors().find(|d| d.join("games/bsgames/Cargo.toml").is_file()).map(std::path::Path::to_path_buf)
+}
+
+/// [`fleet_root_from`] the cwd, then the executable's directory (a `target/release/bsgames`
+/// under the root); `None` when neither is inside the monorepo.
+pub fn fleet_root() -> Option<std::path::PathBuf> {
+    std::env::current_dir()
+        .ok()
+        .and_then(|d| fleet_root_from(&d))
+        .or_else(|| std::env::current_exe().ok().and_then(|e| fleet_root_from(&e)))
+}
+
+/// The command line to launch a game (program first; paths relative to the monorepo root, see
+/// [`fleet_root`]). Spawning is the caller's job.
 pub fn launch_argv(g: &GameEntry) -> Vec<String> {
     match &g.kind {
         LaunchKind::Cargo(run) => {
@@ -285,6 +302,21 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), r.len());
+    }
+
+    #[test]
+    fn fleet_root_is_the_ancestor_holding_this_crate() {
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = here.join("../..").canonicalize().unwrap();
+        // from the crate dir, from a deep subdirectory, and from the root itself
+        assert_eq!(fleet_root_from(here).unwrap().canonicalize().unwrap(), root);
+        assert_eq!(fleet_root_from(&here.join("src/bin")).unwrap().canonicalize().unwrap(), root);
+        assert_eq!(fleet_root_from(&root).unwrap().canonicalize().unwrap(), root);
+        // a tree without the marker resolves to nothing rather than to `/`
+        let tmp = std::env::temp_dir().join(format!("bsgames-root-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("games/other")).unwrap();
+        assert_eq!(fleet_root_from(&tmp.join("games/other")), None);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
