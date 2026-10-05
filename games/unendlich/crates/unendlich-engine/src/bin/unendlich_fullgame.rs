@@ -4513,9 +4513,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let mut fg_roar_stagger = unendlich_engine::sim::sound_render::Stagger::default();
     #[cfg(feature = "audio")]
     let fg_sfx_clock = Instant::now();
-    // The configured effects volume; the air block scales it down while the
+    // The effects volume: the settings slider (`ui_sfx_vol`, persisted), with the old
+    // `UNENDLICH_SFX_VOL` env var as a one-run override; the air block scales it down while the
     // player's head is in a CO2 basin (the docx's "dead silence").
-    let fg_sfx_vol = std::env::var("UNENDLICH_SFX_VOL").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
+    let fg_sfx_env: Option<f32> = std::env::var("UNENDLICH_SFX_VOL").ok().and_then(|v| v.parse::<f32>().ok());
+    let fg_sfx_vol = fg_sfx_env.unwrap_or(1.0);
     #[cfg(feature = "audio")]
     let fg_sfx = {
         let sfx = unendlich_engine::audio::Sfx::start();
@@ -4817,6 +4819,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             if let Some(b) = g("fog").as_bool() { renderer.ui_fog_on = b; }
             if let Some(b) = g("shadows").as_bool() { renderer.ui_shadows_on = b; }
             if let Some(f) = g("music_vol").as_f64() { renderer.ui_music_vol = f as f32; }
+            if let Some(f) = g("sfx_vol").as_f64() { renderer.ui_sfx_vol = (f as f32).clamp(0.0, 1.0); }
             if let Some(f) = g("day_length").as_f64() { renderer.ui_day_length = f as f32; }
             if let Some(n) = g("plant_stride").as_u64() { renderer.ui_plant_stride = n; }
             if let Some(n) = g("leaf_stride").as_u64() { renderer.ui_leaf_stride = n; }
@@ -4886,7 +4889,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     fn save_settings(path: &std::path::Path, r: &unendlich_engine::render::world_renderer::WorldRenderer) {
         let v = serde_json::json!({
             "fog": r.ui_fog_on, "shadows": r.ui_shadows_on,
-            "music_vol": r.ui_music_vol, "day_length": r.ui_day_length,
+            "music_vol": r.ui_music_vol, "sfx_vol": r.ui_sfx_vol, "day_length": r.ui_day_length,
             "plant_stride": r.ui_plant_stride, "leaf_stride": r.ui_leaf_stride,
             "apply_budget": r.ui_apply_budget, "fps_target": r.ui_fps_target,
             "render_distance": r.ui_render_distance,
@@ -17352,7 +17355,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             air_hush += (hush_target - air_hush) * (dt * 2.0).min(1.0);
             #[cfg(feature = "audio")]
             if lifetime_frame % 6 == 0 {
-                fg_sfx.set_master_volume(fg_sfx_vol * (1.0 - air_hush));
+                let base = fg_sfx_env.unwrap_or(renderer.ui_sfx_vol);
+                fg_sfx.set_master_volume(base * (1.0 - air_hush));
             }
             // Crystal blades (sim::crystal_edges, cave_biomes.docx): sprinting
             // through a dense crystal field cuts, once per transit.

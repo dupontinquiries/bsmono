@@ -691,6 +691,9 @@ pub struct WorldRenderer {
     /// "closest to 1x" across peers (see sim::game_speed). Server-side only.
     pub ui_game_speed_pos: f32,
     pub ui_music_vol: f32,
+    /// c21: the effects bus (roars, the procedural one-shots). Lived only in the
+    /// `UNENDLICH_SFX_VOL` env var -- "there is no UI slider for effects yet".
+    pub ui_sfx_vol: f32,
     /// r184: Performance tab (live levers + autotune).
     pub ui_plant_stride: u64,
     pub ui_leaf_stride: u64,
@@ -1911,6 +1914,7 @@ impl WorldRenderer {
             ui_day_length: 1200.0,
             ui_game_speed_pos: crate::sim::game_speed::DEFAULT_POS,
             ui_music_vol: 1.0,
+            ui_sfx_vol: 1.0,
             ui_plant_stride: 4,
             ui_leaf_stride: 2,
             ui_apply_budget: 8,
@@ -3974,6 +3978,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             let mut ui_day_length = self.ui_day_length;
             let mut ui_game_speed_pos = self.ui_game_speed_pos;
             let mut ui_music_vol = self.ui_music_vol;
+            let mut ui_sfx_vol = self.ui_sfx_vol;
             let mut ui_fog_on = self.ui_fog_on;
             let mut ui_shadows_on = self.ui_shadows_on;
             let mut ui_debug_master = self.ui_debug_master;
@@ -4495,7 +4500,11 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                         ui.label("music volume");
                                         unendlich_ui::menu::slider(ui, &mut ui_music_vol, 0.0, 1.0, 11, accent);
                                     });
-                                    ui.label("(audible after the audio backend lands; the director honours it now)");
+                                    ui.horizontal(|ui| {
+                                        ui.label("effects volume");
+                                        unendlich_ui::menu::slider(ui, &mut ui_sfx_vol, 0.0, 1.0, 11, accent);
+                                    });
+                                    ui.weak("the title theme on the menu, its pad alone under play; effects are the roars and the one-shots");
                                 }
                                 2 => {
                                     // r225: day length on the custom slider.
@@ -5908,6 +5917,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             self.ui_day_length = ui_day_length;
             self.ui_game_speed_pos = ui_game_speed_pos;
             self.ui_music_vol = ui_music_vol;
+            self.ui_sfx_vol = ui_sfx_vol;
             self.ui_fog_on = ui_fog_on;
             self.ui_shadows_on = ui_shadows_on;
             self.ui_debug_master = ui_debug_master;
