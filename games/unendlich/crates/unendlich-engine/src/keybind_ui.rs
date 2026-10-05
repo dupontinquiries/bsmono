@@ -39,7 +39,8 @@ pub fn rebindable_actions() -> &'static [(GameAction, &'static str)] {
         (ToggleCinematicCam, "Cinematic Camera"),
         (Bend, "Bending (hold to cast)"),
         (ThrowItem, "Throw / Recall Weapon"),
-        (Screenshot, "Screenshot"),
+        // `Screenshot` stays in the table (F2) but off the page until a frame readback
+        // exists to hang it on: a row for a key that does nothing is a promise.
         (ToggleFullscreen, "Toggle Fullscreen"),
     ]
 }
@@ -154,5 +155,24 @@ mod tests {
         assert!(a.iter().all(|(_, label)| !label.is_empty()));
         // movement keys present
         assert!(a.iter().any(|(act, _)| *act == GameAction::MoveForward));
+    }
+
+    /// Every action the page offers is one the game handles (`DropItem` and `ToggleFullscreen`
+    /// were on the page for a month with no handler; `Screenshot` still has none and is off it).
+    /// The scan asserts a floor on its own match count first, as CLAUDE.md asks of every scan.
+    #[test]
+    fn every_action_on_the_page_is_handled_somewhere() {
+        let bin = include_str!("bin/unendlich_fullgame.rs");
+        let handled = |name: &str| bin.matches(&format!("GameAction::{name}")).count();
+        assert!(handled("MoveForward") >= 1 && handled("OpenInventory") >= 1, "the scan sees the bin");
+        let mut missing = Vec::new();
+        for (act, label) in rebindable_actions() {
+            let name = format!("{act:?}");
+            if handled(&name) == 0 {
+                missing.push(format!("{name} ({label})"));
+            }
+        }
+        assert!(missing.is_empty(), "on the keybind page with no handler in the fullgame: {missing:?}");
+        assert_eq!(handled("Screenshot"), 0, "when a screenshot handler lands, put the row back");
     }
 }
