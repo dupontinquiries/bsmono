@@ -103,7 +103,11 @@ cargo test
 ```
 
 If you build without `--features app`, the binary just prints these
-instructions; everything except the window still compiles.
+instructions; everything except the window still compiles. `app` carries
+`sound` (rodio; `libasound2-dev` on Linux) since c21 -- before, the run line
+above and the games hub both built a silent game -- and a machine with no
+output device plays silent rather than failing. `--features app --no-default-features`
+is not a silent build; drop `sound` from the `app` list in Cargo.toml for one.
 
 ### Verification (2026-08-19)
 

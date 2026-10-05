@@ -46,9 +46,12 @@ serde_json = "1"
 [features]
 # Default = core only (no native deps): cargo build / cargo test work headless.
 default = []
-# The playable window. Pulls eframe (winit/glow). Run with: cargo run --release --features app
-app = ["dep:eframe", "dep:uikit-egui"]
-# Procedural sound playback (off by default; pulls rodio/cpal, needs system audio libs).
+# The playable window, with sound. Pulls eframe (winit/glow) and rodio. Run with:
+# cargo run --release --features app. (`app` alone used to build a SILENT game -- the hub and
+# the README's own run line never asked for `sound`; the playback degrades to silence on a
+# machine with no device, so there is no reason for a window without it.)
+app = ["dep:eframe", "dep:uikit-egui", "sound"]
+# Procedural sound playback (pulls rodio/cpal, needs system audio libs: libasound2-dev on Linux).
 sound = ["dep:rodio"]
 # GPU renderer (wgpu + winit). Off by default. Run: cargo run --release --features gpu --bin gpu
 gpu = ["dep:wgpu", "dep:winit", "dep:pollster", "dep:bytemuck", "dep:gpu-kit", "dep:uikit-egui"]
