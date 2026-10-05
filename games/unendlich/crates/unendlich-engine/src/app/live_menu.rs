@@ -591,11 +591,13 @@ pub fn live_menu_body(ui: &mut egui::Ui, s: &LiveMenuState) -> LiveMenuOut {
                         ui.weak("(newest first)");
                         // r206: a small "more info" hint.
                         ui.label("\u{2139}").on_hover_text(
-                            "World-history points snapshot your world so you can step back.\n\
-                             They're created on a timer, after long travel, and on crafting.\n\
-                             In dev mode (UNENDLICH_DEV=1) they're created far more often,\n\
-                             and you can force one with the button below. Restore loads a\n\
-                             point on next launch; delete prunes a bad one.",
+                            "World-history points hold a copy of your world so you can step back.\n\
+                             They're created on a timer, after long travel, and on crafting;\n\
+                             the newest twelve are kept. In dev mode (UNENDLICH_DEV=1) they're\n\
+                             created far more often, and you can force one with the button below.\n\
+                             Restore loads a point the next time this world is opened -- what it\n\
+                             replaces is kept as a point of its own, so a restore can be undone.\n\
+                             Delete prunes a bad one.",
                         );
                     });
                     ui.add_space(4.0);

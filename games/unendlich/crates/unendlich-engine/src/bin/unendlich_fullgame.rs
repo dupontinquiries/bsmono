@@ -1335,39 +1335,43 @@ fn catalog_file_path() -> std::path::PathBuf {
 }
 
 
-// r203: a single rollback restore point parsed from its .point marker.
-struct RollbackPoint { ts: u64, reason: String, chunks: u32 }
+/// The WORLD HISTORY rows for a world root: `sim::world_history::list`, newest first, each
+/// labelled by age, reason and size, the staged one saying so.
+fn history_labels(root: &std::path::Path) -> Vec<String> {
+    use unendlich_engine::sim::world_history as wh;
+    let now = unix_now_secs();
+    let staged = wh::staged(root);
+    wh::list(root)
+        .iter()
+        .map(|p| {
+            let mut l = wh::label(p, now);
+            if staged == Some(p.ts) {
+                l.push_str("  \u{25b6} restores when the world is next opened");
+            }
+            l
+        })
+        .collect()
+}
 
-/// List a world's rollback points, newest first, by reading the .point
-/// markers written during play. Pure IO; missing dir -> empty.
-fn list_rollback_points(world_name: &str) -> Vec<RollbackPoint> {
-    let dir = format!(
-        "worlds/{}/rollbacks",
-        world_name.replace(['/', '\\', ' '], "_")
-    );
-    let Ok(rd) = std::fs::read_dir(&dir) else { return Vec::new() };
-    let mut pts: Vec<RollbackPoint> = Vec::new();
-    for entry in rd.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("point") {
-            continue;
-        }
-        let ts = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        let body = std::fs::read_to_string(&path).unwrap_or_default();
-        let mut reason = String::from("point");
-        let mut chunks = 0u32;
-        for line in body.lines() {
-            if let Some(r) = line.strip_prefix("reason=") { reason = r.to_string(); }
-            if let Some(c) = line.strip_prefix("chunks=") { chunks = c.trim().parse().unwrap_or(0); }
-        }
-        pts.push(RollbackPoint { ts, reason, chunks });
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A staged world-history restore is applied here, BEFORE the chunk manager opens the
+/// directory: the live region tree is kept as a "before-restore" point, the chosen point's
+/// copy replaces it (`sim::world_history::apply_staged`). Logged either way.
+fn apply_world_history_restore(root: &std::path::Path) {
+    match unendlich_engine::sim::world_history::apply_staged(root, unix_now_secs()) {
+        Ok(Some(a)) => log::info!(
+            "[history] restored point {} ({} chunk file(s)) at {}; the state it replaced is point {}",
+            a.ts, a.chunks, root.display(), a.safety_ts
+        ),
+        Ok(None) => {}
+        Err(e) => log::warn!("[history] staged restore at {} not applied: {e}", root.display()),
     }
-    pts.sort_by(|a, b| b.ts.cmp(&a.ts)); // newest first
-    pts
 }
 
 fn load_catalog_entries() -> Vec<unendlich_engine::sim::world_catalog::WorldEntry> {
@@ -1972,6 +1976,7 @@ fn main() {
     // r514: keep a copy of the world root so the persistent flora store can load/save
     // alongside the chunk edits (the chunk manager takes ownership of `world_root` next).
     let mut flora_root = world_root.clone();
+    apply_world_history_restore(&world_root);
     let mut chunk_manager = ChunkManager::new(generator, num_workers)
         // Cloned: the paintbrush loads and saves its state beside the
         // flora store from this path for the life of the game.
@@ -4606,7 +4611,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // r662: the stack the player is holding on the cursor in the survival
     // inventory (picked up from a slot; dropped into another on the next click).
     let mut fg_inv_cursor: Option<unendlich_engine::items::ItemStack> = None;
-    let mut fg_rollback_world: Option<String> = None; // r203 world whose rollbacks are shown
+    let mut fg_rollback_world: Option<std::path::PathBuf> = None; // r203 world root whose history is shown
     // r394: LAN multiplayer discovery (bin I/O shell, gated by UNENDLICH_LAN_MP=1).
     // The beacon is a real UDP multicast socket (sim::lan_discovery); while in-game
     // we announce the live world on a cadence, and each frame we poll discovered
@@ -6287,19 +6292,21 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 fg_rb_force_point = false;
 
                 let saved = chunk_manager.save_all();
-                if let Some(name) = &current_world_name {
-                    let dir = format!("worlds/{}/rollbacks", name.replace(['/', '\\', ' '], "_"));
-                    let _ = std::fs::create_dir_all(&dir);
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let _ = std::fs::write(
-                        format!("{}/{}.point", dir, ts),
-                        format!("reason={}\nchunks={}\n", reason, saved),
-                    );
+                // c21: a point is a COPY of the world's region tree in the world root
+                // (`sim::world_history`), not a marker beside overwritten files; the
+                // newest KEEP are kept
+                if let Some(root) = chunk_manager.world_root() {
+                    use unendlich_engine::sim::world_history as wh;
+                    match wh::take(root, unix_now_secs(), reason) {
+                        Ok(p) => {
+                            let pruned = wh::prune(root, wh::KEEP);
+                            log::info!("[history] point ({reason}) — {saved} chunk(s) saved, {} chunk file(s) held, {pruned} old point(s) pruned", p.chunks);
+                        }
+                        Err(e) => log::warn!("[history] point ({reason}) not held: {e}"),
+                    }
+                } else {
+                    log::info!("[history] point ({reason}) — {saved} chunk(s) saved, no world root to hold it in");
                 }
-                log::info!("[rollback] point ({reason}) — {saved} chunk(s) saved");
             }
         }
         // r185: preview click -> seed search. The clicked region names a
@@ -18959,6 +18966,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             // hosts the same directory this opens.
                             let new_world_dir =
                                 unendlich_engine::sim::server_config::world_dir_for(&init.name, seed);
+                            apply_world_history_restore(&new_world_dir);
                             chunk_manager.set_world_root(new_world_dir.clone());
                             // r580 FIX (world merging): the flora/crop store and whitelist
                             // were bound to the STARTUP root (worlds/default) and never
@@ -19876,47 +19884,29 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         let idx = renderer.menu_rollback_peek as usize;
                         renderer.menu_rollback_peek = -1;
                         if let Some(e) = entries.get(idx) {
-                            let pts = list_rollback_points(&e.name);
-                            renderer.menu_rollback_list = pts
-                                .iter()
-                                .map(|p| {
-                                    // human time-ago from the unix-second ts
-                                    let ago = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_secs().saturating_sub(p.ts))
-                                        .unwrap_or(0);
-                                    let when = if ago < 90 { format!("{ago}s ago") }
-                                        else if ago < 5400 { format!("{}m ago", ago / 60) }
-                                        else { format!("{}h ago", ago / 3600) };
-                                    format!("{}  ·  {}  ·  {} chunks", when, p.reason, p.chunks)
-                                })
-                                .collect();
+                            // the points live in the world's own directory (name + seed)
+                            let root = unendlich_engine::sim::server_config::world_dir_for(&e.name, e.seed);
+                            renderer.menu_rollback_list = history_labels(&root);
                             renderer.menu_show_rollbacks = true;
-                            fg_rollback_world = Some(e.name.clone());
-                            log::info!("[rollback] {} point(s) for '{}'", pts.len(), e.name);
+                            log::info!("[history] {} point(s) for '{}' at {}", renderer.menu_rollback_list.len(), e.name, root.display());
+                            fg_rollback_world = Some(root);
                         }
                     }
-                    // r203: restore a chosen point. Full chunk-snapshot restore
-                    // is staged separately; for now we record the intent + the
-                    // marker so the player sees the selection take effect and
-                    // the (future) restore loads from this exact point.
+                    // r203/c21: restore a chosen point -- STAGED here, applied by
+                    // `apply_world_history_restore` the next time the world is opened
+                    // (from the list, or at launch). The row says so once staged.
                     if renderer.menu_rollback_restore >= 0 {
                         let idx = renderer.menu_rollback_restore as usize;
                         renderer.menu_rollback_restore = -1;
-                        if let Some(name) = &fg_rollback_world {
-                            let pts = list_rollback_points(name);
+                        if let Some(root) = &fg_rollback_world {
+                            use unendlich_engine::sim::world_history as wh;
+                            let pts = wh::list(root);
                             if let Some(p) = pts.get(idx) {
-                                log::info!(
-                                    "[rollback] restore requested: '{}' point ts={} ({})",
-                                    name, p.ts, p.reason
-                                );
-                                // Stage the restore: the world will reload from
-                                // this point's saved chunks on next launch.
-                                std::fs::write(
-                                    format!("worlds/{}/rollbacks/RESTORE",
-                                        name.replace(['/', '\\', ' '], "_")),
-                                    format!("{}", p.ts),
-                                ).ok();
+                                match wh::stage_restore(root, p.ts) {
+                                    Ok(()) => log::info!("[history] restore staged: point {} ({}) at {}", p.ts, p.reason, root.display()),
+                                    Err(e) => log::warn!("[history] restore of point {} refused: {e}", p.ts),
+                                }
+                                renderer.menu_rollback_list = history_labels(root);
                             }
                         }
                     }
@@ -19926,33 +19916,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     if renderer.menu_rollback_delete >= 0 {
                         let idx = renderer.menu_rollback_delete as usize;
                         renderer.menu_rollback_delete = -1;
-                        if let Some(name) = &fg_rollback_world {
-                            let pts = list_rollback_points(name);
+                        if let Some(root) = &fg_rollback_world {
+                            use unendlich_engine::sim::world_history as wh;
+                            let pts = wh::list(root);
                             if let Some(p) = pts.get(idx) {
-                                let path = format!(
-                                    "worlds/{}/rollbacks/{}.point",
-                                    name.replace(['/', '\\', ' '], "_"), p.ts
-                                );
-                                if let Err(e) = std::fs::remove_file(&path) {
-                                    log::warn!("[rollback] delete point {}: {e}", p.ts);
-                                } else {
-                                    log::info!("[rollback] deleted point ts={}", p.ts);
+                                match wh::delete(root, p.ts) {
+                                    Ok(()) => log::info!("[history] deleted point {}", p.ts),
+                                    Err(e) => log::warn!("[history] delete point {}: {e}", p.ts),
                                 }
-                                // refresh the displayed list
-                                let fresh = list_rollback_points(name);
-                                renderer.menu_rollback_list = fresh
-                                    .iter()
-                                    .map(|q| {
-                                        let ago = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .map(|d| d.as_secs().saturating_sub(q.ts))
-                                            .unwrap_or(0);
-                                        let when = if ago < 90 { format!("{ago}s ago") }
-                                            else if ago < 5400 { format!("{}m ago", ago / 60) }
-                                            else { format!("{}h ago", ago / 3600) };
-                                        format!("{}  ·  {}  ·  {} chunks", when, q.reason, q.chunks)
-                                    })
-                                    .collect();
+                                renderer.menu_rollback_list = history_labels(root);
                             }
                         }
                     }

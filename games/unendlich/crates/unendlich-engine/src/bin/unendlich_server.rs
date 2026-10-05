@@ -69,6 +69,16 @@ fn main() {
     // Persistence: the same directory the fullgame opens for this name and seed (or
     // --world-dir). Without it every edit a player made died with the process.
     let world_dir = cfg.effective_world_dir();
+    // a world-history restore staged from the game's menu (`sim::world_history`) is applied
+    // by whoever opens the directory next -- the server too, before it reads a chunk
+    {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        match unendlich_engine::sim::world_history::apply_staged(&world_dir, now) {
+            Ok(Some(a)) => log::info!("[history] restored point {} ({} chunk file(s)); the replaced state is point {}", a.ts, a.chunks, a.safety_ts),
+            Ok(None) => {}
+            Err(e) => log::warn!("[history] staged restore not applied: {e}"),
+        }
+    }
     let mut chunks = ChunkManager::new(generator, workers).with_storage(world_dir.clone());
     log::info!("[server] world ready ({workers} worker threads); edits persist in {}", world_dir.display());
 
