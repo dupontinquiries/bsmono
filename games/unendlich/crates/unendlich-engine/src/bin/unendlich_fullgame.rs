@@ -9361,6 +9361,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     [fx, fz]
                 },
             );
+            // `DropItem` (rebindable, default Q): on the keybind page since the table was
+            // written, handled by nothing. One of the held stack leaves the hand, tossed a
+            // step ahead and up; `toss` keeps it out of the pickup radius until it has flown.
+            if bindings.is_action_just_pressed(GameAction::DropItem, &input) && !renderer.ui_wants_keyboard && mouse_captured {
+                let sel = fg_app.inventory().selected();
+                if let Some(stack) = fg_app.inventory().slot(sel) {
+                    let rest = stack.count.saturating_sub(1);
+                    fg_app.inventory_mut().set(sel, (rest > 0).then(|| unendlich_engine::items::ItemStack { count: rest, ..stack }));
+                    let f = local_player.forward();
+                    let start = [ppos[0] + f.x * 0.5, ppos[1] - 0.3, ppos[2] + f.z * 0.5];
+                    fg_app.drops_mut().toss(unendlich_engine::items::ItemStack { count: 1, ..stack }, start, [f.x * 5.0, 2.5 + f.y * 2.0, f.z * 5.0]);
+                    log::info!("[items] dropped 1x item#{} ({} left in the slot)", stack.item.0, rest);
+                }
+            }
             let collected = fg_app.drops_mut().collect_near(ppos);
             for stack in collected {
                 let item = stack.item;

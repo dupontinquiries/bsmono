@@ -22,6 +22,9 @@ pub struct Drop {
     pub pos: [f32; 3],
     pub vel: [f32; 3],
     pub age_ticks: u32,
+    /// Not collected before this age: a drop the player just tossed (`toss`) would
+    /// otherwise land inside the pickup radius and come straight back.
+    pub pickup_after: u32,
 }
 
 /// All active drops plus collection/despawn tuning.
@@ -48,7 +51,16 @@ impl DropField {
 
     /// Spawn a drop, e.g. at a broken block's centre with a little pop.
     pub fn spawn(&mut self, stack: ItemStack, pos: [f32; 3], vel: [f32; 3]) {
-        self.drops.push(Drop { stack, pos, vel, age_ticks: 0 });
+        self.drops.push(Drop { stack, pos, vel, age_ticks: 0, pickup_after: 0 });
+    }
+
+    /// Ticks a tossed drop stays uncollectable: long enough to leave the player's reach.
+    pub const TOSS_GRACE_TICKS: u32 = 45;
+
+    /// A drop the player let go of (the `DropItem` key): the same entity, but not collected
+    /// again for [`Self::TOSS_GRACE_TICKS`], so it can fly clear of the pickup radius.
+    pub fn toss(&mut self, stack: ItemStack, pos: [f32; 3], vel: [f32; 3]) {
+        self.drops.push(Drop { stack, pos, vel, age_ticks: 0, pickup_after: Self::TOSS_GRACE_TICKS });
     }
 
     pub fn drops(&self) -> &[Drop] {
@@ -135,7 +147,7 @@ impl DropField {
             let dx = d.pos[0] - player[0];
             let dy = d.pos[1] - player[1];
             let dz = d.pos[2] - player[2];
-            if dx * dx + dy * dy + dz * dz <= r2 {
+            if d.age_ticks >= d.pickup_after && dx * dx + dy * dy + dz * dz <= r2 {
                 collected.push(d.stack);
                 false
             } else {
@@ -191,6 +203,22 @@ mod tests {
         let got = f.collect_near([0.3, 1.0, 0.3]);
         assert_eq!(got.len(), 1, "only the near drop is collected");
         assert_eq!(f.len(), 1, "the far drop remains");
+    }
+
+    #[test]
+    fn a_tossed_drop_is_not_collected_until_it_has_flown_clear() {
+        let mut f = DropField::new();
+        f.toss(stack(), [0.0, 1.0, 0.0], [0.0; 3]);
+        assert!(f.collect_near([0.0, 1.0, 0.0]).is_empty(), "fresh from the hand: not back in it");
+        for _ in 0..DropField::TOSS_GRACE_TICKS - 1 {
+            f.update(1.0 / 60.0, -20.0, floor);
+        }
+        assert!(f.collect_near([0.0, 1.0, 0.0]).is_empty(), "a tick short of the grace");
+        f.update(1.0 / 60.0, -20.0, floor);
+        assert_eq!(f.collect_near([0.0, 1.0, 0.0]).len(), 1, "then it is an ordinary drop");
+        // a block's drop has no grace
+        f.spawn(stack(), [0.0, 1.0, 0.0], [0.0; 3]);
+        assert_eq!(f.collect_near([0.0, 1.0, 0.0]).len(), 1);
     }
 
     #[test]
