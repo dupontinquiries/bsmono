@@ -103,6 +103,13 @@ pub fn registry() -> Vec<GameEntry> {
         GameEntry { id: "skydribble".into(), name: "Skydribble".into(), engine: "wgpu".into(), dir: "games/skydribble".into(), kind: CargoRun::plain() },
         // The Rust port of Blackstar (package `blackstar`, one bin); same shell as skydribble.
         GameEntry { id: "blackstar-rs".into(), name: "Blackstar (Rust)".into(), engine: "wgpu".into(), dir: "games/blackstar-rs".into(), kind: CargoRun::plain() },
+        // A workspace of `core` + `shell`; the game is the `shell` bin (eframe/wgpu, sound on by
+        // default). Single-player: it ignores the handoff env and `--quick-match`.
+        GameEntry { id: "road-warrior".into(), name: "Road Warrior".into(), engine: "wgpu".into(), dir: "games/road-warrior".into(), kind: CargoRun::with(Some("shell"), &[], &[]) },
+        // The deterministic RTS. The native client is `echelon-deck`'s `play` verb, which
+        // needs `window` (minifb) and wants `sound`; it plays a bot, or two decks over the LAN
+        // with `--lan-host`/`--lan-join` (not the handoff env).
+        GameEntry { id: "echelon".into(), name: "Echelon".into(), engine: "minifb".into(), dir: "games/echelon".into(), kind: CargoRun::with(Some("echelon-deck"), &["window", "sound"], &["play"]) },
         GameEntry { id: "blackstar".into(), name: "Blackstar (C++)".into(), engine: "vulkan/opengl".into(), dir: "games/blackstar".into(), kind: LaunchKind::CmakeBin("blackstar".into()) },
     ]
 }
@@ -281,9 +288,9 @@ mod tests {
     use netcode::store::{ProfileService, SnapcoreStore};
 
     #[test]
-    fn registry_has_the_seven_games_with_launchers() {
+    fn registry_has_the_nine_games_with_launchers() {
         let r = registry();
-        assert_eq!(r.len(), 7);
+        assert_eq!(r.len(), 9);
         let bg = r.iter().find(|g| g.id == "clawbound-battleground").unwrap();
         assert_eq!(launch_argv(bg), vec!["cargo", "run", "--release", "--manifest-path", "games/clawbound-battleground/Cargo.toml"]);
         assert_eq!(quick_match_argv(bg), vec!["cargo", "run", "--release", "--manifest-path", "games/clawbound-battleground/Cargo.toml", "--", "--quick-match"]);
@@ -293,6 +300,11 @@ mod tests {
         // several bins: name the playable one
         let soldier = r.iter().find(|g| g.id == "soldier").unwrap();
         assert_eq!(launch_argv(soldier), vec!["cargo", "run", "--release", "--manifest-path", "games/soldier/Cargo.toml", "--bin", "early-fps", "--features", "app"]);
+        // a workspace: the bin names the member; a feature set and a verb for the deck
+        let rw = r.iter().find(|g| g.id == "road-warrior").unwrap();
+        assert_eq!(launch_argv(rw), vec!["cargo", "run", "--release", "--manifest-path", "games/road-warrior/Cargo.toml", "--bin", "shell"]);
+        let ech = r.iter().find(|g| g.id == "echelon").unwrap();
+        assert_eq!(launch_argv(ech), vec!["cargo", "run", "--release", "--manifest-path", "games/echelon/Cargo.toml", "--bin", "echelon-deck", "--features", "window,sound", "--", "play"]);
         // cybertron → cmake bin
         let cyber = r.iter().find(|g| g.id == "blackstar").unwrap();
         assert_eq!(launch_argv(cyber), vec!["games/blackstar/build/blackstar"]);
