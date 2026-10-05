@@ -528,7 +528,7 @@ impl Deck {
         } else {
             "SEL: -".into()
         };
-        vec![
+        let mut lines = vec![
             format!(
                 "ALLOY {}  FLUX {}  SUPPLY {}/{}  T{}",
                 self.world.res[pi].0,
@@ -539,7 +539,15 @@ impl Deck {
             ),
             sel,
             "RIGHTCLICK MOVE  A ATTACK  S STOP  H HOLD  R RALLY".into(),
-        ]
+        ];
+        // over a LAN the HUD says where the turns stand: a world that stops moving is the peer,
+        // and this line is how a person tells that from a hang
+        if let Driver::Lan(lan) = &self.driver {
+            let owed = lan.due / LAN_CFG.turn_len;
+            let state = if owed >= 2 { "WAITING FOR PEER" } else { "IN STEP" };
+            lines.push(format!("LAN P{}  TURN {}  {}  UNACKED {}", self.me, lan.sess.exec_turn(), state, lan.link.unacked()));
+        }
+        lines
     }
 }
 
@@ -719,6 +727,7 @@ mod tests {
         assert_eq!(lan(&a).sess.desync, None);
         assert_eq!(lan(&b).sess.desync, None);
         assert!(a.banner.is_none() && b.banner.is_none());
+        assert!(a.hud_lines_pub().iter().any(|l| l.starts_with("LAN P0") && l.contains("IN STEP")), "{:?}", a.hud_lines_pub());
     }
 
     /// A deck whose peer never answers plays its bootstrap turns and then stands still:
@@ -736,5 +745,7 @@ mod tests {
         assert_eq!(lan(&d).due, MAX_DUE, "owed ticks are capped");
         assert!(d.banner.is_none());
         assert_eq!(lan(&d).sess.lead(), LAN_CFG.delay + 1, "one turn submitted past the delay, waiting");
+        let hud = d.hud_lines_pub();
+        assert!(hud.iter().any(|l| l.contains("WAITING FOR PEER")), "{hud:?}");
     }
 }
