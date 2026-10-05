@@ -42,6 +42,7 @@ pub mod lan_host; // multi-peer host table: addr↔assigned-eid, fanout, livenes
 pub mod lan_host_pump; // reusable host endpoint IO: socket + channel mux + star relay (loopback-tested)
 pub mod join_sync; // join-at-any-time catch-up: tick-stamped chunk edit records (the timebending storage layout), TimeSet scoops, paced batching
 pub mod world_cmd_wire; // r391-mp: WorldCmd reliable-channel codec + remote apply
+pub mod reliable; // c21: the reliable-ordered channel the world commands were documented to ride -- seq/ack/resend per link
 pub mod presence_loop; // r392-mp: host re-announce + browser classify/evict over WorldAdvert
 pub mod client_join; // r393-mp: client join driver (mailbox handshake → hole-punch → connected)
 pub mod dht_mailbox;
