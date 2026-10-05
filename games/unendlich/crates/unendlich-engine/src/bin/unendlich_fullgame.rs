@@ -2960,6 +2960,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // UNENDLICH_CAMERA=portrait:<deg>:<m> is a still camera at <deg> round
     // from the player's facing (0 = in front, 90 = their right side), <m> away,
     // looking back at them: for screenshots of the hands and what they hold.
+    // The windowed placement to come back to from fullscreen (`ToggleFullscreen`, F11).
+    let mut windowed_rect: (i32, i32, u32, u32) = {
+        let (x, y) = window.get_pos();
+        let (w, h) = window.get_size();
+        (x, y, w.max(1) as u32, h.max(1) as u32)
+    };
     let cam_env = std::env::var("UNENDLICH_CAMERA").unwrap_or_default();
     let mut camera_mode: u8 = match cam_env.split(':').next().unwrap_or("") {
         "third" => 1,
@@ -5616,6 +5622,33 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 "[character] now playing as '{}' (plan={}, seed={:#x}) — saved as global default",
                 active_character.name, active_character.arche, active_character.seed
             );
+        }
+        // `ToggleFullscreen` (rebindable, default F11): the binding was in the table and the
+        // keybind page, and nothing handled it. Fullscreen on the primary monitor at its
+        // current video mode; back to the window where it was. The swapchain follows the
+        // framebuffer-size event like any resize.
+        if bindings.is_action_just_pressed(
+            unendlich_engine::keybindings::GameAction::ToggleFullscreen, &input,
+        ) && !renderer.ui_wants_keyboard {
+            let is_full = window.with_window_mode(|m| matches!(m, glfw::WindowMode::FullScreen(_)));
+            if is_full {
+                let (x, y, w, h) = windowed_rect;
+                window.set_monitor(glfw::WindowMode::Windowed, x, y, w, h, None);
+                log::info!("[view] windowed {}x{} at ({x},{y})", w, h);
+            } else {
+                let (x, y) = window.get_pos();
+                let (w, h) = window.get_size();
+                windowed_rect = (x, y, w.max(1) as u32, h.max(1) as u32);
+                glfw.with_primary_monitor(|_, mon| {
+                    match mon.and_then(|m| m.get_video_mode().map(|vm| (m, vm))) {
+                        Some((m, vm)) => {
+                            window.set_monitor(glfw::WindowMode::FullScreen(m), 0, 0, vm.width, vm.height, Some(vm.refresh_rate));
+                            log::info!("[view] fullscreen {}x{}@{}", vm.width, vm.height, vm.refresh_rate);
+                        }
+                        None => log::warn!("[view] no primary monitor video mode; staying windowed"),
+                    }
+                });
+            }
         }
         // r490/r515: third-person toggle (rebindable — default F5).
         if bindings.is_action_just_pressed(
