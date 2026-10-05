@@ -269,6 +269,18 @@ test and a §5b break test; nothing below was seen on a screen or heard.
     executed turn, a silent peer freezes it (owed ticks capped). The crate's FIRST tests (the
     README had called tape mode "CI-proof" over zero tests): a tape, two decks over loopback
     (one world, both orders land, hashes identical, no running ahead), the silent peer.
+  - **clawbound** `0abbdd5ca` the suite's one-in-six desync in `wire::two_peers...` was the
+    terrain race: the battleground build dropped its guard mid-build, and world.rs's own
+    tests set `mountain_bias` 1.7 and re-baked with no lock -- every bake and knob flip is
+    under `TERRAIN_LOCK` now, the lockstep/wire/Prowl-soak tests hold it across stepping (18
+    green runs after; the global grid is still the design). `8a2eb0a47` a person at the
+    hunter's controls (`Game::set_hunter_input`: the stick for movement, the pounce for the
+    catch; the FSM keeps the senses). `b6d591c72` the hunt over the link: `hunt_net`, host-
+    authoritative state (316 B, 30 Hz) with the joiner playing the hunter; the Header carries
+    the TERRAIN POOL (`world::TerrainPool`, `Game::new_match_with_terrain`) because the bake
+    reads the global knobs as it finds them; the Multiplayer entry and the bsgames handoff both
+    land on it; a stale stick (2 s) hands the hunter back to the AI. Loopback-tested; never two
+    machines. Left: the joiner's wildlife stands still; Single Player while joined is confused.
 - **Decided, not wired:** blackstar-rs `dispatch.rs` models voyages (`voyage`/`damage`/
   `survival`/`loot`, orbits and delta-v) that nothing in the shipboard game reaches -- wiring
   it is a game-layer design, not a bug; `suitability.rs` would tell the player "wheels have
