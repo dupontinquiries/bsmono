@@ -152,11 +152,17 @@ impl RoadWarriorApp {
         if audio.is_none() {
             eprintln!("road-warrior: no audio output; running silent");
         }
+        // Honour a saved mute before the first engine frame is mixed.
+        if save.muted {
+            if let Some(a) = &audio {
+                a.send(audio::Msg::Master(0.0));
+            }
+        }
         let listener = cues::Listener::new(&vehicle);
         Self {
             audio,
             listener,
-            muted: false,
+            muted: save.muted,
             vehicle,
             light: BakedLighting::bake(&track, Sun::default(), LIGHT_SAMPLES),
             track,
@@ -199,6 +205,9 @@ impl RoadWarriorApp {
     fn toggle_mute(&mut self) {
         self.muted = !self.muted;
         self.sound(audio::Msg::Master(if self.muted { 0.0 } else { 1.0 }));
+        // remembered across launches, like the campaign position
+        self.save.muted = self.muted;
+        save::save(&self.save);
         self.toasts.push(Toast { message: if self.muted { "Sound off (M)".into() } else { "Sound on".into() }, shown_at: std::time::Instant::now() });
     }
 

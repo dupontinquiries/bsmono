@@ -17,6 +17,11 @@ pub struct SaveState {
     /// than `HashMap` purely so saved JSON has a stable key order — easier to
     /// diff/review a save file by hand, no functional difference otherwise.
     best_times: BTreeMap<String, f32>,
+    /// The M key's state. A player who muted the game expects it to stay muted; the first thing a
+    /// relaunch did was blast the engine bed at full volume. `default` so a save from before the field
+    /// existed still loads (unmuted).
+    #[serde(default)]
+    pub muted: bool,
 }
 
 impl SaveState {
@@ -28,6 +33,7 @@ impl SaveState {
             unlocked_cars: vec![CarKind::RedSedan],
             campaign_level_index: 0,
             best_times: BTreeMap::new(),
+            muted: false,
         }
     }
 
@@ -206,6 +212,19 @@ mod tests {
         assert!(loaded.is_unlocked(CarKind::Pillager));
         assert!(loaded.is_unlocked(CarKind::RedSedan));
         assert_eq!(loaded.campaign_level_index, 2);
+    }
+
+    #[test]
+    fn mute_survives_the_save_and_an_old_save_loads_unmuted() {
+        let mut save = SaveState::new();
+        save.muted = true;
+        let loaded = SaveState::from_json(&save.to_json_pretty().unwrap()).unwrap();
+        assert!(loaded.muted);
+        // a save written before the field existed
+        let old = r#"{"unlocked_cars": ["RedSedan"], "campaign_level_index": 1, "best_times": {}}"#;
+        let loaded = SaveState::from_json(old).expect("a pre-mute save still parses");
+        assert!(!loaded.muted);
+        assert_eq!(loaded.campaign_level_index, 1);
     }
 
     #[test]
