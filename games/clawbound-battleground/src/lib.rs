@@ -121,6 +121,8 @@ pub mod lanlobby;
 pub mod lockstep;
 /// The lockstep wire: redundant inputs, adaptive delay, time dilation, a network simulator.
 pub mod netplay;
+/// A LAN match: the lockstep session on the den's UDP socket, and the plan the host sends.
+pub mod lanmatch;
 /// Oriented capsule hit tests for the cats.
 pub mod hitbox;
 /// The river crossings: fallen logs that can be worked loose and roll.

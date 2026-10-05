@@ -513,6 +513,7 @@ pub fn trial(tuning: Tuning, mut net: NetSim, secs: f32) -> Trial {
                 let inp = Input { mv: [((rng >> 8) as i8) / 2, ((rng >> 16) as i8) / 2], attack: rng & 3 == 0, sneak: false, leap: false, cast: None };
                 s[m].stamp(inp, press, now);
                 s[m].step(&mut games[m], 1.0 / 60.0, now);
+                games[m].events.clear(); // nobody draws them here
                 acc[m] -= 1.0;
             }
             let peer = 1 - m;

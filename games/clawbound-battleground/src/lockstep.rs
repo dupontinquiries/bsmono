@@ -163,7 +163,9 @@ impl Lockstep {
             input.unwrap_or_default().apply(game, self.slots[p]);
         }
         game.tick(dt);
-        game.events.clear();
+        // the tick's events stay for the caller: the shell drains them into floaters,
+        // announcements and the mixer, the same as after a solo `tick` (they are view-only;
+        // the checksum below does not see them)
         self.tick += 1;
         Some(checksum(game))
     }
