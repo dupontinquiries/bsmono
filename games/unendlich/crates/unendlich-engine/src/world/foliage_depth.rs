@@ -14,6 +14,11 @@
 //! costs nothing. Cells outside the chunk count as non-leaf, so a leaf on the
 //! chunk's edge is always drawn in full: a mistake draws too much, never a hole.
 
+// The emitter writes the mesher's vertices and so exists only with a renderer; the depth
+// field and the face test above it are pure and build headless (`--no-default-features`,
+// the documented way to run the engine's tests -- this import broke that build for a
+// month, every test in the crate with it).
+#[cfg(feature = "render-core")]
 use crate::render::mesher::Vertex;
 
 /// Leaves this many blocks deep or less keep their full template.
@@ -73,6 +78,7 @@ pub fn fill_faces(depths: &[u8], n: usize, x: usize, y: usize, z: usize) -> [boo
 
 /// Emit the chosen faces of the unit block at `origin`, lit per face like the
 /// templates (`brightness(normal)`), tinted by `color_mul` (leaf decay).
+#[cfg(feature = "render-core")]
 pub fn emit_fill(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, origin: [f32; 3], faces: [bool; 6],
                  color_mul: [f32; 3], brightness: impl Fn([f32; 3]) -> f32) {
     // (normal, four corners counter-clockwise seen from outside)
@@ -129,14 +135,25 @@ mod tests {
         // The 3x3x3 core (depth >= 3) spans 6..=8; its centre sees only core.
         assert_eq!(fill_faces(&d, n, 7, 7, 7), [false; 6], "surrounded by core: nothing");
         assert_eq!(fill_faces(&d, n, 6, 7, 7), [false, true, false, false, false, false], "only -X faces a depth-2 leaf");
-        let (mut v, mut i) = (Vec::new(), Vec::new());
         let mut faces = 0;
         for z in 6..=8 { for y in 6..=8 { for x in 6..=8 {
-            let f = fill_faces(&d, n, x, y, z);
-            faces += f.iter().filter(|b| **b).count();
-            emit_fill(&mut v, &mut i, [x as f32, y as f32, z as f32], f, [1.0; 3], |_| 1.0);
+            faces += fill_faces(&d, n, x, y, z).iter().filter(|b| **b).count();
         }}}
         assert_eq!(faces, 54, "the 3x3x3 core's shell: 6 sides x 9 faces");
+    }
+
+    /// The emitter itself: four vertices and six indices per face (with a renderer only).
+    #[cfg(feature = "render-core")]
+    #[test]
+    fn the_emitter_writes_a_quad_per_face() {
+        let n = 16;
+        let ball = |x: usize, y: usize, z: usize| (4..11).contains(&x) && (4..11).contains(&y) && (4..11).contains(&z);
+        let d = leaf_depths(n, ball);
+        let (mut v, mut i) = (Vec::new(), Vec::new());
+        for z in 6..=8 { for y in 6..=8 { for x in 6..=8 {
+            let f = fill_faces(&d, n, x, y, z);
+            emit_fill(&mut v, &mut i, [x as f32, y as f32, z as f32], f, [1.0; 3], |_| 1.0);
+        }}}
         assert_eq!((v.len(), i.len()), (54 * 4, 54 * 6));
     }
 
