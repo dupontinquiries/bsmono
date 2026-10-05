@@ -57,14 +57,25 @@ input, `iio-sensor-proxy` needs to be running on the target device.
 
 | Input | Action |
 |---|---|
-| `←` / `→` | Throttle (grounded) / flip control (airborne) |
+| `←` / `→` | Throttle (grounded) / flip control (airborne); on the title, pick a car |
 | `Space` | Jump |
 | `N` | Activate nitro (requires banked nitro from a clean landing) |
+| `Enter` | Start (title), resume (pause), continue (campaign complete) |
+| `Esc` | Pause; on the pause screen, resume |
+| `M` | Sound on/off |
 | Gyro tilt (on-device) | Flip control while airborne, in addition to keyboard |
 
 Left/Right does double duty because a vehicle can't be both grounded and
 airborne — throttle has no effect in the air, tilt has no effect on the
 ground, so there's no actual conflict.
+
+Sound is synthesized (no assets): an engine drone that follows speed and
+throttle, a voice per moment (launch, landing, hit, ram, nitro, dry tank) and
+two stings (a run lost, a level done). It needs an audio output and, on
+Linux, ALSA headers to build (`libasound2-dev`); `cargo build
+--no-default-features -p shell` is the silent binary with no audio
+dependency, and a machine with no output device runs silent. The voices have
+not been heard by the session that wrote them (`shell/src/audio.rs`).
 
 ### Debug env vars (dev-only, compiled out of release builds)
 
@@ -92,7 +103,9 @@ workspace, all passing (`cargo test --workspace`).
   for what's unverified about the `net.hadess.SensorProxy` interface.
 - Car and boss art is a placeholder (colored rectangles drawn procedurally
   in `scene.wgsl`) — no sprites yet.
-- No campaign-complete screen; finishing the last level just shows a toast.
+- ~~No campaign-complete screen; finishing the last level just shows a toast.~~
+  (c21: a title with the car select, a pause screen and a campaign-complete
+  screen -- `shell/src/flow.rs`.)
 - No death penalty beyond retrying the current level — worth deciding if
   that's the right convention (vs. lives, or restarting the campaign).
 
