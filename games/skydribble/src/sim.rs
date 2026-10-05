@@ -23,6 +23,26 @@ use crate::world::World;
 const DT: f32 = 1.0 / 120.0;
 const ARENA: usize = 20; // ARENA CLASSIC: flat pitch, paired goals
 
+/// Every sim ends in one of these lines, and the verdict is also REMEMBERED: a `--sim` that
+/// printed FAIL used to exit 0 like any other run, which is why none of the sims could sit in
+/// `cargo test` or a CI step as anything but a log to read. `main` exits 1 when
+/// [`any_failed`] says so, and `tests/sims.rs` runs the fast sims through the binary and
+/// checks both the line and the status.
+static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn verdict(label: &str, ok: bool) -> bool {
+    println!("{label}: {}", if ok { "PASS" } else { "FAIL" });
+    if !ok {
+        FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    ok
+}
+
+/// Did any sim in this process report FAIL?
+pub fn any_failed() -> bool {
+    FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct Outcome {
     /// seconds spent in each striker phase, summed over bots — the answer to
     /// "where does the state machine stall?", which a sampled trace cannot
@@ -352,10 +372,7 @@ pub fn run(args: &[String]) {
         let (thr, steer) = pad.follow(Vec3::ZERO, Vec3::Z);
         println!("drive-to (+X)    : throttle={thr:+.2} steer={steer:+.2}");
         let follow_ok = thr > 0.5 && steer.abs() > 0.5;
-        println!(
-            "{}",
-            if target_ok && stick_ok && btn_ok && flick_ok && follow_ok { "PLATFORM+TOUCH: PASS" } else { "PLATFORM+TOUCH: FAIL" }
-        );
+        verdict("PLATFORM+TOUCH", target_ok && stick_ok && btn_ok && flick_ok && follow_ok);
         return;
     }
     if name == "carsdf" {
@@ -434,7 +451,7 @@ pub fn run(args: &[String]) {
         println!("{:<34} {}", "longer than wide (not a sphere)", if long_enough { "ok" } else { "FAIL" });
         println!("{:<34} {}", "flatter than long", if flat_enough { "ok" } else { "FAIL" });
         println!("{:<34} {}", "matches the model within 10 cm", if tight { "ok" } else { "FAIL" });
-        println!("{}", if long_enough && flat_enough && tight { "CAR SDF: PASS" } else { "CAR SDF: FAIL" });
+        verdict("CAR SDF", long_enough && flat_enough && tight);
         return;
     }
     if name == "maps" {
@@ -1041,7 +1058,7 @@ pub fn run(args: &[String]) {
         let hull_creased = creased(&hull);
         let ok = worst_median <= 2.0 && (8.0..20.0).contains(&hull_creased);
         println!("   our hull: median {worst_median:.1}d (refs 0.4-2.2), creased {hull_creased:.1}% (refs 10.4%)");
-        println!("{}", if ok { "SHELL: PASS" } else { "SHELL: FAIL" });
+        verdict("SHELL", ok);
         return;
     }
     if name == "predict" {
@@ -1119,7 +1136,7 @@ pub fn run(args: &[String]) {
         println!("   one bounce is the limit on purpose: past it the real ball depends on");
         println!("   spin and contact detail this does not model, and a bot that committed");
         println!("   that far would be confidently wrong");
-        println!("{}", if pass { "PREDICT: PASS" } else { "PREDICT: FAIL" });
+        verdict("PREDICT", pass);
         return;
     }
     if name == "aerial" {
@@ -1208,7 +1225,7 @@ pub fn run(args: &[String]) {
         if touched == 0 {
             println!("   NOTE: arriving within 2 m is not the same as connecting — see DESIGN.md");
         }
-        println!("{}", if pass { "AERIAL: PASS" } else { "AERIAL: FAIL" });
+        verdict("AERIAL", pass);
         return;
     }
     if name == "redirect" {
@@ -1283,7 +1300,7 @@ pub fn run(args: &[String]) {
         check("a car slower than the ball cannot add to it", gains[3] < 1.0);
         check("a gentle touch stays gentle", gains[4] < 2.0);
         check("nothing is turned into a rocket", gains.iter().all(|g| *g < 22.0));
-        println!("{}", if pass { "REDIRECT: PASS" } else { "REDIRECT: FAIL" });
+        verdict("REDIRECT", pass);
         return;
     }
     if name == "carry" {
@@ -1398,7 +1415,7 @@ pub fn run(args: &[String]) {
         check("the ball keeps its own line through a turn", worst < 0.75);
         check("the ball lags to the outside of the turn", bearings.iter().all(|b| *b > 8.0));
         check("and lags further the harder you turn", bearings[2] > bearings[0] + 4.0);
-        println!("{}", if pass { "CARRY: PASS" } else { "CARRY: FAIL" });
+        verdict("CARRY", pass);
         return;
     }
     if name == "hits" {
@@ -1689,7 +1706,7 @@ pub fn run(args: &[String]) {
             }
             worst_step < 0.02
         });
-        println!("{}", if pass { "HITS: PASS" } else { "HITS: FAIL" });
+        verdict("HITS", pass);
         return;
     }
     if name == "flick" {
@@ -2086,7 +2103,7 @@ pub fn run(args: &[String]) {
                 check("a mistimed approach does not", settled < 0.8);
             }
         }
-        println!("{}", if pass { "FLICK: PASS" } else { "FLICK: FAIL" });
+        verdict("FLICK", pass);
         return;
     }
     if name == "dribble" {
@@ -2593,7 +2610,7 @@ pub fn run(args: &[String]) {
             "worst case still evaluates {:.0}% of candidates (a flat tile field is the hard case)",
             worst * 100.0
         );
-        println!("{}", if worst < 0.82 { "MARCH: PASS" } else { "MARCH: FAIL" });
+        verdict("MARCH", worst < 0.82);
         return;
     }
     if name == "academy" {
@@ -2664,7 +2681,7 @@ pub fn run(args: &[String]) {
         check("passing sticks", p.has(0) && p.has(7) && !p.has(3));
         let round = Passed::decode(&p.encode());
         check("it survives the save file", round.has(0) && round.has(7) && round.count() == 2);
-        println!("{}", if pass { "ACADEMY: PASS" } else { "ACADEMY: FAIL" });
+        verdict("ACADEMY", pass);
         return;
     }
     if name == "replay" {
@@ -2739,7 +2756,7 @@ pub fn run(args: &[String]) {
             b > a && b < a + 0.5
         });
         check("playback clamps past the end", pose_at(&frames, total * 5.0).is_some());
-        println!("{}", if pass { "REPLAY: PASS" } else { "REPLAY: FAIL" });
+        verdict("REPLAY", pass);
         return;
     }
     if name == "trials" {
@@ -2827,7 +2844,7 @@ pub fn run(args: &[String]) {
             check("the ghost follows the run", mid > 25.0 && mid < 35.0);
             check("the ghost clamps past its end", end > 55.0);
         }
-        println!("{}", if pass { "TRIALS: PASS" } else { "TRIALS: FAIL" });
+        verdict("TRIALS", pass);
         return;
     }
     if name == "render" {
@@ -3660,7 +3677,7 @@ pub fn run(args: &[String]) {
             );
         }
         println!("worst case still draws {:.0}% of the map", worst * 100.0);
-        println!("{}", if worst < 0.75 && order_ok { "RENDER CULL: PASS" } else { "RENDER CULL: FAIL" });
+        verdict("RENDER CULL", worst < 0.75 && order_ok);
         return;
     }
     if name == "ballspin" {
@@ -3739,7 +3756,7 @@ pub fn run(args: &[String]) {
             physics::step_ball(&mut b, &mut w, &cfg, DT, &mut ev);
             check("spin is capped at 6 rad/s", b.ang.length() <= 6.01);
         }
-        println!("{}", if pass { "BALL SPIN: PASS" } else { "BALL SPIN: FAIL" });
+        verdict("BALL SPIN", pass);
         return;
     }
     if name == "shot" {
@@ -3851,7 +3868,7 @@ pub fn run(args: &[String]) {
                 if ok { "" } else { "   <-- BAD" }
             );
         }
-        println!("{}", if bad == 0 { "SPAWNS: PASS" } else { "SPAWNS: FAIL" });
+        verdict("SPAWNS", bad == 0);
         return;
     }
     if name == "kuiper" {
@@ -3957,7 +3974,7 @@ pub fn run(args: &[String]) {
         check("a new world arrives", world.bodies.len() == before + 1);
         let nb = world.bodies.last().unwrap();
         check("it arrives from high above, falling", nb.pos.y > 200.0 && nb.vel.y < -10.0);
-        println!("{}", if pass { "KUIPER: PASS" } else { "KUIPER: FAIL" });
+        verdict("KUIPER", pass);
         return;
     }
     if name == "planets" {
@@ -4004,7 +4021,7 @@ pub fn run(args: &[String]) {
         println!("bounces in 40 s: {bounces}   peak squash: {:.0}%   returns to round: {}", peak_squash * 100.0, settled_round);
         println!("still moving after 40 s: {still_moving:.1} m/s   highest apex {apex:.0} m");
         let ok = n_bouncy >= 3 && bounces >= 3 && peak_squash > 0.05 && settled_round && still_moving > 1.0;
-        println!("{}", if ok { "PLANETS: PASS" } else { "PLANETS: FAIL" });
+        verdict("PLANETS", ok);
         return;
     }
     if name == "stream" {
@@ -4137,7 +4154,7 @@ pub fn run(args: &[String]) {
             steps_split as f32 / steps_full as f32 * 100.0);
         println!("accuracy    mean channel error {:.3} vs a full march", err);
         let ok = frames >= 35 && err < 0.22;
-        println!("{}", if ok { "STREAM: PASS" } else { "STREAM: FAIL" });
+        verdict("STREAM", ok);
         return;
     }
     if name == "learn" {
@@ -4349,7 +4366,7 @@ pub fn run(args: &[String]) {
             }
             check("the two ends of a pair are shaded apart", hue_ok);
         }
-        println!("{}", if pass { "PORTALS: PASS" } else { "PORTALS: FAIL" });
+        verdict("PORTALS", pass);
         return;
     }
     if name == "platform" {
@@ -4500,7 +4517,7 @@ pub fn run(args: &[String]) {
             pass &= ok;
             println!("   {}", if ok { "the board plays and winds up" } else { "CHESS FAIL" });
         }
-        println!("{}", if pass { "PLATFORMS: PASS" } else { "PLATFORMS: FAIL" });
+        verdict("PLATFORMS", pass);
         return;
     }
     if name == "drive" {
@@ -4756,7 +4773,7 @@ pub fn run(args: &[String]) {
             println!("   render.rs presents: {has_present}, and counts it: {has_inc}");
             check("the present counter is actually incremented", has_present && has_inc);
         }
-        println!("{}", if pass { "FPS: PASS" } else { "FPS: FAIL" });
+        verdict("FPS", pass);
         return;
     }
     if name == "menus" {
@@ -4857,7 +4874,7 @@ pub fn run(args: &[String]) {
                 crate::hud::GARAGE_TOP - crate::hud::GARAGE_ROW_H * 3.5,
             ) == Some(3),
         );
-        println!("{}", if pass { "MENUS: PASS" } else { "MENUS: FAIL" });
+        verdict("MENUS", pass);
         return;
     }
     if name == "garage" {
@@ -4971,7 +4988,7 @@ pub fn run(args: &[String]) {
             junk.skin < SKINS.len() && junk.wheels < WHEELS.len()
         });
         println!("   e.g. {} / {} / {} / {} / {}", round.skin_name(), round.rig_name(), round.wheel_name(), round.trail_name(), round.explosion_name());
-        println!("{}", if pass { "GARAGE: PASS" } else { "GARAGE: FAIL" });
+        verdict("GARAGE", pass);
         return;
     }
     if name == "keys" {
@@ -5027,7 +5044,7 @@ pub fn run(args: &[String]) {
         }
         println!("   ordinary keys swallowed: {:?}", swallowed);
         check("no ordinary key is captured by accident", swallowed.is_empty());
-        println!("{}", if pass { "KEYS: PASS" } else { "KEYS: FAIL" });
+        verdict("KEYS", pass);
         return;
     }
     if name == "hover" {
@@ -5504,7 +5521,7 @@ pub fn run(args: &[String]) {
         check("a longer hold hits harder", powers[3] > powers[0] * 1.8);
         check("and it costs real speed", kept[3] < kept[0] * 0.75);
         check("a tap still fires at base strength", powers[0] > 2.0);
-        println!("{}", if pass { "HOVER: PASS" } else { "HOVER: FAIL" });
+        verdict("HOVER", pass);
         return;
     }
     if name == "parts" {
@@ -5630,7 +5647,7 @@ pub fn run(args: &[String]) {
                 seen.iter().filter(|s| **s).count() >= 4
             }),
         );
-        println!("{}", if pass { "PARTS: PASS" } else { "PARTS: FAIL" });
+        verdict("PARTS", pass);
         return;
     }
     if name == "target" {
@@ -6261,7 +6278,7 @@ pub fn run(args: &[String]) {
                 println!("   {n:<14} nodes {nodes}, with mesh {with_mesh}, transformed {nonident}, MIRRORED {mirrored}");
             }
         }
-        println!("{}", if ok_all { "GLB: PASS" } else { "GLB: FAIL" });
+        verdict("GLB", ok_all);
         return;
     }
     if name == "cars" {
@@ -6417,7 +6434,7 @@ pub fn run(args: &[String]) {
         check("the shell is smooth", smooth < 30.0);
         check("the wedge is faceted", faceted > 40.0);
         check("both come from the same generator", vip_shell.idx.len() > 0 && aeg_wedge.idx.len() > 0);
-        println!("{}", if pass { "CARS: PASS" } else { "CARS: FAIL" });
+        verdict("CARS", pass);
         return;
     }
     if name == "perf" {
@@ -6814,7 +6831,7 @@ pub fn run(args: &[String]) {
                 pass = false;
             }
         }
-        println!("{}", if pass { "LOOPS: PASS" } else { "LOOPS: FAIL" });
+        verdict("LOOPS", pass);
         return;
     }
     if name == "touch" {
@@ -6973,7 +6990,7 @@ pub fn run(args: &[String]) {
             );
         }
         check("no page is a marathon (<= 2 screens)", worst <= 2.0);
-        println!("{}", if pass { "TOUCH MENUS: PASS" } else { "TOUCH MENUS: FAIL" });
+        verdict("TOUCH MENUS", pass);
         return;
     }
     if name == "gyro" {
@@ -7048,7 +7065,7 @@ pub fn run(args: &[String]) {
             g2.update(1.0 / 60.0, &cfg);
         }
         check("impulse kicks then decays", peak > 0.2 && g2.x.abs() < 0.02);
-        println!("{}", if pass { "GYRO: PASS" } else { "GYRO: FAIL" });
+        verdict("GYRO", pass);
         return;
     }
     if name == "sanity" {
@@ -7553,7 +7570,7 @@ pub fn run(args: &[String]) {
             println!("   hovering at rest: height between {lo:.3} and {hi:.3} m over 8 s");
             check("a resting hovercar holds a steady height", (hi - lo) < 0.06);
         }
-        println!("{}", if pass { "SANITY: PASS" } else { "SANITY: FAIL" });
+        verdict("SANITY", pass);
         return;
     }
     if name == "jumpflip" {
@@ -7609,10 +7626,7 @@ pub fn run(args: &[String]) {
             }
         }
         println!("   one press produced {jumps} jump(s) and {dodges} dodge(s)");
-        println!(
-            "{}",
-            if dodges == 0 { "JUMPFLIP: PASS" } else { "JUMPFLIP: FAIL" }
-        );
+        verdict("JUMPFLIP", dodges == 0);
         return;
     }
     if name == "flip" {
@@ -7820,7 +7834,7 @@ pub fn run(args: &[String]) {
                 println!("   the half-flip lost its air roll");
             }
         }
-        println!("{}", if ok_all { "FLIPS: PASS" } else { "FLIPS: FAIL" });
+        verdict("FLIPS", ok_all);
         return;
     }
     if name == "mech" {
@@ -7893,7 +7907,7 @@ pub fn run(args: &[String]) {
         let ok3 = climbed > 6.0;
         println!("dropshot: ramp wall climb {climbed:.1} m above the deck  {}",
             if ok3 { "drivable verticality" } else { "NOT CLIMBABLE" });
-        println!("{}", if ok1 && ok2 && ok3 { "MECHANICS: PASS" } else { "MECHANICS: FAIL" });
+        verdict("MECHANICS", ok1 && ok2 && ok3);
         return;
     }
     if name == "mp" {
@@ -7939,7 +7953,7 @@ pub fn run(args: &[String]) {
             && bp.len() == 1
             && (ap[0] - 1.0).abs() < 1.6
             && (bp[0] - (-1.0)).abs() < 1.6;
-        println!("{}", if ok { "MP LOOPBACK: PASS" } else { "MP LOOPBACK: FAIL" });
+        verdict("MP LOOPBACK", ok);
         let _ = std::fs::remove_dir_all(&store);
         return;
     }

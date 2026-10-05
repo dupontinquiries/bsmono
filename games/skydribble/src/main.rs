@@ -781,6 +781,10 @@ fn main() {
     if argv.iter().any(|a| a == "--sim") {
         // headless AI sim: pure physics, no window, no GPU, no audio
         sim::run(&argv);
+        if sim::any_failed() {
+            // a FAIL line is a failed run: `tests/sims.rs` and any CI step read the status
+            std::process::exit(1);
+        }
         return;
     }
     env_logger::init();

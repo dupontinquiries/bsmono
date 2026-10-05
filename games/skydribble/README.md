@@ -47,7 +47,13 @@ CLI flags: `--seed N`, `--map 0..15`, `--gfx rays|classic`, `--fullscreen` /
 `--join FRIEND`, `--help`.
 
 `cargo test` validates the WGSL shader offline with naga (the same frontend
-wgpu uses at runtime), so shader typos fail in CI instead of on launch.
+wgpu uses at runtime), so shader typos fail in CI instead of on launch — and,
+since 2026-10, runs the 37 fast `--sim` checks through the built binary
+(`tests/sims.rs`): each must print its `LABEL: PASS` line, print no `: FAIL`,
+and exit 0. A sim that reports FAIL now exits 1 (`sim::verdict` remembers it;
+`main` reads it), so a CI step can run `skydribble --sim planets` and trust the
+status. The first run of the harness caught KUIPER seed 9's first drifting
+planet spawning 2.5 m inside a rock, which `World::unbury_drifters` fixes.
 
 ## Controls (all rebindable)
 
