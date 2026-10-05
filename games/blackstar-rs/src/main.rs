@@ -5519,8 +5519,50 @@ impl Game {
     }
 
     /// Scroll wheel: nudge the selected slider in the settings menus.
+    /// Arm whatever the hotbar's ACTIVE slot holds, and say so. Shared by the digit keys
+    /// (which `select` a slot outright) and the wheel (which `cycle`s to the next occupied
+    /// one); the two differ only in how the slot was chosen.
+    fn arm_hotbar(&mut self) {
+        let i = self.hotbar.active_index();
+        let label = match self.hotbar.slot(i) {
+            Some(slot) => match &slot.item {
+                gear::Item::Weapon { verb, element, .. } => {
+                    format!("{} {}", element.name(), gear::verb_name(*verb))
+                }
+                gear::Item::Armor(m) => m.name.to_string(),
+            },
+            None => "-- empty --".to_string(),
+        };
+        // the slot actually arms the weapon. Two separate requests, because
+        // form and element are separate systems: the form is set directly,
+        // but the element goes through Watch::switch so arming a slot cannot
+        // dodge the attune delay a manual element change costs.
+        if let Some(slot) = self.hotbar.slot(i) {
+            let item = slot.item.clone();
+            if let Some(form) = hotbar::form_for(&item) {
+                self.wep.form = form;
+                self.wep.cool = 0.0;
+            }
+            if let Some(elem) = hotbar::element_for(&item) {
+                self.wep.watch.switch(elem);
+            }
+        }
+        self.snd.fire(Sfx::Click);
+        self.toastf(&format!("[{}] {label}", i + 1));
+    }
+
     fn wheel(&mut self, dy: f32) {
         if dy == 0.0 {
+            return;
+        }
+        // IN PLAY THE WHEEL IS THE HOTBAR. `Hotbar::cycle` -- wraps, skips
+        // empty slots -- had no caller: the bar could be addressed by digit
+        // and never scrolled. Wheel up is the previous slot, down the next,
+        // the way every inventory bar reads it; a deck open means the wheel
+        // belongs to the console, not the holster.
+        if matches!(self.mode, Mode::Play) && self.deck.is_none() {
+            self.hotbar.cycle(if dy > 0.0 { -1 } else { 1 });
+            self.arm_hotbar();
             return;
         }
         // OVER THE MODEL, THE WHEEL WALKS THE RIG. The catalogue's preview
@@ -5744,11 +5786,15 @@ impl Game {
                     }
                     Key::Named(NamedKey::ArrowUp) => {
                         d.input(menu::Input::Move(-1));
+                        self.snd.fire(Sfx::Click);
                     }
                     Key::Named(NamedKey::ArrowDown) => {
                         d.input(menu::Input::Move(1));
+                        self.snd.fire(Sfx::Click);
                     }
                     Key::Named(NamedKey::Enter) => {
+                        // a press is heard whether or not it resolves to an order
+                        self.snd.fire(Sfx::Click);
                         // resolve the order OUTSIDE the deck's borrow: acting
                         // on it needs the shell, and rebuilding the console
                         // needs to replace the very thing being borrowed
@@ -5851,34 +5897,8 @@ impl Game {
                 if s.len() == 1 {
                     if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10)) {
                         if (1..=hotbar::SLOTS as u32).contains(&d) {
-                            let i = (d - 1) as usize;
-                            let _ = self.hotbar.select(i);
-                            let label = match self.hotbar.slot(i) {
-                                Some(slot) => match &slot.item {
-                                    gear::Item::Weapon { verb, element, .. } => {
-                                        format!("{} {}", element.name(), gear::verb_name(*verb))
-                                    }
-                                    gear::Item::Armor(m) => m.name.to_string(),
-                                },
-                                None => "-- empty --".to_string(),
-                            };
-                            // the slot actually arms the weapon. Two separate
-                            // requests, because form and element are separate
-                            // systems: the form is set directly, but the
-                            // element goes through Watch::switch so arming a
-                            // slot cannot dodge the attune delay a manual
-                            // element change costs.
-                            if let Some(slot) = self.hotbar.slot(i) {
-                                let item = slot.item.clone();
-                                if let Some(form) = hotbar::form_for(&item) {
-                                    self.wep.form = form;
-                                    self.wep.cool = 0.0;
-                                }
-                                if let Some(elem) = hotbar::element_for(&item) {
-                                    self.wep.watch.switch(elem);
-                                }
-                            }
-                            self.toastf(&format!("[{}] {label}", d));
+                            let _ = self.hotbar.select((d - 1) as usize);
+                            self.arm_hotbar();
                             return;
                         }
                     }
