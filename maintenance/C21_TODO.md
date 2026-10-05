@@ -231,6 +231,19 @@ test and a §5b break test; nothing below was seen on a screen or heard.
     the server, the replaced state kept as a point. `876619520` `a5035513e` world edits over
     a reliable-ordered link (seq/ack/resend per peer; they went out in one raw datagram, and
     a dropped one was a silent divergence) in the inline loop and `HostPump`.
+  - **clawbound-battleground** `9dc21783f` the LAN plan carries the host's rules and every
+    player's ancestor pick (`picks::deal_seated`; the den's HELLO says the pick; the LAN
+    screen has the arrows and the roster); `dc444e56a` `07bfdcdce` the match has music: a
+    synthesized bed per map (root/mode/tempo/colour each) when no `music/<map>` file is in the
+    bank, rendered off the frame thread; `da5144d76` the announcer's calls are read on screen
+    (no recording exists, so they reached nobody).
+  - **soldier** `7653ba5fd` `app` implies `sound`: the README's run line and the hub built a
+    silent game.
+  - **echelon** `1801b8d9f` `812a2bbf6` the UDP transport the README named as remaining
+    (`echelon_net::udp::UdpLink`, re-send until acked, proven through a relay dropping every
+    third datagram) and the runner's `--lan-host`/`--lan-join`: the first Echelon match across
+    two processes (4620 turns, 41 checkpoints, no desync, identical hashes). The Bevy client
+    still plays human vs bot; wiring it to the session is the next step there.
 - **Decided, not wired:** blackstar-rs `dispatch.rs` models voyages (`voyage`/`damage`/
   `survival`/`loot`, orbits and delta-v) that nothing in the shipboard game reaches -- wiring
   it is a game-layer design, not a bug; `suitability.rs` would tell the player "wheels have
@@ -243,9 +256,10 @@ test and a §5b break test; nothing below was seen on a screen or heard.
   `ui_*` fields ARE the settings; the model's draft/apply/revert is a Cancel button nobody has
   asked for) / `gpu_mesher_mode` hard-coded (documented decision) / the inline host loop vs
   `HostPump` duplication (both now carry admission and the reliable link; the dedupe is a
-  refactor of a 20k-line bin); clawbound-battleground: the AI radii vs MAP_SCALE (above),
-  missing music/narrator/announcer assets, LAN ancestor pick + custom rules in the plan;
-  echelon has no transport. Everything synthesized this batch (road-warrior, clawbound) is
+  refactor of a 20k-line bin); clawbound-battleground: the AI radii vs MAP_SCALE (above), the
+  narrator/announcer VOICE (the calls are text now; speech cannot be synthesized here);
+  echelon's Bevy client on the session (the transport exists; the client is human vs bot).
+  Everything synthesized this batch (road-warrior, clawbound, the battleground's beds) is
   unheard: the voices are first passes by their numbers.
 - **Not touched:** blackstar-rs's visual/playtest backlog (`TODO.md` §"Found, NOT fixed" needs
   eyes on a screen), unendlich's BACKLOG §B pure cores (octree re-merge, rebuild coalescer,
