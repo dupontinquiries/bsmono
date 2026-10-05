@@ -4667,12 +4667,19 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                     ui.label("render distance (chunks; higher = farther, costlier)");
                                     int_slider!("distance", ui_render_distance, i32, 2, 32);
                                     ui.add_space(6.0);
-                                    // r325: render resolution scale (neural upscale).
-                                    ui.label("render scale (neural upscale; <100% renders smaller)");
-                                    ui.horizontal(|ui| {
-                                        unendlich_ui::menu::slider(ui, &mut ui_render_scale, 0.5, 1.0, 10, accent);
-                                        ui.add_space(6.0);
-                                        ui.label(egui::RichText::new(format!("{:.0}%", ui_render_scale * 100.0)).strong().color(accent));
+                                    // r325: render resolution scale. NOT WIRED: nothing in the frame
+                                    // loop reads it -- the scene is drawn at the window's size. The knob
+                                    // waits on the post-FX offscreen path (render::postfx: compiled, not
+                                    // in the loop, needs a GPU to land; docs/UPSCALING.md), which is where
+                                    // a smaller target and an upscaling present go. Shown disabled and
+                                    // labelled so, rather than as a slider that moves and changes nothing.
+                                    ui.label("render scale — not wired yet (drawn at window size; waits on the post-FX path)");
+                                    ui.add_enabled_ui(false, |ui| {
+                                        ui.horizontal(|ui| {
+                                            unendlich_ui::menu::slider(ui, &mut ui_render_scale, 0.5, 1.0, 10, accent);
+                                            ui.add_space(6.0);
+                                            ui.label(egui::RichText::new(format!("{:.0}%", ui_render_scale * 100.0)).strong().color(accent));
+                                        });
                                     });
                                     ui.separator();
                                     // Shadow amortization: THE lever for the dominant GPU cost on
