@@ -296,6 +296,10 @@ test and a §5b break test; nothing below was seen on a screen or heard.
     come straight back). `b7b65445c` "Screenshot" (F2) off the keybind page -- no readback
     exists -- and a scan test that fails for any page row the fullgame does not handle.
     `e5e15e788` KNOWN-TEST-FAILURES / README counts.
+  - **echelon-deck** `a336287af` the match is heard: `cues::Listener` reads built / trained /
+    lost / hits (rate-limited) / the banner off the world between frames, Ack on a command;
+    `audio` is the house synth behind `sound` (off by default; the tape and CI stay silent).
+    Unheard.
 - **Decided, not wired:** blackstar-rs `dispatch.rs` models voyages (`voyage`/`damage`/
   `survival`/`loot`, orbits and delta-v) that nothing in the shipboard game reaches -- wiring
   it is a game-layer design, not a bug; `suitability.rs` would tell the player "wheels have
