@@ -523,6 +523,13 @@ pub struct Game {
     /// Hollowstep's others -- his standing one and his echoes (`stalker`).
     pub others: Vec<crate::stalker::Other>,
     pub events: Vec<Event>,
+    /// Which god THIS machine's player looks through: the camera, the HUD, the shop, what the
+    /// clouds hide and what the ear is near. `None` means god 0 (the solo default). A view
+    /// parameter only -- `tick` and the lockstep checksum never read it, so two machines in one
+    /// LAN match carry different values and the same world. (`is_player` is the SIM's flag --
+    /// bots focus every human, no purse for them -- and is true for every human on every
+    /// machine.)
+    pub viewer: Option<usize>,
     pub killfeed: Vec<KillEntry>,
     pub next_wave_t: f32,
     pub over: Option<Team>,
@@ -579,6 +586,13 @@ pub struct Game {
     pub calls: [Option<(usize, f32)>; 2],
     /// The Engineer's Quarry's waking order (`maze`); unused on other maps.
     pub wake: crate::maze::Wake,
+}
+
+impl Game {
+    /// The god this machine's player looks through (see `viewer`): god 0 unless set.
+    pub fn me(&self) -> usize {
+        self.viewer.unwrap_or(0).min(self.gods.len().saturating_sub(1))
+    }
 }
 
 impl Game {
@@ -759,6 +773,7 @@ impl Game {
             mudslides: Vec::new(),
             others: Vec::new(),
             events: Vec::new(),
+            viewer: None,
             killfeed: Vec::new(),
             next_wave_t: WAVE_FIRST,
             over: None,
@@ -1471,6 +1486,20 @@ impl Game {
 #[cfg(test)]
 mod shop_tests {
     use super::*;
+
+    /// The viewer is a view parameter: god 0 by default, whatever is set otherwise, never out
+    /// of range, and the lockstep checksum does not see it (two machines in one match differ).
+    #[test]
+    fn the_viewer_is_god_zero_unless_set_and_never_in_the_checksum() {
+        let mut g = Game::new(7, [1, 2, 3, 4], [6, 7, 8, 9, 10]);
+        assert_eq!(g.me(), 0);
+        let before = crate::lockstep::checksum(&g);
+        g.viewer = Some(5);
+        assert_eq!(g.me(), 5);
+        assert_eq!(crate::lockstep::checksum(&g), before);
+        g.viewer = Some(999);
+        assert_eq!(g.me(), g.gods.len() - 1, "clamped, not a panic");
+    }
 
     #[test]
     fn selling_refunds_a_fraction_and_frees_the_slot() {

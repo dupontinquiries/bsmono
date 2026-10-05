@@ -1063,7 +1063,7 @@ pub fn draw_end(ctx: &egui::Context, game: &Game, again: &mut bool, menu: &mut b
             ui.label(egui::RichText::new(format!("Match time {:.0}:{:02}", (game.t / 60.0).floor() as i32, (game.t % 60.0) as i32)).size(16.0));
             ui.add_space(16.0);
             // player stats
-            let g = &game.gods[0];
+            let g = &game.gods[game.me()];
             ui.label(egui::RichText::new(format!("{} — {} / {} / {}   Lv {}   {:.0} gold", game.god_name(0), g.kills, g.deaths, g.assists, g.level, g.gold)).size(18.0));
             ui.add_space(24.0);
             ui.horizontal(|ui| {
@@ -1314,7 +1314,7 @@ pub fn draw_touch_pad(ctx: &egui::Context, pad: &crate::touch::TouchPad, game: &
     let r_px = |r: f32| r * pad.scale * short / ppp;
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("touchpad")));
     let l = crate::touch::layout(pad.extent, pad.scale);
-    let g = &game.gods[0];
+    let g = &game.gods[game.me()];
     let def = game.def(0);
     let dim = Color32::from_rgba_premultiplied(20, 20, 28, 120);
     let ring = Color32::from_rgba_premultiplied(230, 226, 216, 140);
@@ -1613,7 +1613,7 @@ mod hidpi_tests {
     #[test]
     fn health_bars_sit_over_their_cats_on_a_scaled_display() {
         let game = Game::new_teams(&[0], &[1]);
-        let cat = game.gods[0].pos;
+        let cat = game.gods[game.me()].pos;
         let cam = crate::render::Camera { eye: cat + Vec3::new(0.0, 8.0, -12.0), target: cat + Vec3::Y * 2.6, fov_y: 1.0 };
         let (pw, ph) = (1280.0f32, 720.0f32); // physical pixels
         let vp = cam.view_proj(pw / ph);

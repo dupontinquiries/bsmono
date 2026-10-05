@@ -541,7 +541,7 @@ impl Scene {
         }
 
         // cave roofs: solid, or cut away while the player is under one
-        if let Some(me) = game.gods.iter().find(|g| g.is_player).or(game.gods.first()) {
+        if let Some(me) = game.gods.get(game.me()) {
             for cd in &self.caves {
                 let c = cd.cave.mid() + Vec3::Y * cd.cave.height;
                 let rad = (cd.cave.b - cd.cave.a).length() * 0.5 + cd.cave.half + 4.0;
@@ -836,7 +836,7 @@ impl Scene {
         // still hitting you is worse than ten extra draw calls.
         // an enemy the cloud hides from the player's team is not drawn
         // (skycloud.rs; spectators and bot-only matches see everyone)
-        let viewer = game.gods.iter().find(|g| g.is_player).map(|g| g.team);
+        let viewer = game.gods.get(game.me()).filter(|g| g.is_player).map(|g| g.team);
         for i in 0..game.gods.len() {
             let g = &game.gods[i];
             if g.respawn_t > 0.0 {
@@ -988,7 +988,7 @@ impl Scene {
         // camera and round the player's own cat, so a cat in a bank still
         // sees what is at arm's length.
         if crate::map::active() == crate::map::MapId::Sky {
-            let me = game.gods.iter().find(|g| g.is_player).map(|g| g.pos);
+            let me = game.gods.get(game.me()).filter(|g| g.is_player).map(|g| g.pos);
             for c in crate::skycloud::clouds(game.cloud_seed, game.t) {
                 if c.thick < 0.02 || !sphere_in_frustum(&vp, c.pos + Vec3::Y * 3.0, c.r + 12.0) {
                     continue;

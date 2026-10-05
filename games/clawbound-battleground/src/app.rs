@@ -755,7 +755,7 @@ fn gather_controls(s: &mut AppState, dt: f32) {
         s.cam_dist = (s.cam_dist - c.zoom).clamp(4.5, 16.0);
         if c.recenter {
             if let Some(g) = s.game.as_ref() {
-                s.cam_yaw = g.gods[0].yaw + std::f32::consts::FRAC_PI_2;
+                s.cam_yaw = g.gods[g.me()].yaw + std::f32::consts::FRAC_PI_2;
             }
         }
         if let Some(tap) = c.tap {
@@ -770,7 +770,7 @@ fn gather_controls(s: &mut AppState, dt: f32) {
 /// Screen point (normalized, y down, x in shorter-side units) → ground hit.
 fn ground_point_from_screen(s: &AppState, p: Vec2) -> Option<Vec3> {
     let g = s.game.as_ref()?;
-    let player = &g.gods[0];
+    let player = &g.gods[g.me()];
     let dir = cam_dir(s.cam_yaw, s.cam_pitch);
     let target = player.pos + Vec3::Y * 1.5;
     let cam = Camera { eye: target - dir * crate::map::camera_boom(target, dir, s.cam_dist), target, fov_y: 0.95 };
@@ -801,7 +801,7 @@ fn cam_dir(yaw: f32, pitch: f32) -> Vec3 {
 }
 
 fn compute_aim(s: &AppState) -> Vec3 {
-    let player = &s.game.as_ref().unwrap().gods[0];
+    let player = { let g = s.game.as_ref().unwrap(); &g.gods[g.me()] };
     let dir = cam_dir(s.cam_yaw, s.cam_pitch);
     let eye = player.pos + Vec3::Y * 1.5 - dir * crate::map::camera_boom(player.pos + Vec3::Y * 1.5, dir, s.cam_dist);
     // the camera ray against the REAL surface (the pass has a shelf and
@@ -965,7 +965,7 @@ fn finish_start(s: &mut AppState) {
             god.respawn_t = 999.0;
         }
         let teams: Vec<crate::consts::Team> = g.gods.iter().map(|x| x.team).collect();
-        let p0 = g.gods[0].pos;
+        let p0 = g.gods[g.me()].pos;
         let dir = cam_dir(s.cam_yaw, s.cam_pitch);
         let target = p0 + Vec3::Y * 1.5;
         let play = crate::intro::Shot { eye: target - dir * crate::map::camera_boom(target, dir, s.cam_dist), target, fov_y: 0.95 };
@@ -1022,6 +1022,7 @@ fn render(s: &mut AppState) {
     // fixed-step simulation + player input
     if s.screen == Screen::Playing {
         let c = s.controls;
+        let me = s.game.as_ref().map_or(0, |g| g.me());
         // Esc's panel is the pause menu: the match waits while it is open.
         let paused = sim_paused(s.controls_open, s.capturing.is_some(), s.lan.is_some());
         let aim = if s.game.is_some() { compute_aim(s) } else { Vec3::ZERO };
@@ -1041,19 +1042,19 @@ fn render(s: &mut AppState) {
             if c.leap {
                 let (fwd, right) = input::camera_basis(yaw);
                 let dir = if c.mv.length_squared() > 0.04 { fwd * c.mv.y + right * c.mv.x } else { fwd };
-                g.leap_queue.push((0, dir));
+                g.leap_queue.push((me, dir));
             }
             // Casts: an ability key PREPARES the ability (its guide shows);
             // the attack button fires it at the current aim (`targeting`).
             // A touch drag-to-aim is its own two-step gesture and fires on
             // release, as before.
             // the facing cone couples the cat to where the camera looks
-            g.gods[0].face_ref = input::camera_basis(yaw).0;
+            g.gods[me].face_ref = input::camera_basis(yaw).0;
             let attack_edge = c.attack && !s.attack_was;
             let keys: [bool; 4] = std::array::from_fn(|k| c.cast[k] && c.cast_dir[k].is_none());
             let out = s.targeting.step(crate::targeting::Press { cast: keys, attack: attack_edge, cancel: false });
             if let crate::targeting::Outcome::Fire(slot) = out {
-                g.cast_queue.push((0, slot, aim));
+                g.cast_queue.push((me, slot, aim));
                 s.attack_eaten = true;
             }
             if s.targeting.eats_attack() && c.attack {
@@ -1073,11 +1074,11 @@ fn render(s: &mut AppState) {
                         // the camera is actually looking, not a fixed axis
                         let (fwd, right) = input::camera_basis(yaw);
                         let world_dir = fwd * dir.y + right * dir.x;
-                        g.gods[0].pos + world_dir * 20.0
+                        g.gods[me].pos + world_dir * 20.0
                     } else {
                         aim
                     };
-                    g.cast_queue.push((0, slot, cast_aim));
+                    g.cast_queue.push((me, slot, cast_aim));
                 }
             }
             } // !spectating
@@ -1150,7 +1151,7 @@ fn render(s: &mut AppState) {
                 let (fwd, right) = crate::input::camera_basis(yaw);
                 let mut mv = fwd * c.mv.y + right * c.mv.x;
                 if let Some(t) = walk_to {
-                    let d = Vec3::new(t.x - g.gods[0].pos.x, 0.0, t.z - g.gods[0].pos.z);
+                    let d = Vec3::new(t.x - g.gods[me].pos.x, 0.0, t.z - g.gods[me].pos.z);
                     if d.length() > 0.8 {
                         mv = d.normalize();
                     } else {
@@ -1163,7 +1164,7 @@ fn render(s: &mut AppState) {
                 let gentle = walk_to.is_none() && c.mv.length() > 0.08 && c.mv.length() < 0.5;
                 // a spectated match's god 0 is a bot like the rest
                 if s.spectator.is_none() {
-                    let gi = &mut g.gods[0];
+                    let gi = &mut g.gods[me];
                     gi.sneak = stalk_on || c.sneak_held || gentle;
                     gi.move_dir = mv;
                     // the click that fired a prepared ability is not an attack
@@ -1185,7 +1186,7 @@ fn render(s: &mut AppState) {
                         // sky-tall bolts are lightning (weather or Thunder Front)
                         crate::sim::Event::BoltFx { from, to, .. } if from.y - to.y > 30.0 => {
                             s.thunder_count = s.thunder_count.wrapping_add(1);
-                            s.thunder_dist = (to.distance(g.gods[0].pos) / 160.0).clamp(0.0, 1.0);
+                            s.thunder_dist = (to.distance(g.gods[me].pos) / 160.0).clamp(0.0, 1.0);
                         }
                         _ => {}
                     }
@@ -1209,7 +1210,7 @@ fn render(s: &mut AppState) {
         }
         Screen::Playing => {
             let g = s.game.as_ref().unwrap();
-            let player = &g.gods[0];
+            let player = &g.gods[g.me()];
             let dir = cam_dir(s.cam_yaw, s.cam_pitch);
             // the ground moves: an earthquake (or a nearby boar slam) jolts the camera
             let shake = g.disasters.shake;
@@ -1299,7 +1300,7 @@ fn render(s: &mut AppState) {
     if let Some(amb) = s.ambience.as_ref() {
         let p = match s.game.as_ref() {
             Some(g) if s.screen == Screen::Playing => {
-                let mut p = crate::audio::params_for(g, g.gods[0].pos, s.cam_yaw, s.thunder_count, s.thunder_dist);
+                let mut p = crate::audio::params_for(g, g.gods[g.me()].pos, s.cam_yaw, s.thunder_count, s.thunder_dist);
                 p.fanfare_count = s.fanfare_count;
                 p
             }
@@ -1330,7 +1331,7 @@ fn render(s: &mut AppState) {
                 }
                 let f = cam.target - cam.eye;
                 let right = Vec3::new(f.x, 0.0, f.z).normalize_or_zero().cross(Vec3::Y).normalize_or_zero();
-                let ear = if s.spectator.is_some() { cam.target } else { g.gods[0].pos };
+                let ear = if s.spectator.is_some() { cam.target } else { g.gods[g.me()].pos };
                 // the space the listener is in: reverb and echo, a few times
                 // a second (it glides between places on its own)
                 s.space_tick = s.space_tick.wrapping_add(1);
@@ -1338,7 +1339,7 @@ fn render(s: &mut AppState) {
                     amb.mixer.send(Cmd::Space(crate::reverb::space_at(ear)));
                 }
                 if let Some(w) = g.over {
-                    let me = if s.spectator.is_some() { None } else { Some(g.gods[0].team) };
+                    let me = if s.spectator.is_some() { None } else { Some(g.gods[g.me()].team) };
                     s.announcer.end(w, me, g.t);
                 }
                 for ev in s.audio_events.iter() {
@@ -1393,7 +1394,7 @@ fn render(s: &mut AppState) {
     if let Some(g) = s.game.as_ref() {
         s.renderer.atmosphere = g.weather.atmosphere();
         // catastrophe uniforms: flood rise, shake, fire glow near the player
-        let near_fire = g.disasters.fire.iter().map(|f| f.pos.distance(g.gods[0].pos)).fold(f32::MAX, f32::min);
+        let near_fire = g.disasters.fire.iter().map(|f| f.pos.distance(g.gods[g.me()].pos)).fold(f32::MAX, f32::min);
         let glow = if near_fire < 40.0 { (1.0 - near_fire / 40.0).clamp(0.0, 1.0) } else { 0.0 };
         s.renderer.event = (g.disasters.flood_rise, g.disasters.shake, glow);
         let mut vfx = std::mem::take(&mut s.vfx);
@@ -1401,9 +1402,9 @@ fn render(s: &mut AppState) {
         s.vfx = vfx;
         // the prepared ability's guide, where the camera aims
         if let Some(slot) = s.targeting.slot {
-            if s.screen == Screen::Playing && g.gods[0].respawn_t <= 0.0 {
+            if s.screen == Screen::Playing && g.gods[g.me()].respawn_t <= 0.0 {
                 let ab = g.def(0).abilities[slot as usize];
-                let guide = crate::targeting::guide_for(&ab, g.gods[0].pos, compute_aim(s));
+                let guide = crate::targeting::guide_for(&ab, g.gods[g.me()].pos, compute_aim(s));
                 scene.draw_guide(&mut s.renderer, &crate::targeting::guide_points(&guide, 1.1), ab.color);
             }
         }
