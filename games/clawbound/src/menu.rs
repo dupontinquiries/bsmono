@@ -78,6 +78,8 @@ pub struct Settings {
     pub hires: bool,       // AAA graphics: supersample + denser geometry
     pub clan_abilities: bool,  // survival mode: give each clan a small passive + ultimate (off = hardcore, hunter feels dominant)
     pub prowl_fixed_wind: bool,  // Prowl: freeze the wind for a more readable, planned-around map
+    /// Borderless fullscreen on the current monitor (F11 toggles it too). Off: a window.
+    pub fullscreen: bool,
     pub keybinds: Keybinds,
 }
 impl Default for Settings {
@@ -87,7 +89,7 @@ impl Default for Settings {
             cast_mode: crate::castguide::CastMode::Quick,
             camera_zoom: 1,
             show_cone: false, master_volume: 0.7, difficulty: 1, hires: false,
-            clan_abilities: false, prowl_fixed_wind: false, keybinds: Keybinds::default(),
+            clan_abilities: false, prowl_fixed_wind: false, fullscreen: false, keybinds: Keybinds::default(),
         }
     }
 }
@@ -112,6 +114,7 @@ impl Settings {
         s.push_str(&format!("hires {}\n", self.hires as u8));
         s.push_str(&format!("clan_abilities {}\n", self.clan_abilities as u8));
         s.push_str(&format!("prowl_fixed_wind {}\n", self.prowl_fixed_wind as u8));
+        s.push_str(&format!("fullscreen {}\n", self.fullscreen as u8));
         for (a, k) in &self.keybinds.keys {
             s.push_str(&format!("bind {} {}\n", a.name(), k));
         }
@@ -145,6 +148,7 @@ impl Settings {
                 "hires" => st.hires = flag(rest),
                 "clan_abilities" => st.clan_abilities = flag(rest),
                 "prowl_fixed_wind" => st.prowl_fixed_wind = flag(rest),
+                "fullscreen" => st.fullscreen = flag(rest),
                 "bind" => {
                     if let Some((name, k)) = rest.split_once(' ') {
                         if let Some(a) = Action::from_name(name) {
@@ -289,6 +293,11 @@ impl Menu {
         m
     }
 
+    /// A setting changed outside the menu's own rows (a hotkey): save it like the rest.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     /// Did a setting or a bind change since the last call? The app saves when it did.
     pub fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
@@ -345,6 +354,7 @@ impl Menu {
                 format!("Graphics: {}", if self.settings.hires { "High (AAA)" } else { "Standard" }),
                 format!("Survival clan abilities: {}", if self.settings.clan_abilities { "On" } else { "Off (hardcore)" }),
                 format!("Prowl fixed wind: {}", if self.settings.prowl_fixed_wind { "On (readable)" } else { "Off (dynamic)" }),
+                format!("Fullscreen: {}  (F11)", if self.settings.fullscreen { "On" } else { "Off" }),
                 "Back".into(),
             ],
             Screen::Keybinds => {
@@ -455,6 +465,7 @@ impl Menu {
             (Screen::Settings, 6) => self.settings.hires = !self.settings.hires,
             (Screen::Settings, 7) => self.settings.clan_abilities = !self.settings.clan_abilities,
             (Screen::Settings, 8) => self.settings.prowl_fixed_wind = !self.settings.prowl_fixed_wind,
+            (Screen::Settings, 9) => self.settings.fullscreen = !self.settings.fullscreen,
             _ => {}
         }
     }
@@ -542,6 +553,7 @@ mod tests {
         st.hires = true;
         st.clan_abilities = true;
         st.prowl_fixed_wind = true;
+        st.fullscreen = true;
         st.keybinds.rebind(Action::Leap, "G");
         st.keybinds.rebind(Action::Menu, "Backquote");
         let text = st.to_text();
@@ -552,7 +564,7 @@ mod tests {
         assert!(back.show_cone);
         assert!((back.master_volume - 0.3).abs() < 1e-3);
         assert_eq!(back.difficulty, 2);
-        assert!(back.hires && back.clan_abilities && back.prowl_fixed_wind);
+        assert!(back.hires && back.clan_abilities && back.prowl_fixed_wind && back.fullscreen);
         assert_eq!(back.keybinds.key_for(Action::Leap), "G");
         assert_eq!(back.keybinds.key_for(Action::Menu), "Backquote");
         assert_eq!(back.keybinds.key_for(Action::Up), "W", "an untouched bind is its default");
@@ -626,6 +638,13 @@ mod tests {
         m.cursor = 6;
         m.adjust(1);
         assert!(m.settings.hires);
+        // the fullscreen row is the last before Back, toggles, and marks the settings dirty
+        m.cursor = m.items().len() - 2;
+        assert!(m.items()[m.cursor].starts_with("Fullscreen: Off"));
+        let _ = m.take_dirty();
+        m.adjust(1);
+        assert!(m.settings.fullscreen && m.take_dirty());
+        assert!(m.items()[m.cursor].starts_with("Fullscreen: On"));
         // and Back is wherever the list ends, not a hard-coded 6
         m.cursor = m.items().len() - 1;
         m.activate();

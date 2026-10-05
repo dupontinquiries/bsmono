@@ -1304,6 +1304,12 @@ impl State {
         self.anim_t += dt;
         self.debug_cone = self.menu.settings.show_cone;
         if self.ss_on != self.menu.settings.hires { self.apply_targets(); }   // Graphics toggle → (de)supersample
+        // the fullscreen setting reaches the window when it changes (the window's own state is
+        // the truth: a compositor can leave fullscreen on its own, and the next toggle re-applies)
+        let is_full = self._window.fullscreen().is_some();
+        if is_full != self.menu.settings.fullscreen {
+            self._window.set_fullscreen(if self.menu.settings.fullscreen { Some(winit::window::Fullscreen::Borderless(None)) } else { None });
+        }
         // the master volume reaches the synth when it changes; a menu over a round quiets the air
         if (self.menu.settings.master_volume - self.sent_volume).abs() > 1e-4 {
             self.sent_volume = self.menu.settings.master_volume;
@@ -1708,7 +1714,11 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                 WindowEvent::KeyboardInput { event: key_event, .. } => {
                     if let PhysicalKey::Code(code) = key_event.physical_key {
                         let down = key_event.state == ElementState::Pressed;
-                        if state.menu.open {
+                        // F11 anywhere: the fullscreen setting flips (and is saved like any other)
+                        if code == KeyCode::F11 && down && !key_event.repeat {
+                            state.menu.settings.fullscreen = !state.menu.settings.fullscreen;
+                            state.menu.mark_dirty();
+                        } else if state.menu.open {
                             if down {
                                 use clawbound_rs::menu::MenuCmd;
                                 if state.menu.rebinding.is_some() {

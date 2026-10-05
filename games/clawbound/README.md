@@ -49,7 +49,7 @@ Controls (mouse buttons are bindable alongside the keys):
 - **Shift** — hide (crouch in a bush) / climb a trunk
 - 6v1 & Prowl: **Space / middle-click** — roll (i-frames) · **F / left-click** — leap (airborne, uncatchable)
 - Pop Island: **Space / left-click** — throw a firecracker · **Shift / right-click** — jump
-- **R** — restart · **Esc** — menu
+- **R** — restart · **Esc** — menu · **F11** — fullscreen (also in Settings, remembered)
 
 **A friend as the hunter.** Title → **Multiplayer** hosts the match on the fleet (the
 bsgames hub lists it; a friend's "▶ join" launches their clawbound straight into it), or
