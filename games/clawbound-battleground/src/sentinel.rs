@@ -44,9 +44,14 @@ pub const BURN_EVERY: f32 = 0.5;
 /// Units walked between two of her footfalls (each one heard).
 pub const TREAD: f32 = 3.4;
 
-/// Is this ancestor a Sentinel by kit (her keys are fields)?
+/// Is this ancestor a Sentinel -- by ROLE, which is what the roster says and what size, tread
+/// and the machine's kinship read. It was "has any field on a key", which stopped being the
+/// same thing when Twofang got Face Death (52ac75149): a Warrior with one short rime burst was
+/// dressed in it from the moment he stood up, for the whole match, like a coat. A field on a
+/// non-Sentinel is a burst (`sentinels_and_fields_go_together` requires it to be timed);
+/// only a Sentinel always wears one.
 pub fn is_sentinel(def: &GodDef) -> bool {
-    def.abilities.iter().any(|a| matches!(a.arch, Archetype::Field { .. }))
+    def.role == crate::gods::Role::Sentinel
 }
 
 /// The field she is wearing: what it is, how far it reaches, how strong it
@@ -142,27 +147,29 @@ impl Game {
         (g.field_slot != Some(key)).then_some(key)
     }
 
-    /// Once a tick: every Sentinel's field does what it does.
+    /// Once a tick: every worn field does what it does. A Sentinel always wears one; anyone
+    /// else wears a field only while a cast burst of it lasts.
     pub fn sentinel_tick(&mut self, dt: f32) {
         for g in self.gods.iter_mut() {
             g.ward = 1.0;
         }
         for gi in 0..self.gods.len() {
-            if !is_sentinel(self.def(gi)) {
+            let sentinel = is_sentinel(self.def(gi));
+            if !sentinel && self.gods[gi].field_slot.is_none() {
                 continue;
             }
             // she always wears something: her first coat, from the start
-            if self.gods[gi].field_slot.is_none() {
+            if sentinel && self.gods[gi].field_slot.is_none() {
                 if let Some(s) = self.first_coat(gi) {
                     self.shift_coat(gi, s);
                 }
             }
-            // a lasting coat runs out, and she cools back
+            // a lasting coat runs out: she cools back; a burst just ends
             if self.gods[gi].field_t > 0.0 {
                 self.gods[gi].field_t -= dt;
                 if self.gods[gi].field_t <= 0.0 {
                     self.gods[gi].field_t = 0.0;
-                    let back = self.gods[gi].field_back.take().or_else(|| self.first_coat(gi));
+                    let back = self.gods[gi].field_back.take().or_else(|| if sentinel { self.first_coat(gi) } else { None });
                     self.gods[gi].field_slot = None;
                     if let Some(s) = back {
                         self.shift_coat(gi, s);
@@ -174,7 +181,7 @@ impl Game {
             }
             // her tread: heavy enough to hear
             let g = &self.gods[gi];
-            let moved = g.move_dir.length_squared() > 0.01 && g.dash.is_none() && g.leap.is_none();
+            let moved = sentinel && g.move_dir.length_squared() > 0.01 && g.dash.is_none() && g.leap.is_none();
             if moved {
                 self.gods[gi].stride += self.move_speed(gi) * dt;
                 if self.gods[gi].stride >= TREAD {
@@ -244,21 +251,60 @@ mod tests {
         ROSTER.iter().find(|d| d.role == Role::Sentinel).unwrap().id
     }
 
-    /// Every Sentinel wears only fields, and only a Sentinel does: the role
-    /// and the kit cannot disagree.
+    /// Every Sentinel wears only fields, free; anyone else's field is a timed burst, because
+    /// nothing takes an untimed coat off a cat who does not shift coats (Twofang's Face Death
+    /// is the one there is).
     #[test]
     fn sentinels_and_fields_go_together() {
         let n = ROSTER.iter().filter(|d| d.role == Role::Sentinel).count();
         assert!(n >= 1, "no Sentinel in the roster");
+        let mut bursts = 0;
         for d in ROSTER.iter() {
-            let fields = d.abilities.iter().filter(|a| matches!(a.arch, Archetype::Field { .. })).count();
+            let fields: Vec<&crate::gods::AbilityDef> = d.abilities.iter().filter(|a| matches!(a.arch, Archetype::Field { .. })).collect();
             if d.role == Role::Sentinel {
-                assert_eq!(fields, 4, "{} is a Sentinel with a key that is not a field", d.name);
+                assert_eq!(fields.len(), 4, "{} is a Sentinel with a key that is not a field", d.name);
                 assert!(d.abilities.iter().all(|a| a.cost == 0.0), "{}'s coats cost mana", d.name);
+                assert!(is_sentinel(d));
             } else {
-                assert_eq!(fields, 0, "{} wears a field and is not a Sentinel", d.name);
+                assert!(!is_sentinel(d), "{} is not a Sentinel by role", d.name);
+                for a in fields {
+                    let Archetype::Field { secs, .. } = a.arch else { unreachable!() };
+                    assert!(secs > 0.0, "{}'s {} is a field with no end on a cat who cannot take it off", d.name, a.name);
+                    bursts += 1;
+                }
             }
         }
+        assert!(bursts >= 1, "Twofang's Face Death is a field on a Warrior; the scan must have seen it");
+    }
+
+    /// A Warrior's field is a burst: he stands up bare, wears it for its seconds when he casts
+    /// it, and is bare again after -- not dressed in it for the match like a Sentinel.
+    #[test]
+    fn a_warriors_field_is_a_burst_not_a_coat() {
+        let twofang = ROSTER.iter().find(|d| d.name == "Twofang").expect("Twofang").id;
+        let mut g = Game::new_teams(&[twofang, 0], &[1, 2]);
+        g.gods[0].level = 5;
+        for _ in 0..10 {
+            g.sentinel_tick(DT);
+        }
+        assert_eq!(g.worn(0), None, "a Warrior is not dressed at the start");
+        let key = g.coat_key(0, Material::Rime).expect("Face Death");
+        let Archetype::Field { secs, .. } = g.ability(0, key).unwrap().arch else { panic!() };
+        assert!(secs > 0.0);
+        g.begin_cast(0, key, g.gods[0].pos);
+        assert_eq!(g.worn(0).map(|w| w.material), Some(Material::Rime), "the burst is on at once");
+        for _ in 0..((secs - 2.0 * DT) / DT) as usize {
+            g.sentinel_tick(DT);
+        }
+        assert_eq!(g.worn(0).map(|w| w.material), Some(Material::Rime), "still on inside its seconds");
+        for _ in 0..4 {
+            g.sentinel_tick(DT);
+        }
+        assert_eq!(g.worn(0), None, "and off after them, not put back on");
+        for _ in 0..30 {
+            g.sentinel_tick(DT);
+        }
+        assert_eq!(g.worn(0), None, "and it stays off");
     }
 
     /// A Sentinel is the biggest and the slowest cat there is.
@@ -315,8 +361,14 @@ mod tests {
         let mut g = scene(2, 3.0, 4.0, 20.0);
         g.sentinel_tick(DT);
         wear(&mut g, Material::Rime);
+        // the far enemy stands just outside the coat's own (ranked) reach, whatever it is tuned to
+        let reach = g.worn(0).expect("wearing rime").radius;
+        g.gods[3].pos = AT + Vec3::new(reach + 5.0, 0.0, 0.0);
         g.sentinel_tick(DT);
-        assert!(g.gods[2].slow >= 0.2, "enemy inside: slow {}", g.gods[2].slow);
+        // the coat's own (ranked) amount, capped -- the mechanism, not a tuning number
+        let want = g.worn(0).expect("wearing rime").amount.clamp(0.0, RIME_CAP);
+        assert!(want > 0.0);
+        assert_eq!(g.gods[2].slow, want, "enemy inside: slow {}", g.gods[2].slow);
         assert_eq!(g.gods[3].slow, 0.0, "enemy outside");
         assert_eq!(g.gods[1].slow, 0.0, "her friend");
         let fast = g.move_speed(3);
@@ -357,12 +409,15 @@ mod tests {
         let Archetype::Field { secs, .. } = g.ability(0, heart).unwrap().arch else { panic!() };
         g.begin_cast(0, heart, g.gods[0].pos);
         assert_eq!(g.worn(0).map(|w| w.material), Some(Material::Magma), "the shift is at once");
+        let w = g.worn(0).unwrap();
+        g.gods[3].pos = AT + Vec3::new(w.radius + 5.0, 0.0, 0.0); // just past the heart's reach
         let (near0, far0) = (g.gods[2].hp, g.gods[3].hp);
+        let raw_per_second = w.amount + g.gods[0].power * w.power_scale; // two pulses of half that
         for _ in 0..60 {
             g.sentinel_tick(DT);
         }
         let burned = near0 - g.gods[2].hp;
-        assert!(burned > 20.0, "burned {burned} in a second");
+        assert!(burned > 0.0 && burned <= raw_per_second + 1e-3, "burned {burned} in a second of a {raw_per_second}/s heart");
         assert_eq!(g.gods[3].hp, far0, "the far one burned");
         for _ in 0..((secs + 0.5) / DT) as usize {
             g.sentinel_tick(DT);
