@@ -21,6 +21,7 @@ pub mod lore;
 pub mod class;
 pub mod ancestor;
 pub mod battleground;
+pub mod bglaunch;
 pub mod battleview;
 pub mod capture;
 pub mod castguide;

@@ -249,7 +249,10 @@ fn bearing_word(x0: f32, z0: f32, x1: f32, z1: f32) -> &'static str {
 }
 
 /// Draw the pause/title menu overlay (shared by the sim and prowl render paths).
-fn draw_menu(ctx: &egui::Context, items: &[String], cursor: usize, screen: clawbound_rs::menu::Screen) {
+/// The title menu. `status` is the last thing the menu did that the player needs to read --
+/// hosting started, a Battleground launched, or why either did not -- and until c21 it only ever
+/// went to stderr (`mp_status` was written and never drawn).
+fn draw_menu(ctx: &egui::Context, items: &[String], cursor: usize, screen: clawbound_rs::menu::Screen, status: &str) {
     use clawbound_rs::menu::Screen;
     use egui::{Align2, Color32, RichText};
     egui::Area::new("clawbound_menu".into()).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
@@ -266,6 +269,10 @@ fn draw_menu(ctx: &egui::Context, items: &[String], cursor: usize, screen: clawb
             }
             ui.add_space(10.0);
             ui.label(RichText::new("↑↓ move   ←→ change   Enter select   Esc back").size(12.0).weak());
+            if !status.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new(status).size(13.0).color(Color32::from_rgb(200, 190, 150)));
+            }
         });
     });
 }
@@ -790,6 +797,7 @@ impl State {
 
         let items = self.menu.items();
         let (cursor, open, screen) = (self.menu.cursor, self.menu.open, self.menu.screen);
+        let status = self.mp_status.clone();
         let (obj_text, prey, caught, escapes, stamina, cls, cls_name, clans, b_speed, b_shield, staging, outcome, ab_name, ab_ready, ab_cd, ab_blurb, pv_name, pv_blurb, pv_used) = {
             let p = self.prowl.as_ref().unwrap();
             let ab = p.class.ability();
@@ -835,7 +843,7 @@ impl State {
         let raw = self.egui_state.take_egui_input(&self._window);
         let full = self.egui_ctx.run(raw, |ctx| {
             use egui::{Align2, Color32, RichText};
-            if open { draw_menu(ctx, &items, cursor, screen); return; }
+            if open { draw_menu(ctx, &items, cursor, screen, &status); return; }
             if let Some((title, prompt, is_last, flash)) = tutorial_ui {
                 egui::Area::new("tutorial".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_BOTTOM, [0.0, -70.0]).show(ctx, |ui| {
                     egui::Frame::none().fill(Color32::from_rgba_unmultiplied(20, 16, 28, 210))
@@ -1041,6 +1049,7 @@ impl State {
 
         let items = self.menu.items();
         let (cursor, open, screen) = (self.menu.cursor, self.menu.open, self.menu.screen);
+        let status = self.mp_status.clone();
         let (s0, s1, period, ptime, outcome, carrying, caps, stuns, cls_raw, cls, b_speed, b_shield, b_triple, cd, overtime) = {
             let g = self.capture.as_ref().unwrap();
             let p = &g.mobs[0];
@@ -1056,7 +1065,7 @@ impl State {
         let raw = self.egui_state.take_egui_input(&self._window);
         let full = self.egui_ctx.run(raw, |ctx| {
             use egui::{Align2, Color32, RichText};
-            if open { draw_menu(ctx, &items, cursor, screen); return; }
+            if open { draw_menu(ctx, &items, cursor, screen, &status); return; }
             egui::Area::new("cscore".into()).anchor(Align2::CENTER_TOP, [0.0, 12.0]).show(ctx, |ui| {
                 egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 160)).inner_margin(egui::Margin::symmetric(16.0, 8.0)).rounding(8.0).show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -1276,6 +1285,7 @@ impl State {
         // ── egui overlay (menu) ──
         let items = self.menu.items();
         let (cursor, open, screen) = (self.menu.cursor, self.menu.open, self.menu.screen);
+        let status = self.mp_status.clone();
         let over = self.game.outcome;
         // HUD snapshot (copied out so the egui closure doesn't borrow self)
         let hunter_name = self.kind.params().name;
@@ -1342,26 +1352,9 @@ impl State {
         let ppp = self.egui_ctx.pixels_per_point();
         let raw = self.egui_state.take_egui_input(&self._window);
         let full = self.egui_ctx.run(raw, |ctx| {
-            use clawbound_rs::menu::Screen;
             use egui::{Align2, Color32, RichText};
             if open {
-                egui::Area::new("clawbound_menu".into()).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                    egui::Frame::popup(ui.style()).fill(Color32::from_rgba_unmultiplied(18, 14, 26, 235)).inner_margin(egui::Margin::same(24.0)).show(ui, |ui| {
-                        ui.set_min_width(320.0);
-                        ui.label(RichText::new("C L A W B O U N D").size(30.0).strong().color(Color32::from_rgb(230, 210, 170)));
-                        let sub = match screen { Screen::Title => "", Screen::Play => "Single Player", Screen::Draft => "Battleground Draft", Screen::Settings => "Settings", Screen::Keybinds => "Keybinds" };
-                        if !sub.is_empty() { ui.label(RichText::new(sub).size(14.0).color(Color32::from_rgb(150, 130, 180))); }
-                        ui.add_space(10.0);
-                        for (i, it) in items.iter().enumerate() {
-                            let sel = i == cursor;
-                            let t = RichText::new(format!("{} {}", if sel { "▶" } else { "  " }, it)).size(20.0)
-                                .color(if sel { Color32::from_rgb(255, 220, 120) } else { Color32::from_rgb(205, 205, 210) });
-                            ui.label(t);
-                        }
-                        ui.add_space(10.0);
-                        ui.label(RichText::new("↑↓ move   ←→ change   Enter select   Esc back").size(12.0).weak());
-                    });
-                });
+                draw_menu(ctx, &items, cursor, screen, &status);
             } else if let Some(o) = over {
                 // ── game-over screen: dim the world, then the verdict + a restart prompt ──
                 let a = (over_timer / 0.6).clamp(0.0, 1.0);
@@ -1545,41 +1538,32 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                                 state.prowl = Some(p);
                                                 state.tutorial = Some(TutorialRun { step: 0, intro_t: 4.0, advance_flash: 0.0 });
                                             }
+                                            // The Battleground is the separate game `games/clawbound-
+                                            // battleground` (its own crate, loop and renderer); these
+                                            // rows launch it the way the bsgames hub does -- see
+                                            // `bglaunch`. Until c21 they printed to stderr and reopened
+                                            // the menu, which to a player was a button that did nothing.
                                             MenuCmd::StartBattlegroundDraft(a, b) => {
-                                                // Battleground has no live --play wiring yet (TODO.md:
-                                                // "--play wiring in app.rs: input -> set_input, ability
-                                                // keys, HUD ... camera follow; needs the app feature
-                                                // stack" is a separate, still-open item from this draft
-                                                // screen). Confirming a draft shouldn't pretend to start
-                                                // a match this loop can't render — log the picks and
-                                                // reopen the menu, the same honest fallback the not-yet-
-                                                // wired GameMode arms below already use.
-                                                eprintln!("[battleground] draft confirmed: A={:?} B={:?} (no live --play wiring yet — see TODO.md)", a, b);
+                                                // The arena takes one ancestor on its command line: the
+                                                // player's first pick. The other five are the draft
+                                                // screen's, not the arena's, and are said so.
+                                                let me = clawbound_rs::ancestor::kit(a[0]).name;
+                                                state.mp_status = match clawbound_rs::bglaunch::spawn(Some(me)) {
+                                                    Ok(s) => format!("{s}; the arena draws the other nine (draft A={:?} B={:?} stays here)", a, b),
+                                                    Err(e) => e,
+                                                };
+                                                eprintln!("[battleground] {}", state.mp_status);
                                                 state.menu.open = true;
                                             }
                                             MenuCmd::StartBattleground(a) => {
-                                                // The one-ancestor quick pick from the Play screen.
-                                                // Same honest fallback as the draft arm above and for
-                                                // the same reason: the seven steps that would make this
-                                                // render a live match are specified in TODO.md and not
-                                                // written. Starting a Battleground this loop cannot draw
-                                                // would look like a crash to a player.
-                                                //
-                                                // THIS ARM EXISTS BECAUSE THE MERGE NEEDED IT. Both
-                                                // incoming variants arrived from a line pinned to rustc
-                                                // 1.75, where `--features app` could not be compiled at
-                                                // all, so nothing on either side noticed that app.rs's
-                                                // match had stopped being exhaustive. This tree is on
-                                                // 1.96 and the whole winit/wgpu/egui stack does build,
-                                                // which is how it surfaced.
-                                                eprintln!("[battleground] {a:?} picked (no live --play wiring yet — see TODO.md)");
+                                                let me = clawbound_rs::ancestor::kit(a).name;
+                                                state.mp_status = clawbound_rs::bglaunch::spawn(Some(me)).unwrap_or_else(|e| e);
+                                                eprintln!("[battleground] {}", state.mp_status);
                                                 state.menu.open = true;
                                             }
                                             MenuCmd::QuickPlay => {
-                                                // 5v5 select page (lobby.rs). Its logic is headless and
-                                                // tested; what it has no route to is a rendered match,
-                                                // so the same fallback applies until render_battle exists.
-                                                eprintln!("[battleground] quick play requested (no live --play wiring yet — see TODO.md)");
+                                                state.mp_status = clawbound_rs::bglaunch::spawn(None).unwrap_or_else(|e| e);
+                                                eprintln!("[battleground] {}", state.mp_status);
                                                 state.menu.open = true;
                                             }
                                             MenuCmd::Quit => elwt.exit(),
