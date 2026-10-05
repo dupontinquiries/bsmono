@@ -26,7 +26,7 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
 - [x] Dodge/roll: Space does a burst with i-frames (juke a lunge) on a 1.5s cooldown, costs stamina — player skill move (AI relies on cover)
 - [x] Survive mode (outlast the hunter, no escape point; hunter roams the pack's ground) + smell-scaled flush so cover isn't absolute (badger roots out hiders, hawk sees them from the air)
 - [x] In --play: number keys 1-5 pick the hunter archetype, M toggles Rendezvous/Survive (restarts the match)
-- [ ] Textual HUD (timer/cats-left); netcode transport for a human hunter
+- [ ] Textual HUD (timer/cats-left). ~~netcode transport for a human hunter~~ — c21: `sim::Game::set_hunter_input` + `hunt_net` (host-authoritative state over the fleet socket; the joiner plays the hunter). Unplayed on two machines.
 
 
 - [x] SHADOW enemy #6 (afterlife dark-warrior; Silent Hill + Freddy + Tigerstar): teleport-blink to its quarry, otherworld SHIFT that reveals hiders/reaches climbers/empowers it; dark spectral model + otherworld screen tint; playable via key 6 (nightmare tier: catches 5-6/6)

@@ -51,6 +51,14 @@ Controls (mouse buttons are bindable alongside the keys):
 - Pop Island: **Space / left-click** — throw a firecracker · **Shift / right-click** — jump
 - **R** — restart · **Esc** — menu
 
+**A friend as the hunter.** Title → **Multiplayer** hosts the match on the fleet (the
+bsgames hub lists it; a friend's "▶ join" launches their clawbound straight into it), or
+bsgames hands both ends off itself. The joiner plays the **hunter**: WASD to move, hold
+left-click or Space to pounce; the host's six cats (one of them the host) are the prey.
+The host runs the match and sends its state thirty times a second; the joiner's stick
+rides back (`src/hunt_net.rs`). If the joiner's link drops, the AI takes the hunter back
+after two seconds.
+
 For the phone/web canvas client see **BUILD_WEB.md** (`web` feature, wasm32 → WebGPU).
 
 ## Architecture (`src/`)
@@ -90,8 +98,10 @@ Shared library (`lib.rs`):
 is a hand-rolled wgpu egui renderer.
 
 ## Testing
-`cargo test` runs 69 tests: sim/prowl/capture mechanics, difficulty, yarn-conservation
-and invariant soaks, class/powerup/ring units, menu logic, and the netcode fuzz tests.
+`cargo test` runs the suite (381 in the lib at the time of writing): sim/prowl/capture
+mechanics, difficulty, yarn-conservation and invariant soaks, class/powerup/ring units,
+menu logic, the netcode fuzz tests, the lockstep and wire tests, and the hunt link over
+loopback UDP.
 Render configs are swept headless for panics.
 
 ## Provenance

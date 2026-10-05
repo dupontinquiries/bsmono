@@ -318,6 +318,18 @@ struct State {
     /// the marked follow-up (src/net.rs is the transport-agnostic protocol waiting for it).
     mp: Option<netcode::multiplayer::Multiplayer>,
     mp_status: String,
+    /// The 6v1 over that socket (`hunt_net`): hosting, the friend who joined plays the hunter
+    /// -- their stick lands on `game.set_hunter_input`, the match's state goes back thirty
+    /// times a second; joined, `game` is a mirror of the host's match and this end drives the
+    /// hunter. `hunt_peer` is the joiner's address, learned from its first datagram (the host
+    /// socket is bound, not connected).
+    hunt_host: Option<clawbound_rs::hunt_net::Host>,
+    hunt_client: Option<clawbound_rs::hunt_net::Client>,
+    hunt_peer: Option<std::net::SocketAddr>,
+    hello_acc: f32,
+    reannounce_acc: f32,
+    /// The seed `game` was built with: what the joiner needs to build the same forest.
+    round_seed: u32,
     keys: Keys,
     pbgl: wgpu::BindGroupLayout,
     samp: wgpu::Sampler,
@@ -483,7 +495,7 @@ impl State {
         if audio.is_none() {
             eprintln!("[clawbound] no audio output; running silent");
         }
-        State { _window: window, surface, device, queue, config, scene_pipe, post_pipe, ubuf, ubg, world_vbuf, world_vcount, ent_vbuf, ent_vcount: 0, ent_cap, game, prowl: None, capture: None, tutorial: None, kind, mode, over_timer: 0.0, debug_cone: false, egui_ctx, egui_state, egui_render, menu, audio, hunt_listener: None, prowl_listener: None, sent_volume: -1.0, mp, mp_status, keys: Keys::default(), pbgl, samp, fxbuf, scene_view, depth_view, ss_on: false, scene_w: w as f32, scene_h: h as f32, flick: (0.0, 0.0), mleft_prev: false, pbg, focus, frame: 0.0, last: web_time::Instant::now(), anim_t: 0.0, yaw: 0.55, pitch: 0.62, captured: false, death_t: 0.0, prev_player_alive: true }
+        State { _window: window, surface, device, queue, config, scene_pipe, post_pipe, ubuf, ubg, world_vbuf, world_vcount, ent_vbuf, ent_vcount: 0, ent_cap, game, prowl: None, capture: None, tutorial: None, kind, mode, over_timer: 0.0, debug_cone: false, egui_ctx, egui_state, egui_render, menu, audio, hunt_listener: None, prowl_listener: None, sent_volume: -1.0, mp, mp_status, hunt_host: None, hunt_client: None, hunt_peer: None, hello_acc: 1.0, reannounce_acc: 0.0, round_seed: 0, keys: Keys::default(), pbgl, samp, fxbuf, scene_view, depth_view, ss_on: false, scene_w: w as f32, scene_h: h as f32, flick: (0.0, 0.0), mleft_prev: false, pbg, focus, frame: 0.0, last: web_time::Instant::now(), anim_t: 0.0, yaw: 0.55, pitch: 0.62, captured: false, death_t: 0.0, prev_player_alive: true }
     }
 
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -1171,6 +1183,117 @@ impl State {
         self.present(bg, full, ppp);
     }
 
+    /// Which end of a hunt over the link this is, from the socket's state: hosting with a
+    /// socket is the host, a socket without a token is a joiner, otherwise offline. Creates
+    /// or drops the `hunt_net` side to match, so the Multiplayer toggle and a handoff both
+    /// land here without their own wiring.
+    fn hunt_role_sync(&mut self) {
+        let (hosting, joined) = match &self.mp {
+            Some(m) if m.socket.is_some() => (m.token.is_some(), m.token.is_none()),
+            _ => (false, false),
+        };
+        if hosting && self.hunt_host.is_none() {
+            self.hunt_host = Some(Default::default());
+        }
+        if !hosting && self.hunt_host.is_some() {
+            self.hunt_host = None;
+            self.hunt_peer = None;
+        }
+        if joined && self.hunt_client.is_none() {
+            self.hunt_client = Some(Default::default());
+            self.hello_acc = 1.0; // a Hello goes out this frame
+        }
+        if !joined {
+            self.hunt_client = None;
+        }
+    }
+
+    /// Drain the link before the step: the joiner's stick onto the hunter (host), or the
+    /// host's header and state into the mirror (joiner). Returns whether this end is a
+    /// mirror this frame (no local stepping).
+    fn hunt_recv(&mut self, now: f32, dt: f32) -> bool {
+        use clawbound_rs::hunt_net as hn;
+        let mut buf = [0u8; 2048];
+        let mut inbox: Vec<(Vec<u8>, std::net::SocketAddr)> = Vec::new();
+        if let Some(mp) = &self.mp {
+            while let Some((n, from)) = mp.poll(&mut buf) {
+                inbox.push((buf[..n].to_vec(), from));
+                if inbox.len() > 64 {
+                    break;
+                }
+            }
+        }
+        if let Some(host) = self.hunt_host.as_mut() {
+            for (bytes, from) in &inbox {
+                if let Some(m) = hn::decode(bytes) {
+                    if matches!(m, hn::Msg::Hello) {
+                        self.hunt_peer = Some(*from);
+                    }
+                    host.on_message(m, now);
+                }
+            }
+            if let Some(i) = host.hunter_input(now) {
+                let (mx, mz) = i.axes();
+                self.game.set_hunter_input(mx, mz, i.pounce);
+            }
+            return false;
+        }
+        if let Some(client) = self.hunt_client.as_mut() {
+            for (bytes, _) in &inbox {
+                if let Some(m) = hn::decode(bytes) {
+                    if client.on_message(m, now, &mut self.game) {
+                        // a mirror rebuilt on a new header is a new round for the ears too
+                        if client.states == 0 {
+                            self.hunt_listener = None;
+                        }
+                    }
+                }
+            }
+            // keep knocking until the host answers with its match
+            self.hello_acc += dt;
+            if client.header.is_none() && self.hello_acc >= 1.0 {
+                self.hello_acc = 0.0;
+                if let Some(sock) = self.mp.as_ref().and_then(|m| m.socket.as_ref()) {
+                    let _ = sock.send(&hn::encode_hello());
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    /// After the step: the host's state out to the joiner (and the header when due), or the
+    /// joiner's stick out to the host.
+    fn hunt_send(&mut self, dt: f32) {
+        use clawbound_rs::hunt_net as hn;
+        // a host keeps its session record alive (records carry TTLs: an announce-once host
+        // falls off the friends' lists mid-match)
+        if self.hunt_host.is_some() {
+            self.reannounce_acc += dt;
+            if self.reannounce_acc >= 20.0 {
+                self.reannounce_acc = 0.0;
+                if let Some(mp) = self.mp.as_mut() { mp.reannounce(); }
+            }
+        }
+        let Some(sock) = self.mp.as_ref().and_then(|m| m.socket.as_ref()) else { return };
+        if let (Some(host), Some(peer)) = (self.hunt_host.as_mut(), self.hunt_peer) {
+            if host.header_due {
+                host.header_due = false;
+                let _ = sock.send_to(&hn::encode_header(&hn::Header::of(&self.game, self.round_seed)), peer);
+            }
+            if host.state_due(dt) {
+                let _ = sock.send_to(&hn::encode_state(&self.game), peer);
+            }
+        } else if let Some(client) = self.hunt_client.as_mut() {
+            if client.header.is_some() && client.input_due(dt) {
+                let (ix, iz) = self.keys.move_vec();
+                let (mx, mz) = move_world(self.yaw, ix, iz);
+                let pounce = self.keys.mleft || self.keys.dodge || self.keys.mmiddle;
+                let _ = sock.send(&hn::encode_input(&hn::HunterInput::from_axes(mx, mz, pounce)));
+            }
+        }
+    }
+
     fn render(&mut self) {
         self.frame += 1.0;
         let now = web_time::Instant::now();
@@ -1197,7 +1320,22 @@ impl State {
         let want_capture = !self.menu.open && self.game.outcome.is_none();
         self.set_capture(want_capture);
 
-        if !self.menu.open {
+        // the hunt over the link: the joiner's stick lands before the step, the state goes out
+        // after it; a joiner mirrors the host's match instead of stepping its own
+        self.hunt_role_sync();
+        let now_s = self.anim_t;
+        let mirror = self.hunt_recv(now_s, dt);
+
+        if !self.menu.open && mirror {
+            // the joiner: what the mirrored state did, to hear
+            let l = self.hunt_listener.get_or_insert_with(|| clawbound_rs::cues::HuntListener::new(&self.game));
+            let cues = l.step(&self.game);
+            for c in cues { self.sound(clawbound_rs::audio::Msg::Cue(c)); }
+            self.sound(clawbound_rs::audio::Msg::Air(clawbound_rs::cues::HuntListener::ambience(&self.game)));
+            self.over_timer = if self.game.outcome.is_some() { self.over_timer + dt } else { 0.0 };
+            self.keys.restart = false; // the host's round, the host's restart
+        }
+        if !self.menu.open && !mirror {
             // movement is CAMERA-RELATIVE: rotate the raw WASD vector by the camera yaw
             // so "W" always drives the cat the way the camera is facing (was world-space,
             // which felt like the controls were rotated ~30° off).
@@ -1240,17 +1378,22 @@ impl State {
                 let clan = self.game.clan;
                 let seed = (self.frame as u32).wrapping_mul(2_654_435_761) | 1;
                 self.game = Game::new_match_seeded(self.kind, self.mode, seed);
+                self.round_seed = seed;
                 self.game.difficulty = diff;
                 self.game.clan = clan;
                 self.game.set_abilities_on(self.menu.settings.clan_abilities);
                 self.hunt_listener = None;
                 self.over_timer = 0.0; self.keys.restart = false;
                 self.death_t = 0.0; self.prev_player_alive = true;
+                if let Some(h) = self.hunt_host.as_mut() { h.new_round(); }
             }
         }
+        self.hunt_send(dt);
 
-        // follow the player cat (or the pack centroid if it's been caught)
-        let follow = if self.game.cats[0].alive { (self.game.cats[0].x, self.game.cats[0].z) }
+        // follow the player cat (or the pack centroid if it's been caught); a joiner IS the
+        // hunter and rides on its back
+        let follow = if mirror { (self.game.hunter.x, self.game.hunter.z) }
+            else if self.game.cats[0].alive { (self.game.cats[0].x, self.game.cats[0].z) }
             else {
                 let a: Vec<_> = self.game.cats.iter().filter(|c| c.alive).collect();
                 if a.is_empty() { (self.game.hunter.x, self.game.hunter.z) }
@@ -1392,6 +1535,13 @@ impl State {
         let escaped = self.game.escaped;
         let over_timer = self.over_timer;
         let death_t = self.death_t;
+        // the link, when there is one: who plays the hunter
+        let hunt_line: Option<String> = if let Some(c) = &self.hunt_client {
+            Some(format!("hunter: you — {}", c.status(self.anim_t)))
+        } else if let Some(h) = &self.hunt_host {
+            Some(if h.joined { "hunter: a friend, over the link".to_string() } else { "hosting — a friend can join and play the hunter".to_string() })
+        } else { None };
+        let as_hunter = self.hunt_client.is_some();
         let ppp = self.egui_ctx.pixels_per_point();
         let raw = self.egui_state.take_egui_input(&self._window);
         let full = self.egui_ctx.run(raw, |ctx| {
@@ -1427,6 +1577,9 @@ impl State {
                         ui.spacing_mut().item_spacing.y = 4.0;
                         ui.label(RichText::new(format!("Hunter: {hunter_name}   ·   {mode_name}"))
                             .size(15.0).strong().color(Color32::from_rgb(235, 200, 170)));
+                        if let Some(l) = &hunt_line {
+                            ui.label(RichText::new(l).size(12.0).color(Color32::from_rgb(170, 210, 235)));
+                        }
                         ui.label(RichText::new(format!("Cats remaining  {alive_n}/{total}"))
                             .size(14.0).color(Color32::from_rgb(200, 220, 205)));
                         ui.add(egui::ProgressBar::new(stamina).desired_width(168.0)
@@ -1452,7 +1605,9 @@ impl State {
                     });
                 });
                 egui::Area::new("hint".into()).anchor(Align2::CENTER_BOTTOM, [0.0, -12.0]).show(ctx, |ui| {
-                    let hint = if abilities_on {
+                    let hint = if as_hunter {
+                        "WASD move · mouse look · hold L-click / Space to pounce · the nose roots hiders out · Esc menu"
+                    } else if abilities_on {
                         "WASD move · mouse look · Shift hide · Space/M-click roll · F leap · flick+L-click move (R-click low) · Q ultimate · Esc menu"
                     } else {
                         "WASD move · mouse look · Shift hide · Space/M-click roll · F leap · flick+L-click move (R-click low) · Esc menu"
@@ -1563,7 +1718,7 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                         KeyCode::ArrowLeft | KeyCode::KeyA => state.menu.adjust(-1),
                                         KeyCode::ArrowRight | KeyCode::KeyD => state.menu.adjust(1),
                                         KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => match state.menu.activate() {
-                                            MenuCmd::StartSingle(k, m) => { state.prowl = None; state.capture = None; state.tutorial = None; state.kind = k; state.mode = m; let seed = (state.frame as u32).wrapping_mul(2_654_435_761) | 1; state.game = Game::new_match_seeded(k, m, seed); state.hunt_listener = None; state.game.difficulty = clawbound_rs::menu::difficulty_mult(state.menu.settings.difficulty); state.game.clan = state.menu.sel_clan; state.game.set_abilities_on(state.menu.settings.clan_abilities); state.over_timer = 0.0; }
+                                            MenuCmd::StartSingle(k, m) => { state.prowl = None; state.capture = None; state.tutorial = None; state.kind = k; state.mode = m; let seed = (state.frame as u32).wrapping_mul(2_654_435_761) | 1; state.game = Game::new_match_seeded(k, m, seed); state.round_seed = seed; state.hunt_listener = None; if let Some(h) = state.hunt_host.as_mut() { h.new_round(); } state.game.difficulty = clawbound_rs::menu::difficulty_mult(state.menu.settings.difficulty); state.game.clan = state.menu.sel_clan; state.game.set_abilities_on(state.menu.settings.clan_abilities); state.over_timer = 0.0; }
                                             MenuCmd::StartMode(g, k, c) => {
                                                 use clawbound_rs::menu::GameMode;
                                                 state.prowl = None; state.capture = None; state.tutorial = None;
@@ -1651,12 +1806,13 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                     KeyCode::Digit3 => Some(HK::Badger), KeyCode::Digit4 => Some(HK::Hawk),
                                     KeyCode::Digit5 => Some(HK::Snake), KeyCode::Digit6 => Some(HK::Shadow), _ => None,
                                 };
-                                if let Some(k) = pick { state.kind = k; state.game = Game::new_match(k, state.mode); state.hunt_listener = None; state.over_timer = 0.0; }
+                                if let Some(k) = pick { state.kind = k; state.game = Game::new_match(k, state.mode); state.round_seed = 0; state.hunt_listener = None; state.over_timer = 0.0; if let Some(h) = state.hunt_host.as_mut() { h.new_round(); } }
                                 if code == KeyCode::KeyV { state.menu.settings.show_cone = !state.menu.settings.show_cone; }
                                 if code == KeyCode::KeyM {
                                     use clawbound_rs::sim::Mode;
                                     state.mode = if state.mode == Mode::Rendezvous { Mode::Survive } else { Mode::Rendezvous };
-                                    state.game = Game::new_match(state.kind, state.mode); state.hunt_listener = None; state.over_timer = 0.0;
+                                    state.game = Game::new_match(state.kind, state.mode); state.round_seed = 0; state.hunt_listener = None; state.over_timer = 0.0;
+                                    if let Some(h) = state.hunt_host.as_mut() { h.new_round(); }
                                 }
                             }
                             state.keys.set(code, down, &state.menu.settings.keybinds);

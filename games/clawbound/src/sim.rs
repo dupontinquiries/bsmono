@@ -164,7 +164,19 @@ impl Game {
     /// scatter so repeat matches aren't identical. `seed == 0` reproduces the legacy
     /// fixed layout exactly (so determinism and existing tests are unchanged).
     pub fn new_match_seeded(kind: Kind, mode: Mode, seed: u32) -> Game {
+        Self::new_match_with_terrain(kind, mode, seed, None)
+    }
+
+    /// `new_match_seeded` on a given country: the bake reads the terrain knobs as it finds
+    /// them (a Prowl or a battleground before it leaves its own), so a match built on another
+    /// machine -- the joiner's mirror of a host's hunt (`hunt_net`) -- hands the host's
+    /// [`world::TerrainPool`] here and stands in the same forest. Applied under the terrain
+    /// lock, right before the bake, so nothing can change the knobs in between.
+    pub fn new_match_with_terrain(kind: Kind, mode: Mode, seed: u32, terrain: Option<&world::TerrainPool>) -> Game {
         let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = terrain {
+            world::apply_terrain_pool(p);
+        }
         world::init_world();
         let bushes = world::bush_positions(200);
         let trees = world::tree_positions(120);

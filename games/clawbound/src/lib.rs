@@ -37,6 +37,7 @@ pub mod junglemap;
 pub mod mapeval;
 pub mod menu;
 pub mod net;
+pub mod hunt_net;
 pub mod objectives;
 pub mod openworld;
 pub mod powerup;

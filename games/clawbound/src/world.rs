@@ -89,6 +89,36 @@ pub fn set_terrain_seed(seed: u32) {
 }
 fn terrain_seed() -> u32 { TERRAIN_SEED.load(std::sync::atomic::Ordering::Relaxed) }
 
+/// The five knobs a bake reads, as one value: what a second machine needs to bake the
+/// SAME country (`hunt_net` carries it in the match header), and what a test pins so a
+/// parallel bake elsewhere cannot change the knobs under it. Read with [`terrain_pool`],
+/// put back with [`apply_terrain_pool`] -- under `TERRAIN_LOCK`, right before `init_world`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct TerrainPool {
+    pub mountain_bias: f32,
+    pub land_lift: f32,
+    pub river: u8,
+    pub seed: u32,
+    pub season: u8,
+}
+
+pub fn terrain_pool() -> TerrainPool {
+    TerrainPool {
+        mountain_bias: mountain_bias(),
+        land_lift: land_lift(),
+        river: RIVER_COURSE.load(std::sync::atomic::Ordering::Relaxed),
+        seed: terrain_seed(),
+        season: terrain_season(),
+    }
+}
+
+pub fn apply_terrain_pool(p: &TerrainPool) {
+    set_terrain_pool(p.mountain_bias, p.season);
+    set_land_lift(p.land_lift);
+    set_river_course(p.river);
+    set_terrain_seed(p.seed);
+}
+
 pub const RIVER_MEANDER: u8 = 0;
 pub const RIVER_U_EAST: u8 = 1;
 pub fn set_river_course(course: u8) {
