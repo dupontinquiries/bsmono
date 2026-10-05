@@ -244,6 +244,31 @@ test and a §5b break test; nothing below was seen on a screen or heard.
     third datagram) and the runner's `--lan-host`/`--lan-join`: the first Echelon match across
     two processes (4620 turns, 41 checkpoints, no desync, identical hashes). The Bevy client
     still plays human vs bot; wiring it to the session is the next step there.
+- **The overnight batch, fourth stretch:**
+  - **soldier** `9d8a76aad` the settings page is saved -- nothing on it but the renderer
+    toggle survived a relaunch (sensitivity, FOV, preset, both detail sliders, the team
+    colours, all 22 bindings). `db::Options` is the record (`opt.*`/`bind.*` lines in the same
+    save.txt; its defaults ARE the game's -- `Settings::default()` derives from it), tolerant
+    of an older save, NaN, off-scale numbers and unknown keys; written once a slider drag
+    ends (`Context::is_using_pointer`), never on an untouched launch. The colour pickers lost
+    their alpha slider: `Color32` is premultiplied and the tint never read alpha.
+  - **road-warrior** `176a045df` the mute key is remembered (`SaveState.muted`,
+    `serde(default)` for older saves; the master gain is set before the first mixed frame).
+  - **clawbound-battleground** `60c6e26c9` a bot whose home lane has no enemy tower left goes
+    to the lane with the fewest (`lane_to_push`; ties to the nearest, home again once every
+    tower is down) instead of standing at the shielded titan; a healed bot walks its lane
+    back out from the nearest waypoint instead of beelining to the far one. At 1.42 the ten-bot
+    match now ends at 12:11 with every tower down (9:18 before, towers left); at 3.75 still no
+    end (6/12 towers at 20 min) -- the scale question stands.
+  - **unendlich** `ffe2245a7` `games/unendlich/README.md` was the README of a docs zip; a
+    README for the directory (build/test commands, the module map, where the claims live),
+    the zip companion moved under `docs/claude-notes/`.
+  - **echelon** `fb1578063` the Command Deck plays over the LAN: `Deck` holds a `Driver`
+    (`Local` bot or `Lan` = `Lockstep` + `UdpLink`), `--lan-host`/`--lan-join` on `tape` and
+    `play`; the world steps only on turns with both players' commands, one submission per
+    executed turn, a silent peer freezes it (owed ticks capped). The crate's FIRST tests (the
+    README had called tape mode "CI-proof" over zero tests): a tape, two decks over loopback
+    (one world, both orders land, hashes identical, no running ahead), the silent peer.
 - **Decided, not wired:** blackstar-rs `dispatch.rs` models voyages (`voyage`/`damage`/
   `survival`/`loot`, orbits and delta-v) that nothing in the shipboard game reaches -- wiring
   it is a game-layer design, not a bug; `suitability.rs` would tell the player "wheels have
@@ -258,7 +283,8 @@ test and a §5b break test; nothing below was seen on a screen or heard.
   `HostPump` duplication (both now carry admission and the reliable link; the dedupe is a
   refactor of a 20k-line bin); clawbound-battleground: the AI radii vs MAP_SCALE (above), the
   narrator/announcer VOICE (the calls are text now; speech cannot be synthesized here);
-  echelon's Bevy client on the session (the transport exists; the client is human vs bot).
+  echelon's Bevy client on the session (the deck is; the Bevy `client/` is a detached
+  workspace and still human vs bot).
   Everything synthesized this batch (road-warrior, clawbound, the battleground's beds) is
   unheard: the voices are first passes by their numbers.
 - **Not touched:** blackstar-rs's visual/playtest backlog (`TODO.md` §"Found, NOT fixed" needs
