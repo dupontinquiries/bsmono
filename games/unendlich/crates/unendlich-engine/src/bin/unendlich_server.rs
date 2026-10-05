@@ -66,8 +66,11 @@ fn main() {
         }
     };
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let mut chunks = ChunkManager::new(generator, workers);
-    log::info!("[server] world ready ({workers} worker threads)");
+    // Persistence: the same directory the fullgame opens for this name and seed (or
+    // --world-dir). Without it every edit a player made died with the process.
+    let world_dir = cfg.effective_world_dir();
+    let mut chunks = ChunkManager::new(generator, workers).with_storage(world_dir.clone());
+    log::info!("[server] world ready ({workers} worker threads); edits persist in {}", world_dir.display());
 
     // ---- Networking: the factored-out reusable host ------------------------
     // Session socket + peer table + star relay. `entity id 0` for the host's
@@ -88,13 +91,14 @@ fn main() {
             None
         }
     };
-    // Access policy. The dedicated server runs OPEN for now (anyone may join);
-    // per-world whitelist persistence is the fullgame's model and needs a
-    // world directory this bin doesn't have yet — flagged in the join log.
-    let whitelist = unendlich_engine::sim::whitelist::Whitelist::default();
+    // Access policy: the world's own whitelist.json (the fullgame writes it from its
+    // Multiplayer panel; absent means open). The server never changes it.
+    let whitelist = unendlich_engine::sim::whitelist::Whitelist::load(&world_dir);
     log::info!(
-        "[server] access: {}",
-        if whitelist.open { "OPEN (anyone may join)" } else { "CLOSED (whitelist only)" }
+        "[server] access: {} ({} on allow-list, {})",
+        if whitelist.open { "OPEN (anyone may join)" } else { "CLOSED (whitelist only)" },
+        whitelist.len(),
+        world_dir.join("whitelist.json").display()
     );
     // LAN discovery: announce this world on the multicast beacon so it appears
     // in fullgame Multiplayer lists without needing UNENDLICH_LAN_HOST.
@@ -129,15 +133,14 @@ fn main() {
     let mut last_status = Instant::now();
     let mut tick: u64 = 0;
 
-    // Ctrl-C → clean shutdown flag.
-    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    {
-        let r = running.clone();
-        let _ = ctrlc_set(move || r.store(false, std::sync::atomic::Ordering::SeqCst));
+    // Ctrl-C / SIGTERM → the loop ends and the shutdown save runs.
+    match install_stop_handler() {
+        Ok(()) => log::info!("[server] running — Ctrl-C to stop (edits are saved on the way out)"),
+        Err(e) => log::warn!("[server] no signal handler ({e}): a Ctrl-C will not save; use the autosave"),
     }
-
-    log::info!("[server] running — Ctrl-C to stop");
-    while running.load(std::sync::atomic::Ordering::SeqCst) {
+    let autosave = (cfg.autosave_secs > 0).then(|| Duration::from_secs(cfg.autosave_secs as u64));
+    let mut last_autosave = Instant::now();
+    while !STOP.load(std::sync::atomic::Ordering::SeqCst) {
         let t0 = Instant::now();
         let now_ms = net_start.elapsed().as_millis() as u64;
 
@@ -275,21 +278,46 @@ fn main() {
             );
             last_status = Instant::now();
         }
+        if let Some(every) = autosave {
+            if last_autosave.elapsed() >= every {
+                let saved = chunks.save_all();
+                if saved > 0 {
+                    log::info!("[server] autosave: {saved} edited chunk(s)");
+                }
+                last_autosave = Instant::now();
+            }
+        }
 
         if let Some(rem) = tick_dt.checked_sub(t0.elapsed()) {
             std::thread::sleep(rem);
         }
     }
 
-    log::info!("[server] shutting down after {tick} ticks");
+    let saved = chunks.save_all();
+    log::info!("[server] shutting down after {tick} ticks; {saved} edited chunk(s) saved to {}", world_dir.display());
 }
 
-/// Minimal Ctrl-C handler without pulling a dependency: SIGINT via a thread on Unix, no-op
-/// elsewhere (the process can still be killed). Returns Ok if installed.
-fn ctrlc_set<F: Fn() + Send + 'static>(f: F) -> Result<(), ()> {
-    // Best-effort: spawn a thread that watches for a SIGINT-driven flag is non-trivial without a
-    // crate; instead we rely on the OS to terminate on Ctrl-C and treat this as a no-op hook so
-    // the loop structure is ready for a real handler when a signal crate is added.
-    let _ = f;
+/// Set by the SIGINT/SIGTERM handler; the tick loop ends on it and the shutdown save runs.
+/// (A signal handler may only touch an atomic, which is why the flag is a static.)
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+fn install_stop_handler() -> Result<(), String> {
+    extern "C" fn on_signal(_sig: libc::c_int) {
+        STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    // SAFETY: `on_signal` is an `extern "C" fn(c_int)` that only stores to an atomic, which is
+    // async-signal-safe; `signal` is called once, before the loop, from the main thread.
+    let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        if unsafe { libc::signal(sig, handler) } == libc::SIG_ERR {
+            return Err(format!("signal({sig}) failed: {}", std::io::Error::last_os_error()));
+        }
+    }
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_stop_handler() -> Result<(), String> {
+    Err("no signal handler on this platform".to_string())
 }

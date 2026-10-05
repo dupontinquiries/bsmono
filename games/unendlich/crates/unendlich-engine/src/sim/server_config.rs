@@ -17,6 +17,13 @@ pub struct ServerConfig {
     pub view_distance: u32,
     /// Optional bind address (default 0.0.0.0 for cloud).
     pub bind: String,
+    /// Where the world's edited chunks and whitelist live. `None` means the fullgame's own
+    /// directory for this name and seed (`world_dir_for`), so a world hosted here is the world
+    /// the fullgame opens.
+    pub world_dir: Option<std::path::PathBuf>,
+    /// Seconds between autosaves of edited chunks; 0 turns the timer off (the shutdown save
+    /// still runs).
+    pub autosave_secs: u32,
 }
 
 impl Default for ServerConfig {
@@ -28,7 +35,31 @@ impl Default for ServerConfig {
             tick_hz: 20,
             view_distance: 8,
             bind: "0.0.0.0".to_string(),
+            world_dir: None,
+            autosave_secs: 60,
         }
+    }
+}
+
+/// The directory a world's edits persist in: `worlds/<name>-<seed as 16 hex digits>`, relative
+/// to the cwd, the name reduced to `[A-Za-z0-9_-]` (anything else becomes `_`, an empty name
+/// becomes `world`). This is the fullgame's rule (r163/r291: identity is name+seed, so two
+/// worlds titled alike keep their own edits), lifted here so the dedicated server and the
+/// fullgame cannot disagree about where a world is.
+pub fn world_dir_for(name: &str, seed: u64) -> std::path::PathBuf {
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let stem = if safe.is_empty() { "world".to_string() } else { safe };
+    std::path::PathBuf::from(format!("worlds/{stem}-{seed:016x}"))
+}
+
+impl ServerConfig {
+    /// The world directory this server persists to: `--world-dir` if given, else the
+    /// fullgame's directory for this name and seed.
+    pub fn effective_world_dir(&self) -> std::path::PathBuf {
+        self.world_dir.clone().unwrap_or_else(|| world_dir_for(&self.name, self.seed))
     }
 }
 
@@ -53,6 +84,9 @@ OPTIONS:
   --bind <ADDR>          bind address (default: 0.0.0.0)
   --tick-hz <U32>        simulation ticks per second (default: 20)
   --view-distance <U32>  resident chunk radius (default: 8)
+  --world-dir <PATH>     where edited chunks and whitelist.json persist
+                         (default: worlds/<name>-<seed hex>, the fullgame's directory)
+  --autosave-secs <U32>  seconds between autosaves, 0 = only at shutdown (default: 60)
   -h, --help             print this help
 ";
 
@@ -104,6 +138,15 @@ impl ServerConfig {
                     Ok(v) => cfg.view_distance = v,
                     Err(e) => return ParseOutcome::Error(e),
                 },
+                "--world-dir" => match take_val("--world-dir") {
+                    Ok(v) if !v.trim().is_empty() => cfg.world_dir = Some(std::path::PathBuf::from(v)),
+                    Ok(_) => return ParseOutcome::Error("--world-dir needs a path".to_string()),
+                    Err(e) => return ParseOutcome::Error(e),
+                },
+                "--autosave-secs" => match take_val("--autosave-secs").and_then(parse_u32) {
+                    Ok(v) => cfg.autosave_secs = v,
+                    Err(e) => return ParseOutcome::Error(e),
+                },
                 other => return ParseOutcome::Error(format!("unknown argument: {other}")),
             }
         }
@@ -116,6 +159,9 @@ fn parse_u64(s: String) -> Result<u64, String> {
 }
 fn parse_u16(s: String) -> Result<u16, String> {
     s.parse::<u16>().map_err(|_| format!("invalid port: {s}"))
+}
+fn parse_u32(s: String) -> Result<u32, String> {
+    s.parse::<u32>().map_err(|_| format!("invalid u32: {s}"))
 }
 fn parse_u32_min1(s: String) -> Result<u32, String> {
     let v = s.parse::<u32>().map_err(|_| format!("invalid u32: {s}"))?;
@@ -163,6 +209,31 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn the_world_dir_is_the_fullgames_unless_overridden() {
+        // the fullgame's rule, character for character (r163/r291)
+        assert_eq!(world_dir_for("My World!", 0x2a), std::path::PathBuf::from("worlds/My_World_-000000000000002a"));
+        assert_eq!(world_dir_for("", 1), std::path::PathBuf::from("worlds/world-0000000000000001"));
+        assert_eq!(world_dir_for("atlas-2_b", u64::MAX), std::path::PathBuf::from("worlds/atlas-2_b-ffffffffffffffff"));
+        match parse(&["--name", "atlas", "--seed", "42"]) {
+            ParseOutcome::Config(c) => {
+                assert_eq!(c.world_dir, None);
+                assert_eq!(c.effective_world_dir(), world_dir_for("atlas", 42));
+                assert_eq!(c.autosave_secs, 60);
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&["--world-dir", "/srv/unendlich/atlas", "--autosave-secs=0"]) {
+            ParseOutcome::Config(c) => {
+                assert_eq!(c.effective_world_dir(), std::path::PathBuf::from("/srv/unendlich/atlas"));
+                assert_eq!(c.autosave_secs, 0);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(parse(&["--world-dir", ""]), ParseOutcome::Error(_)));
+        assert!(matches!(parse(&["--autosave-secs", "x"]), ParseOutcome::Error(_)));
     }
 
     #[test]

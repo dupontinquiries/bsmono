@@ -18870,21 +18870,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             if saved > 0 {
                                 log::info!("[saves] {} edited chunk(s) saved before world switch", saved);
                             }
-                            let safe: String = init
-                                .name
-                                .chars()
-                                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-                                .collect();
                             // r291: identity is name+seed, not name alone — a world's
                             // title is just a label and may collide, but the seed
                             // disambiguates the storage dir so two same-titled worlds
                             // keep their OWN edits (a lightweight stand-in for a full
-                            // world-id until that refactor lands).
-                            let stem = if safe.is_empty() { "world".to_string() } else { safe };
-                            let new_world_dir = std::path::PathBuf::from(format!(
-                                "worlds/{}-{:016x}",
-                                stem, seed
-                            ));
+                            // world-id until that refactor lands). The rule lives in
+                            // `server_config::world_dir_for` so the dedicated server
+                            // hosts the same directory this opens.
+                            let new_world_dir =
+                                unendlich_engine::sim::server_config::world_dir_for(&init.name, seed);
                             chunk_manager.set_world_root(new_world_dir.clone());
                             // r580 FIX (world merging): the flora/crop store and whitelist
                             // were bound to the STARTUP root (worlds/default) and never
