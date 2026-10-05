@@ -4766,6 +4766,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let mut lan_last_from_host_ms: u64 = 0;
     // Data-channel datagrams dropped for coming from a non-admitted address.
     let mut lan_dropped_unadmitted: u64 = 0;
+    // c21: a reliable-ordered link per peer (`sim::net::reliable`) for world edits -- a
+    // batch is resent until acked and delivered in order, so a dropped datagram is a
+    // delay, not a block missing on one machine forever. As the host, one per admitted
+    // joiner (re-sequenced on relay); as a joiner, one to the upstream host.
+    let mut lan_links: std::collections::HashMap<std::net::SocketAddrV4, unendlich_engine::sim::net::reliable::Link> =
+        std::collections::HashMap::new();
     let lan_local_ip: Option<[u8; 4]> = if lan_beacon.is_some() {
         let ip = unendlich_engine::sim::lan_discovery::local_lan_ipv4();
         match ip {
@@ -19238,7 +19244,30 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     const CH_WORLDCMD: u8 = 3;
                     const CH_AVATAR: u8 = 4; // r494: peer character appearance
                     const CH_JOINSYNC: u8 = 5; // join-at-any-time: host→joiner edit catch-up (timebending layout)
+                    use unendlich_engine::sim::net::reliable::{CH_ACK, CH_RELIABLE};
                     use unendlich_engine::sim::net::world_cmd_wire::{decode_batch, encode_batch};
+                    // One packed WORLDCMD batch, applied to this world (shared by the raw and
+                    // the reliable channel).
+                    let apply_worldcmd_batch = |raw_packed: &[u8], chunk_manager: &mut ChunkManager| {
+                        if let Some(raw) = unendlich_engine::sim::net::packet_compress::unpack(raw_packed, 64 * 1024) {
+                            if let Some(cmds) = decode_batch(&raw) {
+                                use unendlich_engine::sim::world_authority::WorldCmd;
+                                for (_player, cmd) in &cmds {
+                                    match cmd {
+                                        WorldCmd::Place { pos, block } => {
+                                            if let Ok(bid) = BlockId::try_from(*block as u8) {
+                                                chunk_manager.set_block(pos.0, pos.1, pos.2, bid);
+                                            }
+                                        }
+                                        WorldCmd::Remove { pos } => {
+                                            chunk_manager.set_block(pos.0, pos.1, pos.2, BlockId::Air);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    };
 
                     // Inbound: drain pending datagrams (non-blocking), route by channel.
                     let mut buf = [0u8; 1500];
@@ -19457,32 +19486,39 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                         }
                                     }
                                     CH_WORLDCMD => {
-                                        // r498: payload is packet_compress-framed.
-                                        if let Some(raw) = unendlich_engine::sim::net::packet_compress::unpack(payload, 64 * 1024) {
-                                        if let Some(cmds) = decode_batch(&raw) {
-                                            use unendlich_engine::sim::world_authority::WorldCmd;
-                                            for (_player, cmd) in &cmds {
-                                                match cmd {
-                                                    WorldCmd::Place { pos, block } => {
-                                                        if let Ok(bid) =
-                                                            BlockId::try_from(*block as u8)
-                                                        {
-                                                            chunk_manager
-                                                                .set_block(pos.0, pos.1, pos.2, bid);
+                                        // r498: payload is packet_compress-framed. The raw
+                                        // channel is kept for an older peer; this build sends
+                                        // edits on CH_RELIABLE.
+                                        apply_worldcmd_batch(payload, &mut chunk_manager);
+                                        if let Some(a) = src4 {
+                                            relay_as_host(a, &lan_host);
+                                        }
+                                    }
+                                    CH_RELIABLE => {
+                                        // c21: a sequenced edit batch. Delivered in order once
+                                        // (the link holds a gap's successors and acks); as the
+                                        // host, RE-SENT on every other link rather than relayed
+                                        // verbatim -- sequence numbers are per link.
+                                        if let Some(a) = src4 {
+                                            let delivered = lan_links.entry(a).or_insert_with(unendlich_engine::sim::net::reliable::Link::new).receive(payload);
+                                            for packed in delivered {
+                                                apply_worldcmd_batch(&packed, &mut chunk_manager);
+                                                if lan_peer_addr.is_none() {
+                                                    for t in lan_host.fanout(Some(a)) {
+                                                        let link = lan_links.entry(t).or_insert_with(unendlich_engine::sim::net::reliable::Link::new);
+                                                        if link.send(&packed).is_none() {
+                                                            log::warn!("[lan-mp] reliable window to {t} is full; an edit relay was dropped");
                                                         }
                                                     }
-                                                    WorldCmd::Remove { pos } => {
-                                                        chunk_manager.set_block(
-                                                            pos.0, pos.1, pos.2, BlockId::Air,
-                                                        );
-                                                    }
-                                                    _ => {}
                                                 }
                                             }
                                         }
-                                        }
+                                    }
+                                    CH_ACK => {
                                         if let Some(a) = src4 {
-                                            relay_as_host(a, &lan_host);
+                                            if let Some(link) = lan_links.get_mut(&a) {
+                                                link.on_ack(payload);
+                                            }
                                         }
                                     }
                                     CH_AVATAR => {
@@ -19728,7 +19764,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             }
 
                             // Outbound block edits: drain this frame's place/break edits
-                            // to every target so building/mining propagates.
+                            // onto every target's reliable link (c21; they went out in one
+                            // raw datagram before, and a dropped one was a block missing on
+                            // the other machine for good).
                             if !session.lan_outgoing_edits.is_empty() {
                                 let pid = lan_my_eid;
                                 let batch: Vec<_> = session.lan_outgoing_edits
@@ -19738,12 +19776,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 let bytes = encode_batch(&batch);
                                 // r498: compress bulk edit batches (raw header for
                                 // small ones — single byte, never expands).
-                                let mut dg = vec![CH_WORLDCMD];
-                                dg.extend_from_slice(
-                                    &unendlich_engine::sim::net::packet_compress::pack(&bytes, 48),
-                                );
+                                let packed = unendlich_engine::sim::net::packet_compress::pack(&bytes, 48);
                                 for t in &out_targets {
-                                    let _ = sock.send_to(&dg, std::net::SocketAddr::V4(*t));
+                                    let link = lan_links.entry(*t).or_insert_with(unendlich_engine::sim::net::reliable::Link::new);
+                                    if link.send(&packed).is_none() {
+                                        log::warn!("[lan-mp] reliable window to {t} is full; an edit batch was dropped");
+                                    }
                                 }
                             }
                         } else {
@@ -19756,10 +19794,42 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             session.lan_outgoing_edits.clear();
                         }
                     }
+
+                    // c21: the reliable links' work every frame -- first sends, resends past
+                    // RTO, acks owed -- to every peer with a link, in game or not (an ack for a
+                    // batch that arrived during a menu still has to go).
+                    {
+                        let mut gone: Vec<std::net::SocketAddrV4> = Vec::new();
+                        for (addr, link) in lan_links.iter_mut() {
+                            for dg_payload in link.due(now_ms) {
+                                let mut dg = vec![CH_RELIABLE];
+                                dg.extend_from_slice(&dg_payload);
+                                let _ = sock.send_to(&dg, std::net::SocketAddr::V4(*addr));
+                            }
+                            if let Some(ack) = link.ack_payload() {
+                                let mut dg = vec![CH_ACK];
+                                dg.extend_from_slice(&ack);
+                                let _ = sock.send_to(&dg, std::net::SocketAddr::V4(*addr));
+                            }
+                            if link.given_up {
+                                gone.push(*addr);
+                            }
+                        }
+                        for a in gone {
+                            log::warn!("[lan-mp] {a} never acked {} resend(s) of an edit batch; its reliable link is dropped", unendlich_engine::sim::net::reliable::MAX_TRIES);
+                            lan_links.remove(&a);
+                        }
+                    }
                 }
 
                 if now_ms.saturating_sub(lan_last_ms) >= 200 {
                     lan_last_ms = now_ms;
+                    // c21: a link outlives its peer only until this tick: a pruned joiner (or
+                    // a left host) takes its link with it, so a rejoin starts a fresh sequence.
+                    {
+                        let live: Vec<std::net::SocketAddrV4> = lan_host.fanout(None);
+                        lan_links.retain(|a, _| Some(*a) == lan_peer_addr || live.contains(a));
+                    }
                     // Drain inbound beacons → browser; log newly-seen hosts once.
                     for adv in beacon.poll(now_ms) {
                         let key = adv.key();

@@ -16,6 +16,14 @@
 //! | 2    | ENTITY      | `entity_replication::seal` bytes                    |
 //! | 3    | WORLDCMD    | `packet_compress::pack(world_cmd_wire::encode_batch)`|
 //! | 4    | AVATAR      | `[entity_id u64 LE][appearance 12 B]`               |
+//! | 6    | RELIABLE    | `reliable::frame`: `[seq u32 LE][WORLDCMD payload]`  |
+//! | 7    | ACK         | `[cum u32 LE]`                                       |
+//!
+//! World edits arrive on RELIABLE (c21; `sim::net::reliable`): one link per peer, a batch
+//! delivered once and in order, acked, resent by the sender until it is. The host does not
+//! relay a reliable datagram verbatim -- sequence numbers are per link -- it applies the
+//! batch and re-sends it on every other peer's link. The raw WORLDCMD channel is still
+//! accepted for an older peer.
 //!
 //! The pump is a **star-relay**: every non-handshake datagram from a peer is
 //! forwarded verbatim to every *other* live peer (fanout excludes the source),
@@ -34,6 +42,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use super::entity_replication::receive;
 use super::entity_snapshot::{EntityState, SnapshotGate};
 use super::lan_host::{Admit, DenyReason, LanHost};
+use super::reliable::{Link, CH_ACK, CH_RELIABLE};
 use super::world_cmd_wire::decode_batch;
 use crate::sim::lan_session_wire::LanJoin;
 use crate::sim::world_authority::WorldCmd;
@@ -81,6 +90,8 @@ pub struct HostPump {
     /// joined, denied, or pruned and not yet re-joined). A counter rather than an event: a
     /// stranger can send as fast as it likes, and the status line is where an operator sees it.
     pub dropped_unadmitted: u64,
+    /// The reliable link to each admitted peer (world edits).
+    links: std::collections::HashMap<SocketAddrV4, Link>,
 }
 
 impl HostPump {
@@ -91,7 +102,7 @@ impl HostPump {
         let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, preferred_port))
             .or_else(|_| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)))?;
         sock.set_nonblocking(true)?;
-        Ok(HostPump { sock, host: LanHost::new(host_name, host_entity_id), gate: SnapshotGate::new(), dropped_unadmitted: 0 })
+        Ok(HostPump { sock, host: LanHost::new(host_name, host_entity_id), gate: SnapshotGate::new(), dropped_unadmitted: 0, links: std::collections::HashMap::new() })
     }
 
     /// The actually-bound session port (what adverts should carry).
@@ -162,6 +173,33 @@ impl HostPump {
                             }
                             self.relay(&buf[..n], src);
                         }
+                        CH_RELIABLE => {
+                            if !self.host.note_seen(src, now_ms) {
+                                self.dropped_unadmitted += 1;
+                                continue;
+                            }
+                            let delivered = self.links.entry(src).or_insert_with(Link::new).receive(payload);
+                            for packed in delivered {
+                                if let Some(raw) = super::packet_compress::unpack(&packed, WORLDCMD_MAX_BYTES) {
+                                    if let Some(cmds) = decode_batch(&raw) {
+                                        if !cmds.is_empty() {
+                                            events.push(PumpEvent::WorldCmds(cmds));
+                                        }
+                                    }
+                                }
+                                // re-sent on the other peers' links, not relayed verbatim
+                                for t in self.host.fanout(Some(src)) {
+                                    if self.links.entry(t).or_insert_with(Link::new).send(&packed).is_none() {
+                                        log::warn!("[lan-host] reliable window to {t} is full; an edit relay was dropped");
+                                    }
+                                }
+                            }
+                        }
+                        CH_ACK => {
+                            if let Some(link) = self.links.get_mut(&src) {
+                                link.on_ack(payload);
+                            }
+                        }
                         CH_AVATAR => {
                             if !self.host.note_seen(src, now_ms) {
                                 self.dropped_unadmitted += 1;
@@ -190,7 +228,46 @@ impl HostPump {
         for eid in self.host.prune(now_ms, PEER_TIMEOUT_MS) {
             events.push(PumpEvent::PeerLeft { entity_id: eid });
         }
+        // the links' work: first sends, resends past RTO, acks owed; a pruned peer's link
+        // goes with it, and a peer that never acks is dropped from the links
+        let live = self.host.fanout(None);
+        self.links.retain(|a, _| live.contains(a));
+        let mut gone = Vec::new();
+        for (addr, link) in self.links.iter_mut() {
+            for dg_payload in link.due(now_ms) {
+                let mut dg = vec![CH_RELIABLE];
+                dg.extend_from_slice(&dg_payload);
+                let _ = self.sock.send_to(&dg, *addr);
+            }
+            if let Some(ack) = link.ack_payload() {
+                let mut dg = vec![CH_ACK];
+                dg.extend_from_slice(&ack);
+                let _ = self.sock.send_to(&dg, *addr);
+            }
+            if link.given_up {
+                gone.push(*addr);
+            }
+        }
+        for a in gone {
+            log::warn!("[lan-host] {a} never acked an edit batch; its reliable link is dropped");
+            self.links.remove(&a);
+        }
         events
+    }
+
+    /// Queue a host-originated edit batch (a packed WORLDCMD payload) for every peer, on
+    /// each one's reliable link; sent by the next `pump`.
+    pub fn send_edits_reliably(&mut self, packed: &[u8]) {
+        for t in self.host.fanout(None) {
+            if self.links.entry(t).or_insert_with(Link::new).send(packed).is_none() {
+                log::warn!("[lan-host] reliable window to {t} is full; a host edit batch was dropped");
+            }
+        }
+    }
+
+    /// Edit batches sent to peers and not yet acknowledged, summed over the links.
+    pub fn unacked_edits(&self) -> usize {
+        self.links.values().map(|l| l.unacked()).sum()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -494,6 +571,87 @@ mod tests {
         );
         let (ch, _) = b.recv().expect("world cmd not relayed");
         assert_eq!(ch, CH_WORLDCMD);
+    }
+
+    /// The reliable path end to end on loopback: A's edit batch goes to the host on
+    /// CH_RELIABLE, is surfaced once, acked to A, and re-sent to B on B's own link (B's seq
+    /// starts at 1 whatever A's was). A batch the host never acks is resent by A's link
+    /// after RTO; a duplicate at the host is not surfaced twice; B acks and the host's
+    /// unacked count drops to zero.
+    #[test]
+    fn world_cmds_ride_the_reliable_link_once_in_order_and_are_acked() {
+        use crate::sim::net::reliable::{frame, Link, RTO_MS};
+        use crate::sim::net::world_cmd_wire::encode_batch;
+        let mut pump = pump_on_loopback();
+        let a = Client::connect(pump.port());
+        let b = Client::connect(pump.port());
+        for c in [&a, &b] {
+            c.send(CH_HANDSHAKE, &LanJoin::Join { name: "p".into() }.encode());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        pump.pump(0, "W", 1, 0, &|_| true);
+        a.recv().unwrap();
+        b.recv().unwrap();
+
+        // A sends batch 2 before batch 1 ("1" was lost on the way): nothing is surfaced
+        // until 1 arrives, then both, in order.
+        let one = vec![(7u64, WorldCmd::Remove { pos: (1, 64, 1) })];
+        let two = vec![(7u64, WorldCmd::Remove { pos: (2, 64, 2) })];
+        let p1 = super::super::packet_compress::pack(&encode_batch(&one), 48);
+        let p2 = super::super::packet_compress::pack(&encode_batch(&two), 48);
+        a.send(CH_RELIABLE, &frame(2, &p2));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let ev = pump.pump(100, "W", 1, 0, &|_| true);
+        assert!(!ev.iter().any(|e| matches!(e, PumpEvent::WorldCmds(_))), "two waits for one: {ev:?}");
+        let (ch, ack) = a.recv().expect("an ack even for a held batch");
+        assert_eq!(ch, CH_ACK);
+        assert_eq!(ack, 0u32.to_le_bytes().to_vec(), "nothing contiguous yet");
+        a.send(CH_RELIABLE, &frame(1, &p1));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let ev = pump.pump(200, "W", 1, 0, &|_| true);
+        let surfaced: Vec<_> = ev.iter().filter_map(|e| if let PumpEvent::WorldCmds(c) = e { Some(c.clone()) } else { None }).collect();
+        assert_eq!(surfaced, vec![one.clone(), two.clone()], "both, in order");
+        let (ch, ack) = a.recv().expect("ack");
+        assert_eq!(ch, CH_ACK);
+        assert_eq!(ack, 2u32.to_le_bytes().to_vec());
+
+        // B receives both on ITS link, seq 1 and 2, and acks; the host's unacked drops.
+        let mut b_link = Link::new();
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let (ch, payload) = b.recv().expect("relayed to B");
+            assert_eq!(ch, CH_RELIABLE);
+            got.extend(b_link.receive(&payload));
+        }
+        assert_eq!(got, vec![p1.clone(), p2.clone()]);
+        assert_eq!(pump.unacked_edits(), 2);
+        b.send(CH_ACK, &b_link.ack_payload().unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        pump.pump(300, "W", 1, 0, &|_| true);
+        assert_eq!(pump.unacked_edits(), 0, "B's cumulative ack cleared the host's queue");
+
+        // a duplicate of 2 (A's ack was lost, say) is not surfaced again, and is re-acked
+        a.send(CH_RELIABLE, &frame(2, &p2));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let ev = pump.pump(400, "W", 1, 0, &|_| true);
+        assert!(!ev.iter().any(|e| matches!(e, PumpEvent::WorldCmds(_))), "a duplicate is not applied twice: {ev:?}");
+        let (ch, ack) = a.recv().expect("re-ack");
+        assert_eq!((ch, ack), (CH_ACK, 2u32.to_le_bytes().to_vec()));
+        assert!(b.recv().is_none(), "and not relayed to B again");
+
+        // the host resends what B does not ack: a third batch, B silent, resent after RTO
+        let three = vec![(7u64, WorldCmd::Remove { pos: (3, 64, 3) })];
+        let p3 = super::super::packet_compress::pack(&encode_batch(&three), 48);
+        a.send(CH_RELIABLE, &frame(3, &p3));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        pump.pump(500, "W", 1, 0, &|_| true);
+        a.recv();
+        let (ch, first) = b.recv().expect("first send to B");
+        assert_eq!(ch, CH_RELIABLE);
+        assert!(b.recv().is_none(), "sent once so far");
+        pump.pump(500 + RTO_MS, "W", 1, 0, &|_| true);
+        let (ch, again) = b.recv().expect("resent after RTO with no ack");
+        assert_eq!((ch, again), (CH_RELIABLE, first));
     }
 
     #[test]
