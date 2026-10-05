@@ -322,6 +322,9 @@ test and a §5b break test; nothing below was seen on a screen or heard.
     soldier, skydribble clean.
   - **bsgames** `4a7722fcc` Road Warrior and Echelon (the deck, `window,sound`, `play`) are in
     the games centre's registry; it had listed seven of nine.
+  - **echelon-deck** `12ef10e68` the HUD says where a LAN match stands (IN STEP / WAITING FOR
+    PEER). **unendlich** `1eb218904` F5 was two actions; `ReloadChunks` unbound, a test keeps
+    every preset one-key-one-action (Jump/FlyUp and Sneak/FlyDown share on purpose).
 - **Decided, not wired:** blackstar-rs `dispatch.rs` models voyages (`voyage`/`damage`/
   `survival`/`loot`, orbits and delta-v) that nothing in the shipboard game reaches -- wiring
   it is a game-layer design, not a bug; `suitability.rs` would tell the player "wheels have
