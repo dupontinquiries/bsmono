@@ -29,6 +29,8 @@
 //!   assert KEY OP VALUE   alloy|flux|used2|cap2|sel|myunits|enemyvis
 //!                         with OP in > < >= <= ==
 
+mod audio;
+mod cues;
 mod font;
 mod render;
 
@@ -112,6 +114,10 @@ pub struct Deck {
     pub selection: Vec<u32>,
     pub ghosts: Vec<render::Ghost>,
     pub banner: Option<String>,
+    /// The sound (`audio`): `None` headless or with no output, and the deck runs silent.
+    pub audio: Option<audio::Audio>,
+    /// What this frame of the match was, for the ears (`cues`).
+    listener: cues::Listener,
 }
 
 impl Deck {
@@ -123,12 +129,28 @@ impl Deck {
             Driver::Local { .. } => {
                 for _ in 0..n {
                     if self.banner.is_some() {
-                        return;
+                        break;
                     }
                     self.tick(Vec::new());
                 }
             }
             Driver::Lan(_) => self.step_lan(n),
+        }
+        // once per call, not per tick: a frame's worth of change is one set of cues
+        self.hear();
+    }
+
+    fn sound(&self, m: audio::Msg) {
+        if let Some(a) = &self.audio {
+            a.send(m);
+        }
+    }
+
+    /// What changed since the last frame, to hear.
+    fn hear(&mut self) {
+        let cues = self.listener.step(&self.world, self.me, self.banner.as_deref());
+        for c in cues {
+            self.sound(audio::Msg::Cue(c));
         }
     }
 
@@ -246,6 +268,7 @@ impl Deck {
     pub fn hud_lines_pub(&self) -> Vec<String> { self.hud_lines() }
 
     fn cmd(&mut self, c: Cmd) {
+        self.sound(audio::Msg::Cue(cues::Cue::Ack));
         let pc = PlayerCmd { player: self.me, cmd: c };
         match &mut self.driver {
             // player commands ride an otherwise normal tick
@@ -533,7 +556,7 @@ pub fn deck_with(race0: &str, race1: &str, map: &str, seed: u64, me: u8, driver:
     let r0 = pack.race_index(race0).expect("race");
     let r1 = pack.race_index(race1).expect("enemy race");
     let world = World::new(pack, gm, [r0, r1], seed);
-    Deck { world, ts, me, driver, selection: Vec::new(), ghosts: Vec::new(), banner: None }
+    Deck { world, ts, me, driver, selection: Vec::new(), ghosts: Vec::new(), banner: None, audio: None, listener: cues::Listener::new() }
 }
 
 /// The LAN seat the command line asks for: `--lan-host PORT` binds and waits for the
@@ -604,7 +627,14 @@ fn main() {
             }
         }
         #[cfg(feature = "window")]
-        Some("play") => window::run(deck()),
+        Some("play") => {
+            let mut d = deck();
+            d.audio = audio::Audio::start();
+            if d.audio.is_none() {
+                eprintln!("echelon-deck: no sound (build with --features sound and have an output device)");
+            }
+            window::run(d)
+        }
         #[cfg(not(feature = "window"))]
         Some("play") => {
             eprintln!("built without the `window` feature; rebuild with --features window");

@@ -11,8 +11,13 @@ echelon-bots = { path = "../echelon-bots" }
 echelon-net = { path = "../echelon-net" }
 ron = { workspace = true }
 minifb = { version = "0.25", optional = true }
+# synthesized sound through cpal (needs ALSA headers on Linux: libasound2-dev);
+# the mixer itself is always compiled and tested, only the stream needs this
+cpal = { version = "0.15", optional = true }
 
 [features]
 # interactive window on machines with a display; headless tape mode is
 # the default and what CI exercises
 window = ["dep:minifb"]
+# the window's sound; off by default so the tape and CI build with no audio stack
+sound = ["dep:cpal"]
