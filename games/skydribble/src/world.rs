@@ -3700,7 +3700,38 @@ impl World {
         let mut w = World { nrm_cache: std::cell::Cell::new((Vec3::ZERO, Vec3::ZERO)), sdf_calls: std::cell::Cell::new(0), grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq };
         // prime the mover index so the very first frame is already fast
         w.rebuild_movers();
+        w.unbury_drifters();
         w
+    }
+
+    /// A drifter spawns at a random height over a random radius, and nothing checked what was
+    /// already there: KUIPER seed 9's first planet began 2.5 m inside a rock, and a body inside
+    /// a solid is pushed out along the normal every tick -- it never falls, never bounces, just
+    /// jitters in the wall (`--sim planets` watched exactly that planet and failed on "returns
+    /// to round" and "still moving"). Lift each one straight up until it has a radius of
+    /// clearance; planets fall anyway, so a higher start costs nothing but a longer first drop.
+    /// Returns how many were moved.
+    pub fn unbury_drifters(&mut self) -> usize {
+        let mut moved = 0;
+        for i in 0..self.bodies.len() {
+            if !self.bodies[i].bouncy {
+                continue;
+            }
+            let r = self.bodies[i].r;
+            let mut pos = self.bodies[i].pos;
+            let mut lifted = 0.0f32;
+            while self.sdf(pos) < r * 2.0 && lifted < 400.0 {
+                pos.y += 2.0;
+                lifted += 2.0;
+            }
+            if lifted > 0.0 {
+                self.bodies[i].pos = pos;
+                let si = self.bodies[i].shape;
+                self.shapes[si].pos = pos;
+                moved += 1;
+            }
+        }
+        moved
     }
 
     /// Grip multiplier / boost / vibe queries for the pinball zones.

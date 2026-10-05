@@ -3985,6 +3985,17 @@ pub fn run(args: &[String]) {
         let n_bouncy = world.bodies.iter().filter(|b| b.bouncy).count();
         println!("drifting planets: {n_bouncy}");
         let bi = world.bodies.iter().position(|b| b.bouncy).unwrap();
+        // every drifter starts in the open: one that spawns inside a structure is pushed out
+        // along the normal each tick and jitters there instead of falling (seed 9's first
+        // planet, 2.5 m deep in a rock, before `World::unbury_drifters`)
+        let mut buried = 0;
+        for b in world.bodies.iter().filter(|b| b.bouncy) {
+            let clearance = world.sdf(b.pos) - b.r;
+            if clearance < 0.0 {
+                buried += 1;
+            }
+            println!("planet at ({:>6.1},{:>5.1},{:>6.1}) r={:.1} clearance={:+.1} m", b.pos.x, b.pos.y, b.pos.z, b.r, clearance);
+        }
         // park the car and ball far away so only the planet is in play
         let mut car = physics::Car::new();
         car.pos = Vec3::new(600.0, 40.0, 600.0);
@@ -4020,7 +4031,8 @@ pub fn run(args: &[String]) {
         let still_moving = b.vel.length();
         println!("bounces in 40 s: {bounces}   peak squash: {:.0}%   returns to round: {}", peak_squash * 100.0, settled_round);
         println!("still moving after 40 s: {still_moving:.1} m/s   highest apex {apex:.0} m");
-        let ok = n_bouncy >= 3 && bounces >= 3 && peak_squash > 0.05 && settled_round && still_moving > 1.0;
+        println!("spawned inside a structure: {buried}");
+        let ok = n_bouncy >= 3 && buried == 0 && bounces >= 3 && peak_squash > 0.05 && settled_round && still_moving > 1.0;
         verdict("PLANETS", ok);
         return;
     }
