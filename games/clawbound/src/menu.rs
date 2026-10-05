@@ -35,6 +35,17 @@ impl Action {
             Action::Restart => "R", Action::Menu => "Esc",
         }
     }
+    /// The stable name in `settings.cfg` (`bind <name> <key>`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Action::Up => "up", Action::Down => "down", Action::Left => "left", Action::Right => "right",
+            Action::Crouch => "crouch", Action::Dodge => "dodge", Action::Leap => "leap", Action::Ability => "ability",
+            Action::Restart => "restart", Action::Menu => "menu",
+        }
+    }
+    pub fn from_name(name: &str) -> Option<Action> {
+        ACTIONS.into_iter().find(|a| a.name() == name)
+    }
 }
 
 #[derive(Clone)]
@@ -77,6 +88,106 @@ impl Default for Settings {
             camera_zoom: 1,
             show_cone: false, master_volume: 0.7, difficulty: 1, hires: false,
             clan_abilities: false, prowl_fixed_wind: false, keybinds: Keybinds::default(),
+        }
+    }
+}
+
+impl Settings {
+    /// The file: one `key value` per line, `bind <action> <key>` for the keybinds. Hand-rolled
+    /// because the crate has no serde and the web build must not grow one; unknown keys are
+    /// kept out of the way (ignored) and a missing key is its default, so a file from an
+    /// older or newer build still loads.
+    pub fn to_text(&self) -> String {
+        let mut s = String::from("# clawbound settings -- written by the game; edit while it is closed\n");
+        s.push_str(&format!("show_guides {}\n", self.show_guides as u8));
+        s.push_str(&format!("cast_mode {}\n", match self.cast_mode {
+            crate::castguide::CastMode::Quick => "quick",
+            crate::castguide::CastMode::Normal => "normal",
+            crate::castguide::CastMode::Instant => "instant",
+        }));
+        s.push_str(&format!("camera_zoom {}\n", self.camera_zoom));
+        s.push_str(&format!("show_cone {}\n", self.show_cone as u8));
+        s.push_str(&format!("master_volume {:.2}\n", self.master_volume));
+        s.push_str(&format!("difficulty {}\n", self.difficulty));
+        s.push_str(&format!("hires {}\n", self.hires as u8));
+        s.push_str(&format!("clan_abilities {}\n", self.clan_abilities as u8));
+        s.push_str(&format!("prowl_fixed_wind {}\n", self.prowl_fixed_wind as u8));
+        for (a, k) in &self.keybinds.keys {
+            s.push_str(&format!("bind {} {}\n", a.name(), k));
+        }
+        s
+    }
+
+    pub fn from_text(text: &str) -> Settings {
+        let mut st = Settings::default();
+        let flag = |v: &str| matches!(v, "1" | "true" | "on" | "yes");
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (key, rest) = line.split_once(' ').unwrap_or((line, ""));
+            let rest = rest.trim();
+            match key {
+                "show_guides" => st.show_guides = flag(rest),
+                "cast_mode" => {
+                    st.cast_mode = match rest {
+                        "quick" => crate::castguide::CastMode::Quick,
+                        "normal" => crate::castguide::CastMode::Normal,
+                        "instant" => crate::castguide::CastMode::Instant,
+                        _ => st.cast_mode,
+                    }
+                }
+                "camera_zoom" => st.camera_zoom = rest.parse::<i32>().map_or(st.camera_zoom, |z| z.clamp(0, 4) as u8),
+                "show_cone" => st.show_cone = flag(rest),
+                "master_volume" => st.master_volume = rest.parse::<f32>().ok().filter(|v| v.is_finite()).map_or(st.master_volume, |v| v.clamp(0.0, 1.0)),
+                "difficulty" => st.difficulty = rest.parse::<i32>().map_or(st.difficulty, |d| d.clamp(0, 2) as u8),
+                "hires" => st.hires = flag(rest),
+                "clan_abilities" => st.clan_abilities = flag(rest),
+                "prowl_fixed_wind" => st.prowl_fixed_wind = flag(rest),
+                "bind" => {
+                    if let Some((name, k)) = rest.split_once(' ') {
+                        if let Some(a) = Action::from_name(name) {
+                            let k = k.trim();
+                            if !k.is_empty() {
+                                st.keybinds.rebind(a, k);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        st
+    }
+
+    /// `$XDG_CONFIG_HOME/clawbound/settings.cfg`, or `~/.config/...` -- beside the
+    /// battleground's `controls.cfg`. `None` where there is no home (the web build).
+    pub fn path() -> Option<std::path::PathBuf> {
+        if cfg!(target_arch = "wasm32") {
+            return None;
+        }
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+        Some(base.join("clawbound").join("settings.cfg"))
+    }
+
+    pub fn load() -> Settings {
+        match Self::path().and_then(|p| std::fs::read_to_string(p).ok()) {
+            Some(t) => Settings::from_text(&t),
+            None => Settings::default(),
+        }
+    }
+
+    pub fn save(&self) {
+        if let Some(p) = Self::path() {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = std::fs::write(&p, self.to_text()) {
+                eprintln!("[clawbound] could not save settings to {}: {e}", p.display());
+            }
         }
     }
 }
@@ -157,6 +268,8 @@ pub struct Menu {
     /// gets a legal, no-duplicate draft on Start.
     pub draft: [Ancestor; 6],
     pub rebinding: Option<Action>,   // Some(action) while waiting for a key press
+    /// A setting or a bind changed since the app last took it (`take_dirty`): the app saves.
+    dirty: bool,
 }
 
 impl Default for Menu { fn default() -> Self { Self::new() } }
@@ -166,7 +279,19 @@ impl Menu {
         Menu { open: true, screen: Screen::Title, cursor: 0, settings: Settings::default(),
                sel_hunter: Kind::Fox, sel_mode: Mode::Rendezvous, sel_game: GameMode::Rendezvous, sel_class: Class::Cat, sel_clan: 0, sel_ancestor: 0,
                draft: [ANCESTORS[0], ANCESTORS[1], ANCESTORS[2], ANCESTORS[3], ANCESTORS[4], ANCESTORS[5]],
-               rebinding: None }
+               rebinding: None, dirty: false }
+    }
+
+    /// The menu with the player's saved settings (`Settings::load`).
+    pub fn with_saved_settings() -> Self {
+        let mut m = Menu::new();
+        m.settings = Settings::load();
+        m
+    }
+
+    /// Did a setting or a bind change since the last call? The app saves when it did.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
     }
 
     /// Menu item labels for the current screen (top-to-bottom).
@@ -297,6 +422,16 @@ impl Menu {
             (Screen::Play, 2) => self.next_class(dir),
             (Screen::Play, 3) => self.sel_clan = (self.sel_clan as i32 + dir).rem_euclid(crate::clan::CLAN_COUNT as i32) as u8,
             (Screen::Draft, i) if i < 6 => self.next_draft_pick(i, dir),
+            (Screen::Settings, _) => {
+                self.dirty = true;
+                self.adjust_setting(dir);
+            }
+            _ => {}
+        }
+    }
+
+    fn adjust_setting(&mut self, dir: i32) {
+        match (self.screen, self.cursor) {
             (Screen::Settings, 0) => self.settings.show_guides = !self.settings.show_guides,
             (Screen::Settings, 1) => {
                 // one row, cycled either way, because three modes do not deserve
@@ -377,7 +512,7 @@ impl Menu {
 
     /// Feed the next pressed key while rebinding; returns true if it consumed it.
     pub fn feed_rebind(&mut self, key: &str) -> bool {
-        if let Some(a) = self.rebinding.take() { self.settings.keybinds.rebind(a, key); true } else { false }
+        if let Some(a) = self.rebinding.take() { self.settings.keybinds.rebind(a, key); self.dirty = true; true } else { false }
     }
 
     pub fn back(&mut self) -> MenuCmd {
@@ -391,6 +526,75 @@ impl Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every setting and every bind round-trips through the file, a missing or unknown key
+    /// is harmless, and a bad value falls back to the default rather than out of range.
+    #[test]
+    fn settings_round_trip_through_the_file_and_a_bad_file_loads_as_defaults() {
+        use crate::castguide::CastMode;
+        let mut st = Settings::default();
+        st.show_guides = false;
+        st.cast_mode = CastMode::Instant;
+        st.camera_zoom = 3;
+        st.show_cone = true;
+        st.master_volume = 0.3;
+        st.difficulty = 2;
+        st.hires = true;
+        st.clan_abilities = true;
+        st.prowl_fixed_wind = true;
+        st.keybinds.rebind(Action::Leap, "G");
+        st.keybinds.rebind(Action::Menu, "Backquote");
+        let text = st.to_text();
+        let back = Settings::from_text(&text);
+        assert_eq!(back.show_guides, false);
+        assert_eq!(back.cast_mode, CastMode::Instant);
+        assert_eq!(back.camera_zoom, 3);
+        assert!(back.show_cone);
+        assert!((back.master_volume - 0.3).abs() < 1e-3);
+        assert_eq!(back.difficulty, 2);
+        assert!(back.hires && back.clan_abilities && back.prowl_fixed_wind);
+        assert_eq!(back.keybinds.key_for(Action::Leap), "G");
+        assert_eq!(back.keybinds.key_for(Action::Menu), "Backquote");
+        assert_eq!(back.keybinds.key_for(Action::Up), "W", "an untouched bind is its default");
+        assert_eq!(text.lines().filter(|l| l.starts_with("bind ")).count(), ACTIONS.len(), "every action is written");
+        // the defaults round-trip too, and the file says what it is
+        assert_eq!(Settings::from_text(&Settings::default().to_text()).to_text(), Settings::default().to_text());
+        assert!(text.starts_with("# clawbound settings"));
+        // a file from somewhere else: unknown keys, out-of-range and junk values, no binds
+        let odd = "shiny 1\ncamera_zoom 9\ndifficulty -4\nmaster_volume nope\ncast_mode sideways\nbind nothing X\nbind leap\nhires yes\n";
+        let o = Settings::from_text(odd);
+        assert_eq!(o.camera_zoom, 4, "clamped");
+        assert_eq!(o.difficulty, 0, "clamped");
+        assert_eq!(o.master_volume, Settings::default().master_volume, "junk is the default");
+        assert_eq!(o.cast_mode, CastMode::Quick);
+        assert!(o.hires, "yes is on");
+        assert_eq!(o.keybinds.key_for(Action::Leap), "F", "a bind with no key keeps the default");
+        assert_eq!(Settings::from_text("").to_text(), Settings::default().to_text());
+    }
+
+    /// The app saves on the frame something changed: `adjust` on a settings row and a
+    /// rebind set the flag, a Play-screen adjust does not, and taking it clears it.
+    #[test]
+    fn a_changed_setting_or_bind_is_dirty_once() {
+        let mut m = Menu::new();
+        assert!(!m.take_dirty());
+        m.screen = Screen::Play;
+        m.cursor = 0;
+        m.adjust(1);
+        assert!(!m.take_dirty(), "the Play screen's rows are not settings");
+        m.screen = Screen::Settings;
+        m.cursor = 4;
+        m.adjust(-1);
+        assert!(m.take_dirty());
+        assert!(!m.take_dirty(), "taken once");
+        m.screen = Screen::Keybinds;
+        m.rebinding = Some(Action::Dodge);
+        assert!(m.feed_rebind("X"));
+        assert_eq!(m.settings.keybinds.key_for(Action::Dodge), "X");
+        assert!(m.take_dirty());
+        assert!(!m.feed_rebind("Y"), "nothing was waiting");
+        assert!(!m.take_dirty());
+    }
 
     #[test]
     fn the_new_graphics_rows_adjust_and_back_still_backs_out() {

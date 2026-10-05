@@ -452,7 +452,7 @@ impl State {
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, &*window, None, None);
         let egui_render = crate::egui_render::EguiRender::new(&device, config.format);
-        let mut menu = clawbound_rs::menu::Menu::new();
+        let mut menu = clawbound_rs::menu::Menu::with_saved_settings();
         // ── bsgames handoff: host/join a friend's match before the title screen ever shows ──
         let handoff = netcode::handoff::from_env();
         let mut mp: Option<netcode::multiplayer::Multiplayer> = None;
@@ -1153,6 +1153,9 @@ impl State {
         self.anim_t += dt;
         self.debug_cone = self.menu.settings.show_cone;
         if self.ss_on != self.menu.settings.hires { self.apply_targets(); }   // Graphics toggle → (de)supersample
+        // a changed setting or bind reaches the file the same frame; nothing was persisted
+        // before c21 and every launch began at the defaults
+        if self.menu.take_dirty() { self.menu.settings.save(); }
         if self.capture.is_some() { self.render_capture(dt); return; }
         if self.prowl.is_some() { self.render_prowl(dt); return; }
 
