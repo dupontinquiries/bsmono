@@ -47,7 +47,7 @@ const S_PROC_POW: u64 = 0x7D0C_9100_0006_0006;
 // ---------------------------------------------------------------------------
 
 /// Weapon class archetype.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum WeaponClass {
     Dagger,
     Blade,

@@ -49,7 +49,7 @@ pub use inventory::Inventory;
 /// Opaque handle for an item kind. `0` is reserved as "no item" so callers can
 /// use it as a sentinel if they ever need a non-`Option` representation; the
 /// inventory itself uses `Option<ItemStack>` for empty slots instead.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ItemId(pub u32);
 
 impl ItemId {
@@ -58,7 +58,7 @@ impl ItemId {
 
 /// A non-empty pile of identical items. An empty slot is `None`, never a
 /// `count == 0` stack — that invariant is upheld by [`Inventory`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ItemStack {
     pub item: ItemId,
     pub count: u16,

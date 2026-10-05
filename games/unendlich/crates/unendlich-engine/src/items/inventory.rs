@@ -72,6 +72,16 @@ impl Inventory {
             self.slots[start + k] = st;
         }
     }
+    /// Put a saved layout back: slot for slot, up to this inventory's size (extra saved slots
+    /// are dropped, missing ones stay empty), and never a zero-count stack -- the invariant
+    /// `slot` and every consumer rely on, which a hand-edited or stale save could break.
+    pub fn restore_slots(&mut self, saved: &[Option<ItemStack>]) {
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            *slot = saved.get(i).copied().flatten().filter(|s| s.count > 0 && s.item != ItemId::NONE);
+        }
+        self.selected = self.selected.min(self.hotbar_size - 1);
+    }
+
     /// Contents of slot `i`, or `None` if empty or out of range.
     pub fn slot(&self, i: usize) -> Option<ItemStack> {
         self.slots.get(i).copied().flatten()

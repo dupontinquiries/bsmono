@@ -174,7 +174,7 @@ impl ToolKind {
 /// which is exactly `legendary_weapon::forge(seed, class, element_idx, tier)`.
 /// `element_idx` is interpreted mod 6 (Wood/Water/Air/Dust/Fire/Storm), matching
 /// `forge`'s own element→proc mapping; `tier` is the (uncapped) weapon tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct LegendarySpec {
     pub seed: u64,
     pub class: WeaponClass,

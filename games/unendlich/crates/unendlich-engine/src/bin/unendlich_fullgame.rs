@@ -1478,6 +1478,35 @@ impl<'a> unendlich_engine::sim::physics::WorldQuery for MobWorld<'a> {
     }
 }
 
+/// The player's per-world state as it stands now (`sim::player_save`): written beside the
+/// world's chunks at Save & Quit, the autosave and the world switch.
+fn player_save_now(
+    view: &unendlich_engine::render::camera::View,
+    inventory: &unendlich_engine::items::Inventory,
+    world_clock_elapsed: f32,
+    sky_time_seconds: f64,
+) -> unendlich_engine::sim::player_save::PlayerSave {
+    unendlich_engine::sim::player_save::PlayerSave {
+        format: unendlich_engine::sim::player_save::FORMAT,
+        position: [view.position.x, view.position.y, view.position.z],
+        yaw: view.yaw,
+        pitch: view.pitch,
+        inventory: inventory.slots().to_vec(),
+        selected: inventory.selected(),
+        world_clock_elapsed,
+        sky_time_seconds: Some(sky_time_seconds),
+    }
+}
+
+/// Write `player.json` into the world's directory, if the world has one.
+fn write_player_save(world_root: Option<&std::path::Path>, save: &unendlich_engine::sim::player_save::PlayerSave, why: &str) {
+    let Some(root) = world_root else { return };
+    match save.save(root) {
+        Ok(()) => log::info!("[saves] player state saved ({why}): {}", root.join("player.json").display()),
+        Err(e) => log::warn!("[saves] player state NOT saved ({why}) to {}: {e}", root.display()),
+    }
+}
+
 fn main() {
     // Handle --help / --version BEFORE doing any setup. This keeps the
     // help printer fast and side-effect-free (no logger init, no Vulkan,
@@ -6340,6 +6369,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 renderer.pause_menu_open = false;
                 let saved = chunk_manager.save_all();
                 log::info!("[pause] Save & Quit to Title ({} chunk(s) saved)", saved);
+                write_player_save(
+                    chunk_manager.world_root(),
+                    &player_save_now(&local_player.view, fg_app.inventory(), world_clock_elapsed, sky_state.time_seconds),
+                    "save & quit",
+                );
                 // r204 BUGFIX: quitting to title left the world's uploaded
                 // meshes resident (operator: "mesh not cleared when ... going
                 // to title screen"), so the title showed stale geometry and
@@ -7199,6 +7233,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             let saved = chunk_manager.save_all();
             if saved > 0 {
                 log::info!("[saves] autosave: {} edited chunk(s) flushed", saved);
+            }
+            if fg_app.state() == unendlich_engine::sim::game_flow::AppState::InGame {
+                write_player_save(
+                    chunk_manager.world_root(),
+                    &player_save_now(&local_player.view, fg_app.inventory(), world_clock_elapsed, sky_state.time_seconds),
+                    "autosave",
+                );
             }
         }
         // r156: heavy rain DOUSES unsheltered fires — one check per ~4s;
@@ -18876,6 +18917,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             if saved > 0 {
                                 log::info!("[saves] {} edited chunk(s) saved before world switch", saved);
                             }
+                            if fg_app.state() == unendlich_engine::sim::game_flow::AppState::InGame
+                                || current_world_name.is_some()
+                            {
+                                write_player_save(
+                                    chunk_manager.world_root(),
+                                    &player_save_now(&local_player.view, fg_app.inventory(), world_clock_elapsed, sky_state.time_seconds),
+                                    "world switch",
+                                );
+                            }
                             // r291: identity is name+seed, not name alone — a world's
                             // title is just a label and may collide, but the seed
                             // disambiguates the storage dir so two same-titled worlds
@@ -19061,6 +19111,37 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 renderer.settings_open = false;
                                 renderer.pause_action = 0;
                                 renderer.craft_pick = 0;
+                                // c21: this world's own player.json -- where you stood, what you
+                                // carried, what time it was -- over the seed's spawn and the
+                                // reset above. Absent on a first visit, and then the fresh
+                                // state above stands.
+                                match chunk_manager
+                                    .world_root()
+                                    .and_then(unendlich_engine::sim::player_save::PlayerSave::load)
+                                {
+                                    Some(p) => {
+                                        local_player.view.position = glm::vec3(p.position[0], p.position[1], p.position[2]);
+                                        local_player.view.yaw = p.yaw;
+                                        local_player.view.pitch = p.pitch;
+                                        fg_app.inventory_mut().restore_slots(&p.inventory);
+                                        fg_app.inventory_mut().set_selected(p.selected);
+                                        world_clock_elapsed = p.world_clock_elapsed;
+                                        if let Some(t) = p.sky_time_seconds {
+                                            sky_state.time_seconds = t;
+                                        }
+                                        log::info!(
+                                            "[saves] player state restored: at {:?}, {} stack(s), clock {:.0} min",
+                                            p.position,
+                                            p.inventory.iter().flatten().count(),
+                                            p.world_clock_elapsed
+                                        );
+                                    }
+                                    None => {
+                                        // a world you have not stood in before: nothing of the
+                                        // last world's inventory follows you into it
+                                        fg_app.inventory_mut().restore_slots(&[]);
+                                    }
+                                }
                                 log::info!(
                                     "fullgame: launch seed {seed} -> rebuilt world, surface spawn {new_spawn:?}"
                                 );

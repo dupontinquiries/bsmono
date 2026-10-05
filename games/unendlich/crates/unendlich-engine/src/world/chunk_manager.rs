@@ -976,6 +976,12 @@ impl ChunkManager {
         self.world_root = Some(world_root);
     }
 
+    /// Where this world persists (`with_storage` / `set_world_root`), if anywhere -- the
+    /// directory `player.json` and `whitelist.json` share with the chunk regions.
+    pub fn world_root(&self) -> Option<&std::path::Path> {
+        self.world_root.as_deref()
+    }
+
     pub fn with_storage(mut self, world_root: PathBuf) -> Self {
         log::info!("Persistent storage enabled at {}", world_root.display());
         if let Err(e) = std::fs::create_dir_all(&world_root) {
