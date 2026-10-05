@@ -573,12 +573,14 @@ impl Sortie {
         if !won {
             return format!("{} — lost. nothing recorded{tail}", self.mission.id);
         }
-        let fresh = stations::record_outcome(self.mission.id, self.week);
+        let banked = stations::record_outcome(self.mission.id, self.week);
         let what = if self.week.is_some() { "nightfall" } else { "sortie" };
+        let rewards = banked.lines().join(" · ");
+        let tail = if rewards.is_empty() { tail } else { format!(" · {rewards}{tail}") };
         format!(
             "{} — {what} CLEARED{}{tail}",
             self.mission.id,
-            if fresh { "" } else { "; already on the board" }
+            if banked.fresh { "" } else { "; already on the board" }
         )
     }
 

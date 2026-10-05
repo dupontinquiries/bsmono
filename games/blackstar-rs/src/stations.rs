@@ -1230,32 +1230,117 @@ fn order_target(
 /// loaded save, because the flown path commits minutes after it last read
 /// the file and must not clobber whatever else moved in between.
 ///
-/// Returns whether the clear was fresh.
-pub fn record_outcome(mission_id: &str, nightfall_week: Option<u64>) -> bool {
+/// What a clear banked besides the board entry: the lines a debrief or a sim prints. Every
+/// reward lives HERE, on the one persistence path, because until c21 it did not: `campsim`
+/// and `raidsim` banked chi and the drops themselves, through their own load-modify-store,
+/// and the flown sortie and raid -- the game -- recorded the mission or the shard and nothing
+/// else. A nightfall flown and won trained no chi and paid no kit; a warden beaten on the
+/// field dropped no arm. Only the CLI sims ever rewarded anyone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Banked {
+    /// The clear was not on the board before (a repeat banks nothing and drops nothing).
+    pub fresh: bool,
+    /// Where the drop went, if there was one: "drop: <label> -> bag" and the like.
+    pub drop: Option<String>,
+    /// Chi banked: element, points, level before, level after.
+    pub chi: Option<(crate::weapons::Element, u32, u8, u8)>,
+}
+
+impl Banked {
+    /// The reward lines, for a toast or a sim transcript (empty on a repeat).
+    pub fn lines(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if let Some(d) = &self.drop {
+            v.push(d.clone());
+        }
+        if let Some((e, pts, before, after)) = self.chi {
+            if after > before {
+                v.push(format!("chi: {} +{pts} -- LEVEL {after}", e.name()));
+            } else {
+                v.push(format!("chi: {} +{pts}", e.name()));
+            }
+        }
+        v
+    }
+}
+
+/// Put `drop` in the bag, else the ship's vault, else say it was left on the field.
+fn place_drop(sv: &mut crate::save::Save, drop: crate::gear::Item) -> String {
+    use crate::gear::Gear;
+    use crate::vault::Vault;
+    let mut gear = Gear::from_save(&sv.armed, &sv.worn, &sv.bag);
+    let mut vault = Vault::from_line(&sv.vault);
+    let label = drop.label();
+    let placed = match gear.take(drop.clone()) {
+        Ok(()) => format!("drop: {label} -> bag"),
+        Err(_) => match vault.deposit(&mut { let mut g = Gear::default(); g.bag.push(drop); g }, 0) {
+            Ok(_) => format!("drop: {label} -> the ship's vault (bag full)"),
+            Err(_) => format!("drop: {label} left on the field (bag and vault full)"),
+        },
+    };
+    let (armed, worn, bag) = gear.save_lines();
+    sv.armed = armed;
+    sv.worn = worn;
+    sv.bag = bag;
+    sv.vault = vault.line();
+    placed
+}
+
+/// Bank `pts` of `e` on the save's chi log; (element, points, level before, level after).
+fn bank_chi(sv: &mut crate::save::Save, e: crate::weapons::Element, pts: u32) -> (crate::weapons::Element, u32, u8, u8) {
+    let mut chi = crate::chi::Chi::from_line(&sv.chi);
+    let before = chi.level(e);
+    chi.bank(e, pts);
+    let after = chi.level(e);
+    sv.chi = chi.line();
+    (e, pts, before, after)
+}
+
+/// Returns what was banked (`fresh`, and on a fresh NIGHTFALL the burn's chi and its kit --
+/// a plain mission's reward is the board itself: it opens the next one).
+pub fn record_outcome(mission_id: &str, nightfall_week: Option<u64>) -> Banked {
     let (mut sv, binds, cfg) = crate::save::load();
     let mut camp = crate::campaign::CampaignLog::from_line(&sv.missions);
-    let fresh = camp.record(mission_id);
+    let mut out = Banked { fresh: camp.record(mission_id), ..Banked::default() };
     sv.missions = camp.line();
     if let Some(w) = nightfall_week {
         let mut nf = crate::nightfall::NightfallLog::from_line(&sv.nightfalls);
-        nf.record(w);
+        let fresh_week = nf.record(w);
         sv.nightfalls = nf.line();
+        if fresh_week {
+            // the burn trains the bearer, and some weeks it pays kit
+            let card = crate::nightfall::card(w);
+            out.chi = Some(bank_chi(&mut sv, card.burn, crate::chi::PER_NIGHTFALL));
+            out.drop = crate::gear::nightfall_drop(card.burn).map(|d| place_drop(&mut sv, d));
+            out.fresh = true;
+        }
     }
     crate::save::store(&sv, &binds, &cfg);
-    fresh
+    out
 }
 
 /// Record a recovered warden shard on the save. The raid twin of
 /// `record_outcome` and under the same discipline: its own
-/// load-modify-store, one path for both the flown raid and any future
-/// resolved one. Returns whether the shard was fresh.
-pub fn record_raid_outcome(boss_id: &str) -> bool {
+/// load-modify-store, one path for both the flown raid and the sim.
+/// A fresh shard drops the warden's arm into the bag (vault, field);
+/// `suited` -- a human-suited team walked the arena -- banks the chi the
+/// arena trains as well. Returns what was banked.
+pub fn record_raid_outcome(boss_id: &str, suited: bool) -> Banked {
     let (mut sv, binds, cfg) = crate::save::load();
     let mut raids = crate::raidlog::RaidLog::from_line(&sv.wardens);
     let fresh = raids.record(boss_id);
     sv.wardens = raids.line();
+    let mut out = Banked { fresh, ..Banked::default() };
+    if fresh {
+        if let Some(boss) = crate::raidcon::boss(boss_id) {
+            out.drop = Some(place_drop(&mut sv, crate::gear::warden_drop(boss)));
+            if suited {
+                out.chi = Some(bank_chi(&mut sv, crate::chi::arena_element(boss.arena), crate::chi::PER_SUITED_RAID));
+            }
+        }
+    }
     crate::save::store(&sv, &binds, &cfg);
-    fresh
+    out
 }
 
 /// Accumulated hull wear, read for the next voyage's briefing.
@@ -1334,14 +1419,16 @@ pub fn run_order(order: &Order) -> (String, bool) {
             false,
         );
     }
-    let fresh = record_outcome(m.id, card.as_ref().map(|c| c.week));
+    let banked = record_outcome(m.id, card.as_ref().map(|c| c.week));
     let what = if card.is_some() { "nightfall" } else { "sortie" };
+    let rewards = banked.lines().join(" · ");
     (
         format!(
-            "{} — {} {what} CLEARED{}",
+            "{} — {} {what} CLEARED{}{}{rewards}",
             m.id,
             arrival.line,
-            if fresh { "" } else { "; already on the board" }
+            if banked.fresh { "" } else { "; already on the board" },
+            if rewards.is_empty() { "" } else { " · " },
         ),
         true,
     )
@@ -1352,6 +1439,54 @@ mod tests {
     use super::*;
     use crate::menu::{Host, Input};
     use crate::weapons::{Element, Verb};
+
+    /// The flown raid and the flown nightfall reward through the same path the sims do: a
+    /// fresh shard drops the warden's arm into the bag (and banks the arena's chi for a suited
+    /// team); a fresh nightfall banks the burn's chi and its kit; a repeat banks nothing.
+    #[test]
+    fn a_fresh_clear_banks_its_drop_and_chi_on_the_save_and_a_repeat_banks_nothing() {
+        let dir = crate::save::sandbox_this_thread();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let boss = &crate::raidcon::BOSSES[0];
+        let first = record_raid_outcome(boss.id, true);
+        assert!(first.fresh);
+        let drop = first.drop.as_deref().expect("a fresh shard drops the warden's arm");
+        assert!(drop.contains("-> bag"), "{drop}");
+        let e = crate::chi::arena_element(boss.arena);
+        assert_eq!(first.chi.map(|c| (c.0, c.1)), Some((e, crate::chi::PER_SUITED_RAID)));
+        assert_eq!(first.lines().len(), 2, "{:?}", first.lines());
+        // on disk: the arm is in the bag, the chi on the log, the shard on the board
+        let (sv, _, _) = crate::save::load();
+        let gear = crate::gear::Gear::from_save(&sv.armed, &sv.worn, &sv.bag);
+        assert!(gear.bag.iter().any(|it| it.label() == crate::gear::warden_drop(boss).label()), "bag: {:?}", sv.bag);
+        assert_eq!(crate::chi::Chi::from_line(&sv.chi).points(e), crate::chi::PER_SUITED_RAID);
+        assert!(crate::raidlog::RaidLog::from_line(&sv.wardens).is_cleared(boss.id));
+        // the repeat
+        let again = record_raid_outcome(boss.id, true);
+        assert_eq!(again, Banked { fresh: false, drop: None, chi: None });
+        assert!(again.lines().is_empty());
+        // a machine-bodied team (the flown raid) gets the arm and no chi
+        let boss2 = &crate::raidcon::BOSSES[1];
+        let machine = record_raid_outcome(boss2.id, false);
+        assert!(machine.fresh && machine.drop.is_some() && machine.chi.is_none());
+
+        // the nightfall: the week's burn trains the bearer, and the week is on the board
+        let week = 3;
+        let card = crate::nightfall::card(week);
+        let nf = record_outcome(card.mission.id, Some(week));
+        assert!(nf.fresh);
+        assert_eq!(nf.chi.map(|c| (c.0, c.1)), Some((card.burn, crate::chi::PER_NIGHTFALL)));
+        assert_eq!(nf.drop.is_some(), crate::gear::nightfall_drop(card.burn).is_some());
+        let (sv, _, _) = crate::save::load();
+        assert!(crate::nightfall::NightfallLog::from_line(&sv.nightfalls).cleared(week));
+        let repeat = record_outcome(card.mission.id, Some(week));
+        assert!(!repeat.fresh && repeat.chi.is_none() && repeat.drop.is_none(), "{repeat:?}");
+        // a plain mission's reward is the board
+        let plain = record_outcome(crate::content::MISSIONS[1].id, None);
+        assert!(plain.fresh && plain.lines().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_chartroom_is_bare_until_something_is_carried_home() {

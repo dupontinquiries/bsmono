@@ -497,11 +497,14 @@ impl RaidFlow {
         if !self.scored {
             return format!("the echo is laid to rest — banks nothing{tail}");
         }
-        let fresh = stations::record_raid_outcome(self.boss.id);
+        // the flown team is machine-bodied (`Body::Machine` above): no suited chi
+        let banked = stations::record_raid_outcome(self.boss.id, false);
+        let rewards = banked.lines().join(" · ");
+        let tail = if rewards.is_empty() { tail } else { format!(" · {rewards}{tail}") };
         format!(
             "{} — SHARD RECOVERED{}{tail}",
             self.boss.name,
-            if fresh { "" } else { "; already banked" }
+            if banked.fresh { "" } else { "; already banked" }
         )
     }
 

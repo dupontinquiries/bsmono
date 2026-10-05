@@ -87,7 +87,7 @@ pub fn run(argv: &[String]) {
             }
         }
         Some("nightfall") => {
-            let (log, raids, mut nf) = load_logs();
+            let (log, raids, nf) = load_logs();
             let week = argv
                 .iter()
                 .position(|a| a == "--week")
@@ -110,32 +110,13 @@ pub fn run(argv: &[String]) {
             let won = play(card.mission.id, &squad_refs, doctrine, false, at, Some(&card));
             if won {
                 if commit {
-                    nf.record(week);
-                    let (mut sv, b, cfg) = save::load();
-                    sv.nightfalls = nf.line();
-                    // the burn trains the bearer, and some weeks it pays kit
-                    let mut chi_log = crate::chi::Chi::from_line(&sv.chi);
-                    chi_log.bank(card.burn, crate::chi::PER_NIGHTFALL);
-                    sv.chi = chi_log.line();
-                    println!(
-                        "   chi: {} +{} (L{})",
-                        card.burn.name(),
-                        crate::chi::PER_NIGHTFALL,
-                        chi_log.level(card.burn)
-                    );
-                    if let Some(drop) = crate::gear::nightfall_drop(card.burn) {
-                        let mut gear = crate::gear::Gear::from_save(&sv.armed, &sv.worn, &sv.bag);
-                        let label = drop.label();
-                        match gear.take(drop) {
-                            Ok(()) => println!("   drop: {label} -> bag"),
-                            Err(e) => println!("   drop: {label} refused ({e})"),
-                        }
-                        let (armed, worn, bag_line) = gear.save_lines();
-                        sv.armed = armed;
-                        sv.worn = worn;
-                        sv.bag = bag_line;
+                    // the mission, the week, the burn's chi and its kit -- on the one
+                    // path the flown nightfall takes (`stations::record_outcome`)
+                    let banked = crate::stations::record_outcome(card.mission.id, Some(week));
+                    for line in banked.lines() {
+                        println!("   {line}");
                     }
-                    save::store(&sv, &b, &cfg);
+                    let (_, _, nf) = load_logs();
                     let lit = valence::valence(&log, &raids, nf.count());
                     println!("   week {week} banked -- valence {lit} (+{})", valence::PER_NIGHTFALL);
                 } else {

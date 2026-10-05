@@ -111,55 +111,22 @@ fn load_log() -> RaidLog {
     RaidLog::from_line(&sv.wardens)
 }
 
-/// Bank a set of clears into the save — the shard, the DROP, and (for
-/// a suited team) the chi the arena trained. One load, one store. Every
-/// NEW clear drops its warden's arm into the bag, overflowing to the
-/// ship's vault; a full vault leaves it on the field and says so.
+/// Bank a set of clears into the save -- the shard, the DROP, and (for
+/// a suited team) the chi the arena trained -- through
+/// `stations::record_raid_outcome`, the same path the flown raid takes,
+/// so the sim and the game cannot reward differently. A repeat clear
+/// banks nothing and drops nothing.
 fn bank(ids: &[&str], suited: bool) -> RaidLog {
-    use crate::chi::{self, Chi};
-    use crate::gear::{warden_drop, Gear};
-    use crate::vault::Vault;
-    let (mut sv, b, cfg) = save::load();
-    let mut log = RaidLog::from_line(&sv.wardens);
-    let mut gear = Gear::from_save(&sv.armed, &sv.worn, &sv.bag);
-    let mut vault = Vault::from_line(&sv.vault);
-    let mut chi_log = Chi::from_line(&sv.chi);
     for id in ids {
-        if !log.record(id) {
-            continue; // a repeat clear banks nothing and drops nothing
+        let banked = crate::stations::record_raid_outcome(id, suited);
+        if !banked.fresh {
+            continue;
         }
-        let boss = crate::raidcon::boss(id).unwrap();
-        let drop = warden_drop(boss);
-        let label = drop.label();
-        let placed = match gear.take(drop.clone()) {
-            Ok(()) => format!("   drop: {label} -> bag"),
-            Err(_) => match vault.deposit(&mut { let mut g = Gear::default(); g.bag.push(drop); g }, 0) {
-                Ok(_) => format!("   drop: {label} -> the ship's vault (bag full)"),
-                Err(_) => format!("   drop: {label} left on the field (bag and vault full)"),
-            },
-        };
-        println!("{placed}");
-        if suited {
-            let e = chi::arena_element(boss.arena);
-            let before = chi_log.level(e);
-            chi_log.bank(e, chi::PER_SUITED_RAID);
-            let after = chi_log.level(e);
-            if after > before {
-                println!("   chi: {} +{} -- LEVEL {} (the suit walked {}; the body learned)", e.name(), chi::PER_SUITED_RAID, after, boss.arena);
-            } else {
-                println!("   chi: {} +{} ({})", e.name(), chi::PER_SUITED_RAID, chi_log.points(e));
-            }
+        for line in banked.lines() {
+            println!("   {line}");
         }
     }
-    sv.wardens = log.line();
-    let (armed, worn, bag_line) = gear.save_lines();
-    sv.armed = armed;
-    sv.worn = worn;
-    sv.bag = bag_line;
-    sv.vault = vault.line();
-    sv.chi = chi_log.line();
-    save::store(&sv, &b, &cfg);
-    log
+    load_log()
 }
 
 /// After a single victory: bank it (or say how to), and narrate what the
