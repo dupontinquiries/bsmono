@@ -9412,15 +9412,21 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         #[cfg(feature = "audio")]
         if lifetime_frame % 15 == 0 {
             if let Some(m) = fg_music_player.as_ref() {
-                // r179: crafting/creative menus are IN-WORLD — the title
-                // theme doesn't belong there. Title bus: menus only.
-                let title_bus = if renderer.menu_open || renderer.wizard_open { 1.0 } else { 0.0 };
+                use unendlich_engine::sim::music_director::{stem_mix, MusicTrack};
+                // r179: crafting/creative menus are IN-WORLD — the title theme doesn't
+                // belong there. c21: the director decides what plays, and the stems follow
+                // its track -- every stem on the title, the pad alone as the quiet bed
+                // under play (`AmbientBed`); a title bus of 0.0 used to silence the world.
+                let on_title = matches!(fg_music.track, MusicTrack::TitleTheme);
+                m.set_stem_mix(&stem_mix(fg_music.track));
+                // r187: the cinematic fade-in belongs to the title's first reveal; a game
+                // entered without the menu showing must not inherit its 0
+                let reveal = if on_title { fg_music_fadein } else { 1.0 };
                 m.set_master_volume(
                     renderer.ui_music_vol
                         * fg_music.volume01.max(0.05)
                         * (1.0 - renderer.loading_fade * 0.8)
-                        * title_bus
-                        * fg_music_fadein, // r187: cinematic fade-in
+                        * reveal,
                 );
             }
         }

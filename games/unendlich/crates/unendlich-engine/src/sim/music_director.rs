@@ -5,11 +5,26 @@
 
 use crate::sim::game_flow::AppState;
 
-/// Logical tracks (extend as more music lands). `None` = silence/gameplay ambience.
+/// Logical tracks (extend as more music lands). `None` = silence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MusicTrack {
     None,
-    TitleTheme, // assets/music/title_koyopper.opus
+    TitleTheme, // assets/music/title_koyopper.opus, or its three stems as spatial emitters
+    /// Under play: the title's "music" stem alone -- the pad without its bass and drums --
+    /// quiet. Until c21 `cue_for(InGame)` was `None`: the game had a title theme and then
+    /// nothing for as long as you played. The stems exist; this is the mix that reads as a
+    /// bed rather than the menu following you into the world.
+    AmbientBed,
+}
+
+/// Per-stem scale for a track, by the stems' names in `spatial_audio::menu_stem_layout`,
+/// applied on top of the positional mix. The title plays every stem; the bed is the pad only.
+pub fn stem_mix(track: MusicTrack) -> [(&'static str, f32); 3] {
+    match track {
+        MusicTrack::TitleTheme => [("music", 1.0), ("bass", 1.0), ("drums", 1.0)],
+        MusicTrack::AmbientBed => [("music", 1.0), ("bass", 0.0), ("drums", 0.0)],
+        MusicTrack::None => [("music", 0.0), ("bass", 0.0), ("drums", 0.0)],
+    }
 }
 
 /// What the director wants playing right now.
@@ -20,14 +35,14 @@ pub struct MusicCue {
     pub fade_ms: u32,
 }
 
-/// The cue for a given app state: full title theme in the menu, ducked while
-/// loading/paused, faded out into gameplay.
+/// The cue for a given app state: full title theme in the menu, ducked while loading, the
+/// quiet bed under play (ducked further on the pause menu), silence on the way out.
 pub fn cue_for(state: AppState) -> MusicCue {
     match state {
         AppState::MainMenu => MusicCue { track: MusicTrack::TitleTheme, target_volume01: 1.0, fade_ms: 800 },
         AppState::Loading => MusicCue { track: MusicTrack::TitleTheme, target_volume01: 0.5, fade_ms: 600 },
-        AppState::Paused => MusicCue { track: MusicTrack::TitleTheme, target_volume01: 0.35, fade_ms: 400 },
-        AppState::InGame => MusicCue { track: MusicTrack::None, target_volume01: 0.0, fade_ms: 1500 },
+        AppState::Paused => MusicCue { track: MusicTrack::AmbientBed, target_volume01: 0.12, fade_ms: 400 },
+        AppState::InGame => MusicCue { track: MusicTrack::AmbientBed, target_volume01: 0.25, fade_ms: 2500 },
         AppState::Exiting => MusicCue { track: MusicTrack::None, target_volume01: 0.0, fade_ms: 300 },
     }
 }
@@ -80,6 +95,7 @@ impl MusicState {
     pub fn asset(&self) -> Option<&'static str> {
         match self.track {
             MusicTrack::TitleTheme => Some("assets/music/title_koyopper.opus"),
+            MusicTrack::AmbientBed => Some("assets/music/stems/koYopper (music).opus"),
             MusicTrack::None => None,
         }
     }
@@ -110,19 +126,45 @@ mod tests {
     }
 
     #[test]
-    fn ducks_while_loading_then_fades_out_in_game() {
+    fn ducks_while_loading_then_crosses_to_the_quiet_bed_in_game() {
         let mut m = MusicState { track: MusicTrack::TitleTheme, volume01: 1.0 };
         // loading ducks toward 0.5
         for _ in 0..20 {
             m.step(&cue_for(AppState::Loading), 200);
         }
         assert!((m.volume01 - 0.5).abs() < 0.06, "ducked near 0.5, got {}", m.volume01);
-        // entering gameplay fades the theme out and switches to None
-        for _ in 0..40 {
+        // entering gameplay fades the theme out, then the bed in -- never silence for long
+        let mut silent_steps = 0;
+        for _ in 0..60 {
             m.step(&cue_for(AppState::InGame), 200);
+            if m.volume01 == 0.0 {
+                silent_steps += 1;
+            }
         }
-        assert_eq!(m.track, MusicTrack::None);
-        assert_eq!(m.volume01, 0.0);
+        assert_eq!(m.track, MusicTrack::AmbientBed);
+        assert!((m.volume01 - 0.25).abs() < 1e-3, "the bed settles at a quarter: {}", m.volume01);
+        assert!(silent_steps <= 2, "the swap is one silent step, not a gap: {silent_steps}");
+        // the pause menu ducks the bed and the game brings it back; neither leaves it
+        for _ in 0..30 {
+            m.step(&cue_for(AppState::Paused), 200);
+        }
+        assert_eq!(m.track, MusicTrack::AmbientBed);
+        assert!((m.volume01 - 0.12).abs() < 1e-3, "{}", m.volume01);
+    }
+
+    #[test]
+    fn the_bed_is_the_pad_alone_and_the_title_is_every_stem() {
+        let bed = stem_mix(MusicTrack::AmbientBed);
+        assert_eq!(bed.iter().find(|(n, _)| *n == "music").unwrap().1, 1.0);
+        assert!(bed.iter().filter(|(n, _)| *n != "music").all(|(_, g)| *g == 0.0), "{bed:?}");
+        assert!(stem_mix(MusicTrack::TitleTheme).iter().all(|(_, g)| *g == 1.0));
+        assert!(stem_mix(MusicTrack::None).iter().all(|(_, g)| *g == 0.0));
+        // the names are the layout's, so a renamed stem cannot silently drop out of the mix
+        let layout = crate::sim::spatial_audio::menu_stem_layout();
+        for (n, _) in bed {
+            assert!(layout.iter().any(|s| s.name == n), "{n} is not a stem in menu_stem_layout");
+        }
+        assert_eq!(MusicState { track: MusicTrack::AmbientBed, volume01: 0.2 }.asset(), Some("assets/music/stems/koYopper (music).opus"));
     }
 
     #[test]

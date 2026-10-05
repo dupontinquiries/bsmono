@@ -283,6 +283,9 @@ pub struct SpatialMusic {
     stems: Vec<StemSource>,
     /// r185: per-stem gain atomics shared with the StemGroup source.
     stem_gains: Option<Arc<Vec<std::sync::atomic::AtomicU32>>>,
+    /// c21: per-stem scale from the director (`music_director::stem_mix`), parallel to
+    /// `stems`, multiplied into the positional mix in `update`. 1.0 each until set.
+    stem_mix: Vec<std::sync::atomic::AtomicU32>,
     falloff: f32,
     spatial: bool,
     /// r181: master volume factor (f32 bits) — applied INSIDE update()
@@ -330,11 +333,13 @@ impl SpatialMusic {
         let sink = rodio::Sink::try_new(&handle).ok()?;
         sink.append(StemGroup::new(loops, gains.clone(), channels, rate));
         sink.set_volume(1.0);
+        let stem_mix = (0..stems.len()).map(|_| std::sync::atomic::AtomicU32::new(1.0f32.to_bits())).collect();
         Some(Self {
             _stream: stream,
             sinks: vec![sink],
             stems,
             stem_gains: Some(gains),
+            stem_mix,
             falloff: 6.0,
             spatial: true,
             master_bits: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()),
@@ -348,7 +353,7 @@ impl SpatialMusic {
         let sink = rodio::Sink::try_new(&handle).ok()?;
         sink.append(PcmLoop::new(pcm.samples.clone(), pcm.channels, pcm.rate));
         sink.set_volume(0.8);
-        Some(Self { _stream: stream, sinks: vec![sink], stems: vec![menu_stem_layout()[0]], stem_gains: Option::None, falloff: 6.0, spatial: false, master_bits: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()) })
+        Some(Self { _stream: stream, sinks: vec![sink], stems: vec![menu_stem_layout()[0]], stem_gains: Option::None, stem_mix: vec![std::sync::atomic::AtomicU32::new(1.0f32.to_bits())], falloff: 6.0, spatial: false, master_bits: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()) })
     }
 
     /// Per-frame: crossfade stems by listener position (no-op for single track).
@@ -370,12 +375,26 @@ impl SpatialMusic {
         f32::from_bits(self.master_bits.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// Scale each named stem (the director's `stem_mix`); a name not in the layout is
+    /// ignored, a stem not named keeps its scale. Applied by the next `update`. A single
+    /// mixed track has no stems to scale and plays as it is.
+    pub fn set_stem_mix(&self, mix: &[(&str, f32)]) {
+        for (i, s) in self.stems.iter().enumerate() {
+            if let Some((_, g)) = mix.iter().find(|(n, _)| *n == s.name) {
+                self.stem_mix[i].store(g.clamp(0.0, 1.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     pub fn update(&self, listener: [f32; 3]) {
         if !self.spatial {
             return;
         }
         let m = self.master();
-        let gains = mix_gains(listener, &self.stems, self.falloff);
+        let mut gains = mix_gains(listener, &self.stems, self.falloff);
+        for (g, scale) in gains.iter_mut().zip(self.stem_mix.iter()) {
+            *g *= f32::from_bits(scale.load(std::sync::atomic::Ordering::Relaxed));
+        }
         if let Some(ga) = &self.stem_gains {
             // r185: lockstep group — write per-stem gain atomics; the
             // single sink's volume stays at master separately below.
