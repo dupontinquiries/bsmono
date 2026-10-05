@@ -70,6 +70,8 @@ struct RoadWarriorApp {
     listener: cues::Listener,
     /// `M` toggles it; the master goes to zero, the synth keeps running.
     muted: bool,
+    /// What the window was last told about fullscreen (`None` before the first frame).
+    fullscreen_applied: Option<bool>,
 }
 
 /// Matches the index order the shader assumes (0=Behemoth, 1=SixWheeler,
@@ -163,6 +165,7 @@ impl RoadWarriorApp {
             audio,
             listener,
             muted: save.muted,
+            fullscreen_applied: None,
             vehicle,
             light: BakedLighting::bake(&track, Sun::default(), LIGHT_SAMPLES),
             track,
@@ -365,8 +368,10 @@ impl eframe::App for RoadWarriorApp {
         let unlocked: Vec<CarKind> = self.save.unlocked_cars().to_vec();
         let mut flow_keys: Vec<flow::Key> = Vec::new();
         let mut mute_pressed = false;
+        let mut fullscreen_pressed = false;
         ctx.input(|i| {
             mute_pressed = i.key_pressed(egui::Key::M);
+            fullscreen_pressed = i.key_pressed(egui::Key::F11);
             if i.key_pressed(egui::Key::Escape) {
                 flow_keys.push(flow::Key::Back);
             }
@@ -384,6 +389,15 @@ impl eframe::App for RoadWarriorApp {
         });
         if mute_pressed {
             self.toggle_mute();
+        }
+        if fullscreen_pressed {
+            self.save.fullscreen = !self.save.fullscreen;
+            save::save(&self.save);
+        }
+        // the window follows the saved choice: sent when it changes, and once at the start
+        if self.fullscreen_applied != Some(self.save.fullscreen) {
+            self.fullscreen_applied = Some(self.save.fullscreen);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.save.fullscreen));
         }
         for k in flow_keys {
             match self.flow.on_key(k, &unlocked) {

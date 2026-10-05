@@ -22,6 +22,9 @@ pub struct SaveState {
     /// existed still loads (unmuted).
     #[serde(default)]
     pub muted: bool,
+    /// F11's state: borderless fullscreen, remembered like the mute.
+    #[serde(default)]
+    pub fullscreen: bool,
 }
 
 impl SaveState {
@@ -34,6 +37,7 @@ impl SaveState {
             campaign_level_index: 0,
             best_times: BTreeMap::new(),
             muted: false,
+            fullscreen: false,
         }
     }
 
@@ -218,12 +222,13 @@ mod tests {
     fn mute_survives_the_save_and_an_old_save_loads_unmuted() {
         let mut save = SaveState::new();
         save.muted = true;
+        save.fullscreen = true;
         let loaded = SaveState::from_json(&save.to_json_pretty().unwrap()).unwrap();
-        assert!(loaded.muted);
+        assert!(loaded.muted && loaded.fullscreen);
         // a save written before the field existed
         let old = r#"{"unlocked_cars": ["RedSedan"], "campaign_level_index": 1, "best_times": {}}"#;
         let loaded = SaveState::from_json(old).expect("a pre-mute save still parses");
-        assert!(!loaded.muted);
+        assert!(!loaded.muted && !loaded.fullscreen);
         assert_eq!(loaded.campaign_level_index, 1);
     }
 

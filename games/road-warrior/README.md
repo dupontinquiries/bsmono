@@ -63,6 +63,7 @@ input, `iio-sensor-proxy` needs to be running on the target device.
 | `Enter` | Start (title), resume (pause), continue (campaign complete) |
 | `Esc` | Pause; on the pause screen, resume |
 | `M` | Sound on/off (remembered in the save) |
+| `F11` | Fullscreen (remembered in the save) |
 | Gyro tilt (on-device) | Flip control while airborne, in addition to keyboard |
 
 Left/Right does double duty because a vehicle can't be both grounded and
