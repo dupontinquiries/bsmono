@@ -132,9 +132,76 @@ pub fn deal(limit: GodLimit, fill: Fill, player: u32, size: usize, n: usize, rng
     (blue, red)
 }
 
+/// Deal around seated humans (a LAN match): `seated` is `(on_blue, seat on that side, pick)`
+/// in player order. Each human's pick is placed first -- a pick the limit refuses against the
+/// humans already seated (a second Claypaw under "one per match") is dealt instead, as the
+/// bots' seats are -- and every other seat is filled as [`deal`] fills it. Under
+/// [`Fill::Mirror`] the empty seats are the first human's line. Both sides come back
+/// `size` long.
+pub fn deal_seated(limit: GodLimit, fill: Fill, seated: &[(bool, usize, u32)], size: usize, n: usize, rng: &mut Rng) -> (Vec<u32>, Vec<u32>) {
+    let mut blue: Vec<Option<u32>> = vec![None; size];
+    let mut red: Vec<Option<u32>> = vec![None; size];
+    let placed = |v: &[Option<u32>]| -> Vec<u32> { v.iter().flatten().copied().collect() };
+    for &(on_blue, seat, pick) in seated {
+        let taken = if on_blue { blue.get(seat).map_or(true, |s| s.is_some()) } else { red.get(seat).map_or(true, |s| s.is_some()) };
+        if taken || pick as usize >= n {
+            continue;
+        }
+        let ok = allowed(limit, n, &placed(&blue), &placed(&red), on_blue, pick);
+        if ok {
+            let side = if on_blue { &mut blue } else { &mut red };
+            side[seat] = Some(pick);
+        }
+    }
+    let first = seated.first().map(|s| s.2).unwrap_or(0);
+    for on_blue in [true, false] {
+        for seat in 0..size {
+            let side = if on_blue { &blue } else { &red };
+            if side[seat].is_some() {
+                continue;
+            }
+            let pick = if limit == GodLimit::Open && fill == Fill::Mirror {
+                first
+            } else {
+                let ok: Vec<u32> = (0..n as u32).filter(|&g| allowed(limit, n, &placed(&blue), &placed(&red), on_blue, g)).collect();
+                if ok.is_empty() { (rng.next_u() % n as u64) as u32 } else { ok[(rng.next_u() % ok.len() as u64) as usize] }
+            };
+            let side = if on_blue { &mut blue } else { &mut red };
+            side[seat] = Some(pick);
+        }
+    }
+    (blue.into_iter().flatten().collect(), red.into_iter().flatten().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Humans keep their picks where the limit allows, lose them to the deal where it does
+    /// not, and the rest of the seats are filled legally; Open+Mirror fills with the host's.
+    #[test]
+    fn humans_are_seated_first_and_the_limit_still_holds() {
+        let mut rng = Rng::new(5);
+        let seated = [(true, 0, 3u32), (false, 0, 3), (true, 1, 7), (false, 1, 7)];
+        let (b, r) = deal_seated(GodLimit::Lobby, Fill::Random, &seated, 5, 20, &mut rng);
+        assert_eq!((b.len(), r.len()), (5, 5));
+        assert_eq!(b[0], 3, "the host's pick");
+        assert_ne!(r[0], 3, "one per match: the second human's duplicate was dealt instead");
+        assert_eq!(b[1], 7);
+        assert_ne!(r[1], 7);
+        let mut all = b.clone();
+        all.extend(&r);
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 10, "ten different lines under Lobby");
+        let (b, r) = deal_seated(GodLimit::Team, Fill::Random, &seated, 5, 20, &mut rng);
+        assert_eq!((b[0], r[0], b[1], r[1]), (3, 3, 7, 7), "one per team: the mirror picks stand");
+        let (b, r) = deal_seated(GodLimit::Open, Fill::Mirror, &[(true, 0, 9)], 3, 20, &mut rng);
+        assert_eq!((b, r), (vec![9, 9, 9], vec![9, 9, 9]));
+        // a seat off the side and a pick off the roster are skipped, not panicked on
+        let (b, _) = deal_seated(GodLimit::Open, Fill::Random, &[(true, 9, 1), (true, 0, 99)], 2, 20, &mut rng);
+        assert_eq!(b.len(), 2);
+    }
 
     fn count(v: &[u32], g: u32) -> usize {
         v.iter().filter(|&&x| x == g).count()

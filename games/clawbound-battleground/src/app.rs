@@ -161,11 +161,15 @@ pub fn run(opts: crate::launch::LaunchOptions) {
                                     let name = opts.player_name.clone().unwrap_or_else(|| "Cat".into());
                                     let mp = netcode::multiplayer::Multiplayer::new(crate::lanlobby::GAME, &id, &name);
                                     let hosting = matches!(role, crate::launch::HandoffRole::Host);
-                                    s.lan = Some(crate::lanlobby::LanLobby::open_for_handoff(hosting, opts.peer_id.as_deref(), mp, netcode::lan::LAN_PORT));
+                                    let mut l = crate::lanlobby::LanLobby::open_for_handoff(hosting, opts.peer_id.as_deref(), mp, netcode::lan::LAN_PORT);
+                                    l.my_pick = s.ui.selected as u32;
+                                    s.lan = Some(l);
                                     s.screen = Screen::Lan; // before the quick match, which only starts from Menu
                                 } else if opts.lan {
                                     let me = opts.player_name.clone().or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "Cat".into());
-                                    s.lan = Some(crate::lanlobby::LanLobby::open(&me));
+                                    let mut l = crate::lanlobby::LanLobby::open(&me);
+                                    l.my_pick = s.ui.selected as u32;
+                                    s.lan = Some(l);
                                     s.screen = Screen::Lan;
                                 }
                                 if let Some(n) = &opts.player_name {
@@ -901,16 +905,27 @@ fn start_game_with(s: &mut AppState, lan: Option<(crate::lanmatch::MatchPlan, st
         None => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(42),
     };
     let mut rng = crate::sim::Rng::new(0xBEEF ^ seed);
-    // The match rules (`rules`, the god limit among them) -- a normal
-    // match's in a LAN match: the plan does not carry a custom setup.
-    let rules = if lan.is_some() || s.lan.is_some() { crate::rules::MatchRules::default() } else { s.ui.rules };
-    // In a LAN match everyone's ancestor is drawn from the seed (there is no shared select
-    // screen); solo, the one the player picked.
-    let selected = match &lan {
-        Some((plan, _)) => (plan.seed % crate::gods::ROSTER_LEN as u64) as u32,
-        None => s.ui.selected as u32,
+    // The match rules (`rules`, the god limit among them): the host's, out of the plan, in a
+    // LAN match (every machine parses the same text); the select screen's solo.
+    let rules = match &lan {
+        Some((plan, _)) => crate::rules::MatchRules::parse(&plan.rules).unwrap_or_else(|e| {
+            eprintln!("lan: the host's rules did not parse ({e}); a normal match");
+            crate::rules::MatchRules::default()
+        }),
+        None if s.lan.is_some() => crate::rules::MatchRules::default(),
+        None => s.ui.rules,
     };
-    let (blue, red) = crate::map::team_picks_under(rules.gods, rules.fill(), selected, &mut rng);
+    // Who plays whom: in a LAN match every human sits where the plan puts it with the
+    // ancestor it chose in the den (`picks::deal_seated`; a pick the rules refuse is dealt
+    // instead), the bots around them; solo, the deal around the player's pick.
+    let (blue, red) = match &lan {
+        Some((plan, _)) => {
+            let seats = plan.seats(crate::map::active().team_size());
+            crate::picks::deal_seated(rules.gods, rules.fill(), &seats, crate::map::active().team_size(), crate::gods::ROSTER_LEN, &mut rng)
+        }
+        None => crate::map::team_picks_under(rules.gods, rules.fill(), s.ui.selected as u32, &mut rng),
+    };
+    let selected = blue[0];
     let mut game = if crate::map::active() != crate::map::MapId::Jungle {
         Game::new_teams(&blue, &red)
     } else {
@@ -1648,7 +1663,9 @@ fn render(s: &mut AppState) {
 
     // transitions
     if open_lan {
-        s.lan = Some(crate::lanlobby::LanLobby::open(&std::env::var("USER").unwrap_or_else(|_| "Cat".into())));
+        let mut l = crate::lanlobby::LanLobby::open(&std::env::var("USER").unwrap_or_else(|_| "Cat".into()));
+        l.my_pick = s.ui.selected as u32; // the select screen's choice is the den's starting pick
+        s.lan = Some(l);
         s.screen = Screen::Lan;
     }
     match lan_action {
@@ -1666,8 +1683,10 @@ fn render(s: &mut AppState) {
         crate::lanlobby::Action::Start => {
             let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(42);
             let map = crate::map::MapId::ALL.iter().position(|m| *m == s.launch.map).unwrap_or(0) as u8;
+            // the host's custom rules (the Custom screen's, if it was visited) go in the plan
+            let rules = if s.ui.custom { s.ui.rules.encode() } else { s.launch.rules.encode() };
             if let Some(l) = s.lan.as_mut() {
-                l.start(seed, map);
+                l.start(seed, map, &rules);
             }
         }
         crate::lanlobby::Action::None => {}

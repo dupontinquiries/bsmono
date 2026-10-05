@@ -233,6 +233,26 @@ pub fn draw_lan(ctx: &egui::Context, lobby: &mut crate::lanlobby::LanLobby) -> c
                     action = Action::Back;
                 }
             });
+            // YOUR ANCESTOR: the pick the plan seats you with (a member says it in every
+            // HELLO; the host seats its own as player 0). Arrows, a thumb's width each.
+            ui.add_space(8.0);
+            ui.allocate_ui_with_layout(egui::vec2(388.0, 44.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                if ui.add_sized([44.0, 44.0], egui::Button::new(egui::RichText::new("◀").size(18.0))).clicked() {
+                    lobby.my_pick = (lobby.my_pick + crate::gods::ROSTER_LEN as u32 - 1) % crate::gods::ROSTER_LEN as u32;
+                }
+                let def = crate::gods::god(lobby.my_pick);
+                ui.add_sized([292.0, 44.0], egui::Label::new(egui::RichText::new(format!("You play {}  ·  {}", def.name, def.role.name())).size(17.0).color(Color32::WHITE)));
+                if ui.add_sized([44.0, 44.0], egui::Button::new(egui::RichText::new("▶").size(18.0))).clicked() {
+                    lobby.my_pick = (lobby.my_pick + 1) % crate::gods::ROSTER_LEN as u32;
+                }
+            });
+            // THE DEN: who is in it and what they play, as the host sees it.
+            if lobby.hosting && !lobby.roster.is_empty() {
+                ui.add_space(6.0);
+                for (name, pick) in lobby.members() {
+                    ui.label(egui::RichText::new(format!("{name}  —  {}", crate::gods::god(pick).name)).size(15.0).color(Color32::from_rgb(200, 195, 180)));
+                }
+            }
             // START: the host's, once somebody is in the den (`lanmatch`). A member waits
             // for the host's plan; the footer says so.
             if lobby.hosting {
@@ -252,7 +272,7 @@ pub fn draw_lan(ctx: &egui::Context, lobby: &mut crate::lanlobby::LanLobby) -> c
                 ui.label(egui::RichText::new(note).size(16.0).color(GOLD));
             }
             ui.label(egui::RichText::new(&lobby.status).size(15.0).color(Color32::from_rgb(190, 188, 178)));
-            ui.label(egui::RichText::new("Everyone gets a random ancestor; the host's map; two players face each other, more fill the teams in turn.").size(13.0).color(Color32::from_rgb(190, 188, 178)));
+            ui.label(egui::RichText::new("Everyone plays the ancestor they chose (a duplicate the rules refuse is dealt instead); the host's map and custom rules; two players face each other, more fill the teams in turn.").size(13.0).color(Color32::from_rgb(190, 188, 178)));
         });
     });
     action

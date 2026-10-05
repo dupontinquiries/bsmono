@@ -31,6 +31,12 @@ pub struct MatchPlan {
     /// Every player's address as the host saw it, by player index (`peers[me]` is this machine
     /// and is never sent to).
     pub peers: Vec<SocketAddr>,
+    /// The host's match rules (`MatchRules::encode`; empty for a normal match): every machine
+    /// builds the match under the same rules.
+    pub rules: String,
+    /// Each player's ancestor (`gods::ROSTER` id), by player index, as the host dealt them
+    /// (`picks::deal_seated`): a pick the rules refused became a dealt one.
+    pub picks: Vec<u32>,
 }
 
 /// Most humans a match takes: five a side.
@@ -60,7 +66,9 @@ impl MatchPlan {
     /// The line the host sends player `to` (the host writes `host` for itself).
     pub fn encode_for(&self, to: usize) -> String {
         let addrs: Vec<String> = self.peers.iter().enumerate().map(|(i, a)| if i == 0 { HOST_TOKEN.to_string() } else { a.to_string() }).collect();
-        format!("{START_PREFIX}{}\t{}\t{to}\t{}", self.seed, self.map, addrs.join(","))
+        let picks: Vec<String> = self.picks.iter().map(|p| p.to_string()).collect();
+        let rules: String = self.rules.chars().filter(|c| !c.is_control()).collect();
+        format!("{START_PREFIX}{}\t{}\t{to}\t{}\t{}\t{}", self.seed, self.map, addrs.join(","), rules, picks.join(","))
     }
 
     /// Parse a start line received from `host` (the address the member joined).
@@ -75,10 +83,26 @@ impl MatchPlan {
             .split(',')
             .map(|a| if a.trim() == HOST_TOKEN { Some(host) } else { a.trim().parse().ok() })
             .collect::<Option<Vec<_>>>()?;
-        if peers.is_empty() || peers.len() > MAX_PLAYERS || me >= peers.len() || f.next().is_some() {
+        if peers.is_empty() || peers.len() > MAX_PLAYERS || me >= peers.len() {
             return None;
         }
-        Some(MatchPlan { seed, map, me, peers })
+        let rules = f.next()?.trim().to_string();
+        let picks: Vec<u32> = f.next()?.split(',').filter(|t| !t.trim().is_empty()).map(|t| t.trim().parse().ok()).collect::<Option<Vec<_>>>()?;
+        if picks.len() != peers.len() || picks.iter().any(|&p| p as usize >= crate::gods::ROSTER_LEN) || f.next().is_some() {
+            return None;
+        }
+        Some(MatchPlan { seed, map, me, peers, rules, picks })
+    }
+
+    /// Where each player sits: `(on_blue, seat on that side, pick)` by player index, for
+    /// `picks::deal_seated`.
+    pub fn seats(&self, team_size: usize) -> Vec<(bool, usize, u32)> {
+        let slots = Self::god_slots(self.players(), team_size);
+        slots
+            .iter()
+            .zip(self.picks.iter())
+            .map(|(&slot, &pick)| if slot < team_size { (true, slot, pick) } else { (false, slot - team_size, pick) })
+            .collect()
     }
 }
 
@@ -191,15 +215,21 @@ mod tests {
         let host: SocketAddr = "192.168.1.10:41000".parse().unwrap();
         let a: SocketAddr = "192.168.1.11:5001".parse().unwrap();
         let b: SocketAddr = "192.168.1.12:5002".parse().unwrap();
-        let plan = MatchPlan { seed: 0xBEEF, map: 2, me: 0, peers: vec![host, a, b] };
+        let plan = MatchPlan { seed: 0xBEEF, map: 2, me: 0, peers: vec![host, a, b], rules: "hp=2 gods=open".into(), picks: vec![3, 7, 3] };
         let line = plan.encode_for(2);
         assert!(line.starts_with(START_PREFIX) && line.contains("host,"), "{line}");
         let got = MatchPlan::decode(&line, host).expect("decodes");
         assert_eq!(got, MatchPlan { me: 2, ..plan.clone() });
         assert_eq!(got.my_god(5), 1, "the third player is blue's second god");
-        // garbage, a bad index, a wrong prefix
-        assert_eq!(MatchPlan::decode("CBSTART\tx\t2\t0\thost", host), None);
-        assert_eq!(MatchPlan::decode("CBSTART\t1\t2\t3\thost,1.2.3.4:5", host), None);
+        assert_eq!(got.seats(5), vec![(true, 0, 3), (false, 0, 7), (true, 1, 3)], "host blue seat 0, second player red seat 0, third blue seat 1");
+        // a normal match: no rules text, and the plan still carries every pick
+        let plain = MatchPlan { rules: String::new(), ..plan.clone() };
+        assert_eq!(MatchPlan::decode(&plain.encode_for(1), host).unwrap().rules, "");
+        // garbage, a bad index, a wrong prefix, a pick off the roster, a pick count that is not the player count
+        assert_eq!(MatchPlan::decode("CBSTART\tx\t2\t0\thost\t\t1", host), None);
+        assert_eq!(MatchPlan::decode("CBSTART\t1\t2\t3\thost,1.2.3.4:5\t\t1,2", host), None);
+        assert_eq!(MatchPlan::decode("CBSTART\t1\t2\t0\thost,1.2.3.4:5\t\t1,99", host), None);
+        assert_eq!(MatchPlan::decode("CBSTART\t1\t2\t0\thost,1.2.3.4:5\t\t1", host), None);
         assert_eq!(MatchPlan::decode("CBHELLO\tbob", host), None);
     }
 
@@ -210,7 +240,7 @@ mod tests {
         let sa = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let sb = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let (aa, ab) = (sa.local_addr().unwrap(), sb.local_addr().unwrap());
-        let host_plan = MatchPlan { seed: 11, map: 0, me: 0, peers: vec![aa, ab] };
+        let host_plan = MatchPlan { seed: 11, map: 0, me: 0, peers: vec![aa, ab], rules: String::new(), picks: vec![0, 1] };
         let member_plan = MatchPlan::decode(&host_plan.encode_for(1), aa).unwrap();
         assert_eq!(member_plan.peers, vec![aa, ab]);
         let mut ma = LanMatch::new(host_plan, sa, 1);

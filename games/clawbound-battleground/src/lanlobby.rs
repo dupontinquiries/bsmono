@@ -57,8 +57,12 @@ pub struct LanLobby {
     /// `Beacon::decode` rejects -- so a den hosted from the actual game never
     /// appeared on anyone's screen, and the test passed a made-up 41000.
     game_sock: Option<UdpSocket>,
-    /// Who has joined this den: address, name, last heard.
-    pub roster: Vec<(SocketAddr, String, Instant)>,
+    /// Who has joined this den: address, name, last heard, their ancestor (`gods::ROSTER` id,
+    /// said in every HELLO, so a member changes it by changing it).
+    pub roster: Vec<(SocketAddr, String, Instant, u32)>,
+    /// This machine's ancestor for the match (the select screen's choice; the LAN screen's
+    /// arrows change it). A member says it in every HELLO; the host seats it as player 0.
+    pub my_pick: u32,
     /// The den this player has joined, and what the host last said.
     pub joined: Option<(SocketAddr, String)>,
     join_sock: Option<UdpSocket>,
@@ -93,7 +97,7 @@ impl LanLobby {
             }
         });
         let status = browser.as_ref().err().cloned().unwrap_or_else(|| "Searching the local network...".into());
-        LanLobby { my_name: my_name.into(), my_id, browser, announcer: None, hosting: false, game_sock: None, roster: Vec::new(), joined: None, join_sock: None, last_hello: None, mp: None, handoff_note: None, rows: Vec::new(), status, start: None }
+        LanLobby { my_name: my_name.into(), my_id, browser, announcer: None, hosting: false, game_sock: None, roster: Vec::new(), my_pick: 0, joined: None, join_sock: None, last_hello: None, mp: None, handoff_note: None, rows: Vec::new(), status, start: None }
     }
 
     pub fn port(&self) -> Option<u16> {
@@ -180,6 +184,27 @@ impl LanLobby {
         1 + self.roster.len().min(SLOTS as usize - 1) as u8
     }
 
+    /// `CBHELLO\t<name>\t<pick>`.
+    pub fn hello(name: &str, pick: u32) -> String {
+        format!("CBHELLO\t{name}\t{pick}")
+    }
+
+    /// The name and the pick out of a HELLO's body (after the prefix): a pick that is missing
+    /// (an older build) or off the roster is 0.
+    pub fn parse_hello(rest: &str) -> (String, u32) {
+        let mut f = rest.split('\t');
+        let name: String = f.next().unwrap_or("").chars().filter(|c| !c.is_control()).take(24).collect();
+        let pick = f.next().and_then(|p| p.trim().parse::<u32>().ok()).filter(|&p| (p as usize) < crate::gods::ROSTER_LEN).unwrap_or(0);
+        (name, pick)
+    }
+
+    /// The den's members as the screen lists them: name and ancestor id, the host first.
+    pub fn members(&self) -> Vec<(String, u32)> {
+        let mut v = vec![(self.my_name.clone(), self.my_pick)];
+        v.extend(self.roster.iter().map(|m| (m.1.clone(), m.3)));
+        v
+    }
+
     /// Ask to join a den. Keeps saying HELLO once a second, which is also
     /// the keep-alive: stop, and the host forgets you.
     pub fn join(&mut self, host: SocketAddr) {
@@ -200,13 +225,15 @@ impl LanLobby {
             let mut buf = [0u8; 256];
             for _ in 0..32 {
                 let Ok((n, from)) = sock.recv_from(&mut buf) else { break };
-                let Some(name) = std::str::from_utf8(&buf[..n]).ok().and_then(|t| t.strip_prefix("CBHELLO\t")) else { continue };
-                let name: String = name.chars().filter(|c| !c.is_control()).take(24).collect();
+                let Some(rest) = std::str::from_utf8(&buf[..n]).ok().and_then(|t| t.strip_prefix("CBHELLO\t")) else { continue };
+                // `CBHELLO\t<name>\t<pick>`; a HELLO without a pick (an older build) is pick 0
+                let (name, pick) = Self::parse_hello(rest);
                 let room = self.roster.len() + 1 < SLOTS as usize;
                 if let Some(m) = self.roster.iter_mut().find(|m| m.0 == from) {
                     m.2 = now;
+                    m.3 = pick;
                 } else if room {
-                    self.roster.push((from, name, now));
+                    self.roster.push((from, name, now, pick));
                 } else {
                     let _ = sock.send_to(b"CBFULL", from);
                     continue;
@@ -222,7 +249,7 @@ impl LanLobby {
         // Joined somewhere: HELLO once a second, and listen for the answer.
         if let (Some((host, said)), Some(sock)) = (self.joined.as_mut(), self.join_sock.as_ref()) {
             if self.last_hello.map_or(true, |t| now.duration_since(t) >= HELLO_EVERY) {
-                let _ = sock.send_to(format!("CBHELLO\t{}", self.my_name).as_bytes(), *host);
+                let _ = sock.send_to(Self::hello(&self.my_name, self.my_pick).as_bytes(), *host);
                 self.last_hello = Some(now);
             }
             let mut buf = [0u8; 512]; // a start plan with ten addresses is longer than the 64 the den's replies needed
@@ -285,15 +312,19 @@ impl LanLobby {
     /// members in the order they arrived) and sends each member its own copy, twice (UDP; the
     /// member keeps saying HELLO until it has one, so a lost plan shows as a member still "in
     /// the den"). Returns the host's own plan, also left for `take_start`.
-    pub fn start(&mut self, seed: u64, map: u8) -> Option<crate::lanmatch::MatchPlan> {
+    pub fn start(&mut self, seed: u64, map: u8, rules: &str) -> Option<crate::lanmatch::MatchPlan> {
         if !self.can_start() {
             return None;
         }
         let sock = self.game_sock.as_ref()?;
         let me_addr = sock.local_addr().ok()?;
         let mut peers = vec![me_addr];
-        peers.extend(self.roster.iter().take(crate::lanmatch::MAX_PLAYERS - 1).map(|m| m.0));
-        let plan = crate::lanmatch::MatchPlan { seed, map, me: 0, peers };
+        let mut picks = vec![self.my_pick];
+        for m in self.roster.iter().take(crate::lanmatch::MAX_PLAYERS - 1) {
+            peers.push(m.0);
+            picks.push(m.3);
+        }
+        let plan = crate::lanmatch::MatchPlan { seed, map, me: 0, peers, rules: rules.to_string(), picks };
         for (i, addr) in plan.peers.iter().enumerate().skip(1) {
             let line = plan.encode_for(i);
             for _ in 0..2 {
@@ -409,7 +440,9 @@ mod tests {
     fn the_hosts_start_hands_both_machines_the_same_plan() {
         let mut seeker = LanLobby::open_on("Ash", 0);
         let mut host = LanLobby::open_on("Bramble", 0);
-        assert!(!host.can_start() && host.start(1, 0).is_none(), "nothing to start before hosting");
+        seeker.my_pick = 7;
+        host.my_pick = 3;
+        assert!(!host.can_start() && host.start(1, 0, "").is_none(), "nothing to start before hosting");
         let to = vec![(Ipv4Addr::LOCALHOST, seeker.port().expect("seeker is listening")).into()];
         host.host_to(to);
         assert!(!host.can_start(), "an empty den has nobody to start with");
@@ -434,8 +467,23 @@ mod tests {
             std::thread::sleep(Duration::from_millis(4));
         }
         assert!(host.can_start());
-        let plan = host.start(0xC0FFEE, 2).expect("the host starts");
+        assert_eq!(host.members(), vec![("Bramble".to_string(), 3), ("Ash".to_string(), 7)], "the HELLO carried Ash's pick");
+        // the member changes its mind before the start: the next HELLO carries the new pick
+        seeker.my_pick = 9;
+        let t2 = t1 + HELLO_EVERY;
+        for _ in 0..60 {
+            seeker.tick(t2);
+            host.tick(t2);
+            if host.roster[0].3 == 9 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        assert_eq!(host.roster[0].3, 9, "a changed pick reaches the host with the next HELLO");
+        let plan = host.start(0xC0FFEE, 2, "hp=2").expect("the host starts");
         assert_eq!((plan.me, plan.players(), plan.seed, plan.map), (0, 2, 0xC0FFEE, 2));
+        assert_eq!(plan.picks, vec![3, 9], "the host's pick first, then the member's");
+        assert_eq!(plan.rules, "hp=2");
         let mut got = None;
         for _ in 0..60 {
             seeker.tick(t1);
@@ -447,6 +495,7 @@ mod tests {
         }
         let got = got.expect("the plan reached the member");
         assert_eq!((got.me, got.players(), got.seed, got.map), (1, 2, 0xC0FFEE, 2));
+        assert_eq!((got.picks.clone(), got.rules.as_str()), (vec![3, 9], "hp=2"), "the member builds the match under the host's rules and picks");
         assert_eq!(got.peers[0], addr, "the member fills the host in as the address it joined");
         assert_eq!(got.peers[1], plan.peers[1], "and sees itself as the host saw it");
         assert!(seeker.status.contains("starting"), "{}", seeker.status);
@@ -454,6 +503,15 @@ mod tests {
         assert_eq!(mine, plan);
         assert_eq!(sock.local_addr().unwrap().port(), addr.port(), "the match runs on the den's socket");
         assert!(host.take_start().is_none(), "taken once");
+    }
+
+    #[test]
+    fn a_hello_carries_the_pick_and_an_old_one_is_pick_zero() {
+        assert_eq!(LanLobby::hello("Ash", 7), "CBHELLO\tAsh\t7");
+        assert_eq!(LanLobby::parse_hello("Ash\t7"), ("Ash".to_string(), 7));
+        assert_eq!(LanLobby::parse_hello("Ash"), ("Ash".to_string(), 0), "an older build says no pick");
+        assert_eq!(LanLobby::parse_hello("Ash\t999"), ("Ash".to_string(), 0), "off the roster is no pick");
+        assert_eq!(LanLobby::parse_hello("A\u{7}sh\tx"), ("Ash".to_string(), 0));
     }
 
     #[test]
