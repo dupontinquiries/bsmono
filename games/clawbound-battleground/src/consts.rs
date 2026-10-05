@@ -553,11 +553,19 @@ pub const RESPAWN_PER_LEVEL: f32 = 2.2;
 
 /// Distance from (x, z) to the nearest lane centerline, and negative distance
 /// to each base (props should stay clear of both). Shared by world dressing.
+///
+/// The centreline is the lane's polyline PLUS the stretch each team's minions walk from the
+/// fountain to it (`Lane::path_for` prepends and appends the same two points). That stretch
+/// was not counted: 24 u at MAP_SCALE 1.42, where the scatter's 11 u keep-out happened to
+/// cover it, and 80 u at 3.75, where a grove's bramble bed sat on the Top lane's first
+/// waypoints and `the_lanes_are_open_going_and_the_jungle_is_not` found minions wading it.
 pub fn lane_clearance(x: f32, z: f32) -> f32 {
     let p = Vec3::new(x, 0.0, z);
     let mut best = f32::MAX;
     for &lane in crate::map::lanes() {
-        let pts = lane.polyline();
+        let mut pts = lane.polyline();
+        pts.insert(0, Team::Blue.base_pos() + Vec3::new(0.0, 0.0, Team::Blue.push_z() * 10.0));
+        pts.push(Team::Red.base_pos() + Vec3::new(0.0, 0.0, Team::Red.push_z() * 10.0));
         for w in pts.windows(2) {
             let (a, b) = (w[0], w[1]);
             let ab = b - a;
