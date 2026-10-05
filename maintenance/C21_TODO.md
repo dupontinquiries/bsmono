@@ -185,14 +185,48 @@ test and a §5b break test; nothing below was seen on a screen or heard.
   STARTs the match from the den (plan over the wire, members build the same match). Not seen
   across two windows. Limits in the commit: a leap's wire direction is the move direction,
   ancestors are drawn by the seed, Esc does not pause a LAN match.
+- **The overnight batch (c21, third stretch):**
+  - **unendlich** `713e860fc` an effects-volume slider, persisted (the Audio tab said the
+    setting would be audible "after the audio backend lands"; it had landed).
+  - **skydribble** `8652878d2` 1539 lines of dead second copies of nine sims (a merge kept
+    both sides; `--sim platform`'s second block was a different check that could never run);
+    `62d53b751` the 37 fast sims run under `cargo test` (`tests/sims.rs`: the PASS line, no
+    FAIL line, AND the exit status -- `sim::verdict` remembers a FAIL and `main` exits 1;
+    before, a failed sim exited 0); `c391100b6` the first run found `--sim planets` red: the
+    planet it watches spawned 2.5 m inside a KUIPER rock and jittered there for the whole run
+    (c15's note in blackstar-rs's TODO.md had stopped between "intended" and "tuning";
+    `541b0e13a` resolves it). `World::unbury_drifters` lifts a buried drifter clear.
+  - **blackstar-rs** `a4cd28e00` the mission slides are shown -- `content::Mission.intro` on
+    the brief, `outro` on a won debrief (Enter turns, Esc skips); only `campsim` ever printed
+    them. `245853b28` the wheel cycles the hotbar (`Hotbar::cycle` had no caller), consoles
+    and the holster click.
+  - **clawbound-battleground** `f2144b762` `teamplay` wired: `Game::team_call` decided per
+    tick from `ai::team_view`, bound bots take the call's goal or lane (home lane restored
+    after). The first headless ten-bot runs showed the standoff a team layer makes stable --
+    five a side at one inner tower for forty minutes -- so: a tied or DEFENDED lane is no lane
+    to push, Defend binds the lane's cats and the near ones (the team only against 3+), and
+    the grouped siege waives the tower discipline when the quorum is at the tower with two
+    more of us than of them. Measured at the authored scale: the match ends at 9:18 with the
+    layer, 17:01 without. **At MAP_SCALE 3.75 no bot match ends either way** (40 min, both):
+    the AI's radii (siege 16 u, tower range 24 u, "near" 12-16 u) are absolute, the inner
+    towers sit off the lane paths by more than a bot looks, and the lane path ends AT a
+    shielded titan that kills whoever arrives. The match test asserts progress at 3.75 and
+    the end at 1.42. Also seen and left: a bot healed at the fountain beelines to its old far
+    waypoint through the middle; bots stand at a shielded titan.
+- **Decided, not wired:** blackstar-rs `dispatch.rs` models voyages (`voyage`/`damage`/
+  `survival`/`loot`, orbits and delta-v) that nothing in the shipboard game reaches -- wiring
+  it is a game-layer design, not a bug; `suitability.rs` would tell the player "wheels have
+  6% grip on Io" while the car physics scales nothing with gravity -- an advisor the physics
+  does not back is a lie, so it waits on TODO.md's "Wire traction and mass_bias into real
+  handling". The other five battleground "done" mechanics (markers/daylight/freshkill/
+  shadowrealm/camps) are the Warriors design (`docs/WARRIORS_MECHANICS.md`), a different
+  fantasy from the 5v5 the sim plays; wiring them is a rules change, not a fix.
 - **Still open from the surveys** (ranked): unendlich settings_model unwired / `gpu_mesher_mode`
   hard-coded / World History Restore stub / edit reliability (#5) / the inline host loop vs
-  `HostPump` duplication; clawbound-battleground's six "done" mechanics unwired
-  (markers/daylight/freshkill/shadowrealm/teamplay/camps), missing music/narrator/announcer
-  assets, LAN ancestor pick + custom rules in the plan; clawbound settings persistence, no audio
-  backend; skydribble sims not in `cargo test`, join by address; road-warrior has no audio at
-  all; echelon has no transport; blackstar-rs items 6 and 8 (mission intro/outro text,
-  `dispatch.rs`/`suitability.rs` unreferenced, `Hotbar::cycle`), the `Sfx::Click` consoles.
+  `HostPump` duplication; clawbound-battleground: the AI radii vs MAP_SCALE (above), missing
+  music/narrator/announcer assets, LAN ancestor pick + custom rules in the plan; clawbound
+  settings persistence, no audio backend; skydribble join by address; road-warrior has no
+  audio at all; echelon has no transport.
 - **Not touched:** blackstar-rs's visual/playtest backlog (`TODO.md` §"Found, NOT fixed" needs
   eyes on a screen), unendlich's BACKLOG §B pure cores (octree re-merge, rebuild coalescer,
   `MoistureField::recenter`) — sandbox-verifiable but each is a feature, not a fix, and the
