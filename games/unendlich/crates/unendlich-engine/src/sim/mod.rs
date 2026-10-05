@@ -661,6 +661,7 @@ pub mod pioneer_flora;
 pub mod cave_ore; // r516: depth-weighted ore for the runtime cave-enrichment pass
 pub mod whitelist; // r518: open-server access control (allow-list + open/closed policy)
 pub mod player_save; // c21: per-world player.json -- position, view, inventory, clock
+pub mod death_hold; // c21: the moment between dying and the respawn
 pub mod ui_state; // r525: unified two-level UI state machine (AppMode + MenuState)
 pub mod plant_growth;
 pub mod perf_primitives;

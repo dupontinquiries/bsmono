@@ -2122,7 +2122,10 @@ fn main() {
     let spawn_y = (probe_y + 4) as f32;
     log::info!("Surface y at spawn ({},{}) is {} — spawning camera at y={}",
         spawn_xz.0, spawn_xz.1, probe_y, spawn_y);
-    let spawn_pos = glm::vec3(spawn_xz.0 as f32 + 0.5, spawn_y, spawn_xz.1 as f32 + 0.5);
+    // The live world's spawn: the respawn point. Mutable since c21 -- a world loaded from the
+    // menu sets it (`new_spawn` below); before that a death in any loaded world respawned at
+    // the STARTUP world's spawn, which in another seed is wherever that happens to be.
+    let mut spawn_pos = glm::vec3(spawn_xz.0 as f32 + 0.5, spawn_y, spawn_xz.1 as f32 + 0.5);
     let mut camera = FlyCamera::new(spawn_pos);
     camera.move_speed = 32.0; // a bit faster than default for exploration
     camera.far = 1024.0;
@@ -3150,6 +3153,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         [unendlich_engine::sim::plant_tree_genetics::PlantGenome::neutral(); 3];
     let fg_loot_table = unendlich_engine::items::loot::default_loot_table(); // r149
     // r142: body thermal state (sim::survival_exposure) — lags felt temp.
+    let mut fg_death = unendlich_engine::sim::death_hold::DeathHold::default();
     let mut fg_thermal = unendlich_engine::sim::survival_exposure::Thermal {
         body_c: 36.5,
         comfort: 0.0,
@@ -8553,8 +8557,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
             }
             // r125: DEATH at zero vitality (survival only) — drop everything
-            // where you fell, respawn at world spawn, refill.
-            if survival_mode && fg_app.vitality().energy <= 0.0 {
+            // where you fell; then (c21) the hold: the veil comes down with YOU DIED for
+            // `DeathHold::SECS`, and the respawn at world spawn with a refill happens when
+            // it lifts. It used to happen in the same frame -- a jump cut, no death.
+            if survival_mode && fg_app.vitality().energy <= 0.0 && fg_death.begin() {
                 let here = [
                     local_player.view.position.x,
                     local_player.view.position.y,
@@ -8571,6 +8577,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         ]);
                     }
                 }
+                log::info!(
+                    "[survival] YOU DIED at ({:.0},{:.0},{:.0}) — {} item(s) dropped there",
+                    here[0], here[1], here[2], dropped
+                );
+                renderer.loading_label = format!("YOU DIED — {dropped} item(s) lie where you fell");
+                notices.push(
+                    "death",
+                    format!("You died. {} item(s) lie where you fell", dropped),
+                );
+            }
+            if fg_death.holding() {
+                renderer.loading_fade = fg_death.veil();
+            }
+            if fg_death.tick(dt) {
                 fg_app.vitality_mut().feed(1.0);
                 // r161: a fresh body, not just a full meter — otherwise a
                 // hypothermia death respawns at 28°C and dies again.
@@ -8582,14 +8602,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 bend_resonance = unendlich_engine::sim::bending_charge::Resonance::full();
                 prev_fall_vy = 0.0;
                 local_player.view.position = spawn_pos;
-                log::info!(
-                    "[survival] YOU DIED at ({:.0},{:.0},{:.0}) — {} item(s) dropped there; respawned",
-                    here[0], here[1], here[2], dropped
-                );
-                notices.push(
-                    "death",
-                    format!("You died. {} item(s) lie where you fell", dropped),
-                );
+                renderer.loading_label = String::new();
+                log::info!("[survival] respawned at {:?}", spawn_pos);
             }
             // r130: PLAYER BENDING (B) — stance from movement, element from
             // the ENVIRONMENT (in water -> Water, near heat -> Fire, airborne
@@ -19035,6 +19049,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 let new_spawn =
                                     glm::vec3(sx as f32 + 0.5, (sy + 4) as f32, sz as f32 + 0.5);
                                 local_player.view.position = new_spawn;
+                                spawn_pos = new_spawn; // where a death in THIS world respawns
                                 // Re-arm the one-shot so the monument + flora are
                                 // (re)placed in this freshly launched world too.
                                 landmarks_placed = false;
