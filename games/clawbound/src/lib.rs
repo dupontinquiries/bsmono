@@ -46,5 +46,7 @@ pub mod sim;
 pub mod weather;
 pub mod wire;
 pub mod soundscape;
+/// What just happened in the hunt or the prowl, named, for the sound.
+pub mod cues;
 pub mod world;
 pub mod worldscript;
