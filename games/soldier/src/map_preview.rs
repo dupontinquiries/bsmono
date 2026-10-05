@@ -15,8 +15,10 @@ use crate::camera::scale_for_fov;
 
 pub struct MapPreview {
     pub key: u64,
-    level: crate::level::Level,
-    vantages: Vec<FpsCam>,
+    /// `pub(crate)`: `app.rs`'s `preview_vantages_are_elevated_and_look_down` reads them, so the
+    /// `--features app` test build had not compiled since d854f8ebc made them private.
+    pub(crate) level: crate::level::Level,
+    pub(crate) vantages: Vec<FpsCam>,
     pub light: crate::mesh::Light,
     pub fog: crate::render::Fog,
 }
