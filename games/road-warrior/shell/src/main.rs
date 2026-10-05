@@ -6,6 +6,7 @@
 //! untested: real gyro input (needs actual hardware — see gyro.rs), and
 //! whether any of it is fun.
 
+mod flow;
 mod gyro;
 mod render;
 mod save;
@@ -60,6 +61,8 @@ struct RoadWarriorApp {
     last_frame: std::time::Instant,
     level_start_time: std::time::Instant,
     toasts: Vec<Toast>,
+    /// Title / play / pause / campaign-complete (`flow`).
+    flow: flow::Flow,
 }
 
 /// Matches the index order the shader assumes (0=Behemoth, 1=SixWheeler,
@@ -93,21 +96,12 @@ impl RoadWarriorApp {
 
         let level = campaign.current_level().expect("campaign should have at least one level");
         let (track, mut boss) = level.build();
-        // Real gap found while wiring up per-car visuals: there's no
-        // car-select menu, so Behemoth and Pillager were unlockable but
-        // never actually driveable — this heuristic only ever chose between
-        // SixWheeler and RedSedan. Preferring the most-progressed unlocked
-        // car is a pragmatic partial fix, not a real menu; a proper
-        // car-select screen is separate scope I'm not building unprompted.
-        let starting_car = if save.is_unlocked(CarKind::Pillager) {
-            CarKind::Pillager
-        } else if save.is_unlocked(CarKind::Behemoth) {
-            CarKind::Behemoth
-        } else if save.is_unlocked(CarKind::SixWheeler) {
-            CarKind::SixWheeler
-        } else {
-            CarKind::RedSedan
-        };
+        // The car is chosen on the title screen (`flow`), among the save's unlocked cars.
+        // Until c21 a heuristic picked it ("Pillager if unlocked, else Behemoth, ..."), so an
+        // unlock was a toast and never a choice. The title opens with the newest unlock
+        // selected, which is what the heuristic preferred; this vehicle is replaced on Start.
+        let flow = flow::Flow::new(save.unlocked_cars());
+        let starting_car = flow.selected_car(save.unlocked_cars()).unwrap_or(CarKind::RedSedan);
 
         // Debug-only, opt-in via env var: shrinks the boss to a couple of ram
         // hits' worth of health. Grinding a real 1000-1800 HP boss down takes
@@ -161,7 +155,23 @@ impl RoadWarriorApp {
             last_frame: std::time::Instant::now(),
             level_start_time: std::time::Instant::now(),
             toasts: Vec::new(),
+            flow,
         }
+    }
+
+    /// The title's Start: drive `kind` from the saved level with full stats.
+    fn start_run(&mut self, kind: CarKind) {
+        self.vehicle = Vehicle::new(kind);
+        if cfg!(debug_assertions) && std::env::var("RW_DEBUG_LOW_HP").is_ok() {
+            self.vehicle.health = 1.0;
+        }
+        if self.campaign.is_finished() {
+            self.campaign.seek(0);
+        }
+        self.load_current_level();
+        self.level_start_time = std::time::Instant::now();
+        self.accumulator = 0.0;
+        self.toasts.clear();
     }
 
     /// Resets the current level (fresh boss, vehicle back to full stats at
@@ -308,25 +318,65 @@ impl eframe::App for RoadWarriorApp {
         // via a real gyro, making the desktop build untestable for the
         // core jump/flip loop. `keyboard_tilt` and `throttle` are naturally
         // exclusive since a vehicle can't be both grounded and airborne.
+        // The screens' keys first (`flow`): Esc pauses, Enter/Space confirm, Left/Right select
+        // a car on the title or quit from the pause screen. In play, Left/Right/Space are the
+        // car's and the flow ignores them.
+        let unlocked: Vec<CarKind> = self.save.unlocked_cars().to_vec();
+        let mut flow_keys: Vec<flow::Key> = Vec::new();
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::Escape) {
+                flow_keys.push(flow::Key::Back);
+            }
+            if i.key_pressed(egui::Key::Enter) || (i.key_pressed(egui::Key::Space) && !self.flow.simulates()) {
+                flow_keys.push(flow::Key::Confirm);
+            }
+            if !self.flow.simulates() {
+                if i.key_pressed(egui::Key::ArrowLeft) {
+                    flow_keys.push(flow::Key::Left);
+                }
+                if i.key_pressed(egui::Key::ArrowRight) {
+                    flow_keys.push(flow::Key::Right);
+                }
+            }
+        });
+        for k in flow_keys {
+            match self.flow.on_key(k, &unlocked) {
+                Some(flow::Action::Start(kind)) => self.start_run(kind),
+                Some(flow::Action::Resume) => self.accumulator = 0.0,
+                Some(flow::Action::QuitToTitle) => {
+                    // the level is abandoned; the save already holds the campaign index
+                    self.accumulator = 0.0;
+                }
+                None => {}
+            }
+        }
+
         let mut keyboard_tilt = 0.0f32;
         let mut nitro_active = false;
-        ctx.input(|i| {
+        if self.flow.simulates() {
+            ctx.input(|i| {
+                self.throttle = 0.0;
+                if i.key_down(egui::Key::ArrowRight) {
+                    self.throttle += 1.0;
+                    keyboard_tilt += 1.0;
+                }
+                if i.key_down(egui::Key::ArrowLeft) {
+                    self.throttle -= 1.0;
+                    keyboard_tilt -= 1.0;
+                }
+                if i.key_pressed(egui::Key::Space) && !self.vehicle.airborne {
+                    self.vehicle.launch(6.0);
+                }
+                nitro_active = i.key_down(egui::Key::N);
+            });
+        } else {
             self.throttle = 0.0;
-            if i.key_down(egui::Key::ArrowRight) {
-                self.throttle += 1.0;
-                keyboard_tilt += 1.0;
-            }
-            if i.key_down(egui::Key::ArrowLeft) {
-                self.throttle -= 1.0;
-                keyboard_tilt -= 1.0;
-            }
-            if i.key_pressed(egui::Key::Space) && !self.vehicle.airborne {
-                self.vehicle.launch(6.0);
-            }
-            nitro_active = i.key_down(egui::Key::N);
-        });
+        }
 
         let tilt = (self.tilt.get() + keyboard_tilt).clamp(-1.0, 1.0);
+        // Off the play screen the world stands still: the accumulator is drained so no time
+        // banks up behind a menu (`steps_for` capped it anyway) and no step runs.
+        let steps = if self.flow.simulates() { steps } else { self.accumulator = 0.0; 0 };
 
         // Every step in the frame's budget. `steps` is 1 at 60fps and more
         // when a frame ran long; input is sampled once per frame and held
@@ -354,7 +404,9 @@ impl eframe::App for RoadWarriorApp {
         // the level is complete if the vehicle just died. Respawn resets
         // pos_x back to 0, so a death exactly at the finish line correctly
         // does NOT also count as completing it.
-        if self.vehicle.health <= 0.0 {
+        if !self.flow.simulates() {
+            // no deaths, no completions and no toasts from a world that did not move
+        } else if self.vehicle.health <= 0.0 {
             self.respawn();
         } else if self.vehicle.is_stranded() {
             // An empty tank used to be a SOFTLOCK: the car coasts to a stop,
@@ -376,7 +428,7 @@ impl eframe::App for RoadWarriorApp {
         // past campaign completion: "campaign complete!" printed on every
         // single frame forever, and `save::save()` (a disk write) fired just
         // as often. Real bug, not just a log-spam cosmetic issue.
-        if !self.campaign.is_finished() && campaign::is_level_complete(&self.vehicle, &self.track, self.boss.as_ref()) {
+        if self.flow.simulates() && !self.campaign.is_finished() && campaign::is_level_complete(&self.vehicle, &self.track, self.boss.as_ref()) {
             let mut new_best_msg = None;
             let mut unlocked_msg = None;
             if let Some(level) = self.campaign.current_level() {
@@ -403,10 +455,8 @@ impl eframe::App for RoadWarriorApp {
                 self.load_current_level();
                 self.level_start_time = std::time::Instant::now();
             } else {
-                // TODO: a real full-screen campaign-complete state would be
-                // nicer than a toast, but this at least makes it visible in
-                // the actual game instead of only a terminal.
-                self.toasts.push(Toast { message: "Campaign complete!".to_string(), shown_at: std::time::Instant::now() });
+                // the campaign-complete screen (`flow`); it was a three-second toast
+                self.flow.campaign_finished();
             }
             self.save.campaign_level_index = self.campaign.current_index();
             save::save(&self.save);
@@ -478,6 +528,61 @@ impl eframe::App for RoadWarriorApp {
                             let color = egui::Color32::from_rgba_unmultiplied(255, 220, 120, (alpha * 255.0) as u8);
                             ui.label(egui::RichText::new(&toast.message).color(color).size(20.0).strong());
                         }
+                    });
+            }
+            // The screens over the world (`flow`): the title with its car select, the pause,
+            // the campaign-complete. Drawn as an egui area over the scene, dimmed.
+            if !self.flow.simulates() {
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgba_unmultiplied(6, 8, 12, 150));
+                let gold = egui::Color32::from_rgb(255, 220, 120);
+                let dim = egui::Color32::from_rgb(190, 196, 205);
+                let n_levels = self.campaign.levels.len().max(1);
+                let level_no = (self.campaign.current_index() + 1).min(n_levels);
+                let level_name = self.campaign.current_level().map(|l| l.name.clone()).unwrap_or_default();
+                egui::Area::new("flow_screen".into())
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.vertical_centered(|ui| match self.flow.screen {
+                            flow::Screen::Title { .. } => {
+                                ui.label(egui::RichText::new("ROAD WARRIOR").color(gold).size(44.0).strong());
+                                ui.add_space(10.0);
+                                ui.label(egui::RichText::new(format!("level {level_no}/{n_levels} — {level_name}")).color(dim).size(18.0));
+                                if let Some(best) = self.save.best_time(&level_name) {
+                                    ui.label(egui::RichText::new(format!("best {best:.1}s")).color(dim).size(14.0));
+                                }
+                                ui.add_space(18.0);
+                                let car = self.flow.selected_car(&unlocked).unwrap_or(CarKind::RedSedan);
+                                let st = car.stats();
+                                ui.label(egui::RichText::new(format!("◀  {car:?}  ▶")).color(gold).size(26.0).strong());
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "top {:.0}  accel {:.0}  mass {:.0}  armor {:.0}  tank {:.0}",
+                                        st.top_speed, st.accel, st.mass, st.armor, st.gas_capacity
+                                    ))
+                                    .color(dim)
+                                    .size(14.0),
+                                );
+                                ui.label(egui::RichText::new(format!("{} of {} cars unlocked", unlocked.len(), CarKind::ALL.len())).color(dim).size(13.0));
+                                ui.add_space(18.0);
+                                ui.label(egui::RichText::new("← → choose a car   ·   Enter to drive").color(dim).size(16.0));
+                            }
+                            flow::Screen::Paused => {
+                                ui.label(egui::RichText::new("PAUSED").color(gold).size(40.0).strong());
+                                ui.add_space(12.0);
+                                ui.label(egui::RichText::new("Esc or Enter to resume   ·   ← → quit to the title").color(dim).size(16.0));
+                            }
+                            flow::Screen::CampaignComplete => {
+                                ui.label(egui::RichText::new("CAMPAIGN COMPLETE").color(gold).size(40.0).strong());
+                                ui.add_space(10.0);
+                                for l in &self.campaign.levels {
+                                    let best = self.save.best_time(&l.name).map(|t| format!("{t:.1}s")).unwrap_or_else(|| "—".into());
+                                    ui.label(egui::RichText::new(format!("{}  {best}", l.name)).color(dim).size(16.0));
+                                }
+                                ui.add_space(14.0);
+                                ui.label(egui::RichText::new("Enter for the title — the campaign starts over from level 1").color(dim).size(16.0));
+                            }
+                            flow::Screen::Playing => {}
+                        });
                     });
             }
         });
