@@ -76,6 +76,8 @@ pub enum Sfx {
     Pickup,
     /// A reload sequence began.
     Reload,
+    /// A footfall; the f32 is the ground's hardness 0..1 (`audio::footstep` takes the same).
+    Footstep(f32),
 }
 
 /// A per-map ambient "live event" — a distinctive hazard or spectacle keyed to the map's biome that
@@ -161,6 +163,10 @@ pub struct Game {
     pub uav_timer: f32,
     /// Deployed sentry guns and whether the streak has been spent this life.
     sentries: Vec<Sentry>,
+    /// Footfalls heard so far: `player.step_phase` in half-strides, so each crossing is one
+    /// footstep event (`Sfx::Footstep`). `audio::footstep` existed from the first audio pass and
+    /// nothing ever emitted one.
+    steps_heard: i32,
     pub sentry_used: bool,
     /// Super-ability charge 0..1; fills over time and on kills. Spend it to trigger the class super.
     pub super_charge: f32,
@@ -503,6 +509,7 @@ impl Game {
             strike_used: false,
             uav_timer: 0.0,
             sentries: Vec::new(),
+            steps_heard: 0,
             sentry_used: false,
             super_charge: 0.0,
             gravity_zones: Vec::new(),
@@ -727,6 +734,15 @@ impl Game {
         }
         self.player.gravity_scale = gscale;
         self.player.update(&self.level, input, dt);
+        // Footfalls: one per half-stride of the head-bob phase, on the ground, alive. Crouching
+        // and sprinting are the same thump at a different cadence (the phase runs with speed).
+        let strides = (self.player.step_phase / std::f32::consts::PI).floor() as i32;
+        if strides != self.steps_heard {
+            if self.player.alive && self.player.on_ground && strides > self.steps_heard {
+                self.sfx.push(Sfx::Footstep(GROUND_HARDNESS));
+            }
+            self.steps_heard = strides;
+        }
         // Water splash: a rising edge in submersion (plunging in) throws a crown of droplets scaled by how
         // fast the transition happened; sustained fast wading kicks up a few beads at the feet.
         {
@@ -3527,12 +3543,44 @@ fn _touch(x: f32) -> f32 {
     clampf(x, 0.0, 1.0)
 }
 
+/// The hardness `Sfx::Footstep` carries: the levels are stone and packed earth underfoot
+/// (`audio::footstep`: brighter and shorter the harder). One number until the level says
+/// what is under the boot.
+pub const GROUND_HARDNESS: f32 = 0.6;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn input_fire() -> Input {
         Input { fire: true, ..Default::default() }
+    }
+
+    /// Walking emits a footstep per half-stride, standing still emits none, and a dead player
+    /// makes no footsteps.
+    #[test]
+    fn walking_makes_footsteps_and_standing_still_does_not() {
+        let mut g = Game::new(3);
+        let _ = g.take_sfx();
+        // shuttle: forward then back every 0.75 s, so a wall a second ahead of the spawn (the
+        // seed-3 level has one) does not stop the walk
+        let walk = Input { fwd: 1.0, ..Default::default() };
+        let back = Input { fwd: -1.0, ..Default::default() };
+        for f in 0..240 {
+            g.step(if (f / 45) % 2 == 0 { &walk } else { &back }, 1.0 / 60.0);
+        }
+        let steps = g.take_sfx().iter().filter(|s| matches!(s, Sfx::Footstep(_))).count();
+        assert!((4..=40).contains(&steps), "four seconds of walking: {steps} footsteps");
+        for _ in 0..120 {
+            g.step(&Input::default(), 1.0 / 60.0);
+        }
+        let still = g.take_sfx().iter().filter(|s| matches!(s, Sfx::Footstep(_))).count();
+        assert!(still <= 1, "standing still: {still} footsteps (at most the one that was mid-stride)");
+        g.player.alive = false;
+        g.player.dead_timer = 10.0; // a body on the ground, not one about to respawn this frame
+        g.player.step_phase += 100.0;
+        g.step(&walk, 1.0 / 60.0);
+        assert!(!g.take_sfx().iter().any(|s| matches!(s, Sfx::Footstep(_))), "the dead make no footsteps");
     }
 
     #[test]

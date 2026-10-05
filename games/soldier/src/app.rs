@@ -635,6 +635,7 @@ impl FpsApp {
                 Sfx::Explosion(sz) => crate::audio::explosion(sz, self.seed as u32 ^ s ^ 0x22),
                 Sfx::Pickup => crate::audio::blip(520.0, true, s),
                 Sfx::Reload => crate::audio::reload_click(s),
+                Sfx::Footstep(h) => crate::audio::footstep(h, self.seed as u32 ^ s ^ 0x33),
             };
             a.play(samples);
         }
