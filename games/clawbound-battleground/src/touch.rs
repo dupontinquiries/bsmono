@@ -118,6 +118,14 @@ struct Finger {
     on_stick: bool,
 }
 
+/// `look` and `look_vel` are in shorter-side units (a flick is about one screen a second);
+/// `glide` was measured and tuned in pixels per second (its floor is 40 px/s, its flicks
+/// 300-1200). This is the nominal shorter side that converts between them. Until c21 the
+/// velocity went in unconverted, so every lift -- a 1.2 unit/s flick included -- was under the
+/// 40 "px/s" floor and read as a placed finger: the glide setting never did anything, and the
+/// two plumbing tests written for it (and, by their own commit, never run) failed.
+const GLIDE_PX_PER_UNIT: f32 = 1080.0;
+
 pub struct TouchPad {
     pub enabled: bool,
     /// screen size in shorter-side units (see `layout`)
@@ -272,7 +280,8 @@ impl TouchPad {
             // lifting is not a flick of the view, and launching a coast from
             // one would swing the camera when a player lets go of an ability.
             if !f.on_stick && f.btn.is_none() {
-                self.coast.launch((self.look_vel.x, self.look_vel.y), self.glide);
+                let v = self.look_vel * GLIDE_PX_PER_UNIT;
+                self.coast.launch((v.x, v.y), self.glide);
                 self.look_vel = Vec2::ZERO;
             }
             if let Some(Btn::Ability(i)) = f.btn {
@@ -315,7 +324,7 @@ impl TouchPad {
             self.look_vel = self.look_vel.lerp(v, 0.4);
         } else if !steering {
             let (dx, dy) = self.coast.tick(dt, self.glide);
-            self.look += Vec2::new(dx, dy);
+            self.look += Vec2::new(dx, dy) / GLIDE_PX_PER_UNIT;
         }
         let touches: Vec<TkTouch> = self
             .fingers
@@ -441,6 +450,27 @@ mod tests {
         let after = flick_then_lift(crate::glide::Glide::Smooth, 5);
         assert!(after[0].x > 0.0, "the view must still move on the next frame: {after:?}");
         assert!(after[0].x > after[4].x, "and slow down: {after:?}");
+    }
+
+    /// A placed finger -- creeping, then lifted -- must not coast: that is the glide's floor,
+    /// which only means something once the pad's units reach it in the glide's.
+    #[test]
+    fn a_slow_lift_is_a_placed_finger_and_does_not_coast() {
+        let mut t = TouchPad::new();
+        t.extent = Vec2::new(1.78, 1.0);
+        t.glide = crate::glide::Glide::Smooth;
+        let dt = 1.0 / 60.0;
+        let start = Vec2::new(1.2, 0.35);
+        t.down(1, start);
+        t.end_frame();
+        for i in 1..=6 {
+            t.moved(1, start + Vec2::new(0.0004 * i as f32, 0.0)); // 0.024 units/s: 26 px/s
+            t.tick(dt);
+            t.end_frame();
+        }
+        t.up(1);
+        t.tick(dt);
+        assert_eq!(t.look, Vec2::ZERO, "a careful aim must not drift on release: {:?}", t.look);
     }
 
     /// RIGID IS TODAY'S BEHAVIOUR EXACTLY, through the real pad.
