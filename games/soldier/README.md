@@ -53,8 +53,10 @@ QWERTY preset.
 
 From the pause menu, **Settings** exposes mouse sensitivity, invert-look, field
 of view, a minimap toggle, and fully rebindable movement keys (click a key, then
-press the new one). Press `Esc` again — or hit Resume — to drop back into the
-fight. Clear every enemy to advance to the next, larger wave.
+press the new one). Every setting is saved into the same `save.txt` as your
+profile the moment you change it, so the next launch starts where you left it.
+Press `Esc` again — or hit Resume — to drop back into the fight. Clear every
+enemy to advance to the next, larger wave.
 
 Health **regenerates** after a few seconds out of fire (a red blood vignette
 creeps in at the edges when you're low and fades as you recover), so there are no
@@ -194,7 +196,7 @@ runs comfortably — exactly the trade the period games made.
 | `cosmetics.rs` | Reticles, gun skins, and armor frames (visual + light stat tradeoffs) |
 | `creatures.rs` | The Hunt mode: playable horror creatures + game-mode enum |
 | `profile.rs`   | Persistent K/D metaprofile: kills/deaths, K/D, skill score, Bronze→Diamond tier |
-| `db.rs`        | File-based save backend (profile + loadout) under the user's config dir |
+| `db.rs`        | File-based save backend (profile + loadout + the settings page) under the user's config dir |
 | `particles.rs` | CPU billboard particles: muzzle flash, sparks, blood, smoke, shells, plasma |
 | `pickups.rs`   | Hovering, spinning ammo crates: scatter, enemy drops, collection |
 | `game.rs`      | Ties it together: stepping, firing, recoil, scorestreaks, sentries, waves, tracers, the gun viewmodel |

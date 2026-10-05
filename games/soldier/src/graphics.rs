@@ -89,6 +89,12 @@ impl GraphicsPreset {
         let i = Self::ALL.iter().position(|&p| p == self).unwrap_or(0);
         Self::ALL[(i + 1) % Self::ALL.len()]
     }
+
+    /// The inverse of [`name`](Self::name), case-insensitive, for the save file. Unknown text is `None`
+    /// so a caller keeps whatever it had rather than silently dropping to a preset.
+    pub fn from_name(name: &str) -> Option<GraphicsPreset> {
+        Self::ALL.iter().copied().find(|p| p.name().eq_ignore_ascii_case(name.trim()))
+    }
 }
 
 impl Default for GraphicsPreset {
@@ -165,6 +171,16 @@ mod tests {
         }
         assert_eq!(seen.len(), 4, "cycling should visit every preset");
         assert_eq!(p, GraphicsPreset::Low, "cycling four times returns to the start");
+    }
+
+    #[test]
+    fn preset_names_round_trip_and_junk_is_none() {
+        for p in GraphicsPreset::ALL {
+            assert_eq!(GraphicsPreset::from_name(p.name()), Some(p));
+        }
+        assert_eq!(GraphicsPreset::from_name(" ultra "), Some(GraphicsPreset::Ultra), "case and padding are forgiven");
+        assert_eq!(GraphicsPreset::from_name("Extreme"), None);
+        assert_eq!(GraphicsPreset::from_name(""), None);
     }
 
     #[test]

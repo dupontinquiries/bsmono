@@ -7,10 +7,129 @@
 //! This is the only module that touches the disk for game state; the headless tests never call `load`/`save`.
 
 use crate::cosmetics::{Accent, ArmorFrame, Cosmetics, GunSkin, Reticle};
+use crate::graphics::GraphicsPreset;
 use crate::loadout::{Loadout, Perk};
 use crate::profile::Profile;
 use crate::weapons::WeaponKind;
 use std::path::PathBuf;
+
+/// The player's options as the settings page edits them, in the plain form the save file carries: numbers,
+/// flags, a preset name, two RGB colours and `(action, key)` name pairs. The app's live settings struct
+/// (egui keys and colours) converts to and from this; the record itself knows nothing about egui, so it is
+/// built and tested headless. The defaults here ARE the game's defaults — the app derives its own from them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Options {
+    pub sensitivity: f32,
+    pub invert_y: bool,
+    pub fov_deg: f32,
+    pub third_person: bool,
+    pub show_minimap: bool,
+    pub render_detail: f32,
+    pub texture_detail: f32,
+    pub graphics_preset: GraphicsPreset,
+    pub hostile_color: [u8; 3],
+    pub friendly_color: [u8; 3],
+    /// `(action id, key name)` for every rebindable action, in the app's action order. Empty means "the
+    /// layout's defaults"; an action missing from the list keeps its default key, so a save written by an
+    /// older build (or hand-edited) never strips a binding.
+    pub binds: Vec<(String, String)>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            sensitivity: 0.0022,
+            invert_y: false,
+            fov_deg: 74.0,
+            third_person: false,
+            show_minimap: true,
+            render_detail: 1.4,
+            texture_detail: 3.0,
+            graphics_preset: GraphicsPreset::default(),
+            hostile_color: [230, 120, 40], // orange
+            friendly_color: [70, 190, 90], // green
+            binds: Vec::new(),
+        }
+    }
+}
+
+impl Options {
+    /// Apply one `key=value` line of the save file; `false` if the key is not an option key. Values that
+    /// do not parse leave the field alone, so a damaged line costs one setting, not the record.
+    fn apply_kv(&mut self, k: &str, v: &str) -> bool {
+        match k {
+            "opt.sensitivity" => self.sensitivity = parse_f32(v, self.sensitivity, 0.0001, 0.1),
+            "opt.invert_y" => self.invert_y = flag(v),
+            "opt.fov_deg" => self.fov_deg = parse_f32(v, self.fov_deg, 30.0, 140.0),
+            "opt.third_person" => self.third_person = flag(v),
+            "opt.show_minimap" => self.show_minimap = flag(v),
+            "opt.render_detail" => self.render_detail = parse_f32(v, self.render_detail, 0.1, 10.0),
+            "opt.texture_detail" => self.texture_detail = parse_f32(v, self.texture_detail, 0.5, 16.0),
+            "opt.graphics_preset" => self.graphics_preset = GraphicsPreset::from_name(v).unwrap_or(self.graphics_preset),
+            "opt.hostile_color" => self.hostile_color = parse_hex_rgb(v).unwrap_or(self.hostile_color),
+            "opt.friendly_color" => self.friendly_color = parse_hex_rgb(v).unwrap_or(self.friendly_color),
+            _ => {
+                let Some(action) = k.strip_prefix("bind.") else { return false };
+                if action.is_empty() || v.is_empty() {
+                    return true;
+                }
+                match self.binds.iter_mut().find(|(a, _)| a == action) {
+                    Some(slot) => slot.1 = v.to_string(),
+                    None => self.binds.push((action.to_string(), v.to_string())),
+                }
+            }
+        }
+        true
+    }
+
+    fn to_text(&self) -> String {
+        let mut out = format!(
+            "opt.sensitivity={}\nopt.invert_y={}\nopt.fov_deg={}\nopt.third_person={}\nopt.show_minimap={}\n\
+             opt.render_detail={}\nopt.texture_detail={}\nopt.graphics_preset={}\nopt.hostile_color={}\nopt.friendly_color={}\n",
+            self.sensitivity,
+            self.invert_y as u8,
+            self.fov_deg,
+            self.third_person as u8,
+            self.show_minimap as u8,
+            self.render_detail,
+            self.texture_detail,
+            self.graphics_preset.name(),
+            hex_rgb(self.hostile_color),
+            hex_rgb(self.friendly_color),
+        );
+        for (action, key) in &self.binds {
+            out.push_str(&format!("bind.{action}={key}\n"));
+        }
+        out
+    }
+}
+
+fn flag(v: &str) -> bool {
+    v == "1" || v.eq_ignore_ascii_case("true")
+}
+
+/// A float within `[lo, hi]`, else `keep` — a NaN, an inf or a number off the slider's scale would
+/// otherwise come back as an unusable (or invisible) setting.
+fn parse_f32(v: &str, keep: f32, lo: f32, hi: f32) -> f32 {
+    match v.parse::<f32>() {
+        Ok(x) if x.is_finite() && (lo..=hi).contains(&x) => x,
+        _ => keep,
+    }
+}
+
+/// `#rrggbb` (the `#` optional, case-insensitive).
+pub fn parse_hex_rgb(v: &str) -> Option<[u8; 3]> {
+    let h = v.trim().trim_start_matches('#');
+    if h.len() != 6 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let c = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+    Some([c(0)?, c(2)?, c(4)?])
+}
+
+pub fn hex_rgb(c: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+}
 
 /// The whole persisted player record.
 #[derive(Clone, Debug)]
@@ -22,11 +141,20 @@ pub struct Db {
     pub map_prefs: Vec<usize>,
     /// Preferred renderer: false = software painter (default), true = GPU (wgpu). Read at launch.
     pub gpu_renderer: bool,
+    /// The settings page's state (mouse, view, graphics, colours, key bindings).
+    pub options: Options,
 }
 
 impl Default for Db {
     fn default() -> Self {
-        Self { profile: Profile::default(), loadout: Loadout::default(), cosmetics: Cosmetics::default(), map_prefs: Vec::new(), gpu_renderer: false }
+        Self {
+            profile: Profile::default(),
+            loadout: Loadout::default(),
+            cosmetics: Cosmetics::default(),
+            map_prefs: Vec::new(),
+            gpu_renderer: false,
+            options: Options::default(),
+        }
     }
 }
 
@@ -74,7 +202,9 @@ impl Db {
                     self.map_prefs = v.split(',').filter_map(|t| t.trim().parse::<usize>().ok()).collect();
                 }
                 "gpu_renderer" => self.gpu_renderer = v == "1" || v == "true",
-                _ => {}
+                _ => {
+                    self.options.apply_kv(k, v);
+                }
             }
         }
         self.loadout.perks = perks;
@@ -109,7 +239,7 @@ impl Db {
             c.set.to_text(),
         );
         let prefs: Vec<String> = self.map_prefs.iter().map(|i| i.to_string()).collect();
-        format!("{out}map_prefs={}\ngpu_renderer={}\n", prefs.join(","), self.gpu_renderer as u8)
+        format!("{out}map_prefs={}\ngpu_renderer={}\n{}", prefs.join(","), self.gpu_renderer as u8, self.options.to_text())
     }
 
     /// Persist the whole record (best-effort).
@@ -146,5 +276,79 @@ mod tests {
         assert_eq!(q.loadout.legendary, Some(4));
         assert_eq!(q.map_prefs, vec![2, 5, 9]);
         assert_eq!(q.cosmetics.set.style(crate::character::ArmorSlot::Chest), crate::character::PieceStyle::Heavy);
+    }
+
+    fn edited_options() -> Options {
+        Options {
+            sensitivity: 0.0041,
+            invert_y: true,
+            fov_deg: 91.0,
+            third_person: true,
+            show_minimap: false,
+            render_detail: 2.2,
+            texture_detail: 5.0,
+            graphics_preset: GraphicsPreset::Low,
+            hostile_color: [255, 0, 128],
+            friendly_color: [1, 2, 3],
+            binds: vec![("forward".into(), "W".into()), ("jump".into(), "Space".into()), ("forge_menu".into(), "Escape".into())],
+        }
+    }
+
+    #[test]
+    fn options_round_trip_through_the_save_text() {
+        let mut db = Db::default();
+        db.options = edited_options();
+        let text = db.to_text();
+        let mut q = Db::default();
+        q.parse(&text);
+        assert_eq!(q.options, edited_options());
+        // the option lines sit in the same file as the profile, not beside it
+        assert!(text.contains("opt.fov_deg=91\n"), "{text}");
+        assert!(text.contains("bind.jump=Space\n"), "{text}");
+        assert_eq!(text.matches("bind.").count(), 3);
+    }
+
+    #[test]
+    fn a_save_without_option_lines_yields_the_defaults() {
+        // an older save (profile + loadout only) must not disturb the settings page's defaults
+        let mut q = Db::default();
+        q.parse("# early-fps save\nname=old\nkills=3\n");
+        assert_eq!(q.options, Options::default());
+        assert_eq!(q.profile.name, "old");
+    }
+
+    #[test]
+    fn damaged_option_lines_cost_one_setting_not_the_record() {
+        let mut q = Db::default();
+        q.parse(
+            "opt.sensitivity=NaN\nopt.fov_deg=9999\nopt.render_detail=abc\nopt.graphics_preset=Extreme\n\
+             opt.hostile_color=#12345\nopt.friendly_color=#0a0B0c\nopt.invert_y=true\nbind.=X\nbind.jump=\nbind.dive=J\n",
+        );
+        let d = Options::default();
+        assert_eq!(q.options.sensitivity, d.sensitivity, "NaN is refused");
+        assert_eq!(q.options.fov_deg, d.fov_deg, "off-scale values are refused");
+        assert_eq!(q.options.render_detail, d.render_detail);
+        assert_eq!(q.options.graphics_preset, d.graphics_preset, "unknown preset keeps the default");
+        assert_eq!(q.options.hostile_color, d.hostile_color, "a five-digit colour is refused");
+        assert_eq!(q.options.friendly_color, [0x0a, 0x0b, 0x0c], "mixed-case hex parses");
+        assert!(q.options.invert_y, "the good line beside the bad ones still lands");
+        assert_eq!(q.options.binds, vec![("dive".to_string(), "J".to_string())], "empty action or key lines are skipped");
+    }
+
+    #[test]
+    fn a_repeated_bind_line_overwrites_in_place() {
+        let mut q = Db::default();
+        q.parse("bind.forward=W\nbind.left=A\nbind.forward=Period\n");
+        assert_eq!(q.options.binds, vec![("forward".to_string(), "Period".to_string()), ("left".to_string(), "A".to_string())]);
+    }
+
+    #[test]
+    fn hex_colours_round_trip() {
+        for c in [[0, 0, 0], [255, 255, 255], [230, 120, 40], [1, 2, 3]] {
+            assert_eq!(parse_hex_rgb(&hex_rgb(c)), Some(c));
+        }
+        assert_eq!(parse_hex_rgb("ff0000"), Some([255, 0, 0]), "the hash is optional");
+        assert_eq!(parse_hex_rgb("#ff00zz"), None);
+        assert_eq!(parse_hex_rgb("#ff0000ff"), None, "no alpha");
     }
 }

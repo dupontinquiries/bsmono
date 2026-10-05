@@ -86,7 +86,7 @@ impl BuildState {
 }
 
 /// A rebindable movement action.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BindAction {
     Forward,
     Left,
@@ -112,6 +112,66 @@ enum BindAction {
     ForgeScaleDown,
     ForgeUndo,
     ForgeMenu,
+}
+
+impl BindAction {
+    /// Every rebindable action, in settings-page order. This is also the order the save file lists them in.
+    const ALL: [BindAction; 22] = [
+        BindAction::Forward,
+        BindAction::Left,
+        BindAction::Back,
+        BindAction::Right,
+        BindAction::Jump,
+        BindAction::Sprint,
+        BindAction::Crouch,
+        BindAction::Dive,
+        BindAction::Reload,
+        BindAction::NavUp,
+        BindAction::NavDown,
+        BindAction::NavLeft,
+        BindAction::NavRight,
+        BindAction::NavSelect,
+        BindAction::NavBack,
+        BindAction::ForgeMenu,
+        BindAction::ForgeNextBrush,
+        BindAction::ForgePrevBrush,
+        BindAction::ForgeRotate,
+        BindAction::ForgeScaleUp,
+        BindAction::ForgeScaleDown,
+        BindAction::ForgeUndo,
+    ];
+
+    /// The save-file id (`bind.<id>=<key>`). Stable: renaming one orphans every saved binding for it.
+    fn id(self) -> &'static str {
+        match self {
+            BindAction::Forward => "forward",
+            BindAction::Left => "left",
+            BindAction::Back => "back",
+            BindAction::Right => "right",
+            BindAction::Jump => "jump",
+            BindAction::Sprint => "sprint",
+            BindAction::Crouch => "crouch",
+            BindAction::Dive => "dive",
+            BindAction::Reload => "reload",
+            BindAction::NavUp => "nav_up",
+            BindAction::NavDown => "nav_down",
+            BindAction::NavLeft => "nav_left",
+            BindAction::NavRight => "nav_right",
+            BindAction::NavSelect => "nav_select",
+            BindAction::NavBack => "nav_back",
+            BindAction::ForgeNextBrush => "forge_next",
+            BindAction::ForgePrevBrush => "forge_prev",
+            BindAction::ForgeRotate => "forge_rotate",
+            BindAction::ForgeScaleUp => "forge_scale_up",
+            BindAction::ForgeScaleDown => "forge_scale_down",
+            BindAction::ForgeUndo => "forge_undo",
+            BindAction::ForgeMenu => "forge_menu",
+        }
+    }
+
+    fn from_id(id: &str) -> Option<BindAction> {
+        Self::ALL.iter().copied().find(|a| a.id() == id)
+    }
 }
 
 /// Movement + action keys.
@@ -310,19 +370,56 @@ struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
+        Self::from_options(&crate::db::Options::default())
+    }
+}
+
+impl Settings {
+    /// The live settings a saved record describes. Bindings start from the Dvorak layout (this game's
+    /// default) and each saved `(action, key)` pair overrides one; an unknown action or key name is
+    /// skipped, so a save from a build with different actions still loads. `gpu_renderer` is not part of
+    /// the record — it is `Db::gpu_renderer`, read by `main` before any settings exist.
+    fn from_options(o: &crate::db::Options) -> Self {
+        let mut bindings = Bindings::from_layout(settings_kit::MovementLayout::Dvorak);
+        for (action, key) in &o.binds {
+            if let (Some(a), Some(k)) = (BindAction::from_id(action), Key::from_name(key)) {
+                bindings.set(a, k);
+            }
+        }
+        let rgb = |c: [u8; 3]| egui::Color32::from_rgb(c[0], c[1], c[2]);
         Self {
-            sensitivity: 0.0022,
-            invert_y: false,
-            fov_deg: 74.0,
-            third_person: false,
-            show_minimap: true,
-            bindings: Bindings::from_layout(settings_kit::MovementLayout::Dvorak),
-            render_detail: 1.4,
-            texture_detail: 3.0,
-            graphics_preset: crate::graphics::GraphicsPreset::default(),
-            hostile_color: egui::Color32::from_rgb(230, 120, 40), // orange
-            friendly_color: egui::Color32::from_rgb(70, 190, 90), // green
+            sensitivity: o.sensitivity,
+            invert_y: o.invert_y,
+            fov_deg: o.fov_deg,
+            third_person: o.third_person,
+            show_minimap: o.show_minimap,
+            bindings,
+            render_detail: o.render_detail,
+            texture_detail: o.texture_detail,
+            graphics_preset: o.graphics_preset,
+            hostile_color: rgb(o.hostile_color),
+            friendly_color: rgb(o.friendly_color),
             gpu_renderer: false,
+        }
+    }
+
+    /// The record to save: every option plus all 22 bindings by name (`Key::from_name` parses
+    /// `Key::name`, so the pair survives the file). The colours are saved as the channels the tint reads
+    /// (`Color32` is premultiplied, and the pickers are opaque, so that is the colour as chosen).
+    fn options(&self) -> crate::db::Options {
+        let rgb = |c: egui::Color32| [c.r(), c.g(), c.b()];
+        crate::db::Options {
+            sensitivity: self.sensitivity,
+            invert_y: self.invert_y,
+            fov_deg: self.fov_deg,
+            third_person: self.third_person,
+            show_minimap: self.show_minimap,
+            render_detail: self.render_detail,
+            texture_detail: self.texture_detail,
+            graphics_preset: self.graphics_preset,
+            hostile_color: rgb(self.hostile_color),
+            friendly_color: rgb(self.friendly_color),
+            binds: BindAction::ALL.iter().map(|&a| (a.id().to_string(), self.bindings.get(a).name().to_string())).collect(),
         }
     }
 }
@@ -440,9 +537,12 @@ impl FpsApp {
         if handoff.is_some() {
             eprintln!("[handoff] result: {mp_status}");
         }
+        // The saved settings page (sensitivity, FOV, graphics, colours, key bindings) — defaults when the
+        // save has none. Normalised back into the record below so the first frame's comparison is a no-op.
+        let settings = Settings::from_options(&db.options);
         let mut app = Self {
             game: Game::new(seed),
-            settings: Settings::default(),
+            settings,
             mode: Mode::Start,
             atlas: None,
             atlas_id: egui::TextureId::Managed(0),
@@ -485,6 +585,7 @@ impl FpsApp {
         };
         // Reflect the persisted renderer choice into the live settings so the toggle shows the saved state.
         app.settings.gpu_renderer = app.db.gpu_renderer;
+        app.db.options = app.settings.options();
         app
     }
 
@@ -1628,9 +1729,23 @@ impl eframe::App for FpsApp {
             self.start_new_game(&ctx);
         }
 
-        // Persist the renderer preference the moment it's toggled on the settings page (it's read at launch).
+        // Persist the renderer preference the moment it's toggled on the settings page (it's read at launch),
+        // and the rest of the settings page whenever it differs from the saved record — once a slider drag
+        // has ended rather than on every frame of it. This also catches edits made outside the page (the V
+        // third-person toggle in play), so what you set is what the next launch starts with.
+        let mut dirty = false;
         if self.settings.gpu_renderer != self.db.gpu_renderer {
             self.db.gpu_renderer = self.settings.gpu_renderer;
+            dirty = true;
+        }
+        if !ctx.is_using_pointer() {
+            let options = self.settings.options();
+            if options != self.db.options {
+                self.db.options = options;
+                dirty = true;
+            }
+        }
+        if dirty {
             self.db.save();
         }
 
@@ -2202,10 +2317,10 @@ fn settings_page(ui: &mut egui::Ui, s: &mut Settings, rebinding: &mut Option<Bin
     ui.label(egui::RichText::new("tint hostiles and friendlies to tell factions apart at a glance").monospace().size(11.0).color(dim()));
     ui.horizontal(|ui| {
         ui.label("Hostile");
-        ui.color_edit_button_srgba(&mut s.hostile_color);
+        egui::color_picker::color_edit_button_srgba(ui, &mut s.hostile_color, egui::color_picker::Alpha::Opaque);
         ui.add_space(16.0);
         ui.label("Friendly");
-        ui.color_edit_button_srgba(&mut s.friendly_color);
+        egui::color_picker::color_edit_button_srgba(ui, &mut s.friendly_color, egui::color_picker::Alpha::Opaque);
     });
     if ui.button("Reset to default (orange / green)").clicked() {
         s.hostile_color = egui::Color32::from_rgb(230, 120, 40);
@@ -2503,6 +2618,80 @@ mod preview_tests {
         assert_eq!(b.get(BindAction::ForgeRotate), Key::T);
         // movement keys are untouched by nav/forge rebinds
         assert_eq!(b.get(BindAction::Forward), Key::W);
+    }
+
+    #[test]
+    fn every_action_has_a_unique_id_that_parses_back() {
+        let ids: std::collections::HashSet<&str> = BindAction::ALL.iter().map(|a| a.id()).collect();
+        assert_eq!(ids.len(), BindAction::ALL.len(), "two actions share a save-file id");
+        for a in BindAction::ALL {
+            assert_eq!(BindAction::from_id(a.id()), Some(a));
+        }
+        assert_eq!(BindAction::from_id("warp"), None);
+    }
+
+    #[test]
+    fn default_settings_are_the_documented_defaults() {
+        // `Settings::default()` is now derived from `db::Options::default()`; these are the numbers the
+        // settings page shipped with, so a drift in either record shows up here.
+        let s = Settings::default();
+        assert_eq!(s.sensitivity, 0.0022);
+        assert_eq!(s.fov_deg, 74.0);
+        assert!(!s.invert_y && !s.third_person && s.show_minimap);
+        assert_eq!((s.render_detail, s.texture_detail), (1.4, 3.0));
+        assert_eq!(s.graphics_preset, crate::graphics::GraphicsPreset::default());
+        assert_eq!(s.hostile_color, Color32::from_rgb(230, 120, 40));
+        assert_eq!(s.friendly_color, Color32::from_rgb(70, 190, 90));
+        assert_eq!(s.bindings.get(BindAction::Forward), Key::Period, "the default layout is Dvorak");
+        assert!(!s.gpu_renderer);
+    }
+
+    #[test]
+    fn settings_survive_the_save_record() {
+        let mut s = Settings::default();
+        s.sensitivity = 0.004;
+        s.fov_deg = 95.0;
+        s.invert_y = true;
+        s.third_person = true;
+        s.show_minimap = false;
+        s.render_detail = 2.5;
+        s.texture_detail = 6.0;
+        s.graphics_preset = crate::graphics::GraphicsPreset::Low;
+        s.hostile_color = Color32::from_rgb(1, 2, 3);
+        s.friendly_color = Color32::from_rgb(9, 8, 7);
+        s.bindings.set(BindAction::Jump, Key::F);
+        s.bindings.set(BindAction::ForgeUndo, Key::Backtick);
+        s.bindings.set(BindAction::NavBack, Key::Minus);
+        let o = s.options();
+        assert_eq!(o.binds.len(), BindAction::ALL.len(), "every rebindable action is written");
+        assert!(o.binds.contains(&("jump".to_string(), "F".to_string())));
+        let back = Settings::from_options(&o);
+        assert_eq!(back.sensitivity, 0.004);
+        assert_eq!(back.fov_deg, 95.0);
+        assert!(back.invert_y && back.third_person && !back.show_minimap);
+        assert_eq!((back.render_detail, back.texture_detail), (2.5, 6.0));
+        assert_eq!(back.graphics_preset, crate::graphics::GraphicsPreset::Low);
+        assert_eq!(back.hostile_color, Color32::from_rgb(1, 2, 3));
+        assert_eq!(back.friendly_color, Color32::from_rgb(9, 8, 7));
+        for a in BindAction::ALL {
+            assert_eq!(back.bindings.get(a), s.bindings.get(a), "binding for {}", a.id());
+        }
+        // and the record is stable: a second trip writes the identical record (what the per-frame
+        // dirty check compares, so an unchanged page never saves)
+        assert_eq!(back.options(), o);
+    }
+
+    #[test]
+    fn unknown_saved_actions_and_keys_are_skipped() {
+        let mut o = crate::db::Options::default();
+        o.binds = vec![
+            ("warp".to_string(), "W".to_string()),         // an action this build does not have
+            ("jump".to_string(), "NoSuchKey".to_string()), // a key egui cannot name
+            ("reload".to_string(), "K".to_string()),       // a good one after the bad ones
+        ];
+        let s = Settings::from_options(&o);
+        assert_eq!(s.bindings.get(BindAction::Jump), Key::Space, "an unparseable key keeps the default");
+        assert_eq!(s.bindings.get(BindAction::Reload), Key::K);
     }
 
     #[test]
