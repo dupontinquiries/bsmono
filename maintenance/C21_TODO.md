@@ -320,6 +320,8 @@ test and a §5b break test; nothing below was seen on a screen or heard.
     `cast_on_press` is saved/loaded with no row and no reader (dormant, left); blackstar-rs's
     unread save fields (`wep_mods`, `circuit_*`, `berth`) are documented plumbing-only;
     soldier, skydribble clean.
+  - **bsgames** `4a7722fcc` Road Warrior and Echelon (the deck, `window,sound`, `play`) are in
+    the games centre's registry; it had listed seven of nine.
 - **Decided, not wired:** blackstar-rs `dispatch.rs` models voyages (`voyage`/`damage`/
   `survival`/`loot`, orbits and delta-v) that nothing in the shipboard game reaches -- wiring
   it is a game-layer design, not a bug; `suitability.rs` would tell the player "wheels have
