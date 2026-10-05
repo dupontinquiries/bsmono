@@ -229,7 +229,7 @@ impl Net {
         let mut mp = Multiplayer::new(self.game, &name, &name);
         match mp.host("0.0.0.0:0") {
             Ok(token) => {
-                self.status = format!("HOSTING AS {name}  ({token})");
+                self.status = hosting_line(&name, &token, mp.host_addr());
                 self.role = Role::Host;
                 self.my_slot = 0;
                 self.reset_peers();
@@ -251,7 +251,7 @@ impl Net {
             return self.status.clone();
         }
         let mut mp = Multiplayer::new(self.game, &name, &name);
-        match mp.join(friend) {
+        match dial(&mut mp, friend) {
             Ok(addr) => {
                 self.status = format!("JOINED {friend} AT {addr}");
                 self.role = Role::Client;
@@ -563,6 +563,26 @@ fn apply_state(p: &mut PeerCar, ws: &WireState) {
     p.last = Instant::now();
 }
 
+/// The HOST line: the name, and the address a friend on the LAN types into FRIEND. The fleet
+/// store resolves a name only between machines sharing its path (`FileStore::dev_default_path`
+/// is the OS temp dir), so across two machines the address IS the way in.
+fn hosting_line(name: &str, token: &str, addr: Option<std::net::SocketAddr>) -> String {
+    match addr {
+        Some(a) => format!("HOSTING AS {name} AT {a}  ({token})"),
+        None => format!("HOSTING AS {name}  ({token})"),
+    }
+}
+
+/// FRIEND is a name on the store, or an `ip:port` from a host's HOST line -- an address dials
+/// straight in with nothing to resolve.
+fn dial(mp: &mut Multiplayer, friend: &str) -> Result<String, String> {
+    if Multiplayer::looks_like_addr(friend) {
+        mp.join_addr(friend)
+    } else {
+        mp.join(friend)
+    }
+}
+
 fn clean_name(n: &str) -> String {
     let n: String = n.trim().chars().filter(|c| !c.is_whitespace()).take(16).collect();
     if n.is_empty() {
@@ -596,7 +616,7 @@ impl Net {
         let mut mp = Multiplayer::at_store(self.game, &name, &name, store);
         match mp.host("127.0.0.1:0") {
             Ok(token) => {
-                self.status = format!("HOSTING AS {name}  ({token})");
+                self.status = hosting_line(&name, &token, mp.host_addr());
                 self.role = Role::Host;
                 self.my_slot = 0;
                 self.reset_peers();
@@ -610,7 +630,7 @@ impl Net {
         self.leave();
         let name = clean_name(name);
         let mut mp = Multiplayer::at_store(self.game, &name, &name, store);
-        match mp.join(friend) {
+        match dial(&mut mp, friend) {
             Ok(addr) => {
                 self.status = format!("JOINED {friend} AT {addr}");
                 self.role = Role::Client;
@@ -900,6 +920,53 @@ mod tests {
         let st = right.join_with("CAROL", "ALICE", store.clone());
         assert!(st.starts_with("JOINED"), "{st}");
         let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// FRIEND typed as the host's address: the joiner's store never hears of the host (a
+    /// different path) and the two still find each other on loopback -- HELLO, WELCOME, a
+    /// Joined event each way. This is the two-machine path.
+    #[test]
+    fn join_by_the_hosts_address_needs_no_shared_store() {
+        let store_a = std::env::temp_dir().join(format!("shellkit-net-addr-a-{}-{}", std::process::id(), Instant::now().elapsed().as_nanos()));
+        let store_b = std::env::temp_dir().join(format!("shellkit-net-addr-b-{}-{}", std::process::id(), Instant::now().elapsed().as_nanos()));
+        let _ = std::fs::remove_dir_all(&store_a);
+        let _ = std::fs::remove_dir_all(&store_b);
+        let mut a = Net::new("skydribble");
+        let mut b = Net::new("skydribble");
+        let host_status = a.host_with("ALICE", store_a.clone());
+        let addr = host_status
+            .split(" AT ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("the HOST line carries the address")
+            .to_string();
+        assert!(addr.starts_with("127.0.0.1:"), "{host_status}");
+        assert!(b.join_with("BOB", "ALICE", store_b.clone()).starts_with("JOIN FAILED"), "ALICE is not on BOB's store");
+        let join_status = b.join_with("BOB", &addr, store_b.clone());
+        assert!(join_status.starts_with("JOINED"), "{join_status}");
+        let mut events = Vec::new();
+        let mk = |x: f32| MyState { car: 0, flip: false, boosting: false, pos: Vec3::new(x, 1.0, 0.0), vel: Vec3::ZERO, rot: Quat::IDENTITY, wheel_spin: 0.0, steer_vis: 0.0 };
+        let mut joined = (false, false);
+        for _ in 0..800 {
+            a.tick(0.016, &mk(-4.0), Vec3::ZERO, Vec3::ZERO, Quat::IDENTITY, 20, 9, &mut events);
+            b.tick(0.016, &mk(4.0), Vec3::ZERO, Vec3::ZERO, Quat::IDENTITY, 20, 9, &mut events);
+            for e in events.drain(..) {
+                if let NetEvent::Joined(n) = e {
+                    if n == "BOB" { joined.0 = true }
+                    if n == "HOST" { joined.1 = true }
+                }
+            }
+            if joined.0 && joined.1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(500));
+        }
+        let _ = std::fs::remove_dir_all(&store_a);
+        let _ = std::fs::remove_dir_all(&store_b);
+        assert!(joined.0, "host never saw BOB's Joined event");
+        assert!(joined.1, "client never saw HOST's Joined event");
+        assert_eq!(a.player_count(), 2);
+        assert_eq!(b.player_count(), 2);
     }
 
     #[test]

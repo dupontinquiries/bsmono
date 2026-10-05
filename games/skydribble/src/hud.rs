@@ -1069,7 +1069,7 @@ pub fn online_menu(ui: &mut Vec<UiVert>, a: f32, o: &OnlineUi, blink: f32) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
     panel(ui, a, -0.70, -0.985, 0.70, 0.955);
     label_c(ui, 0.885, 0.019, a, PAPER, "ONLINE");
-    label_c(ui, 0.825, 0.0088, a, DIM, "SESSIONS RIDE THE FLEET NETCODE STORE - SAME MACHINE OR A SHARED TEMP DIR");
+    label_c(ui, 0.825, 0.0088, a, DIM, "FRIEND: A NAME ON THIS MACHINE'S STORE, OR THE HOST'S IP:PORT FROM ITS HOST LINE");
 
     let row_h = ONL_ROW_H;
     let top = ONL_TOP;
@@ -1104,7 +1104,7 @@ pub fn online_menu(ui: &mut Vec<UiVert>, a: f32, o: &OnlineUi, blink: f32) {
         }
     }
 
-    label_c(ui, -0.86, 0.0085, a, DIM, "HOSTING ANNOUNCES YOU AS <NAME> FOR FRIENDS TO JOIN BY THAT NAME");
+    label_c(ui, -0.86, 0.0085, a, DIM, "HOSTING SHOWS YOUR ADDRESS - A FRIEND ON THE LAN TYPES IT UNDER FRIEND AND JOINS");
     legend(ui, -0.93, a, T_HINT, &[("TYPE", "EDIT FIELD"), ("CLICK / ENTER", "ACTIVATE"), ("ESC", "BACK")]);
 }
 

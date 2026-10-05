@@ -20,8 +20,10 @@ pub const ID_JOIN: &str = "online.join";
 pub const ID_LEAVE: &str = "online.leave";
 pub const ID_BACK: &str = "online.back";
 
-/// Max chars for the name / friend-code fields (the old screens' cap).
+/// Max chars for the name field (the old screens' cap).
 pub const FIELD_MAX: usize = 16;
+/// FRIEND also takes a host's `ip:port` from its HOST line; `255.255.255.255:65535` is 21.
+pub const FRIEND_MAX: usize = 24;
 
 /// Build the Online screen from live state. `online` enables LEAVE (leaving
 /// while offline was always a no-op toast; now the row is simply disabled,
@@ -33,9 +35,9 @@ pub fn build(name: &str, friend: &str, online: bool) -> Menu {
         "ONLINE",
         vec![
             Row::field(ID_NAME, "NAME", name, FIELD_MAX).hint("Type to edit — your callsign"),
-            Row::field(ID_FRIEND, "FRIEND", friend, FIELD_MAX).hint("Type to edit — code to join"),
-            Row::action(ID_HOST, "HOST").hint("Host a session under your name"),
-            Row::action(ID_JOIN, "JOIN").hint("Join the friend code above"),
+            Row::field(ID_FRIEND, "FRIEND", friend, FRIEND_MAX).hint("Type to edit — a name on this machine's store, or a host's ip:port"),
+            Row::action(ID_HOST, "HOST").hint("Host a session under your name; the line shows the address a LAN friend types"),
+            Row::action(ID_JOIN, "JOIN").hint("Join the friend above (name or ip:port)"),
             leave,
             Row::action(ID_BACK, "BACK").hint("Save and return"),
         ],

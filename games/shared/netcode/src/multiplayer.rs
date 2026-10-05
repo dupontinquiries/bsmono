@@ -114,6 +114,39 @@ impl Multiplayer {
         Ok(rec.addr)
     }
 
+    /// "▶ Join by address": dial `addr` (`ip:port`) directly, with no record to resolve.
+    /// This is how two MACHINES play today: the shared `FileStore` reaches only machines that
+    /// share its path (`opendht` is the global-reach feature), so a friend's name resolves on
+    /// the same box and nowhere else, while the UDP data plane itself works across any
+    /// machines that can reach the host. The host's address is in its HOST line
+    /// (`host_addr`).
+    pub fn join_addr(&mut self, addr: &str) -> Result<String, String> {
+        let target: std::net::SocketAddr = addr.trim().parse().map_err(|_| format!("{}: not an ip:port", addr.trim()))?;
+        if target.port() == 0 {
+            return Err(format!("{target}: port 0 is nobody"));
+        }
+        let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+        socket.connect(target).map_err(|e| format!("connect {target}: {e}"))?;
+        socket.set_nonblocking(true).ok();
+        self.socket = Some(socket);
+        Ok(target.to_string())
+    }
+
+    /// Does `text` name an address rather than a friend? (`ip:port` parses as one.)
+    pub fn looks_like_addr(text: &str) -> bool {
+        text.trim().parse::<std::net::SocketAddr>().is_ok()
+    }
+
+    /// The address a joiner on the LAN should type while hosting: the routable form of the
+    /// hosting socket's (`routable` turns 0.0.0.0 into the outbound interface's address).
+    pub fn host_addr(&self) -> Option<std::net::SocketAddr> {
+        let sock = self.socket.as_ref()?;
+        if self.token.is_none() {
+            return None;
+        }
+        sock.local_addr().ok().map(routable)
+    }
+
     /// End hosting: tear down the control-plane record (presence flips back to `Online`, so
     /// `join_via_friend` stops offering it — see `SessionExt::end_session`'s doc for the TTL
     /// caveat on the raw record itself).
@@ -209,6 +242,43 @@ mod tests {
         assert_eq!(dial.transport, "udp");
         assert!(dial.addr.starts_with("127.0.0.1:"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Join by address: no store between the two, the joiner dials what the host's HOST line
+    /// says, and a datagram crosses. A name is not an address; port 0 is nobody.
+    #[test]
+    fn join_by_address_dials_without_a_store_and_a_datagram_crosses() {
+        let host_path = tmp_path("addr-host");
+        let join_path = tmp_path("addr-join"); // a DIFFERENT store: nothing to resolve through
+        let mut host = Multiplayer::at_store("skydribble", "ann", "Ann", host_path.clone());
+        host.host("127.0.0.1:0").unwrap();
+        let addr = host.host_addr().expect("hosting has an address");
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+        assert!(addr.port() > 0);
+        let mut joiner = Multiplayer::at_store("skydribble", "bo", "Bo", join_path.clone());
+        assert!(joiner.join("ann").is_err(), "ann is on another store: the name does not resolve");
+        let dialled = joiner.join_addr(&addr.to_string()).expect("the address dials");
+        assert_eq!(dialled, addr.to_string());
+        joiner.socket.as_ref().unwrap().send(b"hello").unwrap();
+        let mut buf = [0u8; 16];
+        let mut got = None;
+        for _ in 0..200 {
+            if let Some((n, from)) = host.poll(&mut buf) {
+                got = Some((buf[..n].to_vec(), from));
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (bytes, _from) = got.expect("the host received the joiner's datagram");
+        assert_eq!(bytes, b"hello");
+        assert!(Multiplayer::looks_like_addr(" 10.0.0.2:4000 "));
+        assert!(!Multiplayer::looks_like_addr("ann"));
+        assert!(!Multiplayer::looks_like_addr("10.0.0.2"), "no port is no address");
+        assert!(joiner.join_addr("ann").unwrap_err().contains("not an ip:port"));
+        assert!(joiner.join_addr("127.0.0.1:0").unwrap_err().contains("port 0"));
+        assert!(joiner.host_addr().is_none(), "a joiner has no host address");
+        let _ = std::fs::remove_file(&host_path);
+        let _ = std::fs::remove_file(&join_path);
     }
 
     #[test]

@@ -397,7 +397,7 @@ fn parse_args() -> Opts {
                 println!("  --dvorak       apply the Dvorak home-row binding preset (persisted)");
                 println!("  --name NAME    multiplayer display name / profile id (persisted)");
                 println!("  --host         announce a session on the fleet store at launch");
-                println!("  --join FRIEND  resolve FRIEND's session and dial in at launch");
+                println!("  --join FRIEND  resolve FRIEND's session and dial in at launch (or FRIEND = the host's ip:port)");
                 println!("  --mute         run silent (doesn't change saved volume)");
                 std::process::exit(0);
             }
@@ -775,6 +775,9 @@ fn terrain_mesh(w: &world::World) -> meshgen::MeshData {
     // node-identical with the physics grid: what you see is what you drive
     meshgen::terrain(world::TG_HALF, (world::TG_N - 1) as u32, |x, z| w.ground_h(x, z))
 }
+
+/// FRIEND holds a name (16) or a host's `ip:port` (`255.255.255.255:65535` is 21).
+const FRIEND_MAX: usize = 24;
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
@@ -2669,8 +2672,10 @@ impl Game {
         if (sel == 0 || sel == 1) && !ch.is_empty() {
             let c = ch.chars().next().unwrap_or(' ');
             if c.is_ascii_graphic() {
-                let field = if sel == 0 { &mut self.save.name } else { &mut self.friend };
-                if field.len() < 16 {
+                // a name is 16; FRIEND also takes a host's `ip:port` from its HOST line, and
+                // "255.255.255.255:65535" is 21 -- the old cap of 16 cut every address short
+                let (field, cap) = if sel == 0 { (&mut self.save.name, 16) } else { (&mut self.friend, FRIEND_MAX) };
+                if field.len() < cap {
                     field.push(c);
                 }
             }

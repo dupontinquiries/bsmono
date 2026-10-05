@@ -625,7 +625,7 @@ fn parse_args() -> Opts {
                 println!("  --dvorak       apply the Dvorak home-row binding preset (persisted)");
                 println!("  --name NAME    multiplayer display name / profile id (persisted)");
                 println!("  --host         announce a session on the fleet store at launch");
-                println!("  --join FRIEND  resolve FRIEND's session and dial in at launch");
+                println!("  --join FRIEND  resolve FRIEND's session and dial in at launch (or FRIEND = the host's ip:port)");
                 println!("  --mute         run silent (doesn't change saved volume)");
                 println!();
                 // A dozen headless drivers had accumulated and `--help` named

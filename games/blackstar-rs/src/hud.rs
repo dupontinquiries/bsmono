@@ -1613,7 +1613,7 @@ pub fn online_footer(ui: &mut Vec<UiVert>, a: f32, status: &str, players: &[Stri
             y -= 0.042;
         }
     }
-    label_c(ui, -0.86, 0.0085, a, DIM, "HOSTING ANNOUNCES YOU AS <NAME> FOR FRIENDS TO JOIN BY THAT NAME");
+    label_c(ui, -0.86, 0.0085, a, DIM, "HOSTING SHOWS YOUR ADDRESS - A FRIEND ON THE LAN TYPES IT UNDER FRIEND AND JOINS");
     legend(ui, -0.93, a, T_HINT, &[("TYPE", "EDIT FIELD"), ("CLICK / ENTER", "ACTIVATE"), ("ESC", "BACK")]);
 }
 
