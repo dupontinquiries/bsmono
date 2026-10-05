@@ -2429,7 +2429,7 @@ fn main() {
         pad: gamepad::Pad::new(),
         last_pad: gamepad::PadState::default(),
         save: sv,        binds,
-        net: net::Net::new(),
+        net: net::Net::new("blackstar-rs"),
         applied_scale: cfg.arena.scale,
         cfg,
         binds_to_settings: false,

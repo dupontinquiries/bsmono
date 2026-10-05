@@ -11,6 +11,13 @@
 //! bsgames integration comes free: `netcode::handoff::from_env()` reads the
 //! BSGAMES_HANDOFF_* variables, so the games centre can launch skydribble
 //! straight into hosting or joining.
+//!
+//! The registry id a `Net` publishes (`"skydribble"`, `"blackstar-rs"`) is
+//! the game's to pass to [`Net::new`]: it is what the hub dispatches a Join
+//! on, and what rejects a cross-game join. Until c21 it was a constant here,
+//! so blackstar-rs announced every match as skydribble -- the hub would have
+//! launched the wrong game for a friend, and a skydribble client could dial a
+//! blackstar-rs host.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -19,7 +26,6 @@ use std::time::Instant;
 use glam::{Quat, Vec3};
 use netcode::multiplayer::Multiplayer;
 
-const GAME: &str = "skydribble";
 const MSG_HELLO: u8 = 1;
 const MSG_WELCOME: u8 = 2;
 const MSG_STATE: u8 = 3;
@@ -70,6 +76,8 @@ pub enum NetEvent {
 }
 
 pub struct Net {
+    /// The registry id this game publishes and joins under (see the module doc).
+    game: &'static str,
     announce_acc: f32, // host heartbeat: re-publish the session every ~20 s
     mp: Option<Multiplayer>,
     pub role: Role,
@@ -183,8 +191,11 @@ fn get_str(b: &[u8], o: &mut usize) -> Option<String> {
 
 // --------------------------------------------------------------------------
 impl Net {
-    pub fn new() -> Net {
+    /// `game` is the bsgames registry id (`bsgames::centre::registry`) this
+    /// build publishes under -- `"skydribble"` or `"blackstar-rs"`.
+    pub fn new(game: &'static str) -> Net {
         Net {
+            game,
             announce_acc: 0.0,
             mp: None,
             role: Role::Offline,
@@ -215,7 +226,7 @@ impl Net {
     pub fn host(&mut self, name: &str) -> String {
         self.leave();
         let name = clean_name(name);
-        let mut mp = Multiplayer::new(GAME, &name, &name);
+        let mut mp = Multiplayer::new(self.game, &name, &name);
         match mp.host("0.0.0.0:0") {
             Ok(token) => {
                 self.status = format!("HOSTING AS {name}  ({token})");
@@ -239,7 +250,7 @@ impl Net {
             self.status = "JOIN: ENTER A FRIEND NAME FIRST".into();
             return self.status.clone();
         }
-        let mut mp = Multiplayer::new(GAME, &name, &name);
+        let mut mp = Multiplayer::new(self.game, &name, &name);
         match mp.join(friend) {
             Ok(addr) => {
                 self.status = format!("JOINED {friend} AT {addr}");
@@ -582,7 +593,7 @@ impl Net {
     pub fn host_with(&mut self, name: &str, store: std::path::PathBuf) -> String {
         self.leave();
         let name = clean_name(name);
-        let mut mp = Multiplayer::at_store(GAME, &name, &name, store);
+        let mut mp = Multiplayer::at_store(self.game, &name, &name, store);
         match mp.host("127.0.0.1:0") {
             Ok(token) => {
                 self.status = format!("HOSTING AS {name}  ({token})");
@@ -598,7 +609,7 @@ impl Net {
     pub fn join_with(&mut self, name: &str, friend: &str, store: std::path::PathBuf) -> String {
         self.leave();
         let name = clean_name(name);
-        let mut mp = Multiplayer::at_store(GAME, &name, &name, store);
+        let mut mp = Multiplayer::at_store(self.game, &name, &name, store);
         match mp.join(friend) {
             Ok(addr) => {
                 self.status = format!("JOINED {friend} AT {addr}");
@@ -640,7 +651,7 @@ mod tests {
     }
 
     fn net_with_peer(p: PeerCar) -> Net {
-        let mut n = Net::new();
+        let mut n = Net::new("skydribble");
         n.peers[0] = Some(p);
         n
     }
@@ -699,7 +710,7 @@ mod tests {
     fn player_count_is_one_plus_live_peers_not_slot_count() {
         // MAX_PLAYERS slots exist regardless of how many are filled --
         // player_count must read occupancy, not Vec length.
-        let mut n = Net::new();
+        let mut n = Net::new("skydribble");
         assert_eq!(n.player_count(), 1, "just the local player, no peers yet");
         n.peers[0] = Some(peer_at(Vec3::ZERO, Vec3::ZERO));
         n.peers[3] = Some(peer_at(Vec3::ZERO, Vec3::ZERO));
@@ -708,7 +719,7 @@ mod tests {
 
     #[test]
     fn peers_iterator_skips_empty_slots() {
-        let mut n = Net::new();
+        let mut n = Net::new("skydribble");
         n.peers[2] = Some(peer_at(Vec3::new(7.0, 0.0, 0.0), Vec3::ZERO));
         let positions: Vec<Vec3> = n.peers().map(|p| p.pos).collect();
         assert_eq!(positions, vec![Vec3::new(7.0, 0.0, 0.0)], "empty slots should not appear");
@@ -857,6 +868,40 @@ mod tests {
     /// wall-clock seconds of `thread::sleep`) since correctness doesn't need
     /// real-time pacing, only enough ticks for HELLO to reach the host and
     /// WELCOME/STATE to come back.
+    /// The announced record carries the id the Net was built for, and a
+    /// different game's client is refused -- the two shellkit games are not
+    /// wire-compatible (different maps and physics) and the hub launches the
+    /// game named in a friend's presence.
+    #[test]
+    fn a_net_publishes_the_game_it_was_built_for_and_refuses_the_other() {
+        let store = std::env::temp_dir().join(format!(
+            "shellkit-net-game-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&store);
+        let mut host = Net::new("blackstar-rs");
+        let st = host.host_with("ALICE", store.clone());
+        assert!(st.starts_with("HOSTING"), "{st}");
+        let probe = Multiplayer::at_store("blackstar-rs", "PROBE", "PROBE", store.clone());
+        let (alice, _) = probe.svc().lookup("ALICE");
+        let alice = alice.expect("the host published a profile");
+        match &alice.presence {
+            netcode::profile::Presence::InGame { game, session } => {
+                assert_eq!(game, "blackstar-rs", "presence names the game the Net was built for");
+                assert!(session.is_some(), "and the session token");
+            }
+            other => panic!("host is not InGame: {other:?}"),
+        }
+        let mut wrong = Net::new("skydribble");
+        let st = wrong.join_with("BOB", "ALICE", store.clone());
+        assert!(st.starts_with("JOIN FAILED"), "a skydribble client must not dial a blackstar-rs host: {st}");
+        let mut right = Net::new("blackstar-rs");
+        let st = right.join_with("CAROL", "ALICE", store.clone());
+        assert!(st.starts_with("JOINED"), "{st}");
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
     #[test]
     fn host_and_join_actually_sync_over_real_loopback_udp() {
         let store = std::env::temp_dir().join(format!(
@@ -865,8 +910,8 @@ mod tests {
             Instant::now().elapsed().as_nanos() // unique across parallel test threads
         ));
         let _ = std::fs::remove_dir_all(&store);
-        let mut a = Net::new();
-        let mut b = Net::new();
+        let mut a = Net::new("skydribble");
+        let mut b = Net::new("skydribble");
         let host_status = a.host_with("ALICE", store.clone());
         assert!(host_status.starts_with("HOSTING"), "host_with failed: {host_status}");
         let join_status = b.join_with("BOB", "ALICE", store.clone());

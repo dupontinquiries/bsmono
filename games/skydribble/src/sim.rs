@@ -9420,8 +9420,8 @@ pub fn run(args: &[String]) {
         // then run the REAL UDP data plane — HELLO, WELCOME, state sync.
         let store = std::env::temp_dir().join(format!("skyd-mp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
-        let mut a = crate::net::Net::new();
-        let mut b = crate::net::Net::new();
+        let mut a = crate::net::Net::new("skydribble");
+        let mut b = crate::net::Net::new("skydribble");
         println!("host: {}", a.host_with("ALICE", store.clone()));
         println!("join: {}", b.join_with("BOB", "ALICE", store.clone()));
         let mut ev: Vec<crate::net::NetEvent> = Vec::new();
