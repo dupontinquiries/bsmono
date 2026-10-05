@@ -6,13 +6,14 @@
 //! untested: real gyro input (needs actual hardware — see gyro.rs), and
 //! whether any of it is fun.
 
+mod audio;
 mod flow;
 mod gyro;
 mod render;
 mod save;
 
 use eframe::egui_wgpu;
-use road_warrior_core::{campaign, encounter, BakedLighting, Boss, CarKind, Campaign, SaveState, Sun, Track, Vehicle};
+use road_warrior_core::{campaign, cues, encounter, BakedLighting, Boss, CarKind, Campaign, SaveState, Sun, Track, Vehicle};
 use gyro::GyroTilt;
 use render::{SceneCallback, SceneResources, SceneUniforms, TerrainUniforms};
 
@@ -63,6 +64,12 @@ struct RoadWarriorApp {
     toasts: Vec<Toast>,
     /// Title / play / pause / campaign-complete (`flow`).
     flow: flow::Flow,
+    /// The sound (`audio`); `None` on a machine with no output, and the game runs silent.
+    audio: Option<audio::Audio>,
+    /// Names the car's moments for the sound (`cues::Listener`).
+    listener: cues::Listener,
+    /// `M` toggles it; the master goes to zero, the synth keeps running.
+    muted: bool,
 }
 
 /// Matches the index order the shader assumes (0=Behemoth, 1=SixWheeler,
@@ -141,7 +148,15 @@ impl RoadWarriorApp {
             vehicle.health = 1.0;
         }
 
+        let audio = audio::Audio::start();
+        if audio.is_none() {
+            eprintln!("road-warrior: no audio output; running silent");
+        }
+        let listener = cues::Listener::new(&vehicle);
         Self {
+            audio,
+            listener,
+            muted: false,
             vehicle,
             light: BakedLighting::bake(&track, Sun::default(), LIGHT_SAMPLES),
             track,
@@ -169,9 +184,22 @@ impl RoadWarriorApp {
             self.campaign.seek(0);
         }
         self.load_current_level();
+        self.listener.reset(&self.vehicle);
         self.level_start_time = std::time::Instant::now();
         self.accumulator = 0.0;
         self.toasts.clear();
+    }
+
+    fn sound(&self, m: audio::Msg) {
+        if let Some(a) = &self.audio {
+            a.send(m);
+        }
+    }
+
+    fn toggle_mute(&mut self) {
+        self.muted = !self.muted;
+        self.sound(audio::Msg::Master(if self.muted { 0.0 } else { 1.0 }));
+        self.toasts.push(Toast { message: if self.muted { "Sound off (M)".into() } else { "Sound on".into() }, shown_at: std::time::Instant::now() });
     }
 
     /// Resets the current level (fresh boss, vehicle back to full stats at
@@ -183,6 +211,8 @@ impl RoadWarriorApp {
         let kind = self.vehicle.kind;
         self.vehicle = Vehicle::new(kind);
         self.load_current_level();
+        self.sound(audio::Msg::Sting(audio::Sting::Lost));
+        self.listener.reset(&self.vehicle);
         self.level_start_time = std::time::Instant::now();
         self.toasts.push(Toast {
             message: "Out of fuel! Retrying level...".to_string(),
@@ -194,6 +224,8 @@ impl RoadWarriorApp {
         let kind = self.vehicle.kind;
         self.vehicle = Vehicle::new(kind);
         self.load_current_level();
+        self.sound(audio::Msg::Sting(audio::Sting::Lost));
+        self.listener.reset(&self.vehicle);
         self.level_start_time = std::time::Instant::now();
         self.toasts.push(Toast { message: "Crashed! Retrying level...".to_string(), shown_at: std::time::Instant::now() });
     }
@@ -323,7 +355,9 @@ impl eframe::App for RoadWarriorApp {
         // car's and the flow ignores them.
         let unlocked: Vec<CarKind> = self.save.unlocked_cars().to_vec();
         let mut flow_keys: Vec<flow::Key> = Vec::new();
+        let mut mute_pressed = false;
         ctx.input(|i| {
+            mute_pressed = i.key_pressed(egui::Key::M);
             if i.key_pressed(egui::Key::Escape) {
                 flow_keys.push(flow::Key::Back);
             }
@@ -339,6 +373,9 @@ impl eframe::App for RoadWarriorApp {
                 }
             }
         });
+        if mute_pressed {
+            self.toggle_mute();
+        }
         for k in flow_keys {
             match self.flow.on_key(k, &unlocked) {
                 Some(flow::Action::Start(kind)) => self.start_run(kind),
@@ -384,11 +421,17 @@ impl eframe::App for RoadWarriorApp {
         // key.
         let mut boss_defeated_this_frame = false;
         for _ in 0..steps {
-            if let Some(boss) = &mut self.boss {
+            let outcome = if let Some(boss) = &mut self.boss {
                 let outcome = encounter::advance(&mut self.vehicle, &self.track, boss, dt, self.throttle, tilt, nitro_active, -9.8);
                 boss_defeated_this_frame |= outcome.boss_defeated_this_tick;
+                Some(outcome)
             } else {
                 road_warrior_core::sim::advance(&mut self.vehicle, &self.track, dt, self.throttle, tilt, nitro_active, -9.8);
+                None
+            };
+            // what the step did, to hear (`cues`)
+            for c in self.listener.step(&self.vehicle, nitro_active, outcome) {
+                self.sound(audio::Msg::Cue(c));
             }
             // Stop sub-stepping the moment the car dies, so a death is not
             // simulated three more steps past the point it happened.
@@ -396,6 +439,12 @@ impl eframe::App for RoadWarriorApp {
                 break;
             }
         }
+        // the engine's note, every frame: idling on the menus, silent-throttle off the play screen
+        self.sound(audio::Msg::Engine(if self.flow.simulates() {
+            cues::engine(&self.vehicle, self.throttle)
+        } else {
+            cues::Engine { rpm: 0.0, load: 0.0 }
+        }));
         if boss_defeated_this_frame {
             self.toasts.push(Toast { message: "Boss defeated!".to_string(), shown_at: std::time::Instant::now() });
         }
@@ -451,8 +500,10 @@ impl eframe::App for RoadWarriorApp {
                 self.toasts.push(Toast { message: msg, shown_at: std::time::Instant::now() });
             }
 
+            self.sound(audio::Msg::Sting(audio::Sting::LevelComplete));
             if self.campaign.advance() {
                 self.load_current_level();
+                self.listener.reset(&self.vehicle);
                 self.level_start_time = std::time::Instant::now();
             } else {
                 // the campaign-complete screen (`flow`); it was a three-second toast

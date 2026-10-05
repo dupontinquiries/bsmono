@@ -3,8 +3,15 @@ name = "shell"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["sound"]
+# Synthesized sound through cpal (needs ALSA headers on Linux: libasound2-dev). Build with
+# --no-default-features for a silent binary with no audio system dependency.
+sound = ["dep:cpal"]
+
 [dependencies]
 road_warrior_core = { path = "../core" }
+cpal = { version = "0.15", optional = true }
 eframe = { version = "0.27", default-features = false, features = ["wgpu", "default_fonts", "x11"] }
 egui = "0.27"
 zbus = { version = "3", default-features = false, features = ["tokio"] }
