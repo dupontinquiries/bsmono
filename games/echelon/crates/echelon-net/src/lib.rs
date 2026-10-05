@@ -8,9 +8,12 @@
 //! Clients periodically exchange state hashes; any mismatch flags a desync
 //! with the earliest offending checkpoint.
 //!
-//! This crate owns no sockets — feed [`Lockstep::recv`] from any transport
-//! (the runner's `--lockstep` mode wires two sessions back-to-back in
-//! memory; the future relay server moves the same `Msg` values over UDP).
+//! This crate owns no sockets in its core — feed [`Lockstep::recv`] from any
+//! transport (the runner's `--lockstep` mode wires two sessions back-to-back
+//! in memory). [`udp::UdpLink`] is the UDP one: the same `Msg` values over a
+//! datagram socket, re-sent until acknowledged.
+
+pub mod udp;
 
 use echelon_sim::PlayerCmd;
 use serde::{Deserialize, Serialize};
@@ -98,7 +101,9 @@ impl Lockstep {
     pub fn recv(&mut self, msg: Msg) {
         match msg {
             Msg::Cmds { turn, player, cmds } => {
-                if player != self.me {
+                // a turn already executed is a transport's re-send (`udp`), not input: it
+                // must not grow the map back
+                if player != self.me && player < self.cfg.players && turn >= self.exec_turn {
                     self.slot(turn)[player as usize] = Some(cmds);
                 }
             }
@@ -160,6 +165,11 @@ impl Lockstep {
         std::mem::take(&mut self.outbox)
     }
 
+    /// The next turn to execute.
+    pub fn exec_turn(&self) -> u32 {
+        self.exec_turn
+    }
+
     /// how many turns ahead of execution the local input stream is
     pub fn lead(&self) -> u32 {
         (self.sent_turn + self.cfg.delay).saturating_sub(self.exec_turn)
@@ -180,6 +190,24 @@ mod tests {
                 my: 0,
             },
         }
+    }
+
+    /// A re-sent `Cmds` for a turn already executed must not grow the map back (a transport
+    /// re-sends until acked); an out-of-range player is ignored rather than indexed.
+    #[test]
+    fn a_stale_or_foreign_cmds_message_is_dropped() {
+        let cfg = NetCfg { players: 2, turn_len: 4, delay: 1 };
+        let mut a = Lockstep::new(cfg, 0);
+        a.submit_local(vec![cmd(0, 1)]);
+        a.recv(Msg::Cmds { turn: 1, player: 1, cmds: vec![cmd(1, 2)] });
+        assert!(a.next_turn().is_some(), "turn 0, the bootstrap");
+        assert!(a.next_turn().is_some(), "turn 1");
+        assert_eq!(a.exec_turn(), 2);
+        assert!(a.cmds.is_empty());
+        a.recv(Msg::Cmds { turn: 1, player: 1, cmds: vec![cmd(1, 2)] });
+        assert!(a.cmds.is_empty(), "the stale re-send grew nothing back");
+        a.recv(Msg::Cmds { turn: 5, player: 7, cmds: vec![] });
+        assert!(a.cmds.is_empty(), "a player off the roster is ignored");
     }
 
     #[test]

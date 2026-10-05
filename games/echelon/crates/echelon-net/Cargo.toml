@@ -9,3 +9,5 @@ description = "Transport-agnostic lockstep session: command turns, input delay, 
 [dependencies]
 echelon-sim = { path = "../echelon-sim" }
 serde.workspace = true
+# the UDP transport's wire text (`udp`); the data pack's own format, already in the tree
+ron.workspace = true

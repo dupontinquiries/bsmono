@@ -159,9 +159,12 @@ creep-like spread, high-ground vision.
 
 - **M0 sim core — done** (this drop): fixed-point lockstep sim, data-driven
   races, bot matches, replay verification.
-- **M2 net core — done in-process** (this drop): `echelon-net` sessions;
-  remaining: UDP/relay transport over `shared/net-kit`, reconnect, drift
-  buffering under real latency.
+- **M2 net core — done in-process** (this drop): `echelon-net` sessions.
+  The UDP transport landed in c21 (`echelon_net::udp::UdpLink`: the same
+  `Msg` values over a datagram socket, re-sent until acknowledged; proven on
+  loopback through a relay that drops every third datagram). Remaining: a
+  relay server and the client wiring (the Bevy client is still human vs bot),
+  reconnect, drift buffering under real latency.
 - **M1 client — builds clean** (verified this session, first time ever: a
   real rustc 1.96 finally cleared Bevy 0.16's MSRV, well past distro 1.75,
   hence the detached workspace). `client/`: Bevy 0.16 front-end over the

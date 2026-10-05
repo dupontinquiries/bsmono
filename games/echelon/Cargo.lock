@@ -114,6 +114,7 @@ name = "echelon-net"
 version = "0.1.0"
 dependencies = [
  "echelon-sim",
+ "ron",
  "serde",
 ]
 
