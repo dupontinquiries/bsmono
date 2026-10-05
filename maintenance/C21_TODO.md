@@ -300,6 +300,19 @@ test and a §5b break test; nothing below was seen on a screen or heard.
     lost / hits (rate-limited) / the banner off the world between frames, Ack on a command;
     `audio` is the house synth behind `sound` (off by default; the tape and CI stay silent).
     Unheard.
+  - **clawbound** `e2f25887d` the Keybinds page's "Menu" row was read by nothing (Esc raw);
+    read now, Esc kept as a menu key whatever is bound. A scan of every game's rebindable
+    actions found no other dead rows (battleground, skydribble, blackstar-rs, soldier all
+    read theirs).
+  - **unendlich settings audit** (every `ui_*` field vs who reads it): `391fb0b70` the "game
+    speed" slider (r235, with a live multiplier label and a reconcile paragraph) drove nothing
+    -- it is now `chunk_manager.tick_speed_multiplier` (the plants/weathering knob F6/F7
+    stepped), the sky's `time_scale` and the day clock, capped at 10x; and F6/F7 were ALSO
+    the raw survival/creative toggle and the rest ritual, so every mode toggle slowed the
+    world by sqrt(10) -- tick speed is `[`/`]` now. `3869fab0a` the "render scale (neural
+    upscale)" slider is disabled and says "not wired" (docs/UPSCALING.md: zero callers; the
+    knob waits on the post-FX offscreen path, which needs a GPU to land). Everything else
+    on the settings page has a reader and a save/load line.
 - **Decided, not wired:** blackstar-rs `dispatch.rs` models voyages (`voyage`/`damage`/
   `survival`/`loot`, orbits and delta-v) that nothing in the shipboard game reaches -- wiring
   it is a game-layer design, not a bug; `suitability.rs` would tell the player "wheels have
