@@ -134,17 +134,18 @@ pub struct Stacking {
     pub interval: f32,
 }
 
-use std::cmp::max;
-
 impl Stacking {
     /// Stacks at which it is full.
     pub fn cap(&self) -> f32 {
         self.max / self.per
     }
-    /// The stat it adds at `stacks` (a Time counter counts whole intervals).
+    /// The stat it adds at `stacks`. A Time counter counts whole intervals, and the first one
+    /// is free: the item starts growing an interval after it is bought (52ac75149's play-feel
+    /// choice). That "minus one" was `stacks.floor() as u32 - 1`, which at zero stacks
+    /// underflows -- a panic in a debug build, and in the release build every player runs,
+    /// four billion stacks: Beacon of Ages granted its whole +1000 INT the moment it was bought.
     pub fn gained(&self, stacks: f32) -> f32 {
-        let n = if self.kind == StackKind::Time { max(0, stacks.floor() as u32 - 1) as f32 } else { stacks };
-        // let n = if self.kind == StackKind::Time { stacks.floor() } else { stacks };
+        let n = if self.kind == StackKind::Time { (stacks.floor() - 1.0).max(0.0) } else { stacks };
         (n.min(self.cap()) * self.per).min(self.max)
     }
 }
@@ -348,7 +349,7 @@ fn build() -> Vec<Item> {
     // push(&mut v, "Sage's Obsession", 2, 1600., Cat::Stacking, s(0.,25.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 1.0, 600.0, 10.0), "+25 INT. Gains +6 INT every minute (max 400).");
     push(&mut v, "Warlord's Standard", 3, 2900., Cat::Stacking, s(45.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::MinionKill, Grow::Strength, 0.5, 125.0, 0.0), "+45 STR. Gains +0.5 STR per minion kill (max 125).");
     push(&mut v, "Eternal Hunger", 3, 3000., Cat::Stacking, s(0.,0.,45.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::GodKill, Grow::Power, 6.0, 90.0, 0.0), "+45 Power. Gains +6 Power per god takedown (max 90).");
-    push(&mut v, "Beacon of Ages", 3, 2800., Cat::Stacking, s(0.,40.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 1.0, 1000.0, 10.0), "+40 INT. Gains +6 INT every minute (max 1000)."); // there is a bug where it applies right away all 1k
+    push(&mut v, "Beacon of Ages", 3, 2800., Cat::Stacking, s(0.,40.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 1.0, 1000.0, 10.0), "+40 INT. Gains +6 INT every minute (max 1000)."); // (it applied all 1000 at once: see Stacking::gained)
     // push(&mut v, "Beacon of Ages", 3, 2800., Cat::Stacking, s(0.,40.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 1.0, 1000.0, 10.0), "+40 INT. Gains +6 INT every minute (max 1000).");
     // push(&mut v, "Beacon of Ages", 3, 2800., Cat::Stacking, s(0.,40.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, Grow::Intelligence, 1.0, 2000.0, 10.0), "+40 INT. Gains +6 INT every minute (max 2000).");
     push(&mut v, "Monument of Ruin", 3, 3100., Cat::Stacking, s(0.,0.,0.,0.,0.,0.,0.,500.,0.,0.,0.), st(StackKind::MinionKill, Grow::Health, 4.0, 640.0, 0.0), "+500 HP. Gains +4 HP per minion kill (max 640).");
@@ -412,5 +413,37 @@ pub fn role_build_order(role: crate::gods::Role) -> [Cat; 5] {
         // she stands in the middle of it: bulk first, then the power her
         // magma burns with
         Sentinel => [Cat::Health, Cat::Protection, Cat::Scaling, Cat::Strength, Cat::Intelligence],
+    }
+}
+
+#[cfg(test)]
+mod stacking_tests {
+    use super::*;
+
+    /// A Time trophy at purchase is worth nothing, grows by `per` an interval after the first,
+    /// and stops at `max`. The zero-stack case is the one that underflowed.
+    #[test]
+    fn a_time_trophy_grows_from_nothing_an_interval_after_the_first() {
+        let beacon = all().iter().find(|i| i.name == "Beacon of Ages").expect("Beacon of Ages");
+        let st = beacon.stack.as_ref().expect("a Time trophy");
+        assert_eq!(st.kind, StackKind::Time);
+        assert_eq!(st.gained(0.0), 0.0, "bought this instant");
+        assert_eq!(st.gained(0.9), 0.0, "inside the first interval");
+        assert_eq!(st.gained(1.0), 0.0, "the first interval is free");
+        assert_eq!(st.gained(2.0), st.per);
+        assert_eq!(st.gained(2.7), st.per, "whole intervals only");
+        assert_eq!(st.gained(3.0), 2.0 * st.per);
+        assert_eq!(st.gained(1e6), st.max, "and never past the cap");
+        assert!(st.gained(0.0) < st.max, "not the whole {} at once", st.max);
+    }
+
+    #[test]
+    fn a_kill_trophy_counts_every_stack_from_the_first() {
+        let charm = all().iter().find(|i| i.name == "Momentum Charm").expect("Momentum Charm");
+        let st = charm.stack.as_ref().unwrap();
+        assert_ne!(st.kind, StackKind::Time);
+        assert_eq!(st.gained(0.0), 0.0);
+        assert_eq!(st.gained(1.0), st.per);
+        assert_eq!(st.gained(1e6), st.max);
     }
 }
