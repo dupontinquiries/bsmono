@@ -29,3 +29,7 @@ settings-kit = { path = "../../shared/settings-kit", optional = true }
 default = []
 app = ["gui", "dep:eframe"]
 gui = ["dep:egui", "dep:uikit-egui", "dep:settings-kit", "dep:qrcode"]
+
+[dev-dependencies]
+# `registry_launches_resolve_against_the_real_manifests` reads `cargo metadata` output.
+serde_json = "1"

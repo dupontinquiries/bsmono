@@ -26,10 +26,45 @@ pub fn hub_service_at(path: std::path::PathBuf) -> HubService {
 /// How a game is started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchKind {
-    /// `cargo run --release` in the game's dir (the Rust games).
-    Cargo,
+    /// `cargo run --release --manifest-path <dir>/Cargo.toml` plus whatever [`CargoRun`] says the
+    /// playable window needs (the Rust games).
+    Cargo(CargoRun),
     /// A CMake-built binary at `<dir>/build/<name>` (cybertron).
     CmakeBin(String),
+}
+
+/// What `cargo run` needs beyond the manifest path to start the PLAYABLE binary. Every field
+/// exists because a plain `cargo run --manifest-path` was refused or ran the wrong thing:
+///
+/// * soldier has four bins and no `default-run` (cargo: "could not determine which binary to
+///   run"); unendlich's manifest is a virtual workspace with twenty-six -- so `bin`.
+/// * soldier's window is behind `app`, unendlich-fullgame requires `ui-overlay`, neither default
+///   (cargo: "requires the features: ..."), and clawbound without `app` is a headless render --
+///   so `features`.
+/// * clawbound's window is `-- --play`; and cargo rejects any game flag placed before `--`
+///   (`--quick-match` was: "unexpected argument '--quick-match' found") -- so `args`, after `--`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CargoRun {
+    /// `--bin NAME`, when the manifest has several binaries or is a workspace root.
+    pub bin: Option<String>,
+    /// `--features A,B` the playable binary requires that are not in the package defaults.
+    pub features: Vec<String>,
+    /// The game's own arguments, passed after `--`.
+    pub args: Vec<String>,
+}
+
+impl CargoRun {
+    /// `cargo run --release --manifest-path <dir>/Cargo.toml`: one binary, default features.
+    pub fn plain() -> LaunchKind {
+        LaunchKind::Cargo(CargoRun::default())
+    }
+    fn with(bin: Option<&str>, features: &[&str], args: &[&str]) -> LaunchKind {
+        LaunchKind::Cargo(CargoRun {
+            bin: bin.map(str::to_string),
+            features: features.iter().map(|f| f.to_string()).collect(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+        })
+    }
 }
 
 /// An installed game.
@@ -44,44 +79,73 @@ pub struct GameEntry {
     pub kind: LaunchKind,
 }
 
-/// The five fleet games.
+/// The fleet games. `id` is the registry id a game publishes in its presence (`Multiplayer::new`'s
+/// first argument) -- the hub's Join finds the game to spawn by it -- so it must match the game.
+/// `registry_launches_resolve_against_the_real_manifests` checks every `Cargo` entry against the
+/// manifest it names: the bin exists and its required features are covered.
 pub fn registry() -> Vec<GameEntry> {
     vec![
-        GameEntry { id: "clawbound".into(), name: "Clawbound".into(), engine: "wgpu".into(), dir: "games/clawbound".into(), kind: LaunchKind::Cargo },
+        // The window is behind `app` and starts with `--play`; without both, `cargo run` is the
+        // headless render-to-file path.
+        GameEntry { id: "clawbound".into(), name: "Clawbound".into(), engine: "wgpu".into(), dir: "games/clawbound".into(), kind: CargoRun::with(None, &["app"], &["--play"]) },
         // The 5v5 arena for Clawbound's thirteen ancestors. Reads `--quick-match` (straight into a
         // match with a random ancestor) and the BSGAMES_HANDOFF_* env (logs the session, plays solo —
         // online play is not wired in it yet). Default features want libasound2-dev; the game's own
         // README covers `--no-default-features` for a silent build.
-        GameEntry { id: "clawbound-battleground".into(), name: "Clawbound: Battleground".into(), engine: "wgpu".into(), dir: "games/clawbound-battleground".into(), kind: LaunchKind::Cargo },
-        GameEntry { id: "soldier".into(), name: "Soldier".into(), engine: "wgpu".into(), dir: "games/soldier".into(), kind: LaunchKind::Cargo },
-        GameEntry { id: "unendlich".into(), name: "Unendlich".into(), engine: "custom".into(), dir: "games/unendlich".into(), kind: LaunchKind::Cargo },
-        GameEntry { id: "blackstar".into(), name: "Blackstar".into(), engine: "vulkan/opengl".into(), dir: "games/blackstar".into(), kind: LaunchKind::CmakeBin("blackstar".into()) },
+        GameEntry { id: "clawbound-battleground".into(), name: "Clawbound: Battleground".into(), engine: "wgpu".into(), dir: "games/clawbound-battleground".into(), kind: CargoRun::plain() },
+        // Package `early-fps`, four bins; the eframe window is `early-fps` behind `app`.
+        GameEntry { id: "soldier".into(), name: "Soldier".into(), engine: "wgpu".into(), dir: "games/soldier".into(), kind: CargoRun::with(Some("early-fps"), &["app"], &[]) },
+        // A virtual workspace; the game is unendlich-engine's `unendlich-fullgame`, which
+        // requires `ui-overlay` on top of the defaults (`tools/run-latest.sh` is the reference).
+        GameEntry { id: "unendlich".into(), name: "Unendlich".into(), engine: "custom".into(), dir: "games/unendlich".into(), kind: CargoRun::with(Some("unendlich-fullgame"), &["ui-overlay"], &[]) },
+        // The Rocket-League-style air-dribble playground; speaks the handoff env and `--quick-match`
+        // (`games/skydribble/integration/README.md`).
+        GameEntry { id: "skydribble".into(), name: "Skydribble".into(), engine: "wgpu".into(), dir: "games/skydribble".into(), kind: CargoRun::plain() },
+        // The Rust port of Blackstar (package `blackstar`, one bin); same shell as skydribble.
+        GameEntry { id: "blackstar-rs".into(), name: "Blackstar (Rust)".into(), engine: "wgpu".into(), dir: "games/blackstar-rs".into(), kind: CargoRun::plain() },
+        GameEntry { id: "blackstar".into(), name: "Blackstar (C++)".into(), engine: "vulkan/opengl".into(), dir: "games/blackstar".into(), kind: LaunchKind::CmakeBin("blackstar".into()) },
     ]
 }
 
-/// The command line to launch a game (program first). Spawning is the caller's job.
+/// The command line to launch a game (program first; paths relative to the monorepo root).
+/// Spawning is the caller's job.
 pub fn launch_argv(g: &GameEntry) -> Vec<String> {
     match &g.kind {
-        LaunchKind::Cargo => vec![
-            "cargo".into(), "run".into(), "--release".into(),
-            "--manifest-path".into(), format!("{}/Cargo.toml", g.dir),
-        ],
+        LaunchKind::Cargo(run) => {
+            let mut argv: Vec<String> = vec![
+                "cargo".into(), "run".into(), "--release".into(),
+                "--manifest-path".into(), format!("{}/Cargo.toml", g.dir),
+            ];
+            if let Some(bin) = &run.bin {
+                argv.push("--bin".into());
+                argv.push(bin.clone());
+            }
+            if !run.features.is_empty() {
+                argv.push("--features".into());
+                argv.push(run.features.join(","));
+            }
+            if !run.args.is_empty() {
+                argv.push("--".into());
+                argv.extend(run.args.iter().cloned());
+            }
+            argv
+        }
         LaunchKind::CmakeBin(bin) => vec![format!("{}/build/{}", g.dir, bin)],
     }
 }
 
-/// The quick-match hook: same launch, plus a `--quick-match` flag each game can read to skip
-/// straight into a simple match instead of the main menu. Today every game just ignores the flag
-/// (none read it yet — this is the seam the per-game menu work builds on, one game at a time; see
-/// `games/soldier/src/multiplayer.rs` for the first real online-play wiring it'll eventually hook
-/// into). Separate from `launch_argv` so a game can diverge further later (its own binary flag
-/// spelling, a distinct quick-match entry point, etc.) without disturbing the plain launch path.
+/// The quick-match hook: same launch, plus a `--quick-match` flag for the game (skydribble,
+/// blackstar-rs and clawbound-battleground read it and skip their menus; the others ignore it).
+/// For a cargo launch the flag goes after `--`, because cargo itself rejects an unknown flag --
+/// until c21 it was appended bare and `cargo run` refused every quick match with "unexpected
+/// argument '--quick-match'". Separate from `launch_argv` so a game can diverge further later
+/// (its own flag spelling, a distinct entry point) without disturbing the plain launch path.
 pub fn quick_match_argv(g: &GameEntry) -> Vec<String> {
     let mut argv = launch_argv(g);
-    match &g.kind {
-        LaunchKind::Cargo => argv.push("--quick-match".into()),
-        LaunchKind::CmakeBin(_) => argv.push("--quick-match".into()),
+    if matches!(g.kind, LaunchKind::Cargo(_)) && !argv.iter().any(|a| a == "--") {
+        argv.push("--".into());
     }
+    argv.push("--quick-match".into());
     argv
 }
 
@@ -200,26 +264,114 @@ mod tests {
     use netcode::store::{ProfileService, SnapcoreStore};
 
     #[test]
-    fn registry_has_the_five_games_with_launchers() {
+    fn registry_has_the_seven_games_with_launchers() {
         let r = registry();
-        assert_eq!(r.len(), 5);
+        assert_eq!(r.len(), 7);
         let bg = r.iter().find(|g| g.id == "clawbound-battleground").unwrap();
         assert_eq!(launch_argv(bg), vec!["cargo", "run", "--release", "--manifest-path", "games/clawbound-battleground/Cargo.toml"]);
-        assert_eq!(quick_match_argv(bg).last().map(String::as_str), Some("--quick-match"));
-        // Rust games → cargo; cybertron → cmake bin
+        assert_eq!(quick_match_argv(bg), vec!["cargo", "run", "--release", "--manifest-path", "games/clawbound-battleground/Cargo.toml", "--", "--quick-match"]);
+        // the window needs a feature and a flag of its own
         let claw = r.iter().find(|g| g.id == "clawbound").unwrap();
-        assert_eq!(launch_argv(claw), vec!["cargo", "run", "--release", "--manifest-path", "games/clawbound/Cargo.toml"]);
+        assert_eq!(launch_argv(claw), vec!["cargo", "run", "--release", "--manifest-path", "games/clawbound/Cargo.toml", "--features", "app", "--", "--play"]);
+        // several bins: name the playable one
+        let soldier = r.iter().find(|g| g.id == "soldier").unwrap();
+        assert_eq!(launch_argv(soldier), vec!["cargo", "run", "--release", "--manifest-path", "games/soldier/Cargo.toml", "--bin", "early-fps", "--features", "app"]);
+        // cybertron → cmake bin
         let cyber = r.iter().find(|g| g.id == "blackstar").unwrap();
         assert_eq!(launch_argv(cyber), vec!["games/blackstar/build/blackstar"]);
+        assert_eq!(quick_match_argv(cyber), vec!["games/blackstar/build/blackstar", "--quick-match"]);
+        // ids are unique: Join dispatches on them
+        let mut ids: Vec<&str> = r.iter().map(|g| g.id.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), r.len());
     }
 
     #[test]
-    fn quick_match_argv_appends_the_flag_to_the_plain_launch() {
-        let r = registry();
-        let claw = r.iter().find(|g| g.id == "clawbound").unwrap();
-        let mut want = launch_argv(claw);
-        want.push("--quick-match".into());
-        assert_eq!(quick_match_argv(claw), want);
+    fn quick_match_flag_goes_to_the_game_not_to_cargo() {
+        for g in registry() {
+            let argv = quick_match_argv(&g);
+            assert_eq!(argv.last().map(String::as_str), Some("--quick-match"), "{}", g.id);
+            if matches!(g.kind, LaunchKind::Cargo(_)) {
+                let sep = argv.iter().position(|a| a == "--").expect("a cargo launch separates game args");
+                assert!(argv[..sep].iter().all(|a| a != "--quick-match"), "{}: cargo would reject it: {argv:?}", g.id);
+                assert_eq!(argv.iter().filter(|a| *a == "--").count(), 1, "{}: one separator: {argv:?}", g.id);
+            }
+        }
+    }
+
+    /// Every `Cargo` entry against the manifest it names, via `cargo metadata --no-deps` (offline,
+    /// ~50 ms even for unendlich's workspace): the manifest exists, the chosen bin (or the only
+    /// bin, when none is chosen) exists, and its `required-features` are covered by the package
+    /// defaults plus the entry's features, transitively. This is the check that `cargo run` does
+    /// before building -- the one that refused soldier, unendlich and every quick match until c21.
+    #[test]
+    fn registry_launches_resolve_against_the_real_manifests() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let mut checked = 0;
+        for g in registry() {
+            let LaunchKind::Cargo(run) = &g.kind else { continue };
+            let manifest = root.join(&g.dir).join("Cargo.toml");
+            assert!(manifest.is_file(), "{}: no manifest at {}", g.id, manifest.display());
+            let out = std::process::Command::new("cargo")
+                .args(["metadata", "--no-deps", "--format-version", "1", "--offline", "--manifest-path"])
+                .arg(&manifest)
+                .output()
+                .expect("run cargo metadata");
+            assert!(out.status.success(), "{}: cargo metadata failed: {}", g.id, String::from_utf8_lossy(&out.stderr));
+            let meta: serde_json::Value = serde_json::from_slice(&out.stdout).expect("metadata is json");
+            let packages = meta["packages"].as_array().expect("packages");
+            // (package, target) pairs for every bin in the manifest's workspace
+            let bins: Vec<(&serde_json::Value, &serde_json::Value)> = packages
+                .iter()
+                .flat_map(|p| p["targets"].as_array().unwrap().iter().map(move |t| (p, t)))
+                .filter(|(_, t)| t["kind"].as_array().unwrap().iter().any(|k| k == "bin"))
+                .collect();
+            let (pkg, target) = match &run.bin {
+                Some(name) => bins
+                    .iter()
+                    .find(|(_, t)| t["name"] == *name)
+                    .copied()
+                    .unwrap_or_else(|| panic!("{}: no bin `{name}` in {}", g.id, manifest.display())),
+                None => {
+                    // cargo's own rule: one bin, or the package's `default-run`
+                    let default_run = packages.iter().find_map(|p| p["default_run"].as_str().map(str::to_string));
+                    match default_run {
+                        Some(name) => bins.iter().find(|(_, t)| t["name"] == *name).copied().unwrap_or_else(|| panic!("{}: default-run `{name}` is not a bin", g.id)),
+                        None => {
+                            assert_eq!(bins.len(), 1, "{}: {} bins, no `bin` chosen and no default-run -- cargo run would refuse: {:?}", g.id, bins.len(), bins.iter().map(|(_, t)| t["name"].to_string()).collect::<Vec<_>>());
+                            bins[0]
+                        }
+                    }
+                }
+            };
+            // feature closure: defaults + the entry's, following feature -> feature edges
+            let table = pkg["features"].as_object().expect("features table");
+            let mut have: Vec<String> = run.features.clone();
+            have.push("default".into());
+            let mut i = 0;
+            while i < have.len() {
+                if let Some(deps) = table.get(&have[i]).and_then(|v| v.as_array()) {
+                    for d in deps {
+                        let d = d.as_str().unwrap_or("");
+                        let d = d.strip_prefix("dep:").unwrap_or(d);
+                        let d = d.split('/').next().unwrap_or(d).trim_end_matches('?');
+                        if !have.iter().any(|h| h == d) {
+                            have.push(d.to_string());
+                        }
+                    }
+                }
+                i += 1;
+            }
+            if let Some(req) = target["required-features"].as_array() {
+                for f in req {
+                    let f = f.as_str().unwrap();
+                    assert!(have.iter().any(|h| h == f), "{}: bin `{}` requires feature `{f}`; the launch enables {:?} (+defaults)", g.id, target["name"], run.features);
+                }
+            }
+            checked += 1;
+        }
+        assert!(checked >= 6, "the scan must have covered the cargo games, not skipped them: {checked}");
     }
 
     #[test]
