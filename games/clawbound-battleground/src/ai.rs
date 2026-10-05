@@ -49,6 +49,33 @@ impl Game {
 /// An enemy god this close to a structure of ours is pushing it.
 pub const THREAT_R: f32 = 14.0;
 
+/// The index of the lane waypoint nearest `pos`: where a bot joins a lane it was not walking
+/// -- a lane change, or the walk back out after healing. Not the far point it last held: from
+/// the fountain that is a straight line through the middle of the map.
+pub fn nearest_waypoint(path: &[Vec3], pos: Vec3) -> usize {
+    (0..path.len()).min_by(|&a, &b| path[a].distance(pos).total_cmp(&path[b].distance(pos))).unwrap_or(0)
+}
+
+/// The lane a bot pushes when no call binds it: its home lane while an enemy tower still
+/// stands on it, else the lane with the fewest standing enemy towers (ties: the one whose
+/// nearest standing tower is closest to `from`). `None` when no enemy tower stands anywhere
+/// -- the titan is open and the home lane leads to it like any other. Without this a bot
+/// whose lane was broken walked its path to the end and stood at the shielded titan for the
+/// rest of the match, while the towers keeping the shield up stood on the other lanes.
+pub fn lane_to_push(game: &Game, team: Team, home: Lane, from: Vec3) -> Option<Lane> {
+    let et = team.other();
+    let standing = |l: Lane| game.towers.iter().filter(move |tw| tw.team == et && tw.lane == l && tw.hp > 0.0);
+    if standing(home).next().is_some() {
+        return Some(home);
+    }
+    let nearest = |l: Lane| standing(l).map(|tw| tw.pos.distance(from)).fold(f32::MAX, f32::min);
+    crate::map::lanes()
+        .iter()
+        .copied()
+        .filter(|&l| standing(l).next().is_some())
+        .min_by(|&a, &b| standing(a).count().cmp(&standing(b).count()).then_with(|| nearest(a).total_cmp(&nearest(b))))
+}
+
 /// The facts `teamplay::Call::decide` counts, read off the match for one team. Kept here
 /// rather than in `teamplay`, which is deliberately a struct of numbers with no borrow of
 /// `Game` -- this is the one place that knows where the numbers come from.
@@ -254,6 +281,12 @@ pub fn think(game: &mut Game, gi: usize) {
     let mut new_state = state;
     let mut cast_req: Option<(u32, Vec3)> = None;
     let mut new_wp = game.gods[gi].ai.as_ref().unwrap().wp;
+    if brain_state == AiState::Retreat && state == AiState::Push {
+        // healed: back out along the lane from where it stands, not toward the far point it
+        // held before the run home (a bot at the fountain beelined there through the middle)
+        let lane = game.gods[gi].ai.as_ref().unwrap().lane;
+        new_wp = nearest_waypoint(&crate::consts::lane_path(lane, team), g.pos);
+    }
     let mut strafe_dir = game.gods[gi].ai.as_ref().unwrap().strafe_dir;
     let mut strafe_t = game.gods[gi].ai.as_ref().unwrap().strafe_t;
     let mut stance = Stance::Hold;
@@ -500,6 +533,10 @@ pub fn think(game: &mut Game, gi: usize) {
     let mut new_lane = home_lane;
     let mut grouped_siege = false;
     if state == AiState::Push && goal.is_none() && !escaping {
+        // a broken home lane sends the bot to one with a tower left (`lane_to_push`)
+        if let Some(l) = lane_to_push(game, team, home_lane, g.pos) {
+            new_lane = l;
+        }
         let call = game.team_call[team as usize];
         if call.binds(hp_frac, new_state == AiState::Retreat) {
             let enemy_near = (0..game.gods.len()).any(|j| game.gods[j].team != team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(g.pos) < THREAT_R);
@@ -535,7 +572,7 @@ pub fn think(game: &mut Game, gi: usize) {
     if new_lane != cur_lane && state == AiState::Push && goal.is_none() {
         // changing lanes: join the other where it is nearest, not at its start
         let path = crate::consts::lane_path(new_lane, team);
-        let nearest = (0..path.len()).min_by(|&a, &b| path[a].distance(g.pos).total_cmp(&path[b].distance(g.pos))).unwrap_or(0);
+        let nearest = nearest_waypoint(&path, g.pos);
         new_wp = nearest;
         let enemy_near = (0..game.gods.len()).any(|j| game.gods[j].team != team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(g.pos) < THREAT_R);
         if !enemy_near && !escaping {
@@ -1134,6 +1171,56 @@ mod team_tests {
         assert_eq!(b.wp, nearest);
     }
 
+    /// Healed at the fountain, a bot walks its lane back out from its start rather than
+    /// cutting across the map to the far waypoint it held before it ran.
+    #[test]
+    fn a_healed_bot_walks_its_lane_back_out_from_the_fountain() {
+        let mut g = game();
+        let bot = 1;
+        let lane = g.gods[bot].ai.as_ref().unwrap().lane;
+        let path = crate::consts::lane_path(lane, Team::Blue);
+        let f = Team::Blue.fountain();
+        g.gods[bot].pos = Vec3::new(f.x, 0.0, f.z);
+        g.gods[bot].hp = g.gods[bot].max_hp;
+        {
+            let b = g.gods[bot].ai.as_mut().unwrap();
+            b.state = AiState::Retreat;
+            b.wp = path.len() - 1;
+        }
+        think(&mut g, bot);
+        let b = g.gods[bot].ai.as_ref().unwrap();
+        assert_eq!(b.state, AiState::Push, "full health at the fountain: back to the lane");
+        assert_eq!(b.wp, nearest_waypoint(&path, g.gods[bot].pos));
+        assert!(b.wp < path.len() - 1, "the far waypoint is forgotten");
+    }
+
+    /// A bot whose own lane has no enemy tower left goes to the lane with the fewest, and
+    /// stays home once every tower is down (the titan is open and the lane no longer matters).
+    #[test]
+    fn a_bot_whose_lane_is_broken_moves_to_the_weakest_lane_with_a_tower() {
+        let mut g = game();
+        let bot = (1..5).find(|&i| g.gods[i].ai.as_ref().unwrap().home == Lane::Mid).expect("a Mid bot");
+        for t in g.towers.iter_mut().filter(|t| t.team == Team::Red && t.lane == Lane::Mid) {
+            t.hp = 0.0;
+        }
+        let top_outer = g.towers.iter().position(|t| t.team == Team::Red && t.lane == Lane::Top && !t.inner).unwrap();
+        g.towers[top_outer].hp = 0.0;
+        assert_eq!(lane_to_push(&g, Team::Blue, Lane::Mid, g.gods[bot].pos), Some(Lane::Top), "one Top tower left vs two on Bot");
+        assert_eq!(lane_to_push(&g, Team::Blue, Lane::Bot, g.gods[bot].pos), Some(Lane::Bot), "a lane with a tower is kept");
+        think(&mut g, bot);
+        let b = g.gods[bot].ai.as_ref().unwrap();
+        assert_eq!(b.lane, Lane::Top);
+        assert_eq!(b.home, Lane::Mid, "the home lane is remembered");
+        let path = crate::consts::lane_path(Lane::Top, Team::Blue);
+        assert_eq!(b.wp, nearest_waypoint(&path, g.gods[bot].pos), "joined where it is nearest");
+        for t in g.towers.iter_mut().filter(|t| t.team == Team::Red) {
+            t.hp = 0.0;
+        }
+        assert_eq!(lane_to_push(&g, Team::Blue, Lane::Mid, g.gods[bot].pos), None);
+        think(&mut g, bot);
+        assert_eq!(g.gods[bot].ai.as_ref().unwrap().lane, Lane::Mid, "every tower down: home again");
+    }
+
     /// Farm is the default and binds nobody: the team starts the match on its own lanes.
     #[test]
     fn a_farm_call_leaves_every_bot_on_its_own_lane_with_no_goal() {
@@ -1176,7 +1263,8 @@ mod match_tests {
     ///
     /// What is asserted depends on the map scale. At the AUTHORED scale (`MAP_SCALE` 1.42)
     /// the match must END inside the budget: measured 9:18 with the layer (Red), 17:01
-    /// without it. At the 3.75 experiment the AI's structure radii (siege at 16 u, tower
+    /// without it, 12:11 (Red, every tower down) once a bot with a broken lane rotates to
+    /// one with a tower left (`lane_to_push`). At the 3.75 experiment the AI's structure radii (siege at 16 u, tower
     /// range 24 u, "near" at 12-16 u) are not scaled with the valley, the inner towers sit
     /// off the lane paths by more than a bot ever looks, and no match ends with or without
     /// the layer (40 minutes measured, both ways) -- so there the test asserts progress,
