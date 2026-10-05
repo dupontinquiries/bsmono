@@ -166,6 +166,8 @@ impl Default for Body {
 
 impl Body {
     pub fn hp_of(&self, s: Section) -> f32 { self.hp[Self::idx(s)] }
+    /// `hp_of` as a fraction of the section's maximum (the HUD's hull readout).
+    pub fn frac_of(&self, s: Section) -> f32 { self.hp_of(s) / s.max_hp() }
     pub fn is_gone(&self, s: Section) -> bool { self.gone[Self::idx(s)] }
     /// A vital section (head, torso) can never actually be marked "gone" —
     /// `apply` only severs `!s.vital()` parts — so checking `is_gone` alone

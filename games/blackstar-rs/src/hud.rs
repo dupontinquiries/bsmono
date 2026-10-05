@@ -69,6 +69,12 @@ pub struct HudInfo<'a> {
     /// a wall. The gait logic already picks this correctly; it just had
     /// no way out of `anim.rs` to reach a HUD until now.
     pub wounded: bool,
+    /// The torso's health as a fraction of its maximum (`sections::Body`): the number the
+    /// death check runs on, which the HUD never showed -- "DAMAGED" pulsed, and the next hit
+    /// was a surprise either way.
+    pub hull: f32,
+    /// Seconds until the downed body is rebuilt (`sections::Rebuild`), 0 while standing.
+    pub rebuild_in: f32,
     /// the equipped form's name and how much of its cooldown remains
     /// (0 = ready, 1 = just fired), or `None` out of robot mode entirely
     pub weapon: Option<WeaponHud>,
@@ -1101,6 +1107,21 @@ pub const HOTBAR_TOP: f32 = HOTBAR_Y + HOTBAR_H + HOTBAR_LIFT;
 /// -0.807, which clears HOTBAR_TOP (-0.828) by ~0.02.
 pub const HOTBAR_CLEARANCE: f32 = 0.165;
 
+/// The hull bar: above the DAMAGED line (whose glyphs span 0.039..0.075), below the reticle's
+/// clear zone.
+pub const HULL_Y0: f32 = 0.090;
+pub const HULL_H: f32 = 0.006;
+
+/// What the hull bar draws for a torso fraction: `None` while whole (nothing is drawn), else
+/// the fill and its colour -- the accent down to a third, the warning colour below it.
+pub fn hull_bar(hull: f32) -> Option<(f32, [f32; 4])> {
+    if !(hull < 1.0) {
+        return None;
+    }
+    let fill = hull.clamp(0.0, 1.0);
+    Some((fill, if fill < 1.0 / 3.0 { WARN } else { CYAN }))
+}
+
 // The centre weapon readout: name, cooldown bar, element, top to bottom.
 // One set of numbers for the draw code and the test that proves the three
 // stay disjoint (name glyphs end above the bar, element starts below it).
@@ -1272,8 +1293,19 @@ pub fn hud(ui: &mut Vec<UiVert>, info: &HudInfo, world: &World, car: &Car, ball:
     // rather than sitting solid so it reads as urgent without being a
     // constant distraction while it's true for a while. Glyph bottom
     // lands at 0.0386, above the reticle's top tick (0.0219).
-    if info.wounded && (info.time * 4.0).sin() > -0.3 {
+    if info.rebuild_in > 0.0 {
+        label_c(ui, 0.075, 0.0052, a, WARN, &format!("STRUCTURAL FAILURE — REBUILDING {:.1}s", info.rebuild_in));
+    } else if info.wounded && (info.time * 4.0).sin() > -0.3 {
         label_c(ui, 0.075, 0.0052, a, WARN, "DAMAGED — TAKE COVER");
+    }
+    // HULL. The torso's own number, above the warning line, drawn only once it is less than
+    // whole: a full bar is furniture, a shrinking one is information.
+    if let Some((fill, colour)) = hull_bar(info.hull) {
+        let bw = 0.09;
+        let bx = -bw * 0.5;
+        quad(ui, bx, HULL_Y0, bx + bw, HULL_Y0 + HULL_H, [0.2, 0.2, 0.24, 0.5]);
+        quad(ui, bx, HULL_Y0, bx + bw * fill, HULL_Y0 + HULL_H, colour);
+        label(ui, bx - font::width("HULL ", 0.0042, a), HULL_Y0 + HULL_H + 0.012, 0.0042, a, DIM, "HULL");
     }
 
     // ---- sparta scoreboard: BLUE n - m ORANGE across the top ----
@@ -1709,6 +1741,29 @@ pub fn splash(ui: &mut Vec<UiVert>, a: f32, t: f32, map_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whole: nothing drawn. Below whole: the fraction, in the accent until a third, then the
+    /// warning colour; clamped so a stale negative never draws backwards.
+    #[test]
+    fn the_hull_bar_appears_when_hurt_and_turns_to_warning_at_a_third() {
+        assert_eq!(hull_bar(1.0), None);
+        assert_eq!(hull_bar(1.5), None);
+        assert_eq!(hull_bar(0.9), Some((0.9, CYAN)));
+        assert_eq!(hull_bar(1.0 / 3.0), Some((1.0 / 3.0, CYAN)));
+        assert_eq!(hull_bar(0.2), Some((0.2, WARN)));
+        assert_eq!(hull_bar(-0.5), Some((0.0, WARN)));
+        assert_eq!(hull_bar(f32::NAN), None, "NaN is not less than whole; nothing is drawn");
+    }
+
+    /// The hull bar sits above the DAMAGED line's glyphs (0.039..0.075) and below the clear
+    /// band under the top plate -- the same disjointness the weapon readout is held to.
+    #[test]
+    fn the_hull_bar_stays_clear_of_the_damaged_line() {
+        let a = 16.0 / 9.0;
+        let damaged = raster(-0.2, 0.075, 0.0052, a, "DAMAGED — TAKE COVER");
+        assert!(HULL_Y0 > damaged.y1, "bar bottom {HULL_Y0} must clear the warning's top {}", damaged.y1);
+        assert!(HULL_Y0 + HULL_H + 0.012 + 0.0042 * 10.0 < 0.5, "and stay out of the middle of the screen");
+    }
 
     /// Rasterize one label the way the renderer will (shadow pass included,
     /// since `label` draws it offset and it extends the ink's box) and

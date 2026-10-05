@@ -7975,6 +7975,8 @@ impl Game {
             },
             first_person: self.cam.mode == camera::CamMode::First,
             wounded: self.loco.gait.wounded(),
+            hull: self.body.frac_of(sections::Section::Torso),
+            rebuild_in: self.rebuild.remaining(),
             // only meaningful once transformed — vehicle mode has no
             // trigger to read out
             weapon: if self.car.robot {
